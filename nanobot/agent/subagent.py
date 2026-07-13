@@ -10,27 +10,30 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hooks.subagent import SubagentHook, SubagentStatus
-from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates
 from nanobot.agent.tools.loader import ToolLoader
 from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.bus.events import InboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.providers.base import LLMProvider
+from nanobot.review.types import ReviewMetaKey
 from nanobot.utils.prompt_templates import render_template
 
 _DIMENSION_RUNNING = "running"
 _DIMENSION_COMPLETED = "completed"
 _DIMENSION_FAILED = "failed"
-_SUBAGENT_SOFT_TOOL_ERROR_TOOLS = frozenset({
-    "github_review",
-    "grep",
-    "list_dir",
-    "local_review",
-    "read_file",
-})
+_SUBAGENT_SOFT_TOOL_ERROR_TOOLS = frozenset(
+    {
+        "github_review",
+        "grep",
+        "list_dir",
+        "local_review",
+        "read_file",
+    }
+)
 
 
 class SubagentManager:
@@ -64,9 +67,7 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
         self.max_iterations = (
-            max_iterations
-            if max_iterations is not None
-            else defaults.max_tool_iterations
+            max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
         self.max_concurrent_subagents = (
             max_concurrent_subagents
@@ -131,6 +132,7 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         origin_message_id: str | None = None,
+        origin_metadata: dict[str, Any] | None = None,
     ) -> str:
         """Start a dedicated review subagent for same-turn result integration."""
         if session_key:
@@ -158,7 +160,9 @@ class SubagentManager:
         self._task_statuses[task_id] = status
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, label, origin, status, origin_message_id)
+            self._run_subagent(
+                task_id, task, label, origin, status, origin_message_id, origin_metadata
+            )
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -189,6 +193,7 @@ class SubagentManager:
         origin: dict[str, str],
         status: SubagentStatus,
         origin_message_id: str | None = None,
+        origin_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Execute a dedicated review subagent and announce structured findings."""
         logger.info("Review subagent [{}] starting task: {}", task_id, label)
@@ -197,10 +202,113 @@ class SubagentManager:
             status.phase = payload.get("phase", status.phase)
             status.iteration = payload.get("iteration", status.iteration)
 
+        lifecycle_status = "error"
         try:
-            tools = self._build_tools()
-            system_prompt = self._build_subagent_prompt()
-            hook = SubagentHook(task_id, status)
+            metadata = dict(origin_metadata or {})
+            target_type = str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower()
+
+            # Align subagent tool workspace with the review local root so that
+            # read_file("types.py") resolves relative to the review target
+            # directory rather than the project root.
+            sub_workspace: Path | None = None
+            local_root = metadata.get(ReviewMetaKey.LOCAL_ROOT)
+            if target_type == "local" and local_root:
+                try:
+                    root_path = Path(str(local_root)).expanduser().resolve()
+                    if root_path.is_dir():
+                        sub_workspace = root_path
+                except (OSError, ValueError):
+                    sub_workspace = None
+
+            tools = self._build_tools(workspace=sub_workspace)
+            system_prompt = self._build_subagent_prompt(workspace=sub_workspace)
+
+            stream_id = f"subagent:{task_id}"
+            origin_channel = origin.get("channel", "cli")
+            origin_chat_id = origin.get("chat_id", "direct")
+
+            # --- Streaming callbacks: publish reasoning / content deltas
+            # to the bus so the WebSocket channel can forward them to the
+            # frontend with subagent discriminator metadata. ---
+            async def _on_progress(
+                content: str,
+                *,
+                reasoning: bool = False,
+                reasoning_end: bool = False,
+                tool_hint: bool = False,
+                tool_events: list[dict[str, Any]] | None = None,
+            ) -> None:
+                meta = dict(metadata)
+                meta["_progress"] = True
+                meta["_tool_hint"] = tool_hint
+                meta["_stream_id"] = stream_id
+                meta["_subagent_id"] = task_id
+                meta["_subagent_label"] = label
+                if reasoning:
+                    meta["_reasoning_delta"] = True
+                if reasoning_end:
+                    meta["_reasoning_end"] = True
+                if tool_events:
+                    meta["_tool_events"] = tool_events
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=origin_channel,
+                        chat_id=origin_chat_id,
+                        content=content,
+                        metadata=meta,
+                    )
+                )
+
+            async def _on_stream(delta: str) -> None:
+                meta = dict(metadata)
+                meta["_stream_delta"] = True
+                meta["_stream_id"] = stream_id
+                meta["_stream_kind"] = "subagent_content"
+                meta["_subagent_id"] = task_id
+                meta["_subagent_label"] = label
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=origin_channel,
+                        chat_id=origin_chat_id,
+                        content=delta,
+                        metadata=meta,
+                    )
+                )
+
+            async def _on_stream_end(*, resuming: bool = False) -> None:
+                meta = dict(metadata)
+                meta["_stream_end"] = True
+                meta["_stream_id"] = stream_id
+                meta["_stream_kind"] = "subagent_content"
+                meta["_subagent_id"] = task_id
+                meta["_subagent_label"] = label
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=origin_channel,
+                        chat_id=origin_chat_id,
+                        content="",
+                        metadata=meta,
+                    )
+                )
+
+            # --- Lifecycle: notify frontend that this subagent is starting ---
+            await self._publish_subagent_lifecycle(
+                origin_channel, origin_chat_id, task_id, label, "running"
+            )
+
+            hook = SubagentHook(
+                task_id,
+                status,
+                tools=tools,
+                origin_channel=origin_channel,
+                origin_chat_id=origin_chat_id,
+                session_key=origin.get("session_key"),
+                origin_message_id=origin_message_id,
+                metadata=metadata,
+                on_progress=_on_progress,
+                on_stream_cb=_on_stream,
+                on_stream_end_cb=_on_stream_end,
+            )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -211,23 +319,26 @@ class SubagentManager:
                 if self._llm_wall_timeout_for_session
                 else None
             )
-            result = await self.runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                hook=hook,
-                max_iterations_message=(
-                    "Review task completed but no structured findings were submitted."
-                ),
-                error_message=None,
-                fail_on_tool_error=True,
-                soft_tool_error_tools=_SUBAGENT_SOFT_TOOL_ERROR_TOOLS,
-                checkpoint_callback=_on_checkpoint,
-                session_key=sess_key,
-                llm_timeout_s=llm_timeout,
-            ))
+            result = await self.runner.run(
+                AgentRunSpec(
+                    initial_messages=messages,
+                    tools=tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    hook=hook,
+                    max_iterations_message=(
+                        "Review task completed but no structured findings were submitted."
+                    ),
+                    error_message=None,
+                    fail_on_tool_error=True,
+                    soft_tool_error_tools=_SUBAGENT_SOFT_TOOL_ERROR_TOOLS,
+                    terminal_tools=frozenset({"review_submit"}),
+                    checkpoint_callback=_on_checkpoint,
+                    session_key=sess_key,
+                    llm_timeout_s=llm_timeout,
+                )
+            )
             status.stop_reason = result.stop_reason
 
             if result.stop_reason == "tool_error":
@@ -252,45 +363,153 @@ class SubagentManager:
                 return
 
             final_result = self._extract_review_submit_result(result.messages, result.tool_events)
-            if final_result is None and result.stop_reason == "completed":
-                status.phase = "retrying_review_submit"
-                retry_messages = list(result.messages) + [{
-                    "role": "user",
-                    "content": (
-                        "You did not call review_submit. You MUST call it now. "
-                        "Use JSON-compatible structured tool arguments. "
-                        "Use findings:[] if no issues were found."
-                    ),
-                }]
-                retry = await self.runner.run(AgentRunSpec(
-                    initial_messages=retry_messages,
-                    tools=tools,
-                    model=self.model,
-                    max_iterations=2,
-                    max_tool_result_chars=self.max_tool_result_chars,
-                    hook=hook,
-                    tool_choice={"function": {"name": "review_submit"}},
-                    response_format={"type": "json_object"},
-                    error_message=None,
-                    fail_on_tool_error=False,
-                    session_key=sess_key,
-                    llm_timeout_s=llm_timeout,
-                ))
-                status.stop_reason = retry.stop_reason
-                final_result = self._extract_review_submit_result(retry.messages, retry.tool_events)
+
+            # When no structured findings were submitted, force a review_submit
+            # call. This covers completed, max_iterations, and
+            # empty_final_response stop reasons — only tool_error and error
+            # take the failure paths above.
             if final_result is None:
-                final_result = result.final_content or (
-                    "Review task completed but no structured findings were submitted."
+                status.phase = "retrying_review_submit"
+                final_result, retry_stop_reason = await self._force_review_submit(
+                    result, tools, hook, sess_key, llm_timeout
                 )
+                status.stop_reason = retry_stop_reason
+
+            if final_result is None:
+                # Retry still produced no structured findings. Announce as a
+                # failure so the finalizer reports an accurate incomplete reason
+                # instead of masking the problem as "completed successfully".
+                final_result = (
+                    "No structured findings submitted: the review subagent did "
+                    "not produce a review_submit result."
+                )
+                logger.warning("Review subagent [{}] ended without structured findings", task_id)
+                status.phase = "done"
+                await self._announce_result(
+                    task_id, label, task, final_result, origin, "error", origin_message_id
+                )
+                return
+
+            # Guard against evidence-less empty findings: a subagent that
+            # submits ``findings: []`` without having successfully read any
+            # target evidence is treated as incomplete rather than clean.
+            if self._is_empty_findings(final_result):
+                if not self._has_successful_evidence_read(result.tool_events, target_type):
+                    final_result = (
+                        "Error: Review incomplete — no target evidence was "
+                        "successfully read before submitting empty findings. "
+                        "The reviewer must read the target files before "
+                        "reporting no issues."
+                    )
+                    logger.warning(
+                        "Review subagent [{}] submitted empty findings without evidence",
+                        task_id,
+                    )
+                    status.phase = "error"
+                    await self._announce_result(
+                        task_id, label, task, final_result, origin, "error", origin_message_id
+                    )
+                    return
+
             logger.info("Review subagent [{}] completed successfully", task_id)
             status.phase = "done"
-            await self._announce_result(task_id, label, task, final_result, origin, "ok", origin_message_id)
+            lifecycle_status = "completed"
+            await self._announce_result(
+                task_id, label, task, final_result, origin, "ok", origin_message_id
+            )
 
         except Exception as e:
             status.phase = "error"
             status.error = str(e)
             logger.exception("Review subagent [{}] failed", task_id)
-            await self._announce_result(task_id, label, task, f"Error: {e}", origin, "error", origin_message_id)
+            await self._announce_result(
+                task_id, label, task, f"Error: {e}", origin, "error", origin_message_id
+            )
+        finally:
+            await self._publish_subagent_lifecycle(
+                origin.get("channel", "cli"),
+                origin.get("chat_id", "direct"),
+                task_id,
+                label,
+                lifecycle_status,
+            )
+
+    async def _force_review_submit(
+        self,
+        result: AgentRunResult,
+        tools: ToolRegistry,
+        hook: SubagentHook,
+        sess_key: str | None,
+        llm_timeout: float | None,
+    ) -> tuple[str | None, str]:
+        """Force a ``review_submit`` call when no structured findings were extracted.
+
+        Returns ``(extracted_result, retry_stop_reason)``. ``extracted_result``
+        is the canonical ``review_submit`` JSON string when the retry succeeds,
+        or ``None`` when the retry still produces no structured findings.
+        """
+        retry_messages = list(result.messages) + [
+            {
+                "role": "user",
+                "content": (
+                    "You did not call review_submit. You MUST call it now. "
+                    "Use JSON-compatible structured tool arguments. "
+                    "Use findings:[] if no issues were found."
+                ),
+            }
+        ]
+        retry = await self.runner.run(
+            AgentRunSpec(
+                initial_messages=retry_messages,
+                tools=tools,
+                model=self.model,
+                max_iterations=2,
+                max_tool_result_chars=self.max_tool_result_chars,
+                hook=hook,
+                tool_choice={"function": {"name": "review_submit"}},
+                response_format={"type": "json_object"},
+                error_message=None,
+                fail_on_tool_error=False,
+                terminal_tools=frozenset({"review_submit"}),
+                session_key=sess_key,
+                llm_timeout_s=llm_timeout,
+            )
+        )
+        extracted = self._extract_review_submit_result(retry.messages, retry.tool_events)
+        return extracted, retry.stop_reason
+
+    @staticmethod
+    def _is_empty_findings(result_json: str) -> bool:
+        """Check whether a review_submit result has zero findings."""
+        try:
+            data = json.loads(result_json)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return (
+            isinstance(data, dict)
+            and data.get("submitted") is True
+            and isinstance(data.get("findings"), list)
+            and len(data["findings"]) == 0
+        )
+
+    @staticmethod
+    def _has_successful_evidence_read(
+        tool_events: list[dict[str, Any]],
+        target_type: str,
+    ) -> bool:
+        """Check whether the subagent successfully read target evidence.
+
+        For local targets, a successful ``read_file`` or ``local_review``
+        counts.  For GitHub targets, a successful ``github_review`` counts.
+        """
+        if target_type == "github":
+            evidence_tools = {"github_review"}
+        else:
+            evidence_tools = {"read_file", "local_review"}
+        for event in tool_events:
+            if event.get("name") in evidence_tools and event.get("status") == "ok":
+                return True
+        return False
 
     async def _announce_result(
         self,
@@ -344,7 +563,42 @@ class SubagentManager:
             label,
             _DIMENSION_COMPLETED if status == "ok" else _DIMENSION_FAILED,
         )
-        logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
+        logger.debug(
+            "Subagent [{}] announced result to {}:{}", task_id, origin["channel"], origin["chat_id"]
+        )
+
+    async def _publish_subagent_lifecycle(
+        self,
+        channel: str,
+        chat_id: str,
+        task_id: str,
+        label: str,
+        status: str,
+    ) -> None:
+        """Publish a subagent lifecycle event (start/end) to the bus.
+
+        ``status`` is ``"running"`` when the subagent starts and
+        ``"completed"`` or ``"error"`` when it finishes.  The WebSocket
+        channel translates this into a ``subagent_status`` wire event so
+        the frontend can create / update per-subagent cards.
+        """
+        meta: dict[str, Any] = {
+            "_subagent_id": task_id,
+            "_subagent_label": label,
+            "_subagent_status": status,
+        }
+        if status == "running":
+            meta["_subagent_start"] = True
+        else:
+            meta["_subagent_end"] = True
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content="",
+                metadata=meta,
+            )
+        )
 
     def _dimension_state(self, session_key: str, label: str) -> str | None:
         return self._session_dimension_state.get(session_key, {}).get(label)
@@ -409,7 +663,7 @@ class SubagentManager:
             lines.append(f"- {result.error}")
         return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
 
-    def _build_subagent_prompt(self) -> str:
+    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
         """Build the system prompt for dedicated review subagents."""
         from nanobot.agent.context import ContextBuilder
 
@@ -417,8 +671,8 @@ class SubagentManager:
         return render_template(
             "agent/review_subagent_system.md",
             time_ctx=time_ctx,
-            workspace=str(self.workspace),
-            skills_summary= "",#保留skillsummary接口
+            workspace=str(workspace or self.workspace),
+            skills_summary="",  # 保留skillsummary接口
         )
 
     @staticmethod
@@ -465,8 +719,11 @@ class SubagentManager:
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
-        tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])
-                 if tid in self._running_tasks and not self._running_tasks[tid].done()]
+        tasks = [
+            self._running_tasks[tid]
+            for tid in self._session_tasks.get(session_key, [])
+            if tid in self._running_tasks and not self._running_tasks[tid].done()
+        ]
         for t in tasks:
             t.cancel()
         if tasks:
@@ -481,6 +738,5 @@ class SubagentManager:
         """Return the number of currently running subagents for a session."""
         tids = self._session_tasks.get(session_key, set())
         return sum(
-            1 for tid in tids
-            if tid in self._running_tasks and not self._running_tasks[tid].done()
+            1 for tid in tids if tid in self._running_tasks and not self._running_tasks[tid].done()
         )

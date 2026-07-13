@@ -60,11 +60,13 @@ async def test_spawn_requires_review_context() -> None:
 async def test_spawn_normalizes_allowed_dimension_label() -> None:
     manager = FakeSubagentManager()
     tool = SpawnTool(manager)  # type: ignore[arg-type]
-    tool.set_context(RequestContext(
-        channel="websocket",
-        chat_id="chat",
-        metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
-    ))
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat",
+            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
+        )
+    )
 
     result = await tool.execute(task="review dependencies", label="Dependency Reviewer")
 
@@ -79,11 +81,13 @@ async def test_spawn_normalizes_allowed_dimension_label() -> None:
 async def test_spawn_rejects_unselected_dimension() -> None:
     manager = FakeSubagentManager()
     tool = SpawnTool(manager)  # type: ignore[arg-type]
-    tool.set_context(RequestContext(
-        channel="websocket",
-        chat_id="chat",
-        metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
-    ))
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat",
+            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
+        )
+    )
 
     result = await tool.execute(task="review security", label="Security Reviewer")
 
@@ -97,13 +101,66 @@ async def test_spawn_surfaces_duplicate_dimension_rejection() -> None:
     manager = FakeSubagentManager()
     manager.result = "Error: Cannot spawn review subagent: dimension 'dependency' has already completed for this review."
     tool = SpawnTool(manager)  # type: ignore[arg-type]
-    tool.set_context(RequestContext(
-        channel="websocket",
-        chat_id="chat",
-        metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
-    ))
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat",
+            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
+        )
+    )
 
     result = await tool.execute(task="review dependencies again", label="dependency")
 
     assert "already completed" in result
     assert manager.calls[0]["label"] == "dependency"
+
+
+@pytest.mark.asyncio
+async def test_spawn_passes_filtered_review_metadata() -> None:
+    """SpawnTool forwards safe review metadata to SubagentManager.spawn()."""
+    manager = FakeSubagentManager()
+    tool = SpawnTool(manager)  # type: ignore[arg-type]
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat",
+            metadata={
+                ReviewMetaKey.ALLOWED_DIMENSIONS: ["security"],
+                ReviewMetaKey.TARGET_TYPE: "local",
+                ReviewMetaKey.LOCAL_ROOT: "/some/path",
+                ReviewMetaKey.ACTION: "review",
+            },
+        )
+    )
+
+    await tool.execute(task="review security", label="security")
+
+    forwarded = manager.calls[0]["origin_metadata"]
+    assert forwarded[ReviewMetaKey.TARGET_TYPE] == "local"
+    assert forwarded[ReviewMetaKey.LOCAL_ROOT] == "/some/path"
+    assert forwarded[ReviewMetaKey.ACTION] == "review"
+    assert forwarded[ReviewMetaKey.ALLOWED_DIMENSIONS] == ["security"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_excludes_evidence_provider() -> None:
+    """EVIDENCE_PROVIDER and other internal objects must not leak to subagents."""
+    manager = FakeSubagentManager()
+    tool = SpawnTool(manager)  # type: ignore[arg-type]
+    sentinel = object()
+    tool.set_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="chat",
+            metadata={
+                ReviewMetaKey.ALLOWED_DIMENSIONS: ["security"],
+                ReviewMetaKey.EVIDENCE_PROVIDER: sentinel,
+            },
+        )
+    )
+
+    await tool.execute(task="review security", label="security")
+
+    forwarded = manager.calls[0]["origin_metadata"]
+    assert ReviewMetaKey.EVIDENCE_PROVIDER not in forwarded
+    assert ReviewMetaKey.ALLOWED_DIMENSIONS in forwarded

@@ -662,6 +662,7 @@ function ReviewAppShell({
               onSelectFinding={setSelectedFinding}
               onPause={() => cancelTurn()}
               findings={state.findings}
+              subagentCards={state.subagentCards}
             />
           )
         }

@@ -336,6 +336,21 @@ class ChannelManager:
     @staticmethod
     async def _send_once(channel: BaseChannel, msg: OutboundMessage) -> None:
         """Send one outbound message without retry policy."""
+        meta = msg.metadata or {}
+        if meta.get("_subagent_start") or meta.get("_subagent_end"):
+            subagent_id = meta.get("_subagent_id", "")
+            subagent_label = meta.get("_subagent_label", "")
+            subagent_status = meta.get("_subagent_status", "running")
+            send_fn = getattr(channel, "send_subagent_status", None)
+            if send_fn is not None:
+                await send_fn(
+                    msg.chat_id,
+                    subagent_id,
+                    subagent_label,
+                    subagent_status,
+                    meta,
+                )
+            return
         if msg.metadata.get("_reasoning_end"):
             await channel.send_reasoning_end(msg.chat_id, msg.metadata)
         elif msg.metadata.get("_reasoning_delta"):

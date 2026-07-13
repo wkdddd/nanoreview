@@ -13,6 +13,27 @@ from nanobot.review.types import ReviewMetaKey, normalize_review_dimension
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
 
+# Metadata keys that are safe to forward to subagent runtime.
+# Excludes EVIDENCE_PROVIDER and other internal objects that are not
+# JSON-serializable or should not leak across the subagent boundary.
+_SAFE_METADATA_KEYS = frozenset(
+    {
+        ReviewMetaKey.MODE,
+        ReviewMetaKey.TARGET,
+        ReviewMetaKey.TARGET_TYPE,
+        ReviewMetaKey.MODE_VARIANT,
+        ReviewMetaKey.ACTION,
+        ReviewMetaKey.FOCUS,
+        ReviewMetaKey.TARGET_REF,
+        ReviewMetaKey.LOCAL_ROOT,
+        ReviewMetaKey.LOCAL_TARGET,
+        ReviewMetaKey.LOCAL_SCOPE_KIND,
+        ReviewMetaKey.MAX_SUBAGENTS,
+        ReviewMetaKey.ALLOWED_DIMENSIONS,
+        ReviewMetaKey.GITHUB_PREFETCH_READY,
+    }
+)
+
 
 @tool_parameters(
     tool_parameters_schema(
@@ -89,6 +110,9 @@ class SpawnTool(Tool, ContextAware):
                 f"({running}/{limit} running). Wait for a running subagent "
                 f"to complete before spawning a new one."
             )
+        origin_metadata = {
+            key: value for key, value in metadata.items() if key in _SAFE_METADATA_KEYS
+        }
         return await self._manager.spawn(
             task=task,
             label=dimension,
@@ -96,6 +120,7 @@ class SpawnTool(Tool, ContextAware):
             origin_chat_id=self._origin_chat_id.get(),
             session_key=self._session_key.get(),
             origin_message_id=self._origin_message_id.get(),
+            origin_metadata=origin_metadata,
         )
 
     @staticmethod
@@ -104,8 +129,6 @@ class SpawnTool(Tool, ContextAware):
         if not isinstance(raw, list):
             return None
         allowed = {
-            dimension
-            for item in raw
-            if (dimension := normalize_review_dimension(str(item)))
+            dimension for item in raw if (dimension := normalize_review_dimension(str(item)))
         }
         return allowed or None

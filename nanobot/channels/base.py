@@ -149,6 +149,22 @@ class BaseChannel(ABC):
         end_meta["_reasoning_end"] = True
         await self.send_reasoning_end(msg.chat_id, end_meta)
 
+    async def send_subagent_status(
+        self,
+        chat_id: str,
+        subagent_id: str,
+        label: str,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Notify the frontend that a subagent started or finished.
+
+        Default is no-op. Channels with a rich UI (WebSocket) override
+        to render per-subagent status cards. ``status`` is one of
+        ``"running"``, ``"completed"``, or ``"error"``.
+        """
+        return
+
     @property
     def supports_streaming(self) -> bool:
         """True when config enables streaming AND this subclass implements send_delta."""

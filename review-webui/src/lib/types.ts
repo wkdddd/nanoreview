@@ -273,23 +273,38 @@ export type InboundEvent =
       text: string;
       stream_id?: string;
       kind?: "review_thinking" | "review_report";
+      subagent_id?: string;
+      subagent_label?: string;
     }
   | {
       event: "stream_end";
       chat_id: string;
       stream_id?: string;
       kind?: "review_thinking" | "review_report";
+      subagent_id?: string;
+      subagent_label?: string;
     }
   | {
       event: "reasoning_delta";
       chat_id: string;
       text: string;
       stream_id?: string;
+      subagent_id?: string;
+      subagent_label?: string;
     }
   | {
       event: "reasoning_end";
       chat_id: string;
       stream_id?: string;
+      subagent_id?: string;
+      subagent_label?: string;
+    }
+  | {
+      event: "subagent_status";
+      chat_id: string;
+      subagent_id: string;
+      label: string;
+      status: "running" | "completed" | "error";
     }
   | {
       event: "runtime_model_updated";

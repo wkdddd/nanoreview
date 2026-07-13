@@ -144,6 +144,19 @@ class GitHubReviewTool(ReviewToolBase):
             max_results,
         )
         try:
+            if self._is_local_review_turn():
+                result_text = (
+                    "Error: github_review is disabled for local review targets. "
+                    "Use local_review(meta/tree/file/repo/diff), read_file, grep, "
+                    "or list_dir for local evidence."
+                )
+                logger.warning(
+                    "github_review.blocked_local_target trace_id={} action={} repo={}",
+                    trace_id,
+                    action_value,
+                    repo,
+                )
+                return result_text
             if action_value not in ALL_REVIEW_TOOL_ACTIONS:
                 result_text = self._unknown_action(action_value)
                 logger.warning(
@@ -241,3 +254,10 @@ class GitHubReviewTool(ReviewToolBase):
         if "/" in repo and "/" in target_repo:
             return repo.strip().lower().rstrip("/") in target_repo.lower()
         return True
+
+    @staticmethod
+    def _is_local_review_turn() -> bool:
+        """Disable github_review tool when the current review targets local files."""
+        ctx = current_request_context()
+        metadata = ctx.metadata if ctx is not None else {}
+        return str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower() == "local"

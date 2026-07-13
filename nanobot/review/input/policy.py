@@ -25,7 +25,7 @@ def policy_for_depth(depth: ReviewDepth, *, requested_max_subagents: int = 4) ->
         return ReviewModePolicy(
             depth=depth,
             roles=_roles(_QUICK_ROLE_KEYS),
-            max_subagents=min(max_subagents, 2),
+            max_subagents=max_subagents,
             severities=("critical", "high"),
             judge_enabled=False,
             evidence_max_results=4,
@@ -35,7 +35,7 @@ def policy_for_depth(depth: ReviewDepth, *, requested_max_subagents: int = 4) ->
         return ReviewModePolicy(
             depth=depth,
             roles=[*DEFAULT_REVIEW_ROLES.values(), *OPTIONAL_REVIEW_ROLES.values()],
-            max_subagents=max(max_subagents, 6),
+            max_subagents=max_subagents,
             severities=("critical", "high", "medium", "low"),
             judge_enabled=True,
             evidence_max_results=12,

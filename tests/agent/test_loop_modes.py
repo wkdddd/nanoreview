@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -10,10 +12,12 @@ from nanobot.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanobot.agent.loop import AgentLoop, TurnContext, TurnState, _is_consumed_subagent_result
 from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.context import current_request_context
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.review.types import ReviewMetaKey
 from nanobot.session.manager import Session
 
 
@@ -68,7 +72,9 @@ class SpawnExecutingRunner:
         tool = spec.tools.get("spawn")
         assert tool is not None
         self.result = await tool.execute(**call.arguments)
-        return AgentRunResult(final_content="ok", messages=spec.initial_messages, tools_used=["spawn"])
+        return AgentRunResult(
+            final_content="ok", messages=spec.initial_messages, tools_used=["spawn"]
+        )
 
 
 class InjectionRunner:
@@ -96,16 +102,21 @@ class ReviewSubmitRetryRunner:
                 final_content="review prose without tool call",
                 messages=list(spec.initial_messages),
                 stop_reason="completed",
+                tool_events=[
+                    {"name": "read_file", "status": "ok", "detail": "file content"},
+                ],
             )
         return AgentRunResult(
             final_content=None,
             messages=list(spec.initial_messages),
-            tool_events=[{
-                "name": "review_submit",
-                "status": "ok",
-                "detail": '{"submitted": true, "findings": [], "errors": []}',
-                "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-            }],
+            tool_events=[
+                {
+                    "name": "review_submit",
+                    "status": "ok",
+                    "detail": '{"submitted": true, "findings": [], "errors": []}',
+                    "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                }
+            ],
         )
 
 
@@ -120,12 +131,15 @@ class BlockingSubmitRunner:
         return AgentRunResult(
             final_content=None,
             messages=list(spec.initial_messages),
-            tool_events=[{
-                "name": "review_submit",
-                "status": "ok",
-                "detail": '{"submitted": true, "findings": [], "errors": []}',
-                "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-            }],
+            tool_events=[
+                {"name": "read_file", "status": "ok", "detail": "file content"},
+                {
+                    "name": "review_submit",
+                    "status": "ok",
+                    "detail": '{"submitted": true, "findings": [], "errors": []}',
+                    "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                },
+            ],
         )
 
 
@@ -205,8 +219,7 @@ class MultiDrainRunner:
         assert "second" in task_ids
         assert any(item.get("content") == "user interjection" for item in second)
         assert any(
-            item.get("_metadata", {}).get("injected_event") == "subagent_barrier"
-            for item in second
+            item.get("_metadata", {}).get("injected_event") == "subagent_barrier" for item in second
         )
 
         messages = list(spec.initial_messages)
@@ -317,6 +330,7 @@ async def test_agent_loop_always_injects_review_context(
     monkeypatch,
 ) -> None:
     """Review context is always resolved regardless of session metadata."""
+
     async def mock_review(*args: Any, **kwargs: Any) -> str:
         return "review system prompt"
 
@@ -458,17 +472,19 @@ def test_session_history_preserves_subagent_result_metadata() -> None:
 
     history = session.get_history()
 
-    assert history == [{
-        "role": "assistant",
-        "content": "wrapped result",
-        "_metadata": {
-            "injected_event": "subagent_result",
-            "subagent_task_id": "task",
-            "subagent_label": "security",
-            "subagent_status": "ok",
-            "subagent_result": raw_result,
-        },
-    }]
+    assert history == [
+        {
+            "role": "assistant",
+            "content": "wrapped result",
+            "_metadata": {
+                "injected_event": "subagent_result",
+                "subagent_task_id": "task",
+                "subagent_label": "security",
+                "subagent_status": "ok",
+                "subagent_result": raw_result,
+            },
+        }
+    ]
 
 
 def test_consumed_subagent_result_helper_matches_consumed_task() -> None:
@@ -538,16 +554,18 @@ async def test_subagent_hook_uses_streaming_request_path() -> None:
 
 
 def test_review_subagent_extracts_review_submit_tool_result() -> None:
-    messages = [{
-        "role": "tool",
-        "tool_call_id": "call_1",
-        "name": "review_submit",
-        "content": (
-            '{"submitted":true,"findings":[{"severity":"high","file":"src/app.py",'
-            '"line":1,"title":"Issue","evidence":"line1",'
-            '"impact":"bad","recommendation":"fix"}],"errors":[]}'
-        ),
-    }]
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "review_submit",
+            "content": (
+                '{"submitted":true,"findings":[{"severity":"high","file":"src/app.py",'
+                '"line":1,"title":"Issue","evidence":"line1",'
+                '"impact":"bad","recommendation":"fix"}],"errors":[]}'
+            ),
+        }
+    ]
 
     result = SubagentManager._extract_review_submit_result(messages)
 
@@ -563,18 +581,22 @@ def test_review_subagent_extracts_untruncated_review_submit_event() -> None:
         '"line":1,"title":"Issue","evidence":"line1",'
         '"impact":"bad","recommendation":"fix"}],"errors":[]}'
     )
-    messages = [{
-        "role": "tool",
-        "tool_call_id": "call_1",
-        "name": "review_submit",
-        "content": raw_result[:60] + "\n... (truncated)",
-    }]
-    tool_events = [{
-        "name": "review_submit",
-        "status": "ok",
-        "detail": raw_result[:120] + "...",
-        "raw_result": raw_result,
-    }]
+    messages = [
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "review_submit",
+            "content": raw_result[:60] + "\n... (truncated)",
+        }
+    ]
+    tool_events = [
+        {
+            "name": "review_submit",
+            "status": "ok",
+            "detail": raw_result[:120] + "...",
+            "raw_result": raw_result,
+        }
+    ]
 
     result = SubagentManager._extract_review_submit_result(messages, tool_events)
 
@@ -585,22 +607,26 @@ def test_review_subagent_extracts_untruncated_review_submit_event() -> None:
 
 
 def test_review_subagent_ignores_unprocessed_review_submit_arguments() -> None:
-    messages = [{
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "review_submit",
-                "arguments": (
-                    '{"findings":[{"severity":"high","file":"src/app.py",'
-                    '"line":1,"title":"Issue","evidence":"line1",'
-                    '"impact":"bad","recommendation":"fix"}]}'
-                ),
-            },
-        }],
-    }]
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "review_submit",
+                        "arguments": (
+                            '{"findings":[{"severity":"high","file":"src/app.py",'
+                            '"line":1,"title":"Issue","evidence":"line1",'
+                            '"impact":"bad","recommendation":"fix"}]}'
+                        ),
+                    },
+                }
+            ],
+        }
+    ]
 
     assert SubagentManager._extract_review_submit_result(messages) is None
 
@@ -642,6 +668,132 @@ async def test_review_subagent_finalization_retry_forces_review_submit(tmp_path)
     assert status.phase == "done"
     assert status.stop_reason == "completed"
     assert manager._dimension_state("cli:direct", "security") == "completed"
+
+
+class MaxIterationsThenSubmitRunner:
+    """Runner that hits max_iterations first, then submits on forced retry."""
+
+    def __init__(self) -> None:
+        self.specs: list[AgentRunSpec] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        if len(self.specs) == 1:
+            return AgentRunResult(
+                final_content="review prose without tool call",
+                messages=list(spec.initial_messages),
+                stop_reason="max_iterations",
+                tool_events=[
+                    {"name": "read_file", "status": "ok", "detail": "file content"},
+                ],
+            )
+        return AgentRunResult(
+            final_content=None,
+            messages=list(spec.initial_messages),
+            tool_events=[
+                {
+                    "name": "review_submit",
+                    "status": "ok",
+                    "detail": '{"submitted": true, "findings": [], "errors": []}',
+                    "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                }
+            ],
+        )
+
+
+class AlwaysNoSubmitRunner:
+    """Runner that never produces a review_submit result."""
+
+    def __init__(self) -> None:
+        self.specs: list[AgentRunSpec] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        return AgentRunResult(
+            final_content="review prose without tool call",
+            messages=list(spec.initial_messages),
+            stop_reason="max_iterations" if len(self.specs) == 1 else "completed",
+        )
+
+
+@pytest.mark.asyncio
+async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_path) -> None:
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    runner = MaxIterationsThenSubmitRunner()
+    manager.runner = runner  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task1",
+        label="security",
+        task_description="review security",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task1",
+        "review security",
+        "security",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+    )
+
+    assert len(runner.specs) == 2
+    assert runner.specs[0].tool_choice is None
+    assert runner.specs[1].tool_choice == {"function": {"name": "review_submit"}}
+    assert runner.specs[1].response_format == {"type": "json_object"}
+    assert status.phase == "done"
+    assert status.stop_reason == "completed"
+    assert manager._dimension_state("cli:direct", "security") == "completed"
+
+    # The announced subagent_result should be canonical JSON
+    results = manager.drain_session_results("cli:direct", limit=1)
+    assert len(results) == 1
+    msg = results[0]
+    assert msg.metadata["subagent_status"] == "ok"
+    result_json = json.loads(msg.metadata["subagent_result"])
+    assert result_json == {"submitted": True, "findings": [], "errors": []}
+
+
+@pytest.mark.asyncio
+async def test_review_subagent_retry_failure_announces_error_not_success(tmp_path) -> None:
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    runner = AlwaysNoSubmitRunner()
+    manager.runner = runner  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task1",
+        label="security",
+        task_description="review security",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task1",
+        "review security",
+        "security",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+    )
+
+    assert len(runner.specs) == 2
+    assert runner.specs[1].tool_choice == {"function": {"name": "review_submit"}}
+    # Should NOT be announced as "completed successfully"
+    assert status.phase == "done"
+    assert manager._dimension_state("cli:direct", "security") == "failed"
+
+    results = manager.drain_session_results("cli:direct", limit=1)
+    assert len(results) == 1
+    msg = results[0]
+    assert msg.metadata["subagent_status"] == "error"
+    assert "no structured findings submitted" in msg.metadata["subagent_result"].lower()
 
 
 @pytest.mark.asyncio
@@ -696,6 +848,302 @@ async def test_subagent_manager_rejects_duplicate_dimension_lifecycle(tmp_path) 
     assert "already completed" in completed_duplicate
     assert manager._dimension_state("cli:direct", "security") == "completed"
     assert len(runner.specs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Review metadata propagation & subagent tool context alignment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subagent_workspace_uses_local_root(tmp_path) -> None:
+    """Subagent tools resolve paths relative to review_local_root, not project root."""
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    (subdir / "target.py").write_text("x = 1\n", encoding="utf-8")
+
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+
+    captured: list[ToolRegistry] = []
+
+    class WorkspaceCaptureRunner:
+        async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+            captured.append(spec.tools)
+            return AgentRunResult(
+                final_content=None,
+                messages=list(spec.initial_messages),
+                tool_events=[
+                    {"name": "read_file", "status": "ok", "detail": "content"},
+                    {
+                        "name": "review_submit",
+                        "status": "ok",
+                        "detail": '{"submitted": true, "findings": [], "errors": []}',
+                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                    },
+                ],
+            )
+
+    manager.runner = WorkspaceCaptureRunner()  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task1",
+        label="security",
+        task_description="review",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task1",
+        "review",
+        "security",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+        origin_metadata={
+            ReviewMetaKey.TARGET_TYPE: "local",
+            ReviewMetaKey.LOCAL_ROOT: str(subdir),
+        },
+    )
+
+    assert status.phase == "done"
+    assert len(captured) == 1
+    read_tool = captured[0].get("read_file")
+    assert read_tool is not None
+    tool_workspace = Path(read_tool._workspace).resolve()  # type: ignore[attr-defined]
+    assert tool_workspace == subdir.resolve()
+
+
+@pytest.mark.asyncio
+async def test_subagent_hook_sets_request_context(tmp_path) -> None:
+    """SubagentHook.before_execute_tools sets current_request_context with metadata."""
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    tools = manager._build_tools()
+
+    hook = SubagentHook(
+        "task1",
+        None,
+        tools=tools,
+        origin_channel="websocket",
+        origin_chat_id="chat",
+        session_key="websocket:chat",
+        metadata={
+            ReviewMetaKey.TARGET_TYPE: "local",
+            ReviewMetaKey.LOCAL_ROOT: str(tmp_path),
+        },
+    )
+
+    context = AgentHookContext(
+        iteration=0,
+        messages=[],
+        tool_calls=[
+            ToolCallRequest(id="call1", name="read_file", arguments={"path": "test.py"}),
+        ],
+    )
+
+    await hook.before_execute_tools(context)
+
+    ctx = current_request_context()
+    assert ctx is not None
+    assert ctx.metadata.get(ReviewMetaKey.TARGET_TYPE) == "local"
+    assert ctx.metadata.get(ReviewMetaKey.LOCAL_ROOT) == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_subagent_read_file_blocked_for_github_target(tmp_path) -> None:
+    """read_file blocks local workspace reads when target_type is github."""
+    (tmp_path / "local.py").write_text("x = 1\n", encoding="utf-8")
+
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    tools = manager._build_tools()
+
+    hook = SubagentHook(
+        "task1",
+        None,
+        tools=tools,
+        origin_channel="websocket",
+        origin_chat_id="chat",
+        metadata={ReviewMetaKey.TARGET_TYPE: "github"},
+    )
+
+    context = AgentHookContext(
+        iteration=0,
+        messages=[],
+        tool_calls=[
+            ToolCallRequest(id="call1", name="read_file", arguments={"path": "local.py"}),
+        ],
+    )
+
+    await hook.before_execute_tools(context)
+
+    read_tool = tools.get("read_file")
+    assert read_tool is not None
+    result = await read_tool.execute(path="local.py")
+    assert "cannot read local workspace files" in str(result).lower()
+
+
+# ---------------------------------------------------------------------------
+# Evidence-less empty findings guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_findings_without_evidence_is_incomplete(tmp_path) -> None:
+    """findings:[] with no evidence reads → error/incomplete, not clean."""
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+
+    class NoEvidenceSubmitRunner:
+        async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+            return AgentRunResult(
+                final_content=None,
+                messages=list(spec.initial_messages),
+                tool_events=[
+                    {
+                        "name": "review_submit",
+                        "status": "ok",
+                        "detail": '{"submitted": true, "findings": [], "errors": []}',
+                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                    },
+                ],
+            )
+
+    manager.runner = NoEvidenceSubmitRunner()  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task1",
+        label="security",
+        task_description="review",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task1",
+        "review",
+        "security",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+        origin_metadata={ReviewMetaKey.TARGET_TYPE: "local"},
+    )
+
+    assert status.phase == "error"
+    results = manager.drain_session_results("cli:direct", limit=1)
+    assert len(results) == 1
+    assert results[0].metadata["subagent_status"] == "error"
+    assert "no target evidence" in results[0].metadata["subagent_result"].lower()
+
+
+@pytest.mark.asyncio
+async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -> None:
+    """findings:[] backed by successful read_file → still ok (no_findings)."""
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+
+    class EvidenceSubmitRunner:
+        async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+            return AgentRunResult(
+                final_content=None,
+                messages=list(spec.initial_messages),
+                tool_events=[
+                    {"name": "read_file", "status": "ok", "detail": "content"},
+                    {
+                        "name": "review_submit",
+                        "status": "ok",
+                        "detail": '{"submitted": true, "findings": [], "errors": []}',
+                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                    },
+                ],
+            )
+
+    manager.runner = EvidenceSubmitRunner()  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task1",
+        label="security",
+        task_description="review",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task1",
+        "review",
+        "security",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+        origin_metadata={ReviewMetaKey.TARGET_TYPE: "local"},
+    )
+
+    assert status.phase == "done"
+    results = manager.drain_session_results("cli:direct", limit=1)
+    assert len(results) == 1
+    assert results[0].metadata["subagent_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) -> None:
+    """For GitHub targets, successful github_review counts as evidence."""
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+
+    class GithubEvidenceRunner:
+        async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+            return AgentRunResult(
+                final_content=None,
+                messages=list(spec.initial_messages),
+                tool_events=[
+                    {"name": "github_review", "status": "ok", "detail": "repo content"},
+                    {
+                        "name": "review_submit",
+                        "status": "ok",
+                        "detail": '{"submitted": true, "findings": [], "errors": []}',
+                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
+                    },
+                ],
+            )
+
+    manager.runner = GithubEvidenceRunner()  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task1",
+        label="security",
+        task_description="review",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task1",
+        "review",
+        "security",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+        origin_metadata={ReviewMetaKey.TARGET_TYPE: "github"},
+    )
+
+    assert status.phase == "done"
+    results = manager.drain_session_results("cli:direct", limit=1)
+    assert len(results) == 1
+    assert results[0].metadata["subagent_status"] == "ok"
 
 
 @pytest.mark.asyncio
@@ -761,7 +1209,9 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_review_spawn_sees_same_turn_allowed_dimensions(tmp_path, monkeypatch) -> None:
+async def test_agent_loop_review_spawn_sees_same_turn_allowed_dimensions(
+    tmp_path, monkeypatch
+) -> None:
     from nanobot.bus.events import InboundMessage
 
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)

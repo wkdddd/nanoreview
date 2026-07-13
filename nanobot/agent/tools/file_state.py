@@ -39,7 +39,7 @@ class FileStates:
         self._state: dict[str, ReadState] = {}
 
     def record_read(self, path: str | Path, offset: int = 1, limit: int | None = None) -> None:
-        """Record that a file was read (called after successful read)."""
+        """Record that a file was read (called after  read)."""
         p = str(Path(path).resolve())
         try:
             mtime = os.path.getmtime(p)

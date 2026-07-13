@@ -3,9 +3,11 @@ import { MessageSquare, ChevronDown, ChevronRight, AlertTriangle, AlertCircle, A
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
+import { SubagentCards } from "./SubagentCards";
 import { SeverityBadge } from "@/components/findings/SeverityBadge";
 import { cn } from "@/lib/utils";
 import type { Finding } from "@/hooks/useReviewSession";
+import type { SubagentCard } from "@/hooks/useReviewSession";
 
 export interface ChatMessageItem {
   id: string;
@@ -30,6 +32,8 @@ interface ChatThreadProps {
   /** Parsed findings from the review report, forwarded to ChatMessage
    * so table-row / inline-code clicks carry the correct severity. */
   findings?: Finding[];
+  /** Per-subagent status cards rendered at the bottom of the thread. */
+  subagentCards?: SubagentCard[];
 }
 
 /** Group consecutive finding messages into batches */
@@ -111,6 +115,7 @@ export function ChatThread({
   onSelectFinding,
   onPause,
   findings,
+  subagentCards,
 }: ChatThreadProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -347,6 +352,9 @@ export function ChatThread({
                   />
                 ));
               })
+            )}
+            {subagentCards && subagentCards.length > 0 && (
+              <SubagentCards cards={subagentCards} />
             )}
             <div ref={bottomRef} />
           </div>

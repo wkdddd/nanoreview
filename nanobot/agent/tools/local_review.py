@@ -191,6 +191,7 @@ class LocalReviewTool(ReviewToolBase):
 
     @staticmethod
     def _is_github_review_turn() -> bool:
+        '''disable local_review tool when github_review'''
         ctx = current_request_context()
         metadata = ctx.metadata if ctx is not None else {}
         return str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower() == "github"

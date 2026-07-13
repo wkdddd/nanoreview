@@ -2896,6 +2896,12 @@ class WebSocketChannel(BaseChannel):
         stream_id = meta.get("_stream_id")
         if stream_id is not None:
             body["stream_id"] = stream_id
+        subagent_id = meta.get("_subagent_id")
+        if subagent_id is not None:
+            body["subagent_id"] = subagent_id
+        subagent_label = meta.get("_subagent_label")
+        if subagent_label is not None:
+            body["subagent_label"] = subagent_label
         self._try_append_webui_transcript(chat_id, body)
         conns = list(self._subs.get(chat_id, ()))
         auto_task_backed = self._is_auto_task_chat(chat_id)
@@ -2919,6 +2925,12 @@ class WebSocketChannel(BaseChannel):
         stream_id = meta.get("_stream_id")
         if stream_id is not None:
             body["stream_id"] = stream_id
+        subagent_id = meta.get("_subagent_id")
+        if subagent_id is not None:
+            body["subagent_id"] = subagent_id
+        subagent_label = meta.get("_subagent_label")
+        if subagent_label is not None:
+            body["subagent_label"] = subagent_label
         self._try_append_webui_transcript(chat_id, body)
         conns = list(self._subs.get(chat_id, ()))
         auto_task_backed = self._is_auto_task_chat(chat_id)
@@ -2949,12 +2961,48 @@ class WebSocketChannel(BaseChannel):
             body["stream_id"] = meta["_stream_id"]
         if meta.get("_stream_kind") is not None:
             body["kind"] = str(meta["_stream_kind"])
+        subagent_id = meta.get("_subagent_id")
+        if subagent_id is not None:
+            body["subagent_id"] = subagent_id
+        subagent_label = meta.get("_subagent_label")
+        if subagent_label is not None:
+            body["subagent_label"] = subagent_label
         self._try_append_webui_transcript(chat_id, body)
         if not conns and not auto_task_backed:
             return
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
             await self._safe_send_to(connection, raw, label=" stream ")
+
+    async def send_subagent_status(
+        self,
+        chat_id: str,
+        subagent_id: str,
+        label: str,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Push a subagent lifecycle event so the frontend can create or
+        update a per-subagent status card.
+
+        ``status`` is ``"running"`` when the subagent starts and
+        ``"completed"`` or ``"error"`` when it finishes.
+        """
+        body: dict[str, Any] = {
+            "event": "subagent_status",
+            "chat_id": chat_id,
+            "subagent_id": subagent_id,
+            "label": label,
+            "status": status,
+        }
+        self._try_append_webui_transcript(chat_id, body)
+        conns = list(self._subs.get(chat_id, ()))
+        auto_task_backed = self._is_auto_task_chat(chat_id)
+        if not conns and not auto_task_backed:
+            return
+        raw = json.dumps(body, ensure_ascii=False)
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" subagent_status ")
 
     async def send_turn_end(
         self,

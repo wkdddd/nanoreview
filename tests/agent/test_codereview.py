@@ -100,6 +100,27 @@ def test_build_code_review_context_includes_subagent_candidate_schema() -> None:
     assert '"evidence"' in prompt
 
 
+def test_build_code_review_context_prohibits_coordinator_review_submit() -> None:
+    prompt = build_code_review_context(
+        target="https://github.com/test/repo",
+        max_subagents=4,
+    )
+    assert "must NEVER call `review_submit`" in prompt
+    assert "subagent-only tool" in prompt
+
+
+def test_build_code_review_context_spawn_task_requires_target_and_evidence() -> None:
+    prompt = build_code_review_context(
+        target="https://github.com/test/repo",
+        max_subagents=4,
+        focus="security",
+    )
+    assert "target path" in prompt.lower()
+    assert "line range" in prompt.lower()
+    assert "evidence source" in prompt.lower()
+    assert "subagent-only tool" in prompt
+
+
 def test_build_code_review_context_matches_system_finalizer_boundary() -> None:
     prompt = build_code_review_context(
         target="https://github.com/test/repo",

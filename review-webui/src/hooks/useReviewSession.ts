@@ -64,6 +64,15 @@ export interface ChatMessage {
   streaming?: boolean;
 }
 
+export interface SubagentCard {
+  id: string;
+  label: string;
+  status: "running" | "completed" | "error";
+  thinking: string;
+  thinkingStreaming: boolean;
+  startedAt: number;
+}
+
 export interface ReviewSessionState {
   phase: ReviewPhase;
   task: ReviewTask | null;
@@ -77,6 +86,7 @@ export interface ReviewSessionState {
   logs: string[];
   error: string | null;
   messages: ChatMessage[];
+  subagentCards: SubagentCard[];
 }
 
 const INITIAL_STATE: ReviewSessionState = {
@@ -92,6 +102,7 @@ const INITIAL_STATE: ReviewSessionState = {
   logs: [],
   error: null,
   messages: [],
+  subagentCards: [],
 };
 
 function labelValue(value: string | undefined, fallback = "auto"): string {
@@ -753,6 +764,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       needsConfirmationCount: 0,
       rejectedCount: 0,
       reportMarkdown: "",
+      subagentCards: [],
       messages: [
         ...prev.messages,
         {
@@ -784,6 +796,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       };
       setState((prev) => ({
         ...prev,
+        subagentCards: [],
         messages: [...prev.messages, userMsg],
       }));
       client.sendMessage(chatId, text);
@@ -831,7 +844,42 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
         return;
       }
       setState((prev) => {
+        if (ev.event === "subagent_status") {
+          if (ev.status === "running") {
+            if (prev.subagentCards.some((c) => c.id === ev.subagent_id)) {
+              return prev;
+            }
+            return {
+              ...prev,
+              subagentCards: [
+                ...prev.subagentCards,
+                {
+                  id: ev.subagent_id,
+                  label: ev.label,
+                  status: "running" as const,
+                  thinking: "",
+                  thinkingStreaming: false,
+                  startedAt: Date.now(),
+                },
+              ],
+            };
+          }
+          return {
+            ...prev,
+            subagentCards: prev.subagentCards.map((card) =>
+              card.id === ev.subagent_id
+                ? { ...card, status: ev.status, thinkingStreaming: false }
+                : card
+            ),
+          };
+        }
+
         if (ev.event === "delta") {
+          if (ev.subagent_id) {
+            // Subagent content deltas are not displayed as regular messages;
+            // the final result is announced by the main agent.
+            return prev;
+          }
           const text = ev.text || "";
           const kind = ev.kind;
           if (kind === "review_thinking") {
@@ -947,6 +995,20 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
         }
 
         if (ev.event === "reasoning_delta") {
+          if (ev.subagent_id) {
+            return {
+              ...prev,
+              subagentCards: prev.subagentCards.map((card) =>
+                card.id === ev.subagent_id
+                  ? {
+                      ...card,
+                      thinking: card.thinking + (ev.text || ""),
+                      thinkingStreaming: true,
+                    }
+                  : card
+              ),
+            };
+          }
           const text = ev.text || "";
           thinkingBufferRef.current += text;
           const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
@@ -980,10 +1042,23 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
         }
 
         if (ev.event === "reasoning_end") {
+          if (ev.subagent_id) {
+            return {
+              ...prev,
+              subagentCards: prev.subagentCards.map((card) =>
+                card.id === ev.subagent_id
+                  ? { ...card, thinkingStreaming: false }
+                  : card
+              ),
+            };
+          }
           return prev;
         }
 
         if (ev.event === "stream_end") {
+          if (ev.subagent_id) {
+            return prev;
+          }
           if (ev.kind === "review_thinking") {
             return prev;
           }
@@ -1177,6 +1252,9 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
           reportMessageRef.current = null;
           textMessageRef.current = null;
           const messages = markAllStreamingComplete(prev.messages);
+          const subagentCards = prev.subagentCards.map((card) =>
+            card.thinkingStreaming ? { ...card, thinkingStreaming: false } : card
+          );
           const missingReviewReport = !!prev.task
             && isBusyPhase(prev.phase)
             && !prev.reportMarkdown
@@ -1186,6 +1264,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
               ...prev,
               phase: "error",
               error: "Review report was not received.",
+              subagentCards,
               messages: [
                 ...messages,
                 {
@@ -1203,6 +1282,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             ...prev,
             phase: phase === "history" && isBusyPhase(prev.phase) ? "stopped" : phase,
             messages,
+            subagentCards,
           };
         }
 

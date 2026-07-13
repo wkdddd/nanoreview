@@ -279,6 +279,26 @@ async def test_local_review_blocked_for_github_review_context(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_github_review_blocked_for_local_review_context(tmp_path: Path) -> None:
+    token = set_current_request_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="review",
+            metadata={ReviewMetaKey.TARGET_TYPE: "local"},
+        )
+    )
+    try:
+        tool = GitHubReviewTool(workspace=tmp_path)
+
+        result = await tool.execute(action="meta", target_repo="owner/repo")
+    finally:
+        reset_current_request_context(token)
+
+    assert result.startswith("Error:")
+    assert "disabled for local review targets" in result
+
+
+@pytest.mark.asyncio
 async def test_read_file_blocks_workspace_files_for_github_review_context(tmp_path: Path) -> None:
     target = tmp_path / ".nanobot" / "tool-results" / "session" / "call.txt"
     target.parent.mkdir(parents=True)
