@@ -108,3 +108,7 @@ bug.md
 review-webui/node_modules/
 
 nanobot-competition-post/
+
+.nanobot/
+
+.trae-html-share-packages/

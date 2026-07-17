@@ -55,6 +55,7 @@ class SubagentHook(AgentHook):
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream_cb: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end_cb: Callable[..., Awaitable[None]] | None = None,
+        on_tool_events: Callable[[list[dict[str, str]]], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__()
         self._task_id = task_id
@@ -69,6 +70,7 @@ class SubagentHook(AgentHook):
         self._on_progress = on_progress
         self._on_stream_cb = on_stream_cb
         self._on_stream_end_cb = on_stream_end_cb
+        self._on_tool_events = on_tool_events
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
 
@@ -151,10 +153,11 @@ class SubagentHook(AgentHook):
             )
 
     async def after_iteration(self, context: AgentHookContext) -> None:
-        if self._status is None:
-            return
-        self._status.iteration = context.iteration
-        self._status.tool_events = list(context.tool_events)
-        self._status.usage = dict(context.usage)
-        if context.error:
-            self._status.error = str(context.error)
+        if self._status is not None:
+            self._status.iteration = context.iteration
+            self._status.tool_events = list(context.tool_events)
+            self._status.usage = dict(context.usage)
+            if context.error:
+                self._status.error = str(context.error)
+        if self._on_tool_events and context.tool_events:
+            await self._on_tool_events(context.tool_events)

@@ -22,6 +22,7 @@ interface ChatMessageProps {
    * severity / dimension when the user clicks a table row or inline
    * code location in the rendered markdown. */
   findings?: Finding[];
+  afterThinking?: ReactNode;
 }
 
 const LOCATION_RE = /^(.+\.(?:[A-Za-z0-9]+)):(\d+)$/;
@@ -146,7 +147,7 @@ function isFindingsTable(headers: string[]): boolean {
   );
 }
 
-export function ChatMessage({ message, onSelectFinding, findings }: ChatMessageProps) {
+export function ChatMessage({ message, onSelectFinding, findings, afterThinking }: ChatMessageProps) {
   const isUser = message.role === "user";
   const isThinkingOnly = !isUser
     && message.type === "text"
@@ -228,6 +229,8 @@ export function ChatMessage({ message, onSelectFinding, findings }: ChatMessageP
           )}
         </div>
       )}
+
+      {afterThinking}
 
       {hasVisibleContent && (
         <div

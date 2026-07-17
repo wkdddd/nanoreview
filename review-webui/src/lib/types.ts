@@ -397,6 +397,14 @@ export interface WebuiThreadPersistedPayload {
   sessionKey?: string;
   savedAt?: string;
   messages: UIMessage[];
+  subagentCards?: Array<{
+    id: string;
+    label: string;
+    status: "running" | "completed" | "error";
+    thinking: string;
+    thinkingStreaming: boolean;
+    startedAt: number;
+  }>;
 }
 
 export interface SessionMessagesPayload {

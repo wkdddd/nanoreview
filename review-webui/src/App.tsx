@@ -354,7 +354,12 @@ function ReviewAppShell({
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
-  const historyCacheRef = useRef<Map<string, { messages: UIMessage[]; task: ReviewTask | null; chatMessages?: ChatMessage[] }>>(new Map());
+  const historyCacheRef = useRef<Map<string, {
+    messages: UIMessage[];
+    task: ReviewTask | null;
+    chatMessages?: ChatMessage[];
+    subagentCards?: ReturnType<typeof useReviewSession>["state"]["subagentCards"];
+  }>>(new Map());
   const historyRequestRef = useRef(0);
   const restoredActiveKeyRef = useRef(false);
   const activeKeyInitializedRef = useRef(false);
@@ -429,6 +434,7 @@ function ReviewAppShell({
           messages: existing?.messages ?? [],
           task: existing?.task ?? state.task,
           chatMessages: state.messages,
+          subagentCards: state.subagentCards,
         });
       }
       setActiveKey(key);
@@ -441,12 +447,14 @@ function ReviewAppShell({
           cached.task ?? taskFromHistory(session, cached.messages) ?? historyTaskFallback(session),
           undefined,
           cached.chatMessages,
+          cached.subagentCards,
         );
       } else {
         reset();
       }
       try {
-        let messages = (await fetchWebuiThread({ token, refreshAuth }, key))?.messages ?? [];
+        const persistedThread = await fetchWebuiThread({ token, refreshAuth }, key);
+        let messages = persistedThread?.messages ?? [];
         if (messages.length === 0) {
           const sessionData = await fetchSessionMessages({ token, refreshAuth }, key);
           messages = (sessionData?.messages ?? [])
@@ -459,8 +467,13 @@ function ReviewAppShell({
         const cachedChatMessages = hasAssistantContent(existing?.chatMessages)
           ? existing?.chatMessages
           : undefined;
-        historyCacheRef.current.set(key, { messages, task, chatMessages: cachedChatMessages });
-        loadHistory(messages, task, undefined, cachedChatMessages);
+        historyCacheRef.current.set(key, {
+          messages,
+          task,
+          chatMessages: cachedChatMessages,
+          subagentCards: persistedThread?.subagentCards ?? [],
+        });
+        loadHistory(messages, task, undefined, cachedChatMessages, persistedThread?.subagentCards ?? []);
       } catch (error) {
         if (historyRequestRef.current !== requestId) return;
         const message = error instanceof Error ? error.message : "Failed to load review session";
@@ -469,7 +482,7 @@ function ReviewAppShell({
         loadHistory([], historyTaskFallback(session), message);
       }
     },
-    [activeKey, loadHistory, refreshAuth, reset, state.messages, state.task, tasks, token],
+    [activeKey, loadHistory, refreshAuth, reset, state.messages, state.task, state.subagentCards, tasks, token],
   );
 
   // Auto-restore the last active session after page refresh.

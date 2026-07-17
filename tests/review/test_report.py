@@ -76,6 +76,11 @@ class TestReportStructure:
         assert "- [x] security" in report
         assert "- [x] performance" in report
 
+    def test_finding_dimension_is_rendered_in_table(self):
+        report = render_review_report("repo", [_dim("security", accepted=[_candidate()])])
+        row = next(line for line in report.splitlines() if line.startswith("| 1 |"))
+        assert row.startswith("| 1 | security |")
+
     def test_needs_confirmation_section(self):
         uncertain = [(_candidate(title="Maybe bug"), ReviewFindingVerdict(
             verdict=FindingVerdict.UNCERTAIN, reason="unclear evidence"
@@ -137,3 +142,4 @@ class TestReportStructure:
         assert "Use parser \\| not split then validate" in report
         finding_rows = [line for line in report.splitlines() if line.startswith("| 1 |")]
         assert len(finding_rows) == 1
+        assert "| security |" in finding_rows[0]

@@ -24,8 +24,15 @@ function ElapsedTime({ startedAt, active }: { startedAt: number; active: boolean
     return () => clearInterval(timer);
   }, [startedAt, active]);
 
-  if (!elapsed) return null;
-  return <span className="text-[10px] text-muted-foreground/70 tabular-nums">{elapsed}</span>;
+  return (
+    <span
+      className="text-[10px] text-muted-foreground/70 tabular-nums"
+      style={{ visibility: elapsed ? "visible" : "hidden" }}
+      aria-hidden={!elapsed}
+    >
+      {elapsed || "0s"}
+    </span>
+  );
 }
 
 const STATUS_CONFIG: Record<
@@ -72,7 +79,7 @@ export function SubagentCards({ cards }: SubagentCardsProps) {
         const config = STATUS_CONFIG[card.status];
         const Icon = config.icon;
         const isCollapsed = collapsed.has(card.id);
-        const hasThinking = card.thinking.trim().length > 0;
+        const hasThinking = card.thinking.length > 0 || card.thinkingStreaming;
 
         return (
           <div
@@ -120,14 +127,15 @@ export function SubagentCards({ cards }: SubagentCardsProps) {
                     <span className="inline-block w-1 h-1 rounded-full bg-blue-500 animate-pulse" />
                   )}
                 </div>
-                <div
+                <textarea
+                  readOnly
+                  aria-label={`${card.label} thinking`}
                   className={cn(
-                    "text-[11px] text-muted-foreground/80 whitespace-pre-wrap break-words max-h-40 overflow-y-auto leading-relaxed",
+                    "block w-full h-32 resize-none border-0 bg-transparent p-0 text-[11px] text-muted-foreground/80 leading-relaxed focus:outline-none overflow-y-auto",
                     card.thinkingStreaming && "animate-pulse",
                   )}
-                >
-                  {card.thinking}
-                </div>
+                  value={card.thinking}
+                />
               </div>
             )}
           </div>

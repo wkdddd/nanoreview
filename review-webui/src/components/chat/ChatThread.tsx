@@ -156,6 +156,10 @@ export function ChatThread({
   }, []);
 
   const messageGroups = useMemo(() => groupMessages(messages), [messages]);
+  const firstReportId = useMemo(
+    () => messages.find((message) => message.type === "report")?.id,
+    [messages],
+  );
 
   const toggleBatch = useCallback((index: number) => {
     setCollapsedBatches((prev) => {
@@ -349,11 +353,16 @@ export function ChatThread({
                     message={message}
                     onSelectFinding={onSelectFinding}
                     findings={findings}
+                    afterThinking={
+                      message.id === firstReportId && subagentCards && subagentCards.length > 0
+                        ? <SubagentCards cards={subagentCards} />
+                        : undefined
+                    }
                   />
                 ));
               })
             )}
-            {subagentCards && subagentCards.length > 0 && (
+            {!messages.some((message) => message.type === "report") && subagentCards && subagentCards.length > 0 && (
               <SubagentCards cards={subagentCards} />
             )}
             <div ref={bottomRef} />

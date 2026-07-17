@@ -10,6 +10,15 @@ import type {
   ToolProgressEvent,
   UIMessage,
 } from "@/lib/types";
+import {
+  type DimensionResult,
+  cleanListItem,
+  countListItems,
+  parseDimensions,
+  parseRecommendations,
+} from "@/lib/parse-report";
+
+export type { DimensionResult };
 
 export type ReviewPhase =
   | "idle"
@@ -31,14 +40,6 @@ export interface ReviewTask {
   action?: ReviewAction;
   depth?: ReviewDepth;
   focus?: ReviewFocus[];
-}
-
-export interface DimensionResult {
-  dimension: string;
-  status: string;
-  acceptedCount: number;
-  rejectedCount: number;
-  uncertainCount: number;
 }
 
 export interface Finding {
@@ -191,55 +192,6 @@ function sectionBody(sections: Array<{ heading: string; body: string }>, names: 
   )?.body.trim() ?? "";
 }
 
-function cleanListItem(line: string): string {
-  return line
-    .trim()
-    .replace(/^[-*+]\s+/, "")
-    .replace(/^\d+[.)]\s+/, "")
-    .replace(/^\[[ xX-]\]\s+/, "")
-    .replace(/\\([\\`*_{}\[\]()#+\-.!|])/g, "$1")
-    .trim();
-}
-
-function parseRecommendations(body: string): string[] {
-  if (!body.trim()) return [];
-  return body
-    .split(/\r?\n/)
-    .map(cleanListItem)
-    .filter((line) => line && !/^no (?:priority )?(?:fixes|recommendations)/i.test(line));
-}
-
-function countListItems(body: string): number {
-  if (!body.trim()) return 0;
-  return body
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^[-*+]\s+/.test(line) || /^\d+[.)]\s+/.test(line))
-    .length;
-}
-
-function parseDimensions(body: string): DimensionResult[] {
-  if (!body.trim()) return [];
-  return body
-    .split(/\r?\n/)
-    .map(cleanListItem)
-    .map((line) => {
-      const match = line.match(/^(?:\*\*)?([^*\u2014-]+?)(?:\*\*)?\s*[\u2014-]\s*(.+)$/);
-      if (!match) return null;
-      const dimension = match[1].trim();
-      const rawStatus = match[2].trim();
-      const noFindings = /no[_\s-]?findings|无发现/i.test(rawStatus);
-      return {
-        dimension,
-        status: noFindings ? "done" : rawStatus,
-        acceptedCount: noFindings ? 0 : 1,
-        rejectedCount: 0,
-        uncertainCount: 0,
-      };
-    })
-    .filter((item): item is DimensionResult => item !== null);
-}
-
 function splitMarkdownTableRow(line: string): string[] {
   const trimmed = line.trim();
   if (!trimmed.startsWith("|")) return [];
@@ -315,6 +267,7 @@ function parseFindings(markdown: string): Finding[] {
   const findings: Finding[] = [];
   let inFindings = false;
   let currentSeverity = "medium";
+  let tableColumns: string[] | null = null;
 
   for (const line of markdown.split(/\r?\n/)) {
     const section = line.match(/^#{3}\s+(.+?)\s*$/);
@@ -333,19 +286,30 @@ function parseFindings(markdown: string): Finding[] {
     }
 
     const cells = splitMarkdownTableRow(line);
+    if (cells.length > 0 && !isTableSeparator(cells) && !/^\d+$/.test(cells[0])) {
+      const normalized = cells.map((cell) => normalizeHeading(cell));
+      if (normalized.includes("dimension") && normalized.includes("file")) {
+        tableColumns = normalized;
+      }
+      continue;
+    }
     if (cells.length < 4 || isTableSeparator(cells) || !/^\d+$/.test(cells[0])) {
       continue;
     }
-    const location = parseLocation(cells[1]);
+    const dimensionIndex = tableColumns?.indexOf("dimension") ?? -1;
+    const fileIndex = tableColumns?.indexOf("file") ?? (dimensionIndex >= 0 ? 2 : 1);
+    const titleIndex = tableColumns?.indexOf("issue") ?? (dimensionIndex >= 0 ? 3 : 2);
+    const impactIndex = tableColumns?.indexOf("impact") ?? (dimensionIndex >= 0 ? 4 : 3);
+    const location = parseLocation(cells[fileIndex] ?? "");
     if (!location) continue;
     const index = Number.parseInt(cells[0], 10);
     findings.push({
       severity: currentSeverity,
-      dimension: "report",
+      dimension: dimensionIndex >= 0 ? cleanListItem(cells[dimensionIndex]) : "report",
       file: location.file,
       line: location.line,
-      title: cleanListItem(cells[2]) || `Finding ${index}`,
-      impact: cleanListItem(cells[3]),
+      title: cleanListItem(cells[titleIndex] ?? "") || `Finding ${index}`,
+      impact: cleanListItem(cells[impactIndex] ?? ""),
       recommendation: recommendations.get(index) ?? "",
     });
   }
@@ -684,7 +648,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
   const assistantCarrierRef = useRef<string | null>(null);
   const reportMessageRef = useRef<string | null>(null);
   const textMessageRef = useRef<string | null>(null);
-  const thinkingBufferRef = useRef("");
   const cancellingRef = useRef(false);
   const reviewInProgressRef = useRef(false);
 
@@ -694,7 +657,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
     assistantCarrierRef.current = null;
     reportMessageRef.current = null;
     textMessageRef.current = null;
-    thinkingBufferRef.current = "";
     cancellingRef.current = false;
     reviewInProgressRef.current = false;
   }, []);
@@ -704,6 +666,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
     task: ReviewTask | null = null,
     error: string | null = null,
     preConverted?: ChatMessage[],
+    subagentCards: SubagentCard[] = [],
   ) => {
     let chatMessages = preConverted ?? messages
       .map(uiMessageToChatMessage)
@@ -741,12 +704,12 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       task,
       error,
       messages: chatMessages,
+      subagentCards,
     }, reportMarkdown));
     reportBufferRef.current = "";
     assistantCarrierRef.current = placeholderId;
     reportMessageRef.current = null;
     textMessageRef.current = null;
-    thinkingBufferRef.current = "";
   }, []);
 
   const startReview = useCallback((task: ReviewTask) => {
@@ -780,7 +743,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
     assistantCarrierRef.current = null;
     reportMessageRef.current = null;
     textMessageRef.current = null;
-    thinkingBufferRef.current = "";
   }, []);
 
   const sendFollowUp = useCallback(
@@ -804,7 +766,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       reportMessageRef.current = null;
       textMessageRef.current = null;
       reportBufferRef.current = "";
-      thinkingBufferRef.current = "";
     },
     [client, chatId]
   );
@@ -844,6 +805,8 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
         return;
       }
       setState((prev) => {
+        const reviewActive = reviewInProgressRef.current || isBusyPhase(prev.phase);
+
         if (ev.event === "subagent_status") {
           if (ev.status === "running") {
             if (prev.subagentCards.some((c) => c.id === ev.subagent_id)) {
@@ -882,8 +845,10 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
           }
           const text = ev.text || "";
           const kind = ev.kind;
+          // Review streams are typed. Unclassified deltas are coordinator prose
+          // from an intermediate model iteration and must not become a chat bubble.
+          if (reviewActive && !kind) return prev;
           if (kind === "review_thinking") {
-            thinkingBufferRef.current += text;
             const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
               ? assistantCarrierRef.current
               : findAssistantCarrierId(prev.messages);
@@ -931,7 +896,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                       ...message,
                       type: "report" as const,
                       content: message.content + text,
-                      thinking: message.thinking || thinkingBufferRef.current || undefined,
+                      thinking: message.thinking || undefined,
                       streaming: true,
                     }
                   : message
@@ -956,7 +921,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                   type: "report",
                   content: text,
                   timestamp: Date.now(),
-                  thinking: thinkingBufferRef.current,
+                  thinking: undefined,
                   streaming: true,
                 },
               ],
@@ -977,7 +942,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
 
           const id = generateId();
           textMessageRef.current = id;
-          assistantCarrierRef.current = id;
           return {
             ...prev,
             messages: [
@@ -1010,7 +974,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             };
           }
           const text = ev.text || "";
-          thinkingBufferRef.current += text;
           const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
             ? assistantCarrierRef.current
             : findAssistantCarrierId(prev.messages);
@@ -1068,6 +1031,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             textMessageRef.current = null;
             return { ...prev, messages: markStreamingCompleteById(prev.messages, reportId) };
           }
+          if (reviewActive) return prev;
           const textId = textMessageRef.current;
           textMessageRef.current = null;
           if (textId) {
@@ -1156,6 +1120,10 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             }
           }
 
+          // Keep finding/progress events above, but hide untyped assistant messages
+          // while a review is active. The final report has an explicit kind.
+          if (reviewActive && !ev.kind) return { ...prev, logs: newLogs };
+
           if (ev.kind === "progress" && progressLines.length > 0) {
             const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
               ? assistantCarrierRef.current
@@ -1190,6 +1158,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
           }
 
           if (!ev.kind && ev.text?.trim()) {
+            if (reviewInProgressRef.current) return prev;
             const content = ev.text;
             const isReport = isLikelyReviewReport(content);
             const existingId = hasMessage(prev.messages, assistantCarrierRef.current)

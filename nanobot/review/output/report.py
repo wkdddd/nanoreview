@@ -225,12 +225,13 @@ def _render_findings(
         if f.severity != current_sev:
             current_sev = f.severity
             lines.append(f"#### {current_sev.capitalize()}\n")
-            lines.append("| # | File | Issue | Impact |")
-            lines.append("|---|------|-------|--------|")
+            lines.append("| # | Dimension | File | Issue | Impact |")
+            lines.append("|---|-----------|------|-------|--------|")
         idx += 1
         loc = _location(f.file, f.line)
         lines.append(
-            f"| {idx} | {_table_cell(loc)} | {_table_cell(f.title)} | {_table_cell(f.impact)} |"
+            f"| {idx} | {_table_cell(f.dimension)} | {_table_cell(loc)} | "
+            f"{_table_cell(f.title)} | {_table_cell(f.impact)} |"
         )
     lines.append("")
     lines.append("**Details:**\n")

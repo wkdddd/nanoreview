@@ -308,6 +308,7 @@ class ReviewConfig(Base):
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
     prefetch_dense_backfill_limit: int = Field(default=256, ge=0)
     subagent_evidence_budget_chars: int = Field(default=24_000, ge=4_000)
+    subagent_reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = None
     github_diff_enable: bool = True
     judge: ReviewJudgeSettings = Field(default_factory=ReviewJudgeSettings)
     auto_tasks: ReviewAutoTaskSettings = Field(

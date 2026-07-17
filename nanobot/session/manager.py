@@ -22,6 +22,7 @@ from nanobot.utils.helpers import (
 )
 from nanobot.utils.log_style import event_message, log_event
 from nanobot.utils.subagent_channel_display import scrub_subagent_announce_body
+from nanobot.utils.subagent_trace import delete_subagent_trace
 
 FILE_MAX_MESSAGES = 2000
 _MESSAGE_TIME_PREFIX_RE = re.compile(r"^\[Message Time: [^\]]+\]\n?")
@@ -617,8 +618,9 @@ class SessionManager:
         """
         path = self._get_session_path(key)
         self.invalidate(key)
+        trace_deleted = delete_subagent_trace(key)
         if not path.exists():
-            return False
+            return trace_deleted
         try:
             path.unlink()
             return True

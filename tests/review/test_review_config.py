@@ -15,3 +15,8 @@ def test_review_token_budget_fields_accept_camel_case() -> None:
     assert config.review.token_budget == 120_000
     assert config.review.prefetch_budget_chars == 12_000
     assert config.review.subagent_evidence_budget_chars == 18_000
+
+
+def test_review_config_accepts_subagent_reasoning_effort() -> None:
+    config = Config.model_validate({"review": {"subagentReasoningEffort": "medium"}})
+    assert config.review.subagent_reasoning_effort == "medium"

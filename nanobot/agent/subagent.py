@@ -21,6 +21,7 @@ from nanobot.config.schema import AgentDefaults, ToolsConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.review.types import ReviewMetaKey
 from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.subagent_trace import append_subagent_trace, flush_subagent_trace
 
 _DIMENSION_RUNNING = "running"
 _DIMENSION_COMPLETED = "completed"
@@ -53,7 +54,9 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
-        llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
+        reasoning_effort: str | None = None,
+        llm_wall_timeout_for_session: Callable[[str | None], float | None]
+        | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -67,13 +70,16 @@ class SubagentManager:
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
         self.max_iterations = (
-            max_iterations if max_iterations is not None else defaults.max_tool_iterations
+            max_iterations
+            if max_iterations is not None
+            else defaults.max_tool_iterations
         )
         self.max_concurrent_subagents = (
             max_concurrent_subagents
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
+        self.reasoning_effort = reasoning_effort
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -96,7 +102,9 @@ class SubagentManager:
         tools_config: ToolsConfig | None = None,
     ) -> ToolContext:
         root = self.workspace if workspace is None else workspace
-        cfg = tools_config if tools_config is not None else self._subagent_tools_config()
+        cfg = (
+            tools_config if tools_config is not None else self._subagent_tools_config()
+        )
         return ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
@@ -150,7 +158,11 @@ class SubagentManager:
                 )
             state[label] = _DIMENSION_RUNNING
         task_id = str(uuid.uuid4())[:8]
-        origin = {"channel": origin_channel, "chat_id": origin_chat_id, "session_key": session_key}
+        origin = {
+            "channel": origin_channel,
+            "chat_id": origin_chat_id,
+            "session_key": session_key,
+        }
         status = SubagentStatus(
             task_id=task_id,
             label=label,
@@ -175,7 +187,10 @@ class SubagentManager:
                 ids.discard(task_id)
                 if not ids:
                     del self._session_tasks[session_key]
-            if session_key and self._dimension_state(session_key, label) == _DIMENSION_RUNNING:
+            if (
+                session_key
+                and self._dimension_state(session_key, label) == _DIMENSION_RUNNING
+            ):
                 self._set_dimension_state(session_key, label, _DIMENSION_FAILED)
 
         bg_task.add_done_callback(_cleanup)
@@ -197,6 +212,13 @@ class SubagentManager:
     ) -> None:
         """Execute a dedicated review subagent and announce structured findings."""
         logger.info("Review subagent [{}] starting task: {}", task_id, label)
+        session_key = (
+            origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        )
+        append_subagent_trace(
+            session_key,
+            {"event": "started", "subagent_id": task_id, "label": label},
+        )
 
         async def _on_checkpoint(payload: dict) -> None:
             status.phase = payload.get("phase", status.phase)
@@ -205,7 +227,9 @@ class SubagentManager:
         lifecycle_status = "error"
         try:
             metadata = dict(origin_metadata or {})
-            target_type = str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower()
+            target_type = (
+                str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower()
+            )
 
             # Align subagent tool workspace with the review local root so that
             # read_file("types.py") resolves relative to the review target
@@ -246,6 +270,14 @@ class SubagentManager:
                 meta["_subagent_label"] = label
                 if reasoning:
                     meta["_reasoning_delta"] = True
+                    append_subagent_trace(
+                        session_key,
+                        {
+                            "event": "reasoning_delta",
+                            "subagent_id": task_id,
+                            "text": content,
+                        },
+                    )
                 if reasoning_end:
                     meta["_reasoning_end"] = True
                 if tool_events:
@@ -308,6 +340,9 @@ class SubagentManager:
                 on_progress=_on_progress,
                 on_stream_cb=_on_stream,
                 on_stream_end_cb=_on_stream_end,
+                on_tool_events=lambda events: self._record_tool_events(
+                    session_key, task_id, events
+                ),
             )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
@@ -326,6 +361,7 @@ class SubagentManager:
                     model=self.model,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
+                    reasoning_effort=self.reasoning_effort,
                     hook=hook,
                     max_iterations_message=(
                         "Review task completed but no structured findings were submitted."
@@ -346,7 +382,13 @@ class SubagentManager:
                 status.tool_events = list(result.tool_events)
                 final_result = self._format_partial_progress(result)
                 await self._announce_result(
-                    task_id, label, task, final_result, origin, "error", origin_message_id
+                    task_id,
+                    label,
+                    task,
+                    final_result,
+                    origin,
+                    "error",
+                    origin_message_id,
                 )
                 return
             if result.stop_reason == "error":
@@ -362,7 +404,9 @@ class SubagentManager:
                 )
                 return
 
-            final_result = self._extract_review_submit_result(result.messages, result.tool_events)
+            final_result = self._extract_review_submit_result(
+                result.messages, result.tool_events
+            )
 
             # When no structured findings were submitted, force a review_submit
             # call. This covers completed, max_iterations, and
@@ -383,10 +427,18 @@ class SubagentManager:
                     "No structured findings submitted: the review subagent did "
                     "not produce a review_submit result."
                 )
-                logger.warning("Review subagent [{}] ended without structured findings", task_id)
+                logger.warning(
+                    "Review subagent [{}] ended without structured findings", task_id
+                )
                 status.phase = "done"
                 await self._announce_result(
-                    task_id, label, task, final_result, origin, "error", origin_message_id
+                    task_id,
+                    label,
+                    task,
+                    final_result,
+                    origin,
+                    "error",
+                    origin_message_id,
                 )
                 return
 
@@ -394,7 +446,9 @@ class SubagentManager:
             # submits ``findings: []`` without having successfully read any
             # target evidence is treated as incomplete rather than clean.
             if self._is_empty_findings(final_result):
-                if not self._has_successful_evidence_read(result.tool_events, target_type):
+                if not self._has_successful_evidence_read(
+                    result.tool_events, target_type
+                ):
                     final_result = (
                         "Error: Review incomplete — no target evidence was "
                         "successfully read before submitting empty findings. "
@@ -407,7 +461,13 @@ class SubagentManager:
                     )
                     status.phase = "error"
                     await self._announce_result(
-                        task_id, label, task, final_result, origin, "error", origin_message_id
+                        task_id,
+                        label,
+                        task,
+                        final_result,
+                        origin,
+                        "error",
+                        origin_message_id,
                     )
                     return
 
@@ -465,6 +525,7 @@ class SubagentManager:
                 model=self.model,
                 max_iterations=2,
                 max_tool_result_chars=self.max_tool_result_chars,
+                reasoning_effort=self.reasoning_effort,
                 hook=hook,
                 tool_choice={"function": {"name": "review_submit"}},
                 response_format={"type": "json_object"},
@@ -475,7 +536,9 @@ class SubagentManager:
                 llm_timeout_s=llm_timeout,
             )
         )
-        extracted = self._extract_review_submit_result(retry.messages, retry.tool_events)
+        extracted = self._extract_review_submit_result(
+            retry.messages, retry.tool_events
+        )
         return extracted, retry.stop_reason
 
     @staticmethod
@@ -522,6 +585,16 @@ class SubagentManager:
         origin_message_id: str | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
+        session_key = (
+            origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        )
+        append_subagent_trace(
+            session_key,
+            {"event": "finished", "subagent_id": task_id, "status": status},
+        )
+        # Flush on terminal state so the sidecar is consistent before the
+        # main agent reads back cards or the session is reloaded.
+        flush_subagent_trace(session_key)
         status_text = "completed successfully" if status == "ok" else "failed"
 
         announce_content = render_template(
@@ -537,7 +610,9 @@ class SubagentManager:
         # session key (which accounts for unified sessions) so the result is
         # routed to the correct pending queue (mid-turn injection) instead of
         # being dispatched as a competing independent task.
-        override = origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        override = (
+            origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
+        )
         metadata: dict[str, Any] = {
             "injected_event": "subagent_result",
             "subagent_task_id": task_id,
@@ -564,8 +639,33 @@ class SubagentManager:
             _DIMENSION_COMPLETED if status == "ok" else _DIMENSION_FAILED,
         )
         logger.debug(
-            "Subagent [{}] announced result to {}:{}", task_id, origin["channel"], origin["chat_id"]
+            "Subagent [{}] announced result to {}:{}",
+            task_id,
+            origin["channel"],
+            origin["chat_id"],
         )
+
+    async def _record_tool_events(
+        self,
+        session_key: str,
+        task_id: str,
+        tool_events: list[dict[str, str]],
+    ) -> None:
+        """Persist only tool names and their terminal status for auditability."""
+        for event in tool_events:
+            name = event.get("name")
+            status = event.get("status")
+            if not isinstance(name, str) or not isinstance(status, str):
+                continue
+            append_subagent_trace(
+                session_key,
+                {
+                    "event": "tool",
+                    "subagent_id": task_id,
+                    "name": name,
+                    "status": "success" if status == "ok" else "error",
+                },
+            )
 
     async def _publish_subagent_lifecycle(
         self,
@@ -625,7 +725,9 @@ class SubagentManager:
             self._cleanup_session_result_queue(session_key)
             return None
 
-    def drain_session_results(self, session_key: str, *, limit: int) -> list[InboundMessage]:
+    def drain_session_results(
+        self, session_key: str, *, limit: int
+    ) -> list[InboundMessage]:
         """Return already completed subagent results for a session."""
         queue = self._session_results.setdefault(session_key, asyncio.Queue())
         items: list[InboundMessage] = []
@@ -639,13 +741,19 @@ class SubagentManager:
 
     def _cleanup_session_result_queue(self, session_key: str) -> None:
         queue = self._session_results.get(session_key)
-        if queue is not None and queue.empty() and session_key not in self._session_tasks:
+        if (
+            queue is not None
+            and queue.empty()
+            and session_key not in self._session_tasks
+        ):
             self._session_results.pop(session_key, None)
 
     @staticmethod
     def _format_partial_progress(result) -> str:
         completed = [e for e in result.tool_events if e["status"] == "ok"]
-        failure = next((e for e in reversed(result.tool_events) if e["status"] == "error"), None)
+        failure = next(
+            (e for e in reversed(result.tool_events) if e["status"] == "error"), None
+        )
         lines: list[str] = []
         if completed:
             lines.append("Completed steps:")
@@ -687,7 +795,9 @@ class SubagentManager:
                 and event.get("status") == "ok"
                 and isinstance(event.get("raw_result"), str)
             ):
-                result = SubagentManager._canonical_review_submit_json(event["raw_result"])
+                result = SubagentManager._canonical_review_submit_json(
+                    event["raw_result"]
+                )
                 if result is not None:
                     return result
 
@@ -738,5 +848,7 @@ class SubagentManager:
         """Return the number of currently running subagents for a session."""
         tids = self._session_tasks.get(session_key, set())
         return sum(
-            1 for tid in tids if tid in self._running_tasks and not self._running_tasks[tid].done()
+            1
+            for tid in tids
+            if tid in self._running_tasks and not self._running_tasks[tid].done()
         )

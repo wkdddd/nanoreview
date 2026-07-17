@@ -13,6 +13,7 @@ from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
 from nanobot.session.manager import SessionManager
+from nanobot.utils.subagent_trace import read_subagent_cards
 
 WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
 _MAX_TRANSCRIPT_FILE_BYTES = 8 * 1024 * 1024
@@ -364,6 +365,8 @@ def replay_transcript_to_ui_messages(
                         review_thinking_created_at = created_at
                     review_thinking_parts.append(chunk)
                 continue
+            if kind is None and review_thinking_parts:
+                continue
             chunk = rec.get("text")
             if not isinstance(chunk, str):
                 continue
@@ -571,8 +574,10 @@ def build_webui_thread_response(
     if not lines:
         return None
     msgs = replay_transcript_to_ui_messages(lines, augment_user_media=augment_user_media)
-    return {
+    response = {
         "schemaVersion": WEBUI_TRANSCRIPT_SCHEMA_VERSION,
         "sessionKey": session_key,
         "messages": msgs,
     }
+    response["subagentCards"] = read_subagent_cards(session_key)
+    return response

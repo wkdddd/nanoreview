@@ -23,7 +23,11 @@ from nanobot.agent.hooks.review_finalizer import ReviewFinalizerHook
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
+from nanobot.agent.tools.file_state import (
+    FileStateStore,
+    bind_file_states,
+    reset_file_states,
+)
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -46,7 +50,10 @@ from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.log_style import log_event
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 from nanobot.utils.session_attachments import merge_turn_media_into_last_assistant
-from nanobot.utils.webui_titles import mark_webui_session, maybe_generate_webui_title_after_turn
+from nanobot.utils.webui_titles import (
+    mark_webui_session,
+    maybe_generate_webui_title_after_turn,
+)
 from nanobot.utils.webui_turn_helpers import publish_turn_run_status
 
 if TYPE_CHECKING:
@@ -57,6 +64,7 @@ if TYPE_CHECKING:
 
 
 UNIFIED_SESSION_KEY = "unified:default"
+
 
 ##状态机
 class TurnState(Enum):
@@ -215,6 +223,7 @@ class AgentLoop:
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        default_reasoning_effort: str | None = None,
     ):
         from nanobot.config.schema import (
             ToolsConfig,
@@ -225,8 +234,12 @@ class AgentLoop:
         _resolve_tool_config_refs()
         _tc = tools_config or ToolsConfig()
         _rag_config = rag_config if rag_config is not None else RAGConfig()
-        _embedding_config = embedding_config if embedding_config is not None else _rag_config.embedding
-        _rerank_config = rerank_config if rerank_config is not None else _rag_config.rerank
+        _embedding_config = (
+            embedding_config if embedding_config is not None else _rag_config.embedding
+        )
+        _rerank_config = (
+            rerank_config if rerank_config is not None else _rag_config.rerank
+        )
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
@@ -235,11 +248,15 @@ class AgentLoop:
         self._preset_snapshot_loader = preset_snapshot_loader
         self._runtime_model_publisher = runtime_model_publisher
         self._provider_signature = provider_signature
-        self._default_selection_signature = preset_helpers.default_selection_signature(provider_signature)
+        self._default_selection_signature = preset_helpers.default_selection_signature(
+            provider_signature
+        )
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = (
-            max_iterations if max_iterations is not None else defaults.max_tool_iterations
+            max_iterations
+            if max_iterations is not None
+            else defaults.max_tool_iterations
         )
         self.context_window_tokens = (
             context_window_tokens
@@ -254,7 +271,8 @@ class AgentLoop:
         )
         self.provider_retry_mode = provider_retry_mode
         self.tool_hint_max_length = (
-            tool_hint_max_length if tool_hint_max_length is not None
+            tool_hint_max_length
+            if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
         self.tools_config = _tc
@@ -262,11 +280,13 @@ class AgentLoop:
         self.permissions_config = _tc
         self.embedding_config = _embedding_config
         self.rerank_config = _rerank_config
-        self.qdrant_config = qdrant_config if qdrant_config is not None else _rag_config.qdrant
+        self.qdrant_config = (
+            qdrant_config if qdrant_config is not None else _rag_config.qdrant
+        )
         self.rag_config = _rag_config
         self.review_config = review_config
         self.exec_config = _tc.exec
-
+        self._default_reasoning_effort = default_reasoning_effort
 
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -276,7 +296,9 @@ class AgentLoop:
         self._pending_turn_traces: dict[str, list[dict[str, Any]]] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
 
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
+        self.context = ContextBuilder(
+            workspace, timezone=timezone, disabled_skills=disabled_skills
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         # One file-read/write tracker per logical session. The tool registry is
@@ -300,6 +322,7 @@ class AgentLoop:
                 if max_concurrent_subagents is not None
                 else defaults.max_concurrent_subagents
             ),
+            reasoning_effort=self._resolve_subagent_reasoning_effort(),
             llm_wall_timeout_for_session=lambda sk: None,
         )
         self._unified_session = unified_session
@@ -365,9 +388,13 @@ class AgentLoop:
         provider = extra.pop("provider", None) or make_provider(config)
         resolved = config.resolve_preset()
         model = extra.pop("model", None) or resolved.model
-        context_window_tokens = extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        context_window_tokens = (
+            extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        )
         provider_snapshot_loader = extra.pop("provider_snapshot_loader", None)
-        preset_snapshot_loader = extra.pop("preset_snapshot_loader", None) or preset_helpers.make_preset_snapshot_loader(
+        preset_snapshot_loader = extra.pop(
+            "preset_snapshot_loader", None
+        ) or preset_helpers.make_preset_snapshot_loader(
             config,
             provider_snapshot_loader,
         )
@@ -401,12 +428,27 @@ class AgentLoop:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
+            default_reasoning_effort=defaults.reasoning_effort,
             **extra,
         )
+
+    def _resolve_subagent_reasoning_effort(self) -> str | None:
+        """Resolve subagent reasoning effort with config inheritance.
+
+        Priority:
+        1. ``review.subagent_reasoning_effort`` (explicit, including ``"none"``)
+        2. ``agents.defaults.reasoning_effort``
+        3. ``None`` (provider default behaviour)
+        """
+        subagent_effort = getattr(self.review_config, "subagent_reasoning_effort", None)
+        if subagent_effort is not None:
+            return subagent_effort
+        return self._default_reasoning_effort
 
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
+        self.subagents.reasoning_effort = self._resolve_subagent_reasoning_effort()
 
     def _apply_provider_snapshot(
         self,
@@ -449,8 +491,13 @@ class AgentLoop:
         except Exception:
             logger.exception("Failed to refresh provider config")
             return
-        default_selection = preset_helpers.default_selection_signature(snapshot.signature)
-        if self._active_preset and self._default_selection_signature in (None, default_selection):
+        default_selection = preset_helpers.default_selection_signature(
+            snapshot.signature
+        )
+        if self._active_preset and self._default_selection_signature in (
+            None,
+            default_selection,
+        ):
             self._default_selection_signature = default_selection
             try:
                 snapshot = self._build_model_preset_snapshot(self._active_preset)
@@ -462,7 +509,9 @@ class AgentLoop:
             self._default_selection_signature = default_selection
         if snapshot.signature == self._provider_signature:
             return
-        self._default_selection_signature = preset_helpers.default_selection_signature(snapshot.signature)
+        self._default_selection_signature = preset_helpers.default_selection_signature(
+            snapshot.signature
+        )
         self._apply_provider_snapshot(snapshot)
 
     @property
@@ -481,11 +530,15 @@ class AgentLoop:
             loader=self._preset_snapshot_loader,
         )
 
-    def set_model_preset(self, name: str | None, *, publish_update: bool = True) -> None:
+    def set_model_preset(
+        self, name: str | None, *, publish_update: bool = True
+    ) -> None:
         """Resolve a preset by name and apply all runtime model dependents."""
         name = preset_helpers.normalize_preset_name(name, self.model_presets)
         snapshot = self._build_model_preset_snapshot(name)
-        self._apply_provider_snapshot(snapshot, publish_update=publish_update, model_preset=name)
+        self._apply_provider_snapshot(
+            snapshot, publish_update=publish_update, model_preset=name
+        )
         self._active_preset = name
 
     def _register_default_tools(self) -> None:
@@ -527,15 +580,25 @@ class AgentLoop:
             return None
         provider = self.provider
         model = self.model
-        preset_name = getattr(judge_settings, "model_preset", None) if judge_settings is not None else None
+        preset_name = (
+            getattr(judge_settings, "model_preset", None)
+            if judge_settings is not None
+            else None
+        )
         if preset_name:
             try:
                 snapshot = self._build_model_preset_snapshot(preset_name)
                 provider = snapshot.provider
                 model = snapshot.model
-                logger.info("review.judge.preset.loaded preset={} model={}", preset_name, model)
+                logger.info(
+                    "review.judge.preset.loaded preset={} model={}", preset_name, model
+                )
             except Exception as exc:
-                logger.warning("review.judge.preset_unavailable preset={} reason={}", preset_name, exc)
+                logger.warning(
+                    "review.judge.preset_unavailable preset={} reason={}",
+                    preset_name,
+                    exc,
+                )
         config = ReviewJudgeConfig(
             enabled=bool(getattr(judge_settings, "enabled", True)),
             max_candidates=int(getattr(judge_settings, "max_candidates", 40)),
@@ -545,8 +608,11 @@ class AgentLoop:
         return ReviewJudge(provider=provider, model=model, config=config)
 
     def _set_tool_context(
-        self, channel: str, chat_id: str,
-        message_id: str | None = None, metadata: dict | None = None,
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        metadata: dict | None = None,
         session_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
@@ -714,7 +780,9 @@ class AgentLoop:
         """Derive a token budget for session history replay from the context window."""
         if self.context_window_tokens <= 0:
             return 0
-        max_output = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
+        max_output = getattr(
+            getattr(self.provider, "generation", None), "max_tokens", 4096
+        )
         try:
             reserved_output = int(max_output)
         except (TypeError, ValueError):
@@ -786,7 +854,9 @@ class AgentLoop:
                 return None
             return await wait(active_session_key, timeout=0.1)
 
-        is_review_session = session is not None and bool(session.metadata.get(ReviewMetaKey.TARGET))
+        is_review_session = session is not None and bool(
+            session.metadata.get(ReviewMetaKey.TARGET)
+        )
         loop_hook = AgentProgressHook(
             on_progress=on_progress,
             on_stream=on_stream,
@@ -798,12 +868,16 @@ class AgentLoop:
             session_key=session_key,
             tool_hint_max_length=self.tool_hint_max_length,
             set_tool_context=self._set_tool_context,
-            on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
+            on_iteration=lambda iteration: setattr(
+                self, "_current_iteration", iteration
+            ),
             suppress_content_progress=is_review_session,
         )
         review_hook: AgentHook | None = None
         if is_review_session and session is not None:
-            review_depth = str(session.metadata.get(ReviewMetaKey.MODE_VARIANT) or "full").lower()
+            review_depth = str(
+                session.metadata.get(ReviewMetaKey.MODE_VARIANT) or "full"
+            ).lower()
             if review_depth not in ("quick", "full", "deep"):
                 review_depth = "full"
             review_hook = ReviewFinalizerHook(
@@ -812,7 +886,9 @@ class AgentLoop:
                 changed_files=[],
                 depth=review_depth,  # type: ignore[arg-type]
                 judge=self._build_review_judge(),
-                allowed_dimensions=session.metadata.get(ReviewMetaKey.ALLOWED_DIMENSIONS),
+                allowed_dimensions=session.metadata.get(
+                    ReviewMetaKey.ALLOWED_DIMENSIONS
+                ),
                 can_finalize=lambda: _running_subagents() == 0,
             )
             on_stream = None
@@ -821,16 +897,16 @@ class AgentLoop:
         if review_hook is not None:
             hooks.append(review_hook)
         hooks.extend(self._extra_hooks)
-        hook: AgentHook = (
-            CompositeHook(hooks) if len(hooks) > 1 else loop_hook
-        )
+        hook: AgentHook = CompositeHook(hooks) if len(hooks) > 1 else loop_hook
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if session is None:
                 return
             self._set_runtime_checkpoint(session, payload)
 
-        async def _drain_pending(*, limit: int = _MAX_INJECTIONS_PER_TURN) -> list[dict[str, Any]]:
+        async def _drain_pending(
+            *, limit: int = _MAX_INJECTIONS_PER_TURN
+        ) -> list[dict[str, Any]]:
             """Drain follow-up messages from the pending queue.
 
             Subagent results are a hard dependency for review turns. While
@@ -910,7 +986,9 @@ class AgentLoop:
                     getattr(self.subagents, "wait_for_session_result", None)
                 ):
                     try:
-                        pending_msg = await asyncio.wait_for(pending_queue.get(), timeout=0.1)
+                        pending_msg = await asyncio.wait_for(
+                            pending_queue.get(), timeout=0.1
+                        )
                     except asyncio.TimeoutError:
                         pending_msg = None
                 if pending_msg is None:
@@ -934,9 +1012,12 @@ class AgentLoop:
 
             return items
 
-        file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
+        file_state_token = bind_file_states(
+            self._file_state_store.for_session(active_session_key)
+        )
         try:
             from nanobot.agent.tools.permissions import resolve_policy
+
             _session_meta = session.metadata if session is not None else {}
             permission_policy = resolve_policy(
                 getattr(self, "permissions_config", None),
@@ -944,7 +1025,9 @@ class AgentLoop:
             )
 
             review_meta = dict(_session_meta)
-            review_tool = self.tools.get("local_review") or self.tools.get("github_review")
+            review_tool = self.tools.get("local_review") or self.tools.get(
+                "github_review"
+            )
             if review_tool is not None:
                 if evidence_provider := getattr(review_tool, "evidence_provider", None):
                     review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = evidence_provider
@@ -963,27 +1046,47 @@ class AgentLoop:
             for key in review_meta_keys_to_sync:
                 if key in review_meta:
                     _session_meta[key] = review_meta[key]
-                elif key in (ReviewMetaKey.LOCAL_ROOT, ReviewMetaKey.LOCAL_TARGET, ReviewMetaKey.LOCAL_SCOPE_KIND):
+                elif key in (
+                    ReviewMetaKey.LOCAL_ROOT,
+                    ReviewMetaKey.LOCAL_TARGET,
+                    ReviewMetaKey.LOCAL_SCOPE_KIND,
+                ):
                     _session_meta.pop(key, None)
             if ReviewMetaKey.ALLOWED_DIMENSIONS in review_meta:
-                if review_hook is not None and hasattr(review_hook, "set_allowed_dimensions"):
-                    review_hook.set_allowed_dimensions(review_meta[ReviewMetaKey.ALLOWED_DIMENSIONS])
-            if review_hook is not None and hasattr(review_hook, "set_validation_context"):
-                target_type_value = str(review_meta.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower()
+                if review_hook is not None and hasattr(
+                    review_hook, "set_allowed_dimensions"
+                ):
+                    review_hook.set_allowed_dimensions(
+                        review_meta[ReviewMetaKey.ALLOWED_DIMENSIONS]
+                    )
+            if review_hook is not None and hasattr(
+                review_hook, "set_validation_context"
+            ):
+                target_type_value = (
+                    str(review_meta.get(ReviewMetaKey.TARGET_TYPE) or "")
+                    .strip()
+                    .lower()
+                )
                 evidence_provider = review_meta.get(ReviewMetaKey.EVIDENCE_PROVIDER)
-                validation_workspace = str(review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self.workspace)
+                validation_workspace = str(
+                    review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self.workspace
+                )
                 changed_files: list[str] = []
                 local_target = review_meta.get(ReviewMetaKey.LOCAL_TARGET)
                 if target_type_value == "github" and evidence_provider is not None:
                     cache_root = getattr(evidence_provider, "last_cache_root", None)
                     if cache_root is not None:
                         validation_workspace = str(cache_root)
-                        changed_files = list(getattr(evidence_provider, "last_changed_files", []))
+                        changed_files = list(
+                            getattr(evidence_provider, "last_changed_files", [])
+                        )
                         local_target = None
                 review_hook.set_validation_context(
                     workspace=validation_workspace,
                     changed_files=changed_files,
-                    local_target=local_target if isinstance(local_target, str) else None,
+                    local_target=local_target
+                    if isinstance(local_target, str)
+                    else None,
                 )
             if review_meta:
                 updated_tool_meta = {
@@ -1003,7 +1106,9 @@ class AgentLoop:
                     session_key=session_key,
                 )
             if specialist_prompt:
-                initial_messages.insert(0, {"role": "system", "content": specialist_prompt})
+                initial_messages.insert(
+                    0, {"role": "system", "content": specialist_prompt}
+                )
 
             async def _permission_request_cb(
                 request_id: str,
@@ -1026,29 +1131,31 @@ class AgentLoop:
                 finally:
                     self._permission_futures.pop(request_id, None)
 
-            result = await self.runner.run(AgentRunSpec(
-                initial_messages=initial_messages,
-                tools=self.tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                hook=hook,
-                error_message="Sorry, I encountered an error calling the AI model.",
-                concurrent_tools=True,
-                workspace=self.workspace,
-                session_key=session.key if session else None,
-                context_window_tokens=self.context_window_tokens,
-                context_block_limit=self.context_block_limit,
-                provider_retry_mode=self.provider_retry_mode,
-                progress_callback=on_progress,
-                stream_progress_deltas=on_stream is not None,
-                retry_wait_callback=on_retry_wait,
-                checkpoint_callback=_checkpoint,
-                injection_callback=_drain_pending,
-                llm_timeout_s=None,
-                permission_policy=permission_policy,
-                permission_request_callback=_permission_request_cb,
-            ))
+            result = await self.runner.run(
+                AgentRunSpec(
+                    initial_messages=initial_messages,
+                    tools=self.tools,
+                    model=self.model,
+                    max_iterations=self.max_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    hook=hook,
+                    error_message="Sorry, I encountered an error calling the AI model.",
+                    concurrent_tools=True,
+                    workspace=self.workspace,
+                    session_key=session.key if session else None,
+                    context_window_tokens=self.context_window_tokens,
+                    context_block_limit=self.context_block_limit,
+                    provider_retry_mode=self.provider_retry_mode,
+                    progress_callback=on_progress,
+                    stream_progress_deltas=on_stream is not None,
+                    retry_wait_callback=on_retry_wait,
+                    checkpoint_callback=_checkpoint,
+                    injection_callback=_drain_pending,
+                    llm_timeout_s=None,
+                    permission_policy=permission_policy,
+                    permission_request_callback=_permission_request_cb,
+                )
+            )
         finally:
             reset_file_states(file_state_token)
         self._last_usage = result.usage
@@ -1062,7 +1169,14 @@ class AgentLoop:
                 await on_stream_end(resuming=False)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections, result.content_replaced
+        return (
+            result.final_content,
+            result.tools_used,
+            result.messages,
+            result.stop_reason,
+            result.had_injections,
+            result.content_replaced,
+        )
 
     def _accumulate_total_usage(self, usage: dict[str, int]) -> None:
         usage_total: int | None = None
@@ -1135,7 +1249,9 @@ class AgentLoop:
                 continue
             if self.commands.is_priority(raw):
                 await self._dispatch_command_inline(
-                    msg, msg.session_key, raw,
+                    msg,
+                    msg.session_key,
+                    raw,
                     self.commands.dispatch_priority,
                 )
                 continue
@@ -1148,7 +1264,9 @@ class AgentLoop:
                 # dispatch them directly (same pattern as priority commands).
                 if self.commands.is_dispatchable_command(raw):
                     await self._dispatch_command_inline(
-                        msg, effective_key, raw,
+                        msg,
+                        effective_key,
+                        raw,
                         self.commands.dispatch,
                     )
                     continue
@@ -1182,8 +1300,9 @@ class AgentLoop:
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(effective_key, []).append(task)
             task.add_done_callback(
-            lambda t, k=effective_key: self._remove_active_task(k, t)
-                                      )
+                lambda t, k=effective_key: self._remove_active_task(k, t)
+            )
+
     def _remove_active_task(self, key: str, task: asyncio.Task) -> None:
         tasks = self._active_tasks.get(key)
         if not tasks:
@@ -1197,8 +1316,7 @@ class AgentLoop:
                 self._cleanup_session_lock(key, lock)
 
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message: per-session serial, cross-session concurrent.
-        """
+        """Process a message: per-session serial, cross-session concurrent."""
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
@@ -1226,41 +1344,48 @@ class AgentLoop:
                 meta["_resuming"] = False
                 meta["_stream_id"] = _current_stream_id()
                 meta["_stream_kind"] = "review_thinking"
-                await self.bus.publish_outbound(OutboundMessage(
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="",
+                        metadata=meta,
+                    )
+                )
+                stream_segment += 1
+            await self.bus.publish_outbound(
+                OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content="",
-                    metadata=meta,
-                ))
-                stream_segment += 1
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="",
-                metadata={
-                    **dict(msg.metadata or {}),
-                    "_turn_end": True,
-                },
-            ))
+                    metadata={
+                        **dict(msg.metadata or {}),
+                        "_turn_end": True,
+                    },
+                )
+            )
             turn_end_sent = True
 
         try:
             async with lock, gate:
                 try:
-
                     on_stream = on_stream_end = None
                     if wants_stream:
+
                         async def on_stream(delta: str) -> None:
                             meta = dict(msg.metadata or {})
                             meta["_stream_delta"] = True  # 标记这是流增量
                             meta["_stream_id"] = _current_stream_id()  # 该段的唯一 ID
                             if review_stream:
                                 meta["_stream_kind"] = "review_thinking"
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content=delta,
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=delta,
+                                    metadata=meta,
+                                )
+                            )
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
@@ -1270,47 +1395,60 @@ class AgentLoop:
                             meta["_stream_id"] = _current_stream_id()
                             if review_stream:
                                 meta["_stream_kind"] = "review_thinking"
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="",
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content="",
+                                    metadata=meta,
+                                )
+                            )
                             stream_segment += 1  # 准备下一段
 
                     response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        msg,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
                         pending_queue=pending,
                         consumed_subagent_task_ids=consumed_subagent_task_ids,
                     )
 
-
                     if response is not None:
-
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
-
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
-
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="",
+                                metadata=msg.metadata or {},
+                            )
+                        )
 
                     if msg.channel == "websocket":
-
-
                         turn_lat = self._pending_turn_latency_ms.pop(session_key, None)
                         turn_trace = self._pending_turn_traces.pop(session_key, None)
-                        turn_metadata: dict[str, Any] = {**msg.metadata, "_turn_end": True}  # 关键标记
+                        turn_metadata: dict[str, Any] = {
+                            **msg.metadata,
+                            "_turn_end": True,
+                        }  # 关键标记
                         if turn_lat is not None:
-                            turn_metadata["latency_ms"] = int(turn_lat)  # 这一轮用了多长时间
+                            turn_metadata["latency_ms"] = int(
+                                turn_lat
+                            )  # 这一轮用了多长时间
                         if turn_trace:
                             turn_metadata["turn_trace"] = turn_trace
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=turn_metadata,
-                        ))
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="",
+                                metadata=turn_metadata,
+                            )
+                        )
                         turn_end_sent = True
                         if msg.metadata.get("webui") is True:
+
                             async def _generate_title_and_notify() -> None:
                                 generated = await maybe_generate_webui_title_after_turn(
                                     channel=msg.channel,
@@ -1321,17 +1459,21 @@ class AgentLoop:
                                     model=self.model,
                                 )
                                 if generated:
-                                    await self.bus.publish_outbound(OutboundMessage(
-                                        channel=msg.channel,
-                                        chat_id=msg.chat_id,
-                                        content="",
-                                        metadata={**msg.metadata, "_session_updated": True},
-                                    ))
+                                    await self.bus.publish_outbound(
+                                        OutboundMessage(
+                                            channel=msg.channel,
+                                            chat_id=msg.chat_id,
+                                            content="",
+                                            metadata={
+                                                **msg.metadata,
+                                                "_session_updated": True,
+                                            },
+                                        )
+                                    )
 
                             self._schedule_background(_generate_title_and_notify())
 
                 except asyncio.CancelledError:
-
                     logger.info("Task cancelled for session {}", session_key)
 
                     try:
@@ -1354,17 +1496,20 @@ class AgentLoop:
                         await publish_forced_turn_end()
                     raise
                 except Exception:
-
-                    logger.exception("Error processing message for session {}", session_key)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
+                    logger.exception(
+                        "Error processing message for session {}", session_key
+                    )
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="Sorry, I encountered an error.",
+                        )
+                    )
                     if msg.channel == "websocket":
                         await publish_forced_turn_end()
 
         finally:
-
             queue = self._pending_queues.pop(session_key, None)
             if queue is not None:
                 leftover = 0
@@ -1381,9 +1526,9 @@ class AgentLoop:
                 if leftover:
                     logger.info(
                         "Re-published {} leftover message(s) to bus for session {}",
-                        leftover, session_key,
+                        leftover,
+                        session_key,
                     )
-
 
             await publish_turn_run_status(self.bus, msg, "idle")
             # 清除本轮的延迟记录
@@ -1470,8 +1615,11 @@ class AgentLoop:
             logger.debug("Subagent result persisted for session {}", key)
             self.sessions.save(session)
         self._set_tool_context(
-            channel, chat_id, msg.metadata.get("message_id"),
-            msg.metadata, session_key=key,
+            channel,
+            chat_id,
+            msg.metadata.get("message_id"),
+            msg.metadata,
+            session_key=key,
         )
         _hist_kwargs: dict[str, Any] = {
             "max_messages": self._max_messages,
@@ -1493,7 +1641,10 @@ class AgentLoop:
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _, _ = await self._run_agent_loop(
-            messages, session=session, channel=channel, chat_id=chat_id,
+            messages,
+            session=session,
+            channel=channel,
+            chat_id=chat_id,
             message_id=msg.metadata.get("message_id"),
             metadata=msg.metadata,
             session_key=key,
@@ -1535,7 +1686,7 @@ class AgentLoop:
         consumed_subagent_task_ids: set[str] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response.
-        
+
         这个方法是一个「状态机引擎」，由以下状态组成：
         1. RESTORE：恢复上次中断的检查点
         2. COMPACT：根据需要进行会话池压缩
@@ -1545,7 +1696,7 @@ class AgentLoop:
         6. SAVE：保存轮下消息到 session
         7. RESPOND：滄下最终的回复
         8. DONE：结束
-        
+
         状态每次转换是由「事件」驱动的，不是固定顺序。
         例如快捷命令可以跳过 BUILD/RUN/SAVE，直接转到 DONE。
         """
@@ -1632,8 +1783,7 @@ class AgentLoop:
             ctx.turn_id,
             len(ctx.trace),
             ", ".join(
-                f"{entry.state.name}={entry.duration_ms:.1f}ms"
-                for entry in ctx.trace
+                f"{entry.state.name}={entry.duration_ms:.1f}ms" for entry in ctx.trace
             ),
         )
         self._remember_turn_trace(ctx.session_key, ctx.trace)
@@ -1653,7 +1803,9 @@ class AgentLoop:
             trace.append(item)
         return trace
 
-    def _remember_turn_trace(self, session_key: str, entries: list[StateTraceEntry]) -> None:
+    def _remember_turn_trace(
+        self, session_key: str, entries: list[StateTraceEntry]
+    ) -> None:
         trace = self._serialize_turn_trace(entries)
         if trace:
             self._pending_turn_traces[session_key] = trace
@@ -1672,11 +1824,17 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Assemble the final outbound message from turn results."""
         # MessageTool suppression
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        if (
+            (mt := self.tools.get("message"))
+            and isinstance(mt, MessageTool)
+            and mt._sent_in_turn
+        ):
             if not had_injections or stop_reason == "empty_final_response":
                 return None
 
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        preview = (
+            final_content[:120] + "..." if len(final_content) > 120 else final_content
+        )
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
@@ -1695,13 +1853,13 @@ class AgentLoop:
 
     async def _state_restore(self, ctx: TurnContext) -> TurnState:
         """Restore checkpoint / pending user turn; extract documents.
-        
+
         RESTORE 是第一个状态，职责是恢复程序的故障。
-        
+
         场景 1：若上次轮转在工具执行中遇到崩溃，
                   检查点被保存到 session metadata 中。
                   此时宁安抽取已执行的工具结果和 assistant 消息。
-                  
+
         场景 2：若用户消息已经丢进 session，但 assistant 消息没有答复（不常见），
                   里面済一个错误提示。
         """
@@ -1713,7 +1871,9 @@ class AgentLoop:
             msg = ctx.msg
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
-        logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
+        logger.info(
+            "Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview
+        )
 
         # 确保 session 存在
         if ctx.session is None:
@@ -1732,7 +1892,9 @@ class AgentLoop:
         return "ok"  # 整个恢复步骤完成，下一个状态是 COMPACT
 
     async def _state_compact(self, ctx: TurnContext) -> str:
-        ctx.session, pending = self.auto_compact.prepare_session(ctx.session, ctx.session_key)
+        ctx.session, pending = self.auto_compact.prepare_session(
+            ctx.session, ctx.session_key
+        )
         ctx.pending_summary = pending
         return "ok"
 
@@ -1753,9 +1915,7 @@ class AgentLoop:
                 ctx.user_persisted_early = self._persist_user_message_early(
                     ctx.msg, ctx.session, _command=True
                 )
-                ctx.session.add_message(
-                    "assistant", result.content, _command=True
-                )
+                ctx.session.add_message("assistant", result.content, _command=True)
                 self.sessions.save(ctx.session)
                 self._clear_pending_user_turn(ctx.session)
             return "shortcut"
@@ -1788,7 +1948,8 @@ class AgentLoop:
         # Filter stale subagent results from prior reviews — the LLM would
         # otherwise try to continue old review work instead of starting fresh.
         ctx.history = [
-            m for m in ctx.history
+            m
+            for m in ctx.history
             if m.get("_metadata", {}).get("injected_event") != "subagent_result"
         ]
 
@@ -1824,7 +1985,14 @@ class AgentLoop:
             pending_queue=ctx.pending_queue,
             consumed_subagent_task_ids=ctx.consumed_subagent_task_ids,
         )
-        final_content, tools_used, all_msgs, stop_reason, had_injections, content_replaced = result
+        (
+            final_content,
+            tools_used,
+            all_msgs,
+            stop_reason,
+            had_injections,
+            content_replaced,
+        ) = result
         ctx.final_content = final_content
         ctx.tools_used = tools_used
         ctx.all_messages = all_msgs
@@ -1839,15 +2007,21 @@ class AgentLoop:
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
         ctx.save_skip = 1 + len(ctx.history) + (1 if ctx.user_persisted_early else 0)
-        skip_msgs = ctx.all_messages[ctx.save_skip:]
+        skip_msgs = ctx.all_messages[ctx.save_skip :]
         ctx.generated_media = generated_image_paths_from_messages(skip_msgs)
         mt = self.tools.get("message")
         extra = getattr(mt, "turn_delivered_media_paths", lambda: [])() if mt else []
-        merge_turn_media_into_last_assistant(ctx.all_messages, ctx.generated_media, extra)
+        merge_turn_media_into_last_assistant(
+            ctx.all_messages, ctx.generated_media, extra
+        )
 
-        ctx.turn_latency_ms = max(0, int((time.time() - ctx.turn_wall_started_at) * 1000))
+        ctx.turn_latency_ms = max(
+            0, int((time.time() - ctx.turn_wall_started_at) * 1000)
+        )
         self._save_turn(
-            ctx.session, ctx.all_messages, ctx.save_skip,
+            ctx.session,
+            ctx.all_messages,
+            ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
         )
         if ctx.msg.channel == "websocket":
@@ -1877,7 +2051,9 @@ class AgentLoop:
         )
         if ctx.outbound and ctx.content_replaced:
             ctx.outbound.metadata.pop("_streamed", None)
-            if ctx.msg.metadata.get("_wants_stream") and _is_review_turn(ctx.msg.metadata):
+            if ctx.msg.metadata.get("_wants_stream") and _is_review_turn(
+                ctx.msg.metadata
+            ):
                 stream_id = f"{ctx.msg.session_key}:{ctx.turn_id}:review_report"
                 report_meta = dict(ctx.msg.metadata or {})
                 report_meta["_stream_delta"] = True
@@ -1893,18 +2069,22 @@ class AgentLoop:
                     len(ctx.final_content or ""),
                 )
                 for chunk in _stream_chunks(ctx.final_content or ""):
-                    await self.bus.publish_outbound(OutboundMessage(
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=ctx.msg.channel,
+                            chat_id=ctx.msg.chat_id,
+                            content=chunk,
+                            metadata=report_meta,
+                        )
+                    )
+                await self.bus.publish_outbound(
+                    OutboundMessage(
                         channel=ctx.msg.channel,
                         chat_id=ctx.msg.chat_id,
-                        content=chunk,
-                        metadata=report_meta,
-                    ))
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=ctx.msg.channel,
-                    chat_id=ctx.msg.chat_id,
-                    content="",
-                    metadata=end_meta,
-                ))
+                        content="",
+                        metadata=end_meta,
+                    )
+                )
                 logger.info("review.report.stream.end session={}", ctx.session_key)
                 ctx.outbound = None
         return "ok"
@@ -1975,15 +2155,25 @@ class AgentLoop:
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
             if role == "tool":
-                if isinstance(content, str) and len(content) > self.max_tool_result_chars:
-                    entry["content"] = truncate_text_fn(content, self.max_tool_result_chars)
+                if (
+                    isinstance(content, str)
+                    and len(content) > self.max_tool_result_chars
+                ):
+                    entry["content"] = truncate_text_fn(
+                        content, self.max_tool_result_chars
+                    )
                 elif isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, should_truncate_text=True)
+                    filtered = self._sanitize_persisted_blocks(
+                        content, should_truncate_text=True
+                    )
                     if not filtered:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and ContextBuilder._RUNTIME_CONTEXT_TAG in content:
+                if (
+                    isinstance(content, str)
+                    and ContextBuilder._RUNTIME_CONTEXT_TAG in content
+                ):
                     # Strip the runtime-context block appended at the end.
                     tag_pos = content.find(ContextBuilder._RUNTIME_CONTEXT_TAG)
                     before = content[:tag_pos].rstrip("\n ")
@@ -1992,7 +2182,9 @@ class AgentLoop:
                     else:
                         continue
                 if isinstance(content, list):
-                    filtered = self._sanitize_persisted_blocks(content, drop_runtime=True)
+                    filtered = self._sanitize_persisted_blocks(
+                        content, drop_runtime=True
+                    )
                     if not filtered:
                         continue
                     entry["content"] = filtered
@@ -2013,9 +2205,14 @@ class AgentLoop:
         """
         if not msg.content:
             return False
-        task_id = msg.metadata.get("subagent_task_id") if isinstance(msg.metadata, dict) else None
+        task_id = (
+            msg.metadata.get("subagent_task_id")
+            if isinstance(msg.metadata, dict)
+            else None
+        )
         if task_id and any(
-            m.get("injected_event") == "subagent_result" and m.get("subagent_task_id") == task_id
+            m.get("injected_event") == "subagent_result"
+            and m.get("subagent_task_id") == task_id
             for m in session.messages
         ):
             return False
@@ -2039,7 +2236,9 @@ class AgentLoop:
         )
         return True
 
-    def _set_runtime_checkpoint(self, session: Session, payload: dict[str, Any]) -> None:
+    def _set_runtime_checkpoint(
+        self, session: Session, payload: dict[str, Any]
+    ) -> None:
         """Persist the latest in-flight turn state into session metadata."""
         session.metadata[self._RUNTIME_CHECKPOINT_KEY] = payload
         self.sessions.save(session)
@@ -2058,18 +2257,23 @@ class AgentLoop:
     def _checkpoint_message_key(message: dict[str, Any]) -> tuple[Any, ...]:
         tc = message.get("tool_calls")
         if isinstance(tc, list):
-            tc = tuple((c.get("id"), c.get("type"),
-                        (c.get("function") or {}).get("name")) for c in tc if isinstance(c, dict))
+            tc = tuple(
+                (c.get("id"), c.get("type"), (c.get("function") or {}).get("name"))
+                for c in tc
+                if isinstance(c, dict)
+            )
         content = message.get("content")
         if isinstance(content, list):
             content = tuple(str(b) for b in content)
-        return (message.get("role"),
-                content,
-                message.get("tool_call_id"),
-                message.get("name"),
-                tc,
-                message.get("reasoning_content"),
-                tuple(message.get("thinking_blocks") or ()))
+        return (
+            message.get("role"),
+            content,
+            message.get("tool_call_id"),
+            message.get("name"),
+            tc,
+            message.get("reasoning_content"),
+            tuple(message.get("thinking_blocks") or ()),
+        )
 
     def _restore_runtime_checkpoint(self, session: Session) -> bool:
         """Materialize an unfinished turn into session history before a new request."""
@@ -2114,7 +2318,8 @@ class AgentLoop:
             existing = session.messages[-size:]
             restored = restored_messages[:size]
             if all(
-                self._checkpoint_message_key(left) == self._checkpoint_message_key(right)
+                self._checkpoint_message_key(left)
+                == self._checkpoint_message_key(right)
                 for left, right in zip(existing, restored)
             ):
                 overlap = size
@@ -2159,8 +2364,11 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            media=media or [],
         )
         return await self._process_message(
             msg,
