@@ -1,87 +1,91 @@
-# Agent.md
+# Agent Guidelines
 
-本文件为在本仓库工作的 AI Agent 提供约定。所有输出、文件写入、命令执行和字符串内容必须统一使用 UTF-8 编码，不能使用 GBK/GB2312。
+本文件是本仓库中 AI 编码代理的首要工作约束。所有输出、文件写入、命令执行和字符串内容必须使用 UTF-8，不能使用 GBK/GB2312。
 
-## 项目概览
+`.agents/` 包含按主题拆分的补充说明：开始工作时先阅读本文件；任务涉及架构、安全或运行时行为时，再阅读对应主题文件。不要让主题文件与本文件重复或产生冲突。
 
-nanobot 是一个轻量级个人code-review Agent，主体为 Python 项目，并包含 React/TypeScript WebUI。核心流程是：渠道接收消息，主Agent 构建上下文并调用 LLM Provider，spawn所需的用于codereview的subagent，然后把响应发回对应渠道。
+## 项目与数据流
+
+NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主体为 Python，配套 React/TypeScript WebUI。核心链路如下：
+
+1. `nanobot/channels/` 接收外部消息并向 `nanobot/bus/` 发布入站事件。
+2. `nanobot/agent/loop.py` 构建上下文、恢复会话并协调一次任务。
+3. `nanobot/agent/runner.py` 调用 LLM、执行工具调用并生成结果。
+4. `nanobot/agent/subagent.py` 按需调度代码审查子代理；`nanobot/review/` 负责审查计划、结果校验和报告。
+5. 出站结果通过消息总线返回对应渠道；`review-webui/` 展示用户可见状态和报告。
+
+重要目录：
+
+- `nanobot/agent/`：AgentLoop、AgentRunner、子代理、上下文、记忆与工具。
+- `nanobot/review/`：代码审查目标解析、计划、子代理提交和报告生成。
+- `nanobot/channels/`：外部平台适配层。
+- `nanobot/providers/`：LLM Provider、注册表和工厂。
+- `nanobot/session/`：会话、上下文压缩和目标状态。
+- `nanobot/config/`：Pydantic 配置模型、配置加载与环境变量解析。
+- `nanobot/templates/`、`nanobot/skills/`：影响模型行为的提示词和技能。
+- `nanobot/agent/tools/`：文件系统、执行、检索、MCP、审查和子代理工具。
+- `nanobot/security/`：网络安全边界。
+- `review-webui/`：Vite + React + Tailwind 审查界面。
+- `tests/`：镜像 `nanobot/` 结构的 Python 测试。
 
 ## 常用命令
 
+在已启用项目 Python 环境的前提下执行：
+
 ```bash
-# 安装开发依赖
-pip install -e ".[dev]"
-
-# 运行测试
+# Python 测试与静态检查
 pytest
-pytest tests/test_xxx.py -v
-
-# 代码检查
+pytest tests/agent/test_codereview.py -v
 ruff check nanobot/
 
-# 只格式化自己改过的文件
-ruff format <changed-files>
-
-# WebUI 开发与构建
+# WebUI
 cd review-webui && bun run dev
 cd review-webui && bun run build
+cd review-webui && bun run test
 
-# 启动 gateway
+# Gateway
 nanobot gateway
 ```
 
-在 Windows/PowerShell 中执行命令时，先设置 UTF-8：
+在 Windows/PowerShell 中执行命令前设置 UTF-8：
 
 ```powershell
 $OutputEncoding = [System.Text.UTF8Encoding]::new()
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 ```
 
-## 目录与职责
+## 测试规范
 
-- `nanobot/agent/`：Agent 核心循环、Runner、Subagent、Hooks 和 Review 流程。
-- `nanobot/channels/`：外部平台渠道接入。
-- `nanobot/providers/`：LLM Provider 实现、注册和工厂。
-- `nanobot/agent/tools/`：Agent 可调用工具。
-- `nanobot/session/`：会话、上下文压缩、目标状态。
-- `nanobot/config/`：Pydantic 配置模型与加载逻辑。
-- `nanobot/templates/`：运行时 Prompt 模板，改动影响 Agent 行为。
-- `nanobot/skills/`：内置技能定义。
-- `review-webui/`：Vite + React + Tailwind WebUI。
-- `tests/`：测试代码。
+- Python 目标版本为 3.11+；pytest 使用 `asyncio_mode = "auto"`。
+- 测试放在 `tests/`，目录结构应镜像被测模块。
+- 改动共享行为、跨模块契约、配置、提示词、工具权限、渠道协议或用户可见 WebUI 行为时，补充或更新最贴近的测试。
+- 前端或后端接口变更必须检查完整调用链：API/消息事件、WebUI 状态、配置、模板、文档与测试。
+- 不做无关重构，不批量格式化，不回滚或覆盖已有用户改动。
+- 日志记录关键状态变化和错误上下文，避免循环内高频噪音；不要记录密钥、令牌、完整会话或不必要的敏感元数据。
 
-## 开发原则
+## 变更原则
 
-- 优先阅读现有代码和约定，再修改。
-- 保持核心小而清晰，新能力优先放在 `channels/`、`tools/`、`skills/`、Provider 或 MCP 扩展中。
-- 对 `nanobot/agent/loop.py`、`nanobot/agent/runner.py` 的改动要谨慎、聚焦，并说明原因。
-- 不做无关重构，不批量格式化整个仓库。
-- Prompt 模板按代码对待：改动要窄，必要时加回归测试。
-- Python 代码使用 `pathlib.Path` 处理路径，保持 Windows 兼容。
-- 异步路径优先使用 async/await，不在事件循环中做长时间阻塞操作。
-
-## 测试与质量
-
-- Python 目标版本为 3.11+。
-- Ruff 行宽为 100，规则见 `pyproject.toml`。
-- pytest 使用 `asyncio_mode = "auto"`。
-- 测试应尽量贴近被改动模块；共享行为或用户可见行为变更要补充覆盖。
-- 修改前后都注意已有工作区变更，不要回滚他人或用户的改动。
-
-## 安全边界
-
-- 文件系统访问应遵守工作区边界；工具相关路径解析使用既有安全函数。
-- 工具中的外部 HTTP 请求应走既有网络校验逻辑，避免直接访问私有地址、云元数据地址等危险目标。
-- Session/memory 写入涉及持久上下文，写入前要清理不必要或敏感的元数据。
-- `agent/memory.py` 使用临时文件、fsync、rename 的原子写入方式，不要简化为普通写入。
+- 先阅读相邻实现、测试和调用链，再修改；不猜测可从代码确认的事实。
+- 保持核心小而清晰。新能力优先落在 `channels/`、`agent/tools/`、`skills/`、Provider 或 MCP 扩展中，不要内联进核心循环。
+- `nanobot/agent/loop.py` 和 `nanobot/agent/runner.py` 是关键路径。改动必须聚焦、最小且说明原因；运行时事件可通用发布，渠道和 WebUI 的协议细节保留在各自适配层。
+- 优先使用简单、可读且显式的代码。仅在消除真实复杂度、保护明确边界或匹配既有模式时新增抽象。
+- 允许channel和 Provider 存在小范围重复；不要为了消除重复而引入复杂基类或共享框架。
+- Bug 修复只改保护该不变量所需的最小表面，并添加最近的回归测试。行为变更、重构和清理不要混在同一改动中。
+- 配置必须显式定义在 `nanobot/config/schema.py` 的 Pydantic 模型中；错误应清晰暴露，Provider 解析路径必须可追踪。
+- 提示词模板、工具描述、技能和会话回放内容都是运行时行为的一部分。变更应窄，并在可行时补充聚焦测试。
+- Python 使用 `pathlib.Path`，异步路径使用 `async`/`await`，不得在事件循环中执行长时间阻塞操作。
 
 ## 协作要求
 
-- 给出必要注释，保证代码可读性
-- 遇到设计不合理处，给出具体位置、影响和建议。
-- 信息不足且会影响正确性时，先提问；能从代码中确认的内容不要猜。
-- 回答与项目相关问题时要结合实际代码回答。
-- 调整代码时不需要兼容旧配置/旧参数。
-- 变更配置、文档、前端或后端时，检查相关联的调用链和用户可见行为。
-- 日志应包含关键节点和错误上下文，但避免噪音。
+- 设计不合理时说明具体位置、影响和可执行建议。
+- 信息不足且会影响正确性时先提问；能从本地代码确认的内容不得猜测。
+- 调整代码时不需要兼容旧配置或旧参数，除非用户明确要求。
+- 交付时说明改动、验证结果，以及未执行的验证和原因。
+
+## 项目具体说明
+
+- Architecture constraints：`.agent/design.md`
+- Security boundaries：`.agent/security.md`
+- Common gotchas：`.agent/gotchas.md`
+- Design principle:`.agent/design.md`
 
