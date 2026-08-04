@@ -15,3 +15,5 @@ HTTP/SSE MCP URLs belong to the same rule. Private endpoints require an explicit
 ## Persistent Prompt Data
 
 Memory, session history, template inputs and tool results can be replayed into future model calls. Bound their size and remove secrets, raw fallback dumps, local media paths, timestamps and internal tool-call markers unless they are essential user context. Do not weaken atomic session persistence in `nanobot/session/manager.py`.
+
+WebUI transcripts and subagent traces under `nanobot.utils.webui_transcript` and `nanobot.utils.subagent_trace` are session-scoped persistence sidecars. Sanitize every persisted text value with `sanitize_persisted_log_text`, enforce per-record and total-file limits, and retain only data needed for recovery. WebSocket session deletion must remove the WebUI transcript through `delete_webui_thread`; `SessionManager.delete_session` removes the associated subagent trace.

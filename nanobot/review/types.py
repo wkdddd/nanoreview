@@ -25,6 +25,9 @@ class ReviewMetaKey:
     ALLOWED_DIMENSIONS = "allowed_review_dimensions"
     EVIDENCE_PROVIDER = "_review_evidence_service"
     GITHUB_PREFETCH_READY = "_review_github_prefetch_ready"
+    DIFF_CONTEXT_WINDOW_TOKENS = "_review_diff_context_window_tokens"
+    GITHUB_PR_HEAD_REF = "_review_github_pr_head_ref"
+    EVIDENCE_BUNDLE = "_review_evidence_bundle"
 
 ReviewTargetType = Literal["auto", "github", "local"]
 ReviewDepth = Literal["quick", "full", "deep"]
@@ -34,6 +37,18 @@ ReviewScopeKind = Literal["file", "directory", "repo"]
 class ReviewAction(StrEnum):
     REPO = "repo"
     DIFF = "diff"
+
+
+@dataclass(slots=True)
+class GitHubDiffEvidence:
+    """Non-RAG evidence collected from one GitHub pull request."""
+
+    snapshot: str
+    head_sha: str
+    patches: dict[str, str] = field(default_factory=dict)
+    changed_files: list[str] = field(default_factory=list)
+    touched_lines: dict[str, list[int]] = field(default_factory=dict)
+    patch_unavailable_files: dict[str, str] = field(default_factory=dict)
 
 
 def review_action_values() -> tuple[str, ...]:
@@ -236,6 +251,41 @@ class ReviewPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceReference:
+    """One bounded, program-authorized unit of review evidence."""
+
+    id: str
+    path: str
+    start_line: int | None = None
+    end_line: int | None = None
+    source: str = "prefetch"
+    tags: tuple[str, ...] = ()
+    excerpt: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewEvidenceBundle:
+    """Evidence exposed to the coordinator and available for subagent routing."""
+
+    references: tuple[EvidenceReference, ...] = ()
+    summary: str = ""
+    status: str = "ok"
+    reason: str = ""
+
+    def by_id(self) -> dict[str, EvidenceReference]:
+        return {reference.id: reference for reference in self.references}
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewAssignment:
+    """Validated coordinator guidance for one program-required dimension."""
+
+    dimension: str
+    focus: str
+    evidence_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewFindingCandidate:
     """A candidate finding produced by a dimension subagent."""
 
@@ -356,6 +406,7 @@ class ReviewEvidenceProvider(Protocol):
         max_results: int,
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
+        context_window_tokens: int | None = None,
     ) -> str: ...
 
     async def github_context(
@@ -379,6 +430,7 @@ class ReviewEvidenceProvider(Protocol):
         max_results: int,
         include_tests: bool | None,
         trace_id: str,
+        context_window_tokens: int | None = None,
     ) -> str: ...
 
     async def dispatch(
@@ -397,4 +449,5 @@ class ReviewEvidenceProvider(Protocol):
         include_tests: bool | None = None,
         local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
+        context_window_tokens: int | None = None,
     ) -> str: ...

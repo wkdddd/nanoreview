@@ -11,7 +11,9 @@ from loguru import logger
 
 from nanobot.review.input import policy_for_depth
 from nanobot.review.types import (
+    EvidenceReference,
     ReviewAction,
+    ReviewEvidenceBundle,
     ReviewEvidenceProvider,
     ReviewMetaKey,
     ReviewPlan,
@@ -31,6 +33,63 @@ class ReviewPrefetchResult:
     status: str
     summary: str | None = None
     reason: str = ""
+    evidence: ReviewEvidenceBundle | None = None
+
+
+_EVIDENCE_HEADER = re.compile(
+    r"^##\s+(?:File:\s+)?(?P<path>[A-Za-z0-9_./\\-]+?)(?::(?P<start>\d+)(?:-(?P<end>\d+))?)?\s*$"
+)
+
+
+def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceBundle:
+    """Convert provider output into bounded references before rendering a summary.
+
+    Evidence providers already use stable review-context headers.  Keeping this
+    parsing at the prefetch boundary means later dispatch never trusts a model
+    supplied path or attempts to recover authorization from prompt text.
+    """
+    summary = _compact_evidence(raw, action=action)
+    references: list[EvidenceReference] = []
+    seen_paths: set[tuple[str, int | None, int | None]] = set()
+    lines = raw.splitlines()
+    for index, line in enumerate(lines):
+        match = _EVIDENCE_HEADER.match(line.strip())
+        if not match:
+            continue
+        path = match.group("path").replace("\\", "/")
+        if path.startswith(("a/", "b/")):
+            path = path[2:]
+        start = int(match.group("start")) if match.group("start") else None
+        end = int(match.group("end")) if match.group("end") else start
+        key = (path, start, end)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        tags: list[str] = []
+        for candidate in lines[index + 1 : index + 5]:
+            stripped = candidate.strip()
+            if stripped.startswith("- matched:"):
+                tags = [tag.strip() for tag in stripped.removeprefix("- matched:").split(",") if tag.strip()]
+                break
+        excerpt = "\n".join(lines[index : index + 8]).strip()[:2_000]
+        references.append(
+            EvidenceReference(
+                id=f"ev-{len(references) + 1:03d}",
+                path=path,
+                start_line=start,
+                end_line=end,
+                source="diff" if action == ReviewAction.DIFF else "rag",
+                tags=tuple(tags),
+                excerpt=excerpt,
+            )
+        )
+    status = "ok" if references else "empty"
+    return ReviewEvidenceBundle(
+        references=tuple(references),
+        summary=summary,
+        status=status,
+        reason="no_structured_evidence_references" if not references else "",
+    )
 
 
 async def _emit_prefetch_progress(
@@ -75,9 +134,11 @@ async def _emit_prefetch_progress(
         logger.exception("review.prefetch.progress_emit_failed trace_id={}", trace_id)
 
 
-def _compact_evidence(raw: str, *, budget: int = 10000) -> str:
+def _compact_evidence(raw: str, *, action: ReviewAction, budget: int = 10000) -> str:
     if not raw.strip():
         return ""
+    if action == ReviewAction.DIFF:
+        return raw
     lines = raw.splitlines()
     kept: list[str] = []
     for line in lines:
@@ -178,6 +239,7 @@ async def maybe_prefetch_review_context(
             include_tests=True,
             local_scope=plan.local_scope,
             trace_id=trace_id,
+            context_window_tokens=session_meta.get(ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS),
         )
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -201,7 +263,8 @@ async def maybe_prefetch_review_context(
         )
         return ReviewPrefetchResult(True, "error", reason=str(exc))
     raw = str(result)
-    summary = _compact_evidence(raw)
+    evidence = _build_evidence_bundle(raw, action=plan.action)
+    summary = evidence.summary
     elapsed_ms = (time.perf_counter() - started) * 1000
     logger.info(
         "review.prefetch.done trace_id={} status=ok action={} raw_chars={} summary_chars={} elapsed_ms={:.1f}",
@@ -223,5 +286,5 @@ async def maybe_prefetch_review_context(
         summary_chars=len(summary),
     )
     if not summary:
-        return ReviewPrefetchResult(True, "no_summary")
-    return ReviewPrefetchResult(True, "ok", summary=summary)
+        return ReviewPrefetchResult(True, "no_summary", evidence=evidence)
+    return ReviewPrefetchResult(True, "ok", summary=summary, evidence=evidence)

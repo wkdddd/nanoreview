@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from nanobot.review.output.validator import ReviewValidator, ValidationContext
-from nanobot.review.types import ReviewFindingCandidate
+from nanobot.review.types import GitHubDiffEvidence, ReviewFindingCandidate
 
 
 @pytest.fixture
@@ -36,6 +36,23 @@ def _make_candidate(**overrides) -> ReviewFindingCandidate:
 
 
 class TestValidatorAccepts:
+    def test_github_diff_candidate_uses_patch_evidence_without_workspace_file(self, tmp_path):
+        evidence = GitHubDiffEvidence(
+            snapshot="owner/repo#1",
+            head_sha="abc123",
+            patches={"src/auth.py": "@@ -1 +1 @@\n-old\n+token = request.token"},
+            changed_files=["src/auth.py"],
+            touched_lines={"src/auth.py": [1]},
+        )
+        validator = ReviewValidator(
+            ValidationContext(workspace=str(tmp_path), remote_diff=evidence)
+        )
+        result = validator.validate_candidates(
+            [_make_candidate(file="src/auth.py", line=1, evidence="token = request.token")],
+            "security",
+        )
+        assert len(result.accepted) == 1
+
     def test_valid_candidate_accepted(self, workspace):
         v = ReviewValidator(ValidationContext(workspace=workspace))
         result = v.validate_candidates([_make_candidate()], "security")
@@ -213,6 +230,23 @@ class TestValidatorAccepts:
 
 
 class TestValidatorRejects:
+    def test_github_diff_without_patch_needs_confirmation(self, tmp_path):
+        evidence = GitHubDiffEvidence(
+            snapshot="owner/repo#1",
+            head_sha="abc123",
+            changed_files=["src/auth.py"],
+            patch_unavailable_files={"src/auth.py": "patch_unavailable"},
+        )
+        validator = ReviewValidator(
+            ValidationContext(workspace=str(tmp_path), remote_diff=evidence)
+        )
+        result = validator.validate_candidates(
+            [_make_candidate(file="src/auth.py", line=1, evidence="token")],
+            "security",
+        )
+        assert len(result.uncertain) == 1
+        assert result.uncertain[0][1].reason == "patch_unavailable"
+
     def test_invalid_severity_rejected(self, workspace):
         v = ReviewValidator(ValidationContext(workspace=workspace))
         c = _make_candidate(severity="extreme")

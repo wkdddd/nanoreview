@@ -259,6 +259,75 @@ async def test_github_review_blocks_duplicate_repo_after_prefetch(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_github_review_blocks_rag_repo_action_during_diff_review(tmp_path: Path) -> None:
+    token = set_current_request_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="review",
+            metadata={ReviewMetaKey.ACTION: "diff"},
+        )
+    )
+    try:
+        result = await GitHubReviewTool(workspace=tmp_path).execute(action="repo", target_repo="test/repo")
+    finally:
+        reset_current_request_context(token)
+
+    assert result.startswith("Error:")
+    assert "unavailable during diff review" in result
+
+
+@pytest.mark.asyncio
+async def test_local_review_blocks_rag_repo_action_during_diff_review(tmp_path: Path) -> None:
+    token = set_current_request_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="review",
+            metadata={ReviewMetaKey.ACTION: "diff"},
+        )
+    )
+    try:
+        result = await LocalReviewTool(workspace=tmp_path).execute(action="repo")
+    finally:
+        reset_current_request_context(token)
+
+    assert result.startswith("Error:")
+    assert "unavailable during diff review" in result
+
+
+@pytest.mark.asyncio
+async def test_github_diff_file_reads_use_pr_head_ref(tmp_path: Path) -> None:
+    token = set_current_request_context(
+        RequestContext(
+            channel="websocket",
+            chat_id="review",
+            metadata={
+                ReviewMetaKey.ACTION: "diff",
+                ReviewMetaKey.GITHUB_PR_HEAD_REF: "head-sha",
+            },
+        )
+    )
+    calls: list[dict[str, object]] = []
+    try:
+        tool = GitHubReviewTool(workspace=tmp_path)
+
+        async def fake_execute(**kwargs: object) -> str:
+            calls.append(kwargs)
+            return "file"
+
+        tool.github.execute = fake_execute  # type: ignore[method-assign]
+        result = await tool.execute(
+            action="file",
+            target_repo="owner/repo",
+            repo_path="src/auth.py",
+        )
+    finally:
+        reset_current_request_context(token)
+
+    assert result == "file"
+    assert calls[0]["ref"] == "head-sha"
+
+
+@pytest.mark.asyncio
 async def test_local_review_blocked_for_github_review_context(tmp_path: Path) -> None:
     token = set_current_request_context(
         RequestContext(

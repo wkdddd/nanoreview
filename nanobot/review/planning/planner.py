@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ from nanobot.review.source.utils import (
 from nanobot.review.types import (
     LocalReviewScope,
     ReviewAction,
+    ReviewEvidenceBundle,
     ReviewMetaKey,
     ReviewPlan,
     ReviewTargetType,
@@ -34,6 +35,15 @@ from nanobot.review.types import (
 from nanobot.session.manager import Session
 
 _LEGACY_REVIEW_SCOPE_KEY = "review_" "target_" "paths"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewPreparation:
+    """Program-owned review inputs prepared before the coordinator runs."""
+
+    plan: ReviewPlan | None
+    prompt: str
+    evidence: ReviewEvidenceBundle | None = None
 
 
 def _find_git_root(path: Path) -> Path | None:
@@ -238,8 +248,25 @@ async def resolve_code_review_context(
     progress_callback: Any | None = None,
 ) -> str:
     """Build the Review-mode system prompt from metadata or the user prompt."""
+    preparation = await prepare_code_review_context(
+        initial_messages,
+        session_meta,
+        progress_callback=progress_callback,
+    )
+    return preparation.prompt
+
+
+async def prepare_code_review_context(
+    initial_messages: list[dict[str, Any]],
+    session_meta: dict[str, Any],
+    progress_callback: Any | None = None,
+) -> ReviewPreparation:
+    """Resolve policy, evidence, and the coordinator-only prompt for one review."""
     from nanobot.review.planning.prefetch import maybe_prefetch_review_context
-    from nanobot.review.planning.prompt import build_review_fallback_prompt, render_review_prompt
+    from nanobot.review.planning.prompt import (
+        build_review_fallback_prompt,
+        render_review_coordinator_prompt,
+    )
 
     user_content = latest_user_text(initial_messages)
     plan = build_review_plan(
@@ -253,7 +280,7 @@ async def resolve_code_review_context(
         target_ref=session_meta.get(ReviewMetaKey.TARGET_REF) if isinstance(session_meta.get(ReviewMetaKey.TARGET_REF), str) else None,
     )
     if plan is None:
-        return build_review_fallback_prompt()
+        return ReviewPreparation(None, build_review_fallback_prompt())
     session_meta.pop(_LEGACY_REVIEW_SCOPE_KEY, None)
     if plan.local_scope:
         session_meta[ReviewMetaKey.LOCAL_ROOT] = plan.local_scope.review_root
@@ -294,7 +321,14 @@ async def resolve_code_review_context(
             ),
         )
     session_meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = [role.name for role in plan.roles]
-    return render_review_prompt(plan)
+    evidence = prefetch_summary.evidence
+    if evidence is not None:
+        session_meta[ReviewMetaKey.EVIDENCE_BUNDLE] = evidence
+    return ReviewPreparation(
+        plan=plan,
+        prompt=render_review_coordinator_prompt(plan, evidence),
+        evidence=evidence,
+    )
 
 
 def build_code_review_context(

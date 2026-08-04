@@ -19,9 +19,8 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hooks.lifecycle import AgentHook, CompositeHook
 from nanobot.agent.hooks.progress import AgentProgressHook
-from nanobot.agent.hooks.review_finalizer import ReviewFinalizerHook
 from nanobot.agent.memory import Consolidator
-from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunResult, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.file_state import (
     FileStateStore,
@@ -36,10 +35,13 @@ from nanobot.command import CommandContext, CommandRouter, register_builtin_comm
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
-from nanobot.review import (
-    apply_review_metadata_from_message,
-    resolve_code_review_context,
+from nanobot.review import apply_review_metadata_from_message
+from nanobot.agent.orchestration import (
+    ReviewExecutionContext,
+    ReviewOrchestrator,
+    ReviewPlanningError,
 )
+from nanobot.review.planning.planner import prepare_code_review_context
 from nanobot.review.output.judge import ReviewJudge, ReviewJudgeConfig
 from nanobot.review.types import ReviewMetaKey
 from nanobot.session.manager import Session, SessionManager
@@ -874,23 +876,7 @@ class AgentLoop:
             suppress_content_progress=is_review_session,
         )
         review_hook: AgentHook | None = None
-        if is_review_session and session is not None:
-            review_depth = str(
-                session.metadata.get(ReviewMetaKey.MODE_VARIANT) or "full"
-            ).lower()
-            if review_depth not in ("quick", "full", "deep"):
-                review_depth = "full"
-            review_hook = ReviewFinalizerHook(
-                workspace=str(self.workspace),
-                target_name=str(session.metadata.get(ReviewMetaKey.TARGET) or "target"),
-                changed_files=[],
-                depth=review_depth,  # type: ignore[arg-type]
-                judge=self._build_review_judge(),
-                allowed_dimensions=session.metadata.get(
-                    ReviewMetaKey.ALLOWED_DIMENSIONS
-                ),
-                can_finalize=lambda: _running_subagents() == 0,
-            )
+        if is_review_session:
             on_stream = None
             on_stream_end = None
         hooks: list[AgentHook] = [loop_hook]
@@ -1025,20 +1011,28 @@ class AgentLoop:
             )
 
             review_meta = dict(_session_meta)
+            review_meta.setdefault(
+                ReviewMetaKey.MAX_SUBAGENTS,
+                getattr(self.review_config, "max_concurrent_subagents", 4),
+            )
+            review_meta[ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS] = self.context_window_tokens
             review_tool = self.tools.get("local_review") or self.tools.get(
                 "github_review"
             )
             if review_tool is not None:
                 if evidence_provider := getattr(review_tool, "evidence_provider", None):
                     review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = evidence_provider
-            specialist_prompt = await resolve_code_review_context(
+            review_preparation = await prepare_code_review_context(
                 initial_messages,
                 review_meta,
                 progress_callback=on_progress,
             )
+            specialist_prompt = review_preparation.prompt
             review_meta_keys_to_sync = (
                 ReviewMetaKey.ALLOWED_DIMENSIONS,
                 ReviewMetaKey.GITHUB_PREFETCH_READY,
+                ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS,
+                ReviewMetaKey.GITHUB_PR_HEAD_REF,
                 ReviewMetaKey.LOCAL_ROOT,
                 ReviewMetaKey.LOCAL_TARGET,
                 ReviewMetaKey.LOCAL_SCOPE_KIND,
@@ -1059,21 +1053,27 @@ class AgentLoop:
                     review_hook.set_allowed_dimensions(
                         review_meta[ReviewMetaKey.ALLOWED_DIMENSIONS]
                     )
-            if review_hook is not None and hasattr(
-                review_hook, "set_validation_context"
-            ):
+            validation_workspace = str(
+                review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self.workspace
+            )
+            changed_files: list[str] = []
+            local_target = review_meta.get(ReviewMetaKey.LOCAL_TARGET)
+            remote_diff = None
+            if review_preparation.plan is not None:
                 target_type_value = (
                     str(review_meta.get(ReviewMetaKey.TARGET_TYPE) or "")
                     .strip()
                     .lower()
                 )
                 evidence_provider = review_meta.get(ReviewMetaKey.EVIDENCE_PROVIDER)
-                validation_workspace = str(
-                    review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self.workspace
-                )
-                changed_files: list[str] = []
-                local_target = review_meta.get(ReviewMetaKey.LOCAL_TARGET)
                 if target_type_value == "github" and evidence_provider is not None:
+                    diff_evidence = getattr(evidence_provider, "last_diff_evidence", None)
+                    if diff_evidence is not None:
+                        remote_diff = diff_evidence
+                        changed_files = list(getattr(diff_evidence, "changed_files", []))
+                        review_meta[ReviewMetaKey.GITHUB_PR_HEAD_REF] = getattr(
+                            diff_evidence, "head_sha", ""
+                        )
                     cache_root = getattr(evidence_provider, "last_cache_root", None)
                     if cache_root is not None:
                         validation_workspace = str(cache_root)
@@ -1081,13 +1081,6 @@ class AgentLoop:
                             getattr(evidence_provider, "last_changed_files", [])
                         )
                         local_target = None
-                review_hook.set_validation_context(
-                    workspace=validation_workspace,
-                    changed_files=changed_files,
-                    local_target=local_target
-                    if isinstance(local_target, str)
-                    else None,
-                )
             if review_meta:
                 updated_tool_meta = {
                     **dict(metadata or {}),
@@ -1131,8 +1124,57 @@ class AgentLoop:
                 finally:
                     self._permission_futures.pop(request_id, None)
 
-            result = await self.runner.run(
-                AgentRunSpec(
+            async def _persist_automatic_subagent_result(
+                subagent_message: InboundMessage,
+            ) -> None:
+                if session is None:
+                    return
+                if self._persist_subagent_followup(session, subagent_message):
+                    self.sessions.save(session)
+
+            if review_preparation.plan is not None and review_preparation.evidence is not None:
+                orchestrator = ReviewOrchestrator(
+                    runner=self.runner,
+                    subagents=self.subagents,
+                    model=self.model,
+                    workspace=self.workspace,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    judge=self._build_review_judge(),
+                )
+                try:
+                    final_content = await orchestrator.execute(
+                        coordinator_messages=initial_messages,
+                        plan=review_preparation.plan,
+                        evidence=review_preparation.evidence,
+                        context=ReviewExecutionContext(
+                            channel=channel,
+                            chat_id=chat_id,
+                            session_key=active_session_key,
+                            message_id=message_id,
+                            metadata=updated_tool_meta if review_meta else dict(metadata or {}),
+                            concurrency=review_preparation.plan.max_subagents,
+                            result_callback=_persist_automatic_subagent_result,
+                        ),
+                        validation_workspace=validation_workspace,
+                        changed_files=changed_files,
+                        local_target=local_target if isinstance(local_target, str) else None,
+                        remote_diff=remote_diff,
+                    )
+                    result = AgentRunResult(
+                        final_content=final_content,
+                        messages=list(initial_messages),
+                    )
+                except ReviewPlanningError as exc:
+                    logger.warning("review.orchestration.failed reason={}", exc)
+                    result = AgentRunResult(
+                        final_content=f"## Code Review Report\n\n### Error\n\n{exc}",
+                        messages=list(initial_messages),
+                        stop_reason="error",
+                        error=str(exc),
+                    )
+            else:
+                result = await self.runner.run(
+                    AgentRunSpec(
                     initial_messages=initial_messages,
                     tools=self.tools,
                     model=self.model,
@@ -1154,8 +1196,8 @@ class AgentLoop:
                     llm_timeout_s=None,
                     permission_policy=permission_policy,
                     permission_request_callback=_permission_request_cb,
+                    )
                 )
-            )
         finally:
             reset_file_states(file_state_token)
         self._last_usage = result.usage

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Download, Shield } from "lucide-react";
 import { ChatThread } from "@/components/chat/ChatThread";
 import { CodePanel } from "@/components/code/CodePanel";
-import { AutoTasksView } from "@/components/auto-tasks/AutoTasksView";
 import { ReviewShell } from "@/components/layout/ReviewShell";
 import type { SessionInfo } from "@/components/layout/SessionInfoBar";
 import { NewReviewForm, type NewReviewSubmit } from "@/components/review/NewReviewForm";
@@ -133,7 +132,7 @@ function historyTaskFallback(session: ChatSummary | null): ReviewTask | null {
 function hasAssistantContent(messages: ChatMessage[] | undefined): boolean {
   return !!messages?.some((message) =>
     message.role === "agent"
-    && (message.content.trim().length > 0 || !!message.thinking?.trim())
+    && message.content.trim().length > 0
   );
 }
 
@@ -350,7 +349,6 @@ function ReviewAppShell({
   }, [settings.theme]);
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [sidebarView, setSidebarView] = useState<"reviews" | "auto">("reviews");
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("connecting");
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
@@ -382,18 +380,9 @@ function ReviewAppShell({
     () => tasks.find((task) => task.key === activeKey) ?? null,
     [activeKey, tasks],
   );
-  const autoTaskSessions = useMemo(
-    () => tasks
-      .filter((task) => !!task.autoTaskRunId)
-      .sort((a, b) => {
-        if (!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;
-        return 0;
-      }),
-    [tasks],
-  );
   const dailySessions = useMemo(
     () => tasks
-      .filter((task) => !task.autoTaskRunId)
+      .slice()
       .sort((a, b) => {
         if (!!b.pinned !== !!a.pinned) return b.pinned ? 1 : -1;
         return 0;
@@ -415,7 +404,6 @@ function ReviewAppShell({
 
   const handleNewTask = useCallback(() => {
     historyRequestRef.current += 1;
-    setSidebarView("reviews");
     setActiveKey(null);
     setSelectedFinding(null);
     setSessionError(null);
@@ -427,7 +415,6 @@ function ReviewAppShell({
       const requestId = historyRequestRef.current + 1;
       historyRequestRef.current = requestId;
       const session = tasks.find((task) => task.key === key) ?? null;
-      setSidebarView("reviews");
       if (activeKey && state.messages.length > 0) {
         const existing = historyCacheRef.current.get(activeKey);
         historyCacheRef.current.set(activeKey, {
@@ -494,15 +481,6 @@ function ReviewAppShell({
       handleSelectTask(savedKey);
     }
   }, [loading, tasks, activeKey, handleSelectTask]);
-
-  const handleOpenAutoTasks = useCallback(() => {
-    historyRequestRef.current += 1;
-    setSidebarView("auto");
-    setActiveKey(null);
-    setSelectedFinding(null);
-    setSessionError(null);
-    reset();
-  }, [reset]);
 
   const handleDeleteTask = useCallback(
     async (key: string) => {
@@ -635,7 +613,6 @@ function ReviewAppShell({
         modelName={modelName}
         onOpenSettings={() => setSettingsOpen(true)}
         onLogout={onLogout}
-        autoTaskSessions={autoTaskSessions}
         dailySessions={dailySessions}
         activeKey={activeKey}
         sidebarLoading={loading}
@@ -645,11 +622,8 @@ function ReviewAppShell({
         onTaskDelete={handleDeleteTask}
         onTaskPin={handlePinTask}
         onTaskRename={handleRenameTask}
-        onOpenAutoTasks={handleOpenAutoTasks}
         mainContent={
-          sidebarView === "auto" ? (
-            <AutoTasksView onSessionsChanged={refresh} />
-          ) : showReviewForm ? (
+          showReviewForm ? (
             <div className="flex h-full min-h-0 items-center justify-center overflow-hidden p-3">
               <NewReviewForm
                 defaultDepth={settings.defaultDepth}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -11,20 +12,21 @@ from pathlib import Path
 from loguru import logger
 
 from nanobot.rag.review_service import (
-    DEFAULT_BINARY_EXTS,
     REMOTE_SOURCE_TYPE,
     SOURCE_TYPE,
     RepositoryRAGRequest,
     RepositoryRAGService,
 )
+from nanobot.review.file_filter import review_file_filter_reason
 from nanobot.review.source.github import GitHubRepoReader
 from nanobot.review.source.utils import (
     changed_lines_from_patch,
     clean_scope_paths,
     path_matches_scope,
 )
-from nanobot.review.types import LocalReviewScope
+from nanobot.review.types import GitHubDiffEvidence, LocalReviewScope
 from nanobot.utils.log_style import event_message, log_event
+from nanobot.utils.helpers import estimate_message_tokens
 
 
 @dataclass(slots=True)
@@ -48,6 +50,7 @@ class ReviewEvidenceService:
         self.github = github or GitHubRepoReader(workspace=self.workspace)
         self.last_cache_root: Path | None = None
         self.last_changed_files: list[str] = []
+        self.last_diff_evidence: GitHubDiffEvidence | None = None
 
     async def dispatch(
         self,
@@ -65,10 +68,12 @@ class ReviewEvidenceService:
         include_tests: bool | None = None,
         local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
+        context_window_tokens: int | None = None,
     ) -> str:
         """Unified entry point that routes to the appropriate evidence method."""
         self.last_cache_root = None
         self.last_changed_files = []
+        self.last_diff_evidence = None
         if target_type == "github":
             if action == "diff":
                 return await self.github_diff_context(
@@ -78,6 +83,7 @@ class ReviewEvidenceService:
                     max_results=max_results,
                     include_tests=include_tests,
                     trace_id=trace_id,
+                    context_window_tokens=context_window_tokens,
                 )
             return await self.github_context(
                 repo=repo,
@@ -96,6 +102,7 @@ class ReviewEvidenceService:
                 max_results=max_results,
                 include_tests=include_tests,
                 local_scope=local_scope,
+                context_window_tokens=context_window_tokens,
             )
         return await self.local_context(
             review_query=review_query,
@@ -134,7 +141,7 @@ class ReviewEvidenceService:
                     candidate.relative_to(rag_service.workspace)
                 except ValueError:
                     raise PermissionError(f"target path is outside review root: {rel}") from None
-                if candidate.is_file() and candidate.suffix.lower() not in DEFAULT_BINARY_EXTS:
+                if candidate.is_file() and review_file_filter_reason(rel) is None:
                     files.append(candidate)
                 elif candidate.is_dir():
                     files.extend(rag_service.iter_candidate_files(candidate))
@@ -208,72 +215,112 @@ class ReviewEvidenceService:
         max_results: int,
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
+        context_window_tokens: int | None = None,
     ) -> str:
         started = time.perf_counter()
         rag_service = self._rag_for_scope(local_scope)
-        summary = await asyncio.to_thread(self.local_changed_summary, rag_service.workspace)
-        changed = summary.files
-        touched_lines = summary.touched_lines
+        patches, skipped = await asyncio.to_thread(self.local_changed_patches, rag_service.workspace)
         scopes = clean_scope_paths(local_scope.scope_paths if local_scope else [])
         if scopes:
-            changed = [path for path in changed if path_matches_scope(path, scopes)]
-            touched_lines = {
-                path: lines for path, lines in touched_lines.items() if path_matches_scope(path, scopes)
-            }
-        query = review_query or "code review local changed files regressions tests security"
-        if changed:
-            query = f"{query} {' '.join(changed[:40])}"
-        files = self._scope_files(rag_service, local_scope, changed or None)
-        result = await rag_service.retrieve(
-            RepositoryRAGRequest(
-                source_type=SOURCE_TYPE,
-                review_query=query.strip(),
-                files=files,
-                max_results=max_results,
-                include_tests=include_tests,
-                touched_lines=touched_lines,
-                related_tests=False,
-                trace_id="local_changed",
-            )
+            patches = {path: patch for path, patch in patches.items() if path_matches_scope(path, scopes)}
+            skipped = {path: reason for path, reason in skipped.items() if path_matches_scope(path, scopes)}
+        result = self._render_diff_context(
+            title="Local Diff Review Context",
+            target="local workspace",
+            patches=patches,
+            skipped=skipped,
+            context_window_tokens=context_window_tokens,
         )
-        block = result.context if result.hits else "No relevant repository review references found."
-        if not changed:
-            scope_line = f"- scope paths: {', '.join(scopes[:20])}\n" if scopes else ""
-            result = "[Local Diff Review Context]\n" + scope_line + "- changed files: unavailable or none\n\n" + block
-            log_event(
-                logger,
-                "info",
-                "review.evidence.local_changed.done",
-                status="empty",
-                trace_id="local_changed",
-                reason="no_changed_files",
-                scopes_count=len(scopes),
-                changed_files=0,
-                context_chars=len(result),
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return result
-        result = (
-            "[Local Diff Review Context]\n"
-            + (f"- scope paths: {', '.join(scopes[:20])}\n" if scopes else "")
-            + f"- changed files: {len(changed)}\n"
-            + f"- touched files: {len(touched_lines)}\n"
-            + "\n".join(f"  - {path}" for path in changed[:80])
-            + "\n\n"
-            + block
-        )
+        self.last_changed_files = list(patches)
         log_event(
             logger,
             "info",
             "review.evidence.local_changed.done",
-            status="success",
+            status="success" if patches else "empty",
             trace_id="local_changed",
             scopes_count=len(scopes),
-            changed_files=len(changed),
+            changed_files=len(patches),
+            skipped_files=len(skipped),
             context_chars=len(result),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
         return result
+
+    def local_changed_patches(self, workspace: Path | None = None) -> tuple[dict[str, str], dict[str, str]]:
+        """Read local changed patches without indexing or retrieval."""
+        root = (workspace or self.workspace).expanduser().resolve()
+        summary = self.local_changed_summary(root)
+        try:
+            untracked = set(self._git_cli("ls-files", "--others", "--exclude-standard", cwd=root).splitlines())
+        except Exception:
+            untracked = set()
+        patches: dict[str, str] = {}
+        skipped: dict[str, str] = {}
+        for path in summary.files:
+            reason = review_file_filter_reason(path)
+            if reason:
+                skipped[path] = reason
+                continue
+            if path in untracked:
+                target = (root / path).resolve()
+                try:
+                    target.relative_to(root)
+                    content = target.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError, ValueError):
+                    skipped[path] = "unreadable_file"
+                    continue
+                patch = "".join(
+                    difflib.unified_diff(
+                        [],
+                        content.splitlines(keepends=True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    )
+                )
+            else:
+                try:
+                    unstaged = self._git_cli("diff", "--no-ext-diff", "--unified=3", "--", path, cwd=root)
+                    staged = self._git_cli("diff", "--no-ext-diff", "--cached", "--unified=3", "--", path, cwd=root)
+                except Exception:
+                    skipped[path] = "patch_unavailable"
+                    continue
+                patch = "\n".join(part for part in (staged, unstaged) if part.strip())
+            if not patch.strip():
+                skipped[path] = "patch_unavailable"
+            elif review_file_filter_reason(path, patch) is not None:
+                skipped[path] = review_file_filter_reason(path, patch) or "filtered"
+            else:
+                patches[path] = patch
+        return patches, skipped
+
+    @staticmethod
+    def _render_diff_context(
+        *,
+        title: str,
+        target: str,
+        patches: dict[str, str],
+        skipped: dict[str, str],
+        context_window_tokens: int | None,
+    ) -> str:
+        lines = [f"[{title}]", f"- target: {target}", f"- changed files: {len(patches)}"]
+        if skipped:
+            lines.append(f"- filtered or unavailable files: {len(skipped)}")
+        token_limit = int(context_window_tokens * 0.8) if context_window_tokens else None
+        for path, patch in patches.items():
+            token_count = estimate_message_tokens({"role": "tool", "content": patch})
+            if token_limit and token_count > token_limit:
+                skipped[path] = "token_threshold_exceeded"
+                logger.warning(
+                    "review.evidence.diff.file_skipped path={} reason=token_threshold_exceeded tokens={} token_limit={}",
+                    path,
+                    token_count,
+                    token_limit,
+                )
+                continue
+            lines.extend(("", f"## File: {path}", patch.rstrip()))
+        for path, reason in skipped.items():
+            lines.append(f"- skipped: {path} ({reason}; read on demand)")
+        return "\n".join(lines)
 
     def local_changed_summary(self, workspace: Path | None = None) -> LocalChangedSummary:
         root = (workspace or self.workspace).expanduser().resolve()
@@ -292,7 +339,7 @@ class ReviewEvidenceService:
             text_paths: list[str] = []
             for path in sorted(raw_paths):
                 rel_path = self._path_relative_to_root(path, worktree=worktree, root=root)
-                if rel_path is None or Path(rel_path).suffix.lower() in DEFAULT_BINARY_EXTS:
+                if rel_path is None or review_file_filter_reason(rel_path) is not None:
                     continue
                 text_paths.append(rel_path)
                 lines: set[int] = set()
@@ -329,7 +376,7 @@ class ReviewEvidenceService:
             paths.update(self._git_cli("diff", "--name-only", "--cached", cwd=root).splitlines())
             paths.update(self._git_cli("ls-files", "--others", "--exclude-standard", cwd=root).splitlines())
             text_paths = sorted(
-                path for path in paths if path and Path(path).suffix.lower() not in DEFAULT_BINARY_EXTS
+                path for path in paths if review_file_filter_reason(path) is None
             )
             untracked = set(self._git_cli("ls-files", "--others", "--exclude-standard", cwd=root).splitlines())
             touched: dict[str, list[int]] = {}
@@ -395,7 +442,7 @@ class ReviewEvidenceService:
             target.relative_to(Path(worktree).resolve())
         except ValueError:
             return []
-        if target.suffix.lower() in DEFAULT_BINARY_EXTS:
+        if review_file_filter_reason(path) is not None:
             return []
         try:
             text = target.read_text(encoding="utf-8")
@@ -410,7 +457,7 @@ class ReviewEvidenceService:
             target.relative_to(root)
         except ValueError:
             return []
-        if target.suffix.lower() in DEFAULT_BINARY_EXTS:
+        if review_file_filter_reason(path) is not None:
             return []
         try:
             text = target.read_text(encoding="utf-8")
@@ -573,6 +620,7 @@ class ReviewEvidenceService:
         max_results: int,
         include_tests: bool | None,
         trace_id: str,
+        context_window_tokens: int | None = None,
     ) -> str:
         started = time.perf_counter()
         if pr_number <= 0:
@@ -587,10 +635,8 @@ class ReviewEvidenceService:
                 elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
             )
             return "Error: pr_number is required for action='diff'."
-        if not review_query or not review_query.strip():
-            review_query = "code review changed lines regressions security tests"
         try:
-            snapshot, files, touched_lines = await self.github.fetch_pr_files(
+            evidence = await self.github.fetch_pr_files(
                 repo,
                 pr_number=pr_number,
                 trace_id=trace_id,
@@ -604,8 +650,9 @@ class ReviewEvidenceService:
                 )
             )
             return f"Error: failed to fetch GitHub PR diff context: {exc}"
-        self.last_changed_files = list(files)
-        if not files:
+        self.last_diff_evidence = evidence
+        self.last_changed_files = list(evidence.changed_files)
+        if not evidence.changed_files:
             log_event(
                 logger,
                 "info",
@@ -618,41 +665,24 @@ class ReviewEvidenceService:
                 elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
             )
             return "No text files found for GitHub PR diff retrieval."
-        cache_root, context, hits_count = await self.retrieve_snapshot_context(
-            snapshot_name=snapshot,
-            files=files,
-            review_query=review_query,
-            max_results=max_results,
-            include_tests=include_tests,
-            trace_id=trace_id,
-            touched_lines=touched_lines,
-            related_tests=False,
+        skipped: dict[str, str] = dict(evidence.patch_unavailable_files)
+        usable_patches: dict[str, str] = {}
+        for path, patch in evidence.patches.items():
+            reason = review_file_filter_reason(path, patch)
+            if reason:
+                skipped[path] = reason
+            else:
+                usable_patches[path] = patch
+        result = self._render_diff_context(
+            title="GitHub PR Diff Review Context",
+            target=evidence.snapshot,
+            patches=usable_patches,
+            skipped=skipped,
+            context_window_tokens=context_window_tokens,
         )
-        header = [
-            "[GitHub PR Diff Review Context]",
-            f"- repository/pr: {snapshot}",
-            f"- cached files: {len(files)}",
-            f"- cache: {cache_root}",
-            "",
-        ]
-        if hits_count <= 0:
-            result = "\n".join(header) + "No relevant GitHub PR diff references found."
-            log_event(
-                logger,
-                "info",
-                "review.evidence.github_diff.done",
-                status="no_hits",
-                trace_id=trace_id,
-                repo=repo,
-                pr=pr_number,
-                snapshot=snapshot,
-                files_count=len(files),
-                hits_count=0,
-                context_chars=len(result),
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return result
-        result = "\n".join(header) + context
+        evidence.patch_unavailable_files.update(skipped)
+        for path in skipped:
+            evidence.patches.pop(path, None)
         log_event(
             logger,
             "info",
@@ -661,9 +691,9 @@ class ReviewEvidenceService:
             trace_id=trace_id,
             repo=repo,
             pr=pr_number,
-            snapshot=snapshot,
-            files_count=len(files),
-            hits_count=hits_count,
+            snapshot=evidence.snapshot,
+            files_count=len(usable_patches),
+            skipped_files=len(skipped),
             context_chars=len(result),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )

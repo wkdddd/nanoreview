@@ -4,7 +4,7 @@
 
 `nanobot/channels/` publishes inbound messages to `nanobot/bus/`. `AgentLoop` restores session state, builds context and orchestrates the task. `AgentRunner` owns the LLM/tool execution loop. Results are emitted through the bus to the source channel.
 
-Code review is a specialization of that flow. `nanobot/review/` normalizes review targets, builds a plan, dispatches specialized subagents, validates structured findings, and renders the final report. `nanobot/agent/subagent.py` owns subagent lifecycle; user-facing review state must remain coherent with `review-webui/`.
+Code review is a specialization of that flow. `nanobot/review/` normalizes review targets, builds a plan, dispatches specialized subagents, validates structured findings, and renders the final report. `nanobot/review/orchestration.py` owns the program-controlled coordinator-plan submission, dispatch, collection and finalization path; `AgentLoop` constructs its execution context but must not absorb that review-specific behavior. `nanobot/agent/subagent.py` owns subagent lifecycle; user-facing review state must remain coherent with `review-webui/`.
 
 ## Ownership Boundaries
 
@@ -13,6 +13,8 @@ Code review is a specialization of that flow. `nanobot/review/` normalizes revie
 - `channels/`: transport-specific parsing, delivery, retries and platform UI behavior.
 - `providers/`: provider-specific request/response adaptation and model resolution.
 - `agent/tools/`: explicit model-callable capability contracts and permission checks.
+- `review/orchestration.py`: controlled review execution, including validated coordinator assignments, subagent dispatch, result collection and finalization.
+- `review/planning/`, `review/input/`, `review/output/` and `review/source/`: review target normalization, evidence and policy, report validation, and source acquisition.
 - `session/`: durable session state, replay, compaction and goal lifecycle.
 - `templates/` and `skills/`: model behavior contracts; treat as runtime code.
 - `review-webui/`: presentation and interaction; keep API/WebSocket wire details out of core orchestration.

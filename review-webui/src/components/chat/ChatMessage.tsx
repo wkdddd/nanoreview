@@ -14,7 +14,6 @@ interface ChatMessageProps {
     content: string;
     timestamp: number;
     finding?: Finding;
-    thinking?: string;
     streaming?: boolean;
   };
   onSelectFinding?: (finding: Finding) => void;
@@ -149,15 +148,13 @@ function isFindingsTable(headers: string[]): boolean {
 
 export function ChatMessage({ message, onSelectFinding, findings, afterThinking }: ChatMessageProps) {
   const isUser = message.role === "user";
-  const isThinkingOnly = !isUser
+  const isOutputMessage = !isUser
     && message.type === "text"
-    && message.content.trim().length === 0
-    && !!message.thinking?.trim();
-  const hasThinking = message.thinking && message.thinking.length > 0;
-  const [userToggledThinking, setUserToggledThinking] = useState(false);
-  const [showThinking, setShowThinking] = useState(() => Boolean(message.streaming || isThinkingOnly));
+    && message.content.trim().length > 0;
+  const [userToggledOutput, setUserToggledOutput] = useState(false);
+  const [showOutput, setShowOutput] = useState(() => Boolean(message.streaming));
   const collapseTimerRef = useRef<number | null>(null);
-  const hasVisibleContent = message.type !== "text" || message.content.trim().length > 0;
+  const hasVisibleContent = !isOutputMessage && (message.type !== "text" || message.content.trim().length > 0);
   const clickableFindings = useMemo(
     () => [
       ...(findings ?? []),
@@ -165,28 +162,24 @@ export function ChatMessage({ message, onSelectFinding, findings, afterThinking 
     ],
     [findings, message.content, message.type],
   );
-  const toggleThinking = () => {
-    setUserToggledThinking(true);
-    setShowThinking((value) => !value);
+  const toggleOutput = () => {
+    setUserToggledOutput(true);
+    setShowOutput((value) => !value);
   };
 
   useEffect(() => {
-    if (!hasThinking) return;
+    if (!isOutputMessage) return;
     if (collapseTimerRef.current !== null) {
       window.clearTimeout(collapseTimerRef.current);
       collapseTimerRef.current = null;
     }
     if (message.streaming) {
-      if (!userToggledThinking) setShowThinking(true);
+      if (!userToggledOutput) setShowOutput(true);
       return;
     }
-    if (isThinkingOnly) {
-      if (!userToggledThinking) setShowThinking(true);
-      return;
-    }
-    if (!userToggledThinking) {
+    if (!userToggledOutput) {
       collapseTimerRef.current = window.setTimeout(() => {
-        setShowThinking(false);
+        setShowOutput(false);
         collapseTimerRef.current = null;
       }, 700);
     }
@@ -196,41 +189,40 @@ export function ChatMessage({ message, onSelectFinding, findings, afterThinking 
         collapseTimerRef.current = null;
       }
     };
-  }, [hasThinking, isThinkingOnly, message.streaming, userToggledThinking]);
+  }, [isOutputMessage, message.streaming, userToggledOutput]);
 
   return (
     <div className={cn("flex flex-col", isUser ? "items-end" : "items-start")}>
-      {/* Thinking block (agent only, collapsible) */}
-      {hasThinking && !isUser && (
+      {isOutputMessage && (
         <div className="mb-1.5 w-full max-w-[80%]">
           <button
-            onClick={toggleThinking}
+            onClick={toggleOutput}
             className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors px-1"
-            aria-label="Toggle thinking"
-            aria-expanded={showThinking}
+            aria-label="Toggle output"
+            aria-expanded={showOutput}
           >
-            {showThinking ? (
+            {showOutput ? (
               <ChevronDown className="w-2.5 h-2.5" />
             ) : (
               <ChevronRight className="w-2.5 h-2.5" />
             )}
             <span className="italic">
-              {message.streaming && message.type !== "report"
-                ? "Thinking..."
-                : isThinkingOnly
-                  ? "已停止前的思考"
-                  : "Thinking"}
+              {message.streaming ? "Output..." : "Output"}
             </span>
           </button>
-          {showThinking && (
+          {showOutput && (
             <div className="mt-0.5 px-2 py-1.5 text-[11px] text-muted-foreground/80 leading-relaxed bg-muted/50 rounded-md border border-border/50 max-h-32 overflow-y-auto scrollbar-thin">
-              {message.thinking}
+              <span className="whitespace-pre-wrap">{message.content}</span>
             </div>
           )}
         </div>
       )}
 
-      {afterThinking}
+      {afterThinking && (
+        <div className="w-full max-w-[90%]">
+          {afterThinking}
+        </div>
+      )}
 
       {hasVisibleContent && (
         <div

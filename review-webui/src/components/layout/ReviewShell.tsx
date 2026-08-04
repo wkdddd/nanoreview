@@ -21,7 +21,6 @@ export interface ReviewShellProps {
   onLogout?: () => void;
 
   /** Sidebar props */
-  autoTaskSessions: ChatSummary[];
   dailySessions: ChatSummary[];
   activeKey: string | null;
   sidebarLoading: boolean;
@@ -31,7 +30,6 @@ export interface ReviewShellProps {
   onTaskDelete: (key: string) => void;
   onTaskPin: (key: string) => void;
   onTaskRename: (key: string, customTitle: string) => Promise<void>;
-  onOpenAutoTasks: () => void;
 
   /** Content areas */
   mainContent: ReactNode;
@@ -50,7 +48,6 @@ export function ReviewShell({
   modelName,
   onOpenSettings,
   onLogout,
-  autoTaskSessions,
   dailySessions,
   activeKey,
   sidebarLoading,
@@ -60,7 +57,6 @@ export function ReviewShell({
   onTaskDelete,
   onTaskPin,
   onTaskRename,
-  onOpenAutoTasks,
   mainContent,
   rightPanelContent,
   sidebarOpen,
@@ -85,7 +81,6 @@ export function ReviewShell({
         {sidebarOpen ? (
           <div className="flex shrink-0 relative">
             <ReviewSidebar
-              autoTaskSessions={autoTaskSessions}
               dailySessions={dailySessions}
               activeKey={activeKey}
               loading={sidebarLoading}
@@ -95,7 +90,6 @@ export function ReviewShell({
               onDelete={onTaskDelete}
               onPin={onTaskPin}
               onRename={onTaskRename}
-              onOpenAutoTasks={onOpenAutoTasks}
             />
           </div>
         ) : null}

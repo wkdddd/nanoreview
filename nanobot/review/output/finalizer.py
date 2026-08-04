@@ -18,6 +18,7 @@ from nanobot.review.types import (
     ReviewFindingVerdict,
     ReviewJudgedFinding,
     ReviewModePolicy,
+    GitHubDiffEvidence,
     normalize_review_dimension,
 )
 
@@ -63,6 +64,7 @@ class ReviewFinalizer:
         policy: ReviewModePolicy | None = None,
         allowed_dimensions: list[str] | set[str] | None = None,
         local_target: str | None = None,
+        remote_diff: GitHubDiffEvidence | None = None,
     ) -> None:
         self._workspace = workspace
         self._changed_files = list(changed_files or [])
@@ -71,6 +73,7 @@ class ReviewFinalizer:
             workspace=workspace,
             changed_files=self._changed_files,
             local_target=local_target,
+            remote_diff=remote_diff,
         )
         self._validator = ReviewValidator(self._ctx)
         self._dimensions: list[ReviewDimensionResult] = []
@@ -87,6 +90,7 @@ class ReviewFinalizer:
         workspace: str,
         changed_files: list[str] | None = None,
         local_target: str | None = None,
+        remote_diff: GitHubDiffEvidence | None = None,
     ) -> None:
         if self._dimensions:
             logger.warning("review.finalizer.validation_context_ignored reason=already_ingested")
@@ -98,6 +102,7 @@ class ReviewFinalizer:
             workspace=workspace,
             changed_files=self._changed_files,
             local_target=local_target,
+            remote_diff=remote_diff,
         )
         self._validator = ReviewValidator(self._ctx)
 

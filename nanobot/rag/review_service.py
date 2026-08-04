@@ -22,6 +22,12 @@ from nanobot.rag.chunker import TreeSitterChunker
 from nanobot.rag.config import RAGRetrievalConfig
 from nanobot.rag.index import RAGIndex
 from nanobot.rag.runtime import RAGRuntime
+from nanobot.review.file_filter import (
+    DEFAULT_REVIEW_BINARY_EXTS,
+    DEFAULT_REVIEW_IGNORE_DIRS,
+    DEFAULT_REVIEW_IGNORE_GLOBS,
+    review_file_filter_reason,
+)
 from nanobot.rag.utils import (
     IndexedChunk,
     IndexedHit,
@@ -35,39 +41,8 @@ from nanobot.utils.log_style import log_event
 SOURCE_TYPE = "code_review"
 REMOTE_SOURCE_TYPE = "code_review_github"
 
-DEFAULT_IGNORE_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    "node_modules",
-    "dist",
-    "build",
-    "coverage",
-    "htmlcov",
-}
-
-DEFAULT_BINARY_EXTS = {
-    # 图片
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".svg", ".bmp", ".tiff",
-    # 音视频
-    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".flac", ".ogg", ".mkv", ".webm",
-    # 编译产物
-    ".pyc", ".pyo", ".class", ".exe", ".dll", ".so", ".dylib", ".o", ".a",
-    # 压缩/打包
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar", ".7z", ".whl", ".egg", ".jar",
-    # 字体
-    ".ttf", ".otf", ".woff", ".woff2", ".eot",
-    # 二进制文档
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    # 数据库
-    ".db", ".sqlite", ".sqlite3",
-    # 其他
-    ".bin", ".dat",
-}
+DEFAULT_IGNORE_DIRS = set(DEFAULT_REVIEW_IGNORE_DIRS)
+DEFAULT_BINARY_EXTS = set(DEFAULT_REVIEW_BINARY_EXTS)
 
 REVIEW_RISK_TERMS = {
     "security": {
@@ -116,18 +91,7 @@ REVIEW_RISK_TERMS = {
     "test": {"test", "spec", "fixture", "mock"},
 }
 
-DEFAULT_IGNORE_GLOBS = (
-    "*.pyc",
-    "*.pyo",
-    "*.png",
-    "*.jpg",
-    "*.jpeg",
-    "*.webp",
-    "*.gif",
-    "*.ico",
-    "*.lock",
-    ".nanobot_snapshot.json",
-)
+DEFAULT_IGNORE_GLOBS = DEFAULT_REVIEW_IGNORE_GLOBS
 
 
 @dataclass(slots=True)
@@ -740,6 +704,8 @@ class RepositoryRAGService:
         try:
             rel_parts = path.relative_to(root).parts
         except ValueError:
+            return True
+        if review_file_filter_reason(path.relative_to(root).as_posix()) is not None:
             return True
         if self.ignored_dir_parts(rel_parts):
             return True

@@ -141,6 +141,7 @@ class SubagentManager:
         session_key: str | None = None,
         origin_message_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
+        deliver_to_bus: bool = True,
     ) -> str:
         """Start a dedicated review subagent for same-turn result integration."""
         if session_key:
@@ -162,6 +163,7 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
+            "deliver_to_bus": deliver_to_bus,
         }
         status = SubagentStatus(
             task_id=task_id,
@@ -527,7 +529,10 @@ class SubagentManager:
                 max_tool_result_chars=self.max_tool_result_chars,
                 reasoning_effort=self.reasoning_effort,
                 hook=hook,
-                tool_choice={"function": {"name": "review_submit"}},
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "review_submit"},
+                },
                 response_format={"type": "json_object"},
                 error_message=None,
                 fail_on_tool_error=False,
@@ -631,7 +636,8 @@ class SubagentManager:
             metadata=metadata,
         )
 
-        await self.bus.publish_inbound(msg)
+        if origin.get("deliver_to_bus", True):
+            await self.bus.publish_inbound(msg)
         self._publish_session_result(override, msg)
         self._set_dimension_state(
             override,

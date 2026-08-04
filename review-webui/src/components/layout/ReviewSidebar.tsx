@@ -1,12 +1,11 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, MessageSquare, Trash2, Loader2, Github, Pin, Pencil, Check, X } from "lucide-react";
+import { Plus, MessageSquare, Trash2, Loader2, Pin, Pencil, Check, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ChatSummary, ReviewFocus } from "@/lib/types";
 
 export interface ReviewSidebarProps {
-  autoTaskSessions: ChatSummary[];
   dailySessions: ChatSummary[];
   activeKey: string | null;
   loading: boolean;
@@ -17,7 +16,6 @@ export interface ReviewSidebarProps {
   onDelete: (key: string) => void;
   onPin: (key: string) => void;
   onRename: (key: string, customTitle: string) => Promise<void>;
-  onOpenAutoTasks: () => void;
 }
 
 function formatRelativeTime(dateStr: string | null): string {
@@ -64,22 +62,16 @@ function reviewFocusLabel(focus: ReviewFocus[] | string[]): string {
   return focus.length > 0 ? focus.join(", ") : "";
 }
 
-function getDisplayTitle(task: ChatSummary, autoTask?: boolean): string {
+function getDisplayTitle(task: ChatSummary): string {
   if (task.customTitle?.trim()) return task.customTitle.trim();
   const isReview = !!task.reviewTarget;
   if (isReview) return shortReviewTarget(task.reviewTarget) || "Review";
-  return task.title
-    || (autoTask && task.githubRepo && task.githubPrNumber
-      ? `${task.githubRepo} PR #${task.githubPrNumber}`
-      : autoTask
-        ? "AutoTask Review"
-        : "Untitled Review");
+  return task.title || "Untitled Review";
 }
 
 function TaskItem({
   task,
   isActive,
-  autoTask,
   isDeleting,
   onSelect,
   onDelete,
@@ -88,7 +80,6 @@ function TaskItem({
 }: {
   task: ChatSummary;
   isActive: boolean;
-  autoTask?: boolean;
   isDeleting?: boolean;
   onSelect: () => void;
   onDelete: () => void;
@@ -103,17 +94,8 @@ function TaskItem({
     task.reviewTargetType,
     reviewFocusLabel(reviewFocus),
   ].filter(Boolean).join(" · ");
-  const displayTitle = getDisplayTitle(task, autoTask);
-  const source = isReview
-    ? reviewSource
-    : autoTask
-    ? [
-        task.githubRepo,
-        task.githubPrNumber ? `PR #${task.githubPrNumber}` : null,
-        task.reviewMode,
-        task.reviewAction,
-      ].filter(Boolean).join(" - ")
-    : "";
+  const displayTitle = getDisplayTitle(task);
+  const source = isReview ? reviewSource : "";
   const preview = isReview ? (task.reviewTarget || "") : (task.preview || "");
 
   const [menuOpen, setMenuOpen] = useState(false);
@@ -331,7 +313,6 @@ function SessionSection({
   loading,
   emptyTitle,
   emptyDescription,
-  autoTask,
   deletingKey,
   onSelect,
   onDelete,
@@ -344,7 +325,6 @@ function SessionSection({
   loading?: boolean;
   emptyTitle: string;
   emptyDescription: string;
-  autoTask?: boolean;
   deletingKey?: string | null;
   onSelect: (key: string) => void;
   onDelete: (key: string) => void;
@@ -374,7 +354,6 @@ function SessionSection({
             <TaskItem
               key={task.key}
               task={task}
-              autoTask={autoTask}
               isActive={task.key === activeKey}
               isDeleting={task.key === deletingKey}
               onSelect={() => onSelect(task.key)}
@@ -390,7 +369,6 @@ function SessionSection({
 }
 
 export function ReviewSidebar({
-  autoTaskSessions,
   dailySessions,
   activeKey,
   loading,
@@ -400,7 +378,6 @@ export function ReviewSidebar({
   onDelete,
   onPin,
   onRename,
-  onOpenAutoTasks,
 }: ReviewSidebarProps) {
   return (
     <aside className="flex h-full w-[220px] shrink-0 flex-col border-r bg-[hsl(var(--sidebar))]">
@@ -410,16 +387,6 @@ export function ReviewSidebar({
           Review Tasks
         </h2>
         <div className="flex items-center gap-0.5">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-6 w-6"
-            onClick={onOpenAutoTasks}
-            aria-label="Open AutoTask rules"
-            title="Open AutoTask rules"
-          >
-            <Github className="h-3.5 w-3.5" />
-          </Button>
           <Button
             variant="ghost"
             size="icon"
@@ -446,19 +413,6 @@ export function ReviewSidebar({
           ) : (
             <>
               <SessionSection
-                title="AutoTask"
-                tasks={autoTaskSessions}
-                activeKey={activeKey}
-                loading={loading}
-                emptyTitle="No AutoTask sessions"
-                emptyDescription="GitHub PR auto reviews will appear here after a rule runs."
-                autoTask
-                onSelect={onSelect}
-                onDelete={onDelete}
-                onPin={onPin}
-                onRename={onRename}
-              />
-              <SessionSection
                 title="日常任务"
                 tasks={dailySessions}
                 activeKey={activeKey}
@@ -470,7 +424,7 @@ export function ReviewSidebar({
                 onPin={onPin}
                 onRename={onRename}
               />
-              {!loading && autoTaskSessions.length === 0 && dailySessions.length === 0 ? (
+              {!loading && dailySessions.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-10 text-muted-foreground/50">
                   <MessageSquare className="h-7 w-7 stroke-[1.5]" />
                 </div>

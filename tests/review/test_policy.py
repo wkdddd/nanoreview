@@ -2,10 +2,10 @@ from nanobot.review.input import apply_policy_to_roles, policy_for_depth
 from nanobot.review.types import ALL_REVIEW_ROLES
 
 
-def test_quick_policy_is_high_risk_only() -> None:
+def test_quick_policy_preserves_requested_subagent_limit() -> None:
     policy = policy_for_depth("quick", requested_max_subagents=6)
 
-    assert policy.max_subagents == 2
+    assert policy.max_subagents == 6
     assert policy.severities == ("critical", "high")
     assert policy.judge_enabled is False
     assert [role.name for role in policy.roles] == ["security", "bug-risk", "tests"]
@@ -24,10 +24,10 @@ def test_full_policy_enables_judge_and_default_roles() -> None:
     ]
 
 
-def test_deep_policy_adds_optional_roles_and_more_capacity() -> None:
+def test_deep_policy_adds_optional_roles_and_preserves_subagent_limit() -> None:
     policy = policy_for_depth("deep", requested_max_subagents=4)
 
-    assert policy.max_subagents == 6
+    assert policy.max_subagents == 4
     assert policy.include_optional_roles is True
     assert "dependency" in {role.name for role in policy.roles}
 

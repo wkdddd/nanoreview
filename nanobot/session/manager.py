@@ -30,10 +30,6 @@ _LOCAL_IMAGE_BREADCRUMB_RE = re.compile(r"^\[image: (?:/|~)[^\]]+\]\s*$")
 _TOOL_CALL_ECHO_RE = re.compile(r'^\s*(?:generate_image|message)\([^)]*\)\s*$')
 _SESSION_PREVIEW_MAX_CHARS = 120
 _SESSION_LIST_METADATA_KEYS = {
-    "auto_task_id",
-    "auto_task_run_id",
-    "github_repo",
-    "github_pr_number",
     "review_target",
     "review_target_type",
     "review_action",

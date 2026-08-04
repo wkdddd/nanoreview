@@ -13,9 +13,10 @@ from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
 from nanobot.session.manager import SessionManager
+from nanobot.utils.log_sanitization import sanitize_persisted_log_text
 from nanobot.utils.subagent_trace import read_subagent_cards
 
-WEBUI_TRANSCRIPT_SCHEMA_VERSION = 3
+WEBUI_TRANSCRIPT_SCHEMA_VERSION = 4
 _MAX_TRANSCRIPT_FILE_BYTES = 8 * 1024 * 1024
 
 
@@ -53,17 +54,32 @@ def read_transcript_lines(session_key: str) -> list[dict[str, Any]]:
 
 
 def append_transcript_object(session_key: str, obj: dict[str, Any]) -> None:
-    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    raw = json.dumps(_sanitize_transcript_value(obj), ensure_ascii=False, separators=(",", ":"))
     if len(raw.encode("utf-8")) > _MAX_TRANSCRIPT_FILE_BYTES:
         msg = "webui transcript line too large"
         raise ValueError(msg)
     path = webui_transcript_path(session_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
     line = raw + "\n"
+    line_size = len(line.encode("utf-8"))
+    if path.is_file() and path.stat().st_size + line_size > _MAX_TRANSCRIPT_FILE_BYTES:
+        logger.warning("webui transcript size limit reached, skipping append: {}", path)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
+
+
+def _sanitize_transcript_value(value: Any) -> Any:
+    """Recursively sanitize text before writing a WebUI transcript sidecar."""
+    if isinstance(value, str):
+        return sanitize_persisted_log_text(value)
+    if isinstance(value, list):
+        return [_sanitize_transcript_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _sanitize_transcript_value(item) for key, item in value.items()}
+    return value
 
 
 def delete_webui_transcript(session_key: str) -> bool:
@@ -129,6 +145,74 @@ def _record_created_at_ms(rec: dict[str, Any], idx: int, fallback_base: int) -> 
     return fallback_base + idx
 
 
+def replay_transcript_to_subagent_cards(
+    lines: list[dict[str, Any]],
+    cards: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach persisted subagent content streams to their display cards."""
+    by_id: dict[str, dict[str, Any]] = {}
+    ordered_ids: list[str] = []
+
+    def card_for(task_id: str, label: Any, created_at: int) -> dict[str, Any]:
+        card = by_id.get(task_id)
+        if card is not None:
+            return card
+        card = {
+            "id": task_id,
+            "label": str(label or task_id),
+            "status": "running",
+            "output": "",
+            "outputStreaming": False,
+            "startedAt": created_at,
+        }
+        by_id[task_id] = card
+        ordered_ids.append(task_id)
+        return card
+
+    for card in cards:
+        task_id = card.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        copied = {
+            "id": task_id,
+            "label": str(card.get("label") or task_id),
+            "status": card.get("status") if card.get("status") in {"running", "completed", "error"} else "error",
+            "output": "",
+            "outputStreaming": False,
+            "startedAt": int(card.get("startedAt") or 0),
+        }
+        by_id[task_id] = copied
+        ordered_ids.append(task_id)
+
+    for idx, rec in enumerate(lines):
+        task_id = rec.get("subagent_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        created_at = _record_created_at_ms(rec, idx, int(time.time() * 1000))
+        card = card_for(task_id, rec.get("subagent_label") or rec.get("label"), created_at)
+        event = rec.get("event")
+        if event == "subagent_status":
+            label = rec.get("label")
+            if isinstance(label, str) and label:
+                card["label"] = label
+            status = rec.get("status")
+            if status in {"running", "completed", "error"}:
+                card["status"] = status
+                if status != "running":
+                    card["outputStreaming"] = False
+            continue
+        if event == "delta" and rec.get("kind") == "subagent_content":
+            text = rec.get("text")
+            if isinstance(text, str) and text:
+                card["output"] += text
+                card["outputStreaming"] = True
+            continue
+        if event == "stream_end" and rec.get("kind") == "subagent_content":
+            card["outputStreaming"] = False
+
+    return [by_id[task_id] for task_id in ordered_ids]
+
+
 def replay_transcript_to_ui_messages(
     lines: list[dict[str, Any]],
     *,
@@ -145,6 +229,7 @@ def replay_transcript_to_ui_messages(
     buffer_parts: list[str] = []
     review_thinking_parts: list[str] = []
     review_thinking_created_at: int | None = None
+    saw_review_thinking = False
     suppress_until_turn_end = False
     _ts_base = int(time.time() * 1000)
 
@@ -301,6 +386,10 @@ def replay_transcript_to_ui_messages(
     for idx, rec in enumerate(lines):
         ev = rec.get("event")
         created_at = _record_created_at_ms(rec, idx, _ts_base)
+        if rec.get("subagent_id"):
+            # Subagent content belongs in its own card rather than the main
+            # assistant conversation. See ``replay_transcript_to_subagent_cards``.
+            continue
         if ev == "user":
             text = rec.get("text")
             text_s = text if isinstance(text, str) else ""
@@ -359,13 +448,9 @@ def replay_transcript_to_ui_messages(
                 continue
             kind = rec.get("kind")
             if kind == "review_thinking":
-                chunk = rec.get("text")
-                if isinstance(chunk, str) and chunk:
-                    if review_thinking_created_at is None:
-                        review_thinking_created_at = created_at
-                    review_thinking_parts.append(chunk)
+                saw_review_thinking = True
                 continue
-            if kind is None and review_thinking_parts:
+            if kind is None and saw_review_thinking:
                 continue
             chunk = rec.get("text")
             if not isinstance(chunk, str):
@@ -390,9 +475,6 @@ def replay_transcript_to_ui_messages(
             for i, m in enumerate(messages):
                 if m.get("id") == buffer_message_id:
                     updated = {**m, "content": combined, "isStreaming": True}
-                    if kind == "review_report" and review_thinking_parts:
-                        updated["reasoning"] = "".join(review_thinking_parts)
-                        updated["reasoningStreaming"] = False
                     messages[i] = updated
                     break
             continue
@@ -412,18 +494,9 @@ def replay_transcript_to_ui_messages(
             continue
 
         if ev == "reasoning_delta":
-            if suppress_until_turn_end:
-                continue
-            chunk = rec.get("text")
-            if not isinstance(chunk, str) or not chunk:
-                continue
-            attach_reasoning_chunk(messages, chunk, idx, created_at)
             continue
 
         if ev == "reasoning_end":
-            if suppress_until_turn_end:
-                continue
-            close_reasoning(messages)
             continue
 
         if ev == "message":
@@ -435,11 +508,6 @@ def replay_transcript_to_ui_messages(
                 continue
             kind = rec.get("kind")
             if kind == "reasoning":
-                line = rec.get("text")
-                if not isinstance(line, str) or not line:
-                    continue
-                attach_reasoning_chunk(messages, line, idx, created_at)
-                close_reasoning(messages)
                 continue
             if kind in ("tool_hint", "progress"):
                 structured = tool_trace_lines_from_events(rec.get("tool_events"))
@@ -499,6 +567,7 @@ def replay_transcript_to_ui_messages(
 
         if ev == "turn_end":
             suppress_until_turn_end = False
+            saw_review_thinking = False
             flush_review_thinking(idx, created_at, streaming=False)
             for i, m in enumerate(messages):
                 if m.get("isStreaming"):
@@ -579,5 +648,8 @@ def build_webui_thread_response(
         "sessionKey": session_key,
         "messages": msgs,
     }
-    response["subagentCards"] = read_subagent_cards(session_key)
+    response["subagentCards"] = replay_transcript_to_subagent_cards(
+        lines,
+        read_subagent_cards(session_key),
+    )
     return response

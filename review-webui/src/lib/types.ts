@@ -103,58 +103,12 @@ export interface ChatSummary {
   title?: string;
   preview: string;
   metadata?: Record<string, unknown>;
-  autoTaskId?: string;
-  autoTaskRunId?: string;
-  githubRepo?: string;
-  githubPrNumber?: number;
   reviewTarget?: string;
   reviewTargetType?: ReviewTargetType;
   reviewAction?: ReviewAction;
   reviewMode?: ReviewDepth;
   pinned?: boolean;
   customTitle?: string;
-}
-
-export interface AutoTask {
-  id: string;
-  name: string;
-  repo: string;
-  enabled: boolean;
-  mode?: ReviewDepth | null;
-  focus?: ReviewFocus[] | null;
-  max_subagents?: number | null;
-  created_at: string;
-  updated_at: string;
-  last_run_at?: string | null;
-  last_status?: string | null;
-}
-
-export type AutoTaskRunStatus = "queued" | "running" | "completed" | "failed" | "skipped";
-
-export interface AutoTaskRun {
-  run_id: string;
-  task_id: string;
-  repo: string;
-  pr_number: number;
-  pr_title: string;
-  pr_url: string;
-  status: AutoTaskRunStatus;
-  session_key?: string | null;
-  chat_id?: string | null;
-  reason?: string;
-  report_available: boolean;
-  report_filename?: string;
-  started_at: string;
-  completed_at?: string | null;
-}
-
-export interface AutoTaskPayload {
-  name?: string;
-  repo: string;
-  enabled?: boolean;
-  mode?: ReviewDepth | null;
-  focus?: ReviewFocus[] | null;
-  max_subagents?: number | null;
 }
 
 export interface BootstrapResponse {
@@ -272,7 +226,7 @@ export type InboundEvent =
       chat_id: string;
       text: string;
       stream_id?: string;
-      kind?: "review_thinking" | "review_report";
+      kind?: "review_thinking" | "review_report" | "subagent_content";
       subagent_id?: string;
       subagent_label?: string;
     }
@@ -401,8 +355,8 @@ export interface WebuiThreadPersistedPayload {
     id: string;
     label: string;
     status: "running" | "completed" | "error";
-    thinking: string;
-    thinkingStreaming: boolean;
+    output: string;
+    outputStreaming: boolean;
     startedAt: number;
   }>;
 }

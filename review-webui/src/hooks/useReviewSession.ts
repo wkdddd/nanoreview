@@ -61,7 +61,6 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   finding?: Finding;
-  thinking?: string;
   streaming?: boolean;
 }
 
@@ -69,8 +68,8 @@ export interface SubagentCard {
   id: string;
   label: string;
   status: "running" | "completed" | "error";
-  thinking: string;
-  thinkingStreaming: boolean;
+  output: string;
+  outputStreaming: boolean;
   startedAt: number;
 }
 
@@ -346,8 +345,7 @@ export function uiMessageToChatMessage(message: UIMessage): ChatMessage | null {
   const content = message.role === "user"
     ? formatReviewRequestContent(message.content, message.review)
     : message.content;
-  const thinking = message.role === "assistant" ? message.reasoning : undefined;
-  if (message.role === "assistant" && !content.trim() && !thinking?.trim()) {
+  if (message.role === "assistant" && !content.trim()) {
     return null;
   }
   const type = message.role === "assistant" && isLikelyReviewReport(message.content) ? "report" : "text";
@@ -357,8 +355,7 @@ export function uiMessageToChatMessage(message: UIMessage): ChatMessage | null {
     type,
     content,
     timestamp: message.createdAt,
-    thinking,
-    streaming: message.role === "assistant" ? message.reasoningStreaming : undefined,
+    streaming: message.role === "assistant" ? message.isStreaming : undefined,
   };
 }
 
@@ -421,10 +418,6 @@ function reviewFromMetadata(metadata: unknown): UIMessage["review"] | undefined 
   };
 }
 
-function stringFromUnknown(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
 export function sessionMessageToUIMessage(
   message: Record<string, unknown>,
   index: number,
@@ -432,13 +425,7 @@ export function sessionMessageToUIMessage(
   const role = message.role;
   if (role !== "user" && role !== "assistant") return null;
   const content = extractContent(message.content);
-  const reasoning = stringFromUnknown(
-    message.reasoning
-      ?? message.reasoning_content
-      ?? message.thinking
-      ?? message.thinking_content,
-  );
-  if (!content.trim() && !(role === "assistant" && reasoning?.trim())) return null;
+  if (!content.trim()) return null;
   const createdAt = numberFromTimestamp(
     message.createdAt ?? message.created_at ?? message.timestamp,
     Date.now() + index,
@@ -451,32 +438,11 @@ export function sessionMessageToUIMessage(
     kind: "message",
     createdAt,
     review,
-    ...(role === "assistant" && reasoning ? { reasoning } : {}),
   };
 }
 
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function appendThinking(message: ChatMessage, text: string, streaming = true): ChatMessage {
-  const nextThinking = message.thinking ? `${message.thinking}${text}` : text;
-  return {
-    ...message,
-    thinking: nextThinking,
-    streaming: message.streaming || streaming,
-  };
-}
-
-function appendProgressLine(message: ChatMessage, text: string): ChatMessage {
-  const trimmed = text.trim();
-  if (!trimmed) return message;
-  const prefix = message.thinking && message.thinking.trim() ? "\n" : "";
-  return appendThinking(message, `${prefix}${trimmed}\n`, true);
-}
-
-function appendProgressLines(message: ChatMessage, lines: string[]): ChatMessage {
-  return lines.reduce((next, line) => appendProgressLine(next, line), message);
 }
 
 function formatElapsed(ms: unknown): string {
@@ -621,18 +587,42 @@ function hasVisibleAgentFinal(messages: ChatMessage[]): boolean {
   );
 }
 
-function hasThinkingOnlyAgent(messages: ChatMessage[]): boolean {
-  return messages.some((message) =>
-    message.role === "agent"
-    && message.content.trim().length === 0
-    && !!message.thinking?.trim()
+function completedOrStoppedPhase(messages: ChatMessage[]): ReviewPhase {
+  if (hasVisibleAgentFinal(messages)) return "completed";
+  return "history";
+}
+
+function appendSubagentOutput(
+  cards: SubagentCard[],
+  id: string,
+  label: string | undefined,
+  text: string,
+): SubagentCard[] {
+  const existing = cards.find((card) => card.id === id);
+  if (!existing) {
+    return [
+      ...cards,
+      {
+        id,
+        label: label || id,
+        status: "running",
+        output: text,
+        outputStreaming: true,
+        startedAt: Date.now(),
+      },
+    ];
+  }
+  return cards.map((card) =>
+    card.id === id
+      ? { ...card, output: card.output + text, outputStreaming: true }
+      : card,
   );
 }
 
-function completedOrStoppedPhase(messages: ChatMessage[]): ReviewPhase {
-  if (hasVisibleAgentFinal(messages)) return "completed";
-  if (hasThinkingOnlyAgent(messages)) return "stopped";
-  return "history";
+function completeSubagentOutput(cards: SubagentCard[], id: string): SubagentCard[] {
+  return cards.map((card) =>
+    card.id === id ? { ...card, outputStreaming: false } : card,
+  );
 }
 
 function isBusyPhase(phase: ReviewPhase): boolean {
@@ -679,7 +669,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
     let placeholderId: string | null = null;
     if (reviewInProgressRef.current && !error) {
       const hasAgent = chatMessages.some(
-        (m) => m.role === "agent" && (m.content.trim() || m.thinking?.trim()),
+        (m) => m.role === "agent" && m.content.trim(),
       );
       if (!hasAgent) {
         placeholderId = generateId();
@@ -689,7 +679,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
           type: "text",
           content: "",
           timestamp: Date.now(),
-          thinking: "Review in progress...\n",
           streaming: true,
         }];
       }
@@ -805,8 +794,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
         return;
       }
       setState((prev) => {
-        const reviewActive = reviewInProgressRef.current || isBusyPhase(prev.phase);
-
         if (ev.event === "subagent_status") {
           if (ev.status === "running") {
             if (prev.subagentCards.some((c) => c.id === ev.subagent_id)) {
@@ -820,8 +807,8 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                   id: ev.subagent_id,
                   label: ev.label,
                   status: "running" as const,
-                  thinking: "",
-                  thinkingStreaming: false,
+                  output: "",
+                  outputStreaming: false,
                   startedAt: Date.now(),
                 },
               ],
@@ -831,7 +818,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             ...prev,
             subagentCards: prev.subagentCards.map((card) =>
               card.id === ev.subagent_id
-                ? { ...card, status: ev.status, thinkingStreaming: false }
+                ? { ...card, status: ev.status, outputStreaming: false }
                 : card
             ),
           };
@@ -839,44 +826,20 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
 
         if (ev.event === "delta") {
           if (ev.subagent_id) {
-            // Subagent content deltas are not displayed as regular messages;
-            // the final result is announced by the main agent.
-            return prev;
+            return {
+              ...prev,
+              subagentCards: appendSubagentOutput(
+                prev.subagentCards,
+                ev.subagent_id,
+                ev.subagent_label,
+                ev.text || "",
+              ),
+            };
           }
           const text = ev.text || "";
           const kind = ev.kind;
-          // Review streams are typed. Unclassified deltas are coordinator prose
-          // from an intermediate model iteration and must not become a chat bubble.
-          if (reviewActive && !kind) return prev;
           if (kind === "review_thinking") {
-            const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
-              ? assistantCarrierRef.current
-              : findAssistantCarrierId(prev.messages);
-            if (existingId) {
-              assistantCarrierRef.current = existingId;
-              const updated = prev.messages.map((message) =>
-                message.id === existingId ? appendThinking(message, text, true) : message
-              );
-              return { ...prev, messages: updated, phase: "reviewing" };
-            }
-            const id = generateId();
-            assistantCarrierRef.current = id;
-            return {
-              ...prev,
-              phase: "reviewing",
-              messages: [
-                ...prev.messages,
-                {
-                  id,
-                  role: "agent",
-                  type: "text",
-                  content: "",
-                  timestamp: Date.now(),
-                  thinking: text,
-                  streaming: true,
-                },
-              ],
-            };
+            return prev;
           }
 
           const isReport = kind === "review_report" || reportBufferRef.current.length > 0;
@@ -896,7 +859,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                       ...message,
                       type: "report" as const,
                       content: message.content + text,
-                      thinking: message.thinking || undefined,
                       streaming: true,
                     }
                   : message
@@ -921,7 +883,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                   type: "report",
                   content: text,
                   timestamp: Date.now(),
-                  thinking: undefined,
                   streaming: true,
                 },
               ],
@@ -959,68 +920,19 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
         }
 
         if (ev.event === "reasoning_delta") {
-          if (ev.subagent_id) {
-            return {
-              ...prev,
-              subagentCards: prev.subagentCards.map((card) =>
-                card.id === ev.subagent_id
-                  ? {
-                      ...card,
-                      thinking: card.thinking + (ev.text || ""),
-                      thinkingStreaming: true,
-                    }
-                  : card
-              ),
-            };
-          }
-          const text = ev.text || "";
-          const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
-            ? assistantCarrierRef.current
-            : findAssistantCarrierId(prev.messages);
-          if (existingId) {
-            assistantCarrierRef.current = existingId;
-            const updated = prev.messages.map((message) =>
-              message.id === existingId ? appendThinking(message, text, true) : message
-            );
-            return { ...prev, phase: "reviewing", messages: updated };
-          }
-          const id = generateId();
-          assistantCarrierRef.current = id;
-          return {
-            ...prev,
-            phase: "reviewing",
-            messages: [
-              ...prev.messages,
-              {
-                id,
-                role: "agent",
-                type: "text",
-                content: "",
-                timestamp: Date.now(),
-                thinking: text,
-                streaming: true,
-              },
-            ],
-          };
+          return prev;
         }
 
         if (ev.event === "reasoning_end") {
-          if (ev.subagent_id) {
-            return {
-              ...prev,
-              subagentCards: prev.subagentCards.map((card) =>
-                card.id === ev.subagent_id
-                  ? { ...card, thinkingStreaming: false }
-                  : card
-              ),
-            };
-          }
           return prev;
         }
 
         if (ev.event === "stream_end") {
           if (ev.subagent_id) {
-            return prev;
+            return {
+              ...prev,
+              subagentCards: completeSubagentOutput(prev.subagentCards, ev.subagent_id),
+            };
           }
           if (ev.kind === "review_thinking") {
             return prev;
@@ -1031,7 +943,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             textMessageRef.current = null;
             return { ...prev, messages: markStreamingCompleteById(prev.messages, reportId) };
           }
-          if (reviewActive) return prev;
           const textId = textMessageRef.current;
           textMessageRef.current = null;
           if (textId) {
@@ -1120,45 +1031,15 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             }
           }
 
-          // Keep finding/progress events above, but hide untyped assistant messages
-          // while a review is active. The final report has an explicit kind.
-          if (reviewActive && !ev.kind) return { ...prev, logs: newLogs };
-
           if (ev.kind === "progress" && progressLines.length > 0) {
-            const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
-              ? assistantCarrierRef.current
-              : findAssistantCarrierId(prev.messages);
-            if (existingId) {
-              assistantCarrierRef.current = existingId;
-              const updated = prev.messages.map((message) =>
-                message.id === existingId ? appendProgressLines(message, progressLines) : message
-              );
-              return { ...prev, logs: newLogs, phase: "prefetching", messages: updated };
-            }
-            const id = generateId();
-            assistantCarrierRef.current = id;
-            const thinking = progressLines.map((line) => line.trim()).filter(Boolean).join("\n");
             return {
               ...prev,
               phase: "prefetching",
               logs: newLogs,
-              messages: [
-                ...prev.messages,
-                {
-                  id,
-                  role: "agent",
-                  type: "text",
-                  content: "",
-                  timestamp: Date.now(),
-                  thinking: `${thinking}\n`,
-                  streaming: true,
-                },
-              ],
             };
           }
 
           if (!ev.kind && ev.text?.trim()) {
-            if (reviewInProgressRef.current) return prev;
             const content = ev.text;
             const isReport = isLikelyReviewReport(content);
             const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
@@ -1222,7 +1103,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
           textMessageRef.current = null;
           const messages = markAllStreamingComplete(prev.messages);
           const subagentCards = prev.subagentCards.map((card) =>
-            card.thinkingStreaming ? { ...card, thinkingStreaming: false } : card
+            card.outputStreaming ? { ...card, outputStreaming: false } : card
           );
           const missingReviewReport = !!prev.task
             && isBusyPhase(prev.phase)
@@ -1262,7 +1143,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             // If there's no agent message, create a placeholder so the user
             // sees a streaming indicator after page refresh.
             const hasAgent = prev.messages.some(
-              (m) => m.role === "agent" && (m.content.trim() || m.thinking?.trim()),
+              (m) => m.role === "agent" && m.content.trim(),
             );
             if (!hasAgent) {
               const id = generateId();
@@ -1278,7 +1159,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                     type: "text",
                     content: "",
                     timestamp: Date.now(),
-                    thinking: "Review in progress...\n",
                     streaming: true,
                   },
                 ],

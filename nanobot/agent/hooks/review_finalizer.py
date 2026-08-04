@@ -12,7 +12,7 @@ from nanobot.agent.hooks.lifecycle import AgentHook, AgentHookContext
 from nanobot.review.input import policy_for_depth
 from nanobot.review.output.finalizer import ReviewFinalizer
 from nanobot.review.output.judge import ReviewJudge
-from nanobot.review.types import ReviewDepth
+from nanobot.review.types import GitHubDiffEvidence, ReviewDepth
 
 
 class ReviewFinalizerHook(AgentHook):
@@ -32,6 +32,7 @@ class ReviewFinalizerHook(AgentHook):
         judge: ReviewJudge | None = None,
         allowed_dimensions: list[str] | set[str] | None = None,
         can_finalize: Callable[[], bool] | None = None,
+        remote_diff: GitHubDiffEvidence | None = None,
     ) -> None:
         super().__init__()
         self._target_name = target_name
@@ -41,6 +42,7 @@ class ReviewFinalizerHook(AgentHook):
             changed_files,
             policy=self._policy,
             allowed_dimensions=allowed_dimensions,
+            remote_diff=remote_diff,
         )
         self._rendered = False
         self._rendered_report: str | None = None
@@ -58,11 +60,13 @@ class ReviewFinalizerHook(AgentHook):
         workspace: str,
         changed_files: list[str] | None = None,
         local_target: str | None = None,
+        remote_diff: GitHubDiffEvidence | None = None,
     ) -> None:
         self._finalizer.set_validation_context(
             workspace=workspace,
             changed_files=changed_files,
             local_target=local_target,
+            remote_diff=remote_diff,
         )
 
     async def after_iteration(self, context: AgentHookContext) -> None:

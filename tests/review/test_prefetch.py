@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import nanobot.review.planning.planner as planner
+
 from nanobot.review.planning.planner import build_review_plan
 from nanobot.review.planning.prefetch import maybe_prefetch_review_context
 from nanobot.review.types import LocalReviewScope, ReviewAction, ReviewPlan
@@ -25,6 +27,11 @@ class _EvidenceService:
 class _EmptyEvidenceService:
     async def dispatch(self, **kwargs: object) -> str:
         return ""
+
+
+class _PatchEvidenceService:
+    async def dispatch(self, **kwargs: object) -> str:
+        return "[Local Diff Review Context]\n## File: src/auth.py\n+token = value"
 
 
 async def test_prefetch_calls_review_evidence_service_and_compacts_evidence() -> None:
@@ -55,6 +62,9 @@ async def test_prefetch_calls_review_evidence_service_and_compacts_evidence() ->
     assert summary.status == "ok"
     assert "## src/auth.py:1-10" in (summary.summary or "")
     assert "ignored body line" not in (summary.summary or "")
+    assert summary.evidence is not None
+    assert summary.evidence.references[0].path == "src/auth.py"
+    assert summary.evidence.references[0].id == "ev-001"
 
 
 async def test_prefetch_emits_progress_events() -> None:
@@ -111,6 +121,25 @@ async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
     assert result.summary is None
 
 
+async def test_diff_prefetch_preserves_filtered_patch_body() -> None:
+    plan = ReviewPlan(
+        target=".",
+        target_name="workspace",
+        target_type="local",
+        action=ReviewAction.DIFF,
+        depth="full",
+        roles=[],
+        forced_focus=False,
+        max_subagents=1,
+    )
+    result = await maybe_prefetch_review_context(
+        plan,
+        {"_review_evidence_service": _PatchEvidenceService()},
+    )
+
+    assert "+token = value" in (result.summary or "")
+
+
 def test_github_blob_url_becomes_scoped_review_plan() -> None:
     plan = build_review_plan(
         target="https://github.com/wkdddd/nanobot/blob/main/review-webui/index.html",
@@ -127,10 +156,11 @@ def test_github_blob_url_becomes_scoped_review_plan() -> None:
     assert plan.target_subpath_kind == "blob"
 
 
-def test_local_file_target_becomes_file_scope(tmp_path) -> None:
+def test_local_file_target_becomes_file_scope(tmp_path, monkeypatch) -> None:
     target = tmp_path / "src" / "auth.py"
     target.parent.mkdir()
     target.write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(planner, "_find_git_root", lambda path: None)
 
     plan = build_review_plan(
         target=str(target),

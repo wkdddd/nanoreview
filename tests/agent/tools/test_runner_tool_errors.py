@@ -314,4 +314,4 @@ async def test_drain_injections_falls_back_when_signature_is_unavailable(monkeyp
         make_spec(injection_callback=OpaqueInjectionCallback())
     )
 
-    assert injected == [{"role": "user", "content": "limit=3"}]
+    assert injected == [{"role": "user", "content": "limit=5"}]

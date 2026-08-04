@@ -15,13 +15,13 @@ from nanobot.rag.review_service import (
     rrf_merge,
 )
 from nanobot.rag.utils import IndexedChunk, IndexedHit
-from nanobot.review.planning.evidence import LocalChangedSummary, ReviewEvidenceService
+from nanobot.review.planning.evidence import ReviewEvidenceService
 from nanobot.review.source.utils import (
     changed_lines_from_patch,
     parse_pr_target,
     parse_repo,
 )
-from nanobot.review.types import LocalReviewScope
+from nanobot.review.types import GitHubDiffEvidence, LocalReviewScope
 
 
 class _GitHub:
@@ -136,25 +136,19 @@ async def test_review_evidence_uses_local_file_scope(tmp_path: Path, monkeypatch
 @pytest.mark.asyncio
 async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
-    captured: dict[str, object] = {}
-
-    class _Result:
-        hits: list[object] = [object()]
-        context = "context"
-
-    async def fake_retrieve(request: RepositoryRAGRequest) -> _Result:
-        captured["request"] = request
-        return _Result()
-
     monkeypatch.setattr(
         service,
-        "local_changed_summary",
-        lambda _workspace=None: LocalChangedSummary(
-            files=["src/auth.py", "docs/readme.md"],
-            touched_lines={"src/auth.py": [2], "docs/readme.md": [1]},
+        "local_changed_patches",
+        lambda _workspace=None: (
+            {"src/auth.py": "@@ -1 +1 @@\n-old\n+new", "docs/readme.md": "+ignored"},
+            {},
         ),
     )
-    monkeypatch.setattr(service.repository_rag, "retrieve", fake_retrieve)
+
+    async def fail_retrieve(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("diff review must not call RAG retrieval")
+
+    monkeypatch.setattr(service.repository_rag, "retrieve", fail_retrieve)
 
     result = await service.local_changed_context(
         review_query="regression",
@@ -172,10 +166,29 @@ async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, 
     assert result.startswith("[Local Diff Review Context]")
     assert "src/auth.py" in result
     assert "docs/readme.md" not in result
-    request = captured["request"]
-    assert isinstance(request, RepositoryRAGRequest)
-    assert request.review_query == "regression src/auth.py"
-    assert request.touched_lines == {"src/auth.py": [2]}
+    assert "+new" in result
+
+
+@pytest.mark.asyncio
+async def test_local_diff_skips_single_patch_over_context_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    monkeypatch.setattr(
+        service,
+        "local_changed_patches",
+        lambda _workspace=None: ({"src/large.py": "+" + ("x" * 200)}, {}),
+    )
+
+    result = await service.local_changed_context(
+        review_query="review",
+        max_results=5,
+        include_tests=True,
+        context_window_tokens=8,
+    )
+
+    assert "token_threshold_exceeded" in result
+    assert "## File: src/large.py" not in result
 
 
 def test_local_changed_summary_parses_staged_unstaged_and_untracked_lines(tmp_path: Path) -> None:
@@ -353,7 +366,7 @@ async def test_review_evidence_local_context_logs_no_hits(
 
 
 @pytest.mark.asyncio
-async def test_review_evidence_github_diff_logs_no_hits(
+async def test_review_evidence_github_diff_uses_patches_without_rag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -362,13 +375,20 @@ async def test_review_evidence_github_diff_logs_no_hits(
     handler_id = logger.add(sink, level="INFO", format="{message}")
 
     async def fake_fetch_pr_files(*_args: object, **_kwargs: object):
-        return "test/repo#42", {"src/auth.py": "def auth(): pass"}, {"src/auth.py": [1]}
+        return GitHubDiffEvidence(
+            snapshot="test/repo#42",
+            head_sha="abc123",
+            patches={"src/auth.py": "@@ -1 +1 @@\n-old\n+def auth(): pass"},
+            changed_files=["src/auth.py", "src/big.py"],
+            touched_lines={"src/auth.py": [1]},
+            patch_unavailable_files={"src/big.py": "patch_unavailable"},
+        )
 
-    async def fake_snapshot_context(*_args: object, **_kwargs: object):
-        return tmp_path / "cache", "No relevant GitHub PR diff references found.", 0
+    async def fail_snapshot_context(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("diff review must not create a RAG snapshot")
 
     monkeypatch.setattr(service.github, "fetch_pr_files", fake_fetch_pr_files)
-    monkeypatch.setattr(service, "retrieve_snapshot_context", fake_snapshot_context)
+    monkeypatch.setattr(service, "retrieve_snapshot_context", fail_snapshot_context)
     try:
         result = await service.github_diff_context(
             repo="test/repo",
@@ -381,9 +401,11 @@ async def test_review_evidence_github_diff_logs_no_hits(
     finally:
         logger.remove(handler_id)
 
-    assert "No relevant GitHub PR diff references found." in result
+    assert "def auth(): pass" in result
+    assert "src/big.py" in result
+    assert "patch_unavailable" in result
     assert "review.evidence.github_diff.done" in sink.text
-    assert "status=no_hits" in sink.text
+    assert "status=success" in sink.text
     assert "trace_id=trace-1" in sink.text
 
 

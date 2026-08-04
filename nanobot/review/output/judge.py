@@ -103,7 +103,10 @@ class ReviewJudge:
                     model=self._model,
                     max_tokens=self._config.max_tokens,
                     temperature=0,
-                    tool_choice={"function": {"name": "submit_verdicts"}},
+                    tool_choice={
+                        "type": "function",
+                        "function": {"name": "submit_verdicts"},
+                    },
                 ),
                 timeout=self._config.timeout_seconds,
             )

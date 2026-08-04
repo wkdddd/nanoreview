@@ -1,7 +1,4 @@
 import type {
-  AutoTask,
-  AutoTaskPayload,
-  AutoTaskRun,
   ChatSummary,
   CodeContextPayload,
   ReviewAction,
@@ -82,11 +79,6 @@ function stringField(source: Record<string, unknown> | undefined, key: string): 
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-function numberField(source: Record<string, unknown> | undefined, key: string): number | undefined {
-  const value = source?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
 function reviewTargetTypeField(value?: string): ReviewTargetType | undefined {
   return value === "auto" || value === "github" || value === "local" ? value : undefined;
 }
@@ -125,10 +117,6 @@ export async function listSessions(auth: ApiAuth): Promise<ChatSummary[]> {
       title: session.title ?? "",
       preview: session.preview ?? "",
       metadata,
-      autoTaskId: stringField(metadata, "auto_task_id"),
-      autoTaskRunId: stringField(metadata, "auto_task_run_id"),
-      githubRepo: stringField(metadata, "github_repo"),
-      githubPrNumber: numberField(metadata, "github_pr_number"),
       reviewTarget: stringField(metadata, "review_target"),
       reviewTargetType,
       reviewAction,
@@ -243,73 +231,4 @@ export async function updateSession(
   const path = `/api/sessions/${encodeURIComponent(key)}/update${qs ? `?${qs}` : ""}`;
   const body = await request<{ updated: boolean }>(path, auth, { method: "GET" });
   return body.updated;
-}
-
-export async function listAutoTasks(auth: ApiAuth): Promise<AutoTask[]> {
-  const body = await request<{ tasks: AutoTask[] }>("/api/auto-tasks", auth);
-  return body.tasks;
-}
-
-export async function createAutoTask(
-  auth: ApiAuth,
-  payload: AutoTaskPayload,
-): Promise<AutoTask> {
-  const body = await request<{ task: AutoTask }>("/api/auto-tasks", auth, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  return body.task;
-}
-
-export async function updateAutoTask(
-  auth: ApiAuth,
-  id: string,
-  payload: Partial<AutoTaskPayload>,
-): Promise<AutoTask> {
-  const body = await request<{ task: AutoTask }>(`/api/auto-tasks/${encodeURIComponent(id)}`, auth, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  return body.task;
-}
-
-export async function deleteAutoTask(auth: ApiAuth, id: string): Promise<boolean> {
-  const body = await request<{ deleted: boolean }>(
-    `/api/auto-tasks/${encodeURIComponent(id)}/delete`,
-    auth,
-    { method: "POST" },
-  );
-  return body.deleted;
-}
-
-export async function listAutoTaskRuns(auth: ApiAuth, id: string): Promise<AutoTaskRun[]> {
-  const body = await request<{ runs: AutoTaskRun[] }>(
-    `/api/auto-tasks/${encodeURIComponent(id)}/runs`,
-    auth,
-  );
-  return body.runs;
-}
-
-export async function runAutoTaskNow(
-  auth: ApiAuth,
-  id: string,
-  prNumber: number,
-): Promise<AutoTaskRun> {
-  const body = await request<{ run: AutoTaskRun }>(
-    `/api/auto-tasks/${encodeURIComponent(id)}/run`,
-    auth,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pr_number: prNumber }),
-    },
-  );
-  return body.run;
-}
-
-export function autoTaskReportUrl(id: string, runId: string, token: string): string {
-  const params = new URLSearchParams({ token });
-  return `/api/auto-tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/report?${params.toString()}`;
 }

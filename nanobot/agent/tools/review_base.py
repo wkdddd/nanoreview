@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.context import current_request_context
 from nanobot.rag import create_rag_runtime
 from nanobot.rag.config import RAGConfig
 from nanobot.rag.review_service import (
@@ -20,7 +21,7 @@ from nanobot.rag.runtime import RAGRuntime
 from nanobot.review.planning.evidence import ReviewEvidenceService
 from nanobot.review.source.github import GitHubRepoConfig, GitHubRepoReader
 from nanobot.review.source.local import LocalRepoReader
-from nanobot.review.types import ReviewAction
+from nanobot.review.types import ReviewAction, ReviewMetaKey
 
 READER_ACTIONS = ("meta", "tree", "file")
 REVIEW_ACTIONS = tuple(action.value for action in ReviewAction)
@@ -100,6 +101,35 @@ class ReviewToolBase(Tool):
     def _unknown_action(self, action: str) -> str:
         allowed = ", ".join(ALL_REVIEW_TOOL_ACTIONS)
         return f"Error: unknown {self.name} action '{action}'. Use {allowed}."
+
+    @staticmethod
+    def _blocks_rag_repo_action(action: str) -> bool:
+        ctx = current_request_context()
+        metadata = ctx.metadata if ctx is not None else {}
+        return (
+            action == ReviewAction.REPO.value
+            and str(metadata.get(ReviewMetaKey.ACTION) or "").strip().lower()
+            == ReviewAction.DIFF.value
+        )
+
+    @staticmethod
+    def _diff_context_window_tokens() -> int | None:
+        ctx = current_request_context()
+        metadata = ctx.metadata if ctx is not None else {}
+        value = metadata.get(ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS)
+        try:
+            return int(value) if value is not None and int(value) > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _github_pr_head_ref() -> str | None:
+        ctx = current_request_context()
+        metadata = ctx.metadata if ctx is not None else {}
+        if str(metadata.get(ReviewMetaKey.ACTION) or "").strip().lower() != ReviewAction.DIFF.value:
+            return None
+        value = str(metadata.get(ReviewMetaKey.GITHUB_PR_HEAD_REF) or "").strip()
+        return value or None
 
     def _log_finish(
         self,

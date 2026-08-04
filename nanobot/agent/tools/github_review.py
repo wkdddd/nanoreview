@@ -98,9 +98,9 @@ class GitHubReviewTool(ReviewToolBase):
     @property
     def description(self) -> str:
         return (
-            "GitHub repository reader and CodeReview RAG tool. Use meta/tree/file for "
-            "read-only GitHub API inspection, repo for full or scoped remote evidence retrieval, "
-            "and diff for GitHub pull request review. Do not clone repositories; repo/diff "
+            "GitHub repository reader and review evidence tool. Use meta/tree/file for "
+            "read-only GitHub API inspection, repo for RAG-backed full or scoped remote evidence retrieval, "
+            "and diff for programmatically filtered GitHub pull request patches. Do not clone repositories; repo/diff "
             "actions use fixed snapshots under workspace/.nanobot/review_github."
         )
 
@@ -166,6 +166,13 @@ class GitHubReviewTool(ReviewToolBase):
                     repo,
                 )
                 return result_text
+            if self._blocks_rag_repo_action(action_value):
+                result_text = (
+                    "Error: github_review action='repo' is unavailable during diff review because "
+                    "it uses RAG. Use github_review(action='meta'/'tree'/'file')."
+                )
+                logger.warning("github_review.rag_repo_blocked trace_id={} repo={}", trace_id, repo)
+                return result_text
             if not self.github.config.enable:
                 result_text = "Error: GitHub repository access is disabled by tools.githubRepo.enable."
                 logger.warning("github_review.disabled trace_id={} repo={}", trace_id, repo)
@@ -199,7 +206,7 @@ class GitHubReviewTool(ReviewToolBase):
                     action=action_value,
                     repo=repo,
                     path=repo_path,
-                    ref=ref,
+                    ref=ref or self._github_pr_head_ref(),
                     pattern=tree_pattern,
                     max_entries=tree_limit,
                     pr_number=int(pr_number or 0),
@@ -218,6 +225,7 @@ class GitHubReviewTool(ReviewToolBase):
                 max_results=max_results,
                 include_tests=include_tests,
                 trace_id=trace_id,
+                context_window_tokens=self._diff_context_window_tokens(),
             )
             return result_text
         except Exception as exc:

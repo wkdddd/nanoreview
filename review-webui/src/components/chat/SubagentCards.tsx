@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
-import { Loader2, CheckCircle2, XCircle, ChevronDown, ChevronRight, Brain } from "lucide-react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Loader2, CheckCircle2, XCircle, ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SubagentCard } from "@/hooks/useReviewSession";
 
@@ -60,9 +60,47 @@ const STATUS_CONFIG: Record<
 };
 
 export function SubagentCards({ cards }: SubagentCardsProps) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [collapsed, setCollapsed] = useState<Set<string>>(
+    () => new Set(cards.filter((card) => card.output && !card.outputStreaming).map((card) => card.id)),
+  );
+  const userToggledRef = useRef(new Set<string>());
+  const previousStreamingRef = useRef(new Map(cards.map((card) => [card.id, card.outputStreaming])));
+  const collapseTimersRef = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    const previous = previousStreamingRef.current;
+    for (const card of cards) {
+      const wasStreaming = previous.get(card.id) ?? false;
+      if (card.outputStreaming && !wasStreaming && !userToggledRef.current.has(card.id)) {
+        const timer = collapseTimersRef.current.get(card.id);
+        if (timer !== undefined) window.clearTimeout(timer);
+        collapseTimersRef.current.delete(card.id);
+        setCollapsed((current) => {
+          const next = new Set(current);
+          next.delete(card.id);
+          return next;
+        });
+      }
+      if (!card.outputStreaming && wasStreaming && !userToggledRef.current.has(card.id)) {
+        const timer = window.setTimeout(() => {
+          setCollapsed((current) => new Set(current).add(card.id));
+          collapseTimersRef.current.delete(card.id);
+        }, 700);
+        collapseTimersRef.current.set(card.id, timer);
+      }
+      previous.set(card.id, card.outputStreaming);
+    }
+  }, [cards]);
+
+  useEffect(() => () => {
+    collapseTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+  }, []);
 
   const toggle = useCallback((id: string) => {
+    userToggledRef.current.add(id);
+    const timer = collapseTimersRef.current.get(id);
+    if (timer !== undefined) window.clearTimeout(timer);
+    collapseTimersRef.current.delete(id);
     setCollapsed((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -79,7 +117,7 @@ export function SubagentCards({ cards }: SubagentCardsProps) {
         const config = STATUS_CONFIG[card.status];
         const Icon = config.icon;
         const isCollapsed = collapsed.has(card.id);
-        const hasThinking = card.thinking.length > 0 || card.thinkingStreaming;
+        const hasOutput = card.output.length > 0 || card.outputStreaming;
 
         return (
           <div
@@ -104,7 +142,7 @@ export function SubagentCards({ cards }: SubagentCardsProps) {
                 {config.label}
               </span>
               <ElapsedTime startedAt={card.startedAt} active={card.status === "running"} />
-              {hasThinking && (
+              {hasOutput && (
                 <div className="ml-auto">
                   {isCollapsed ? (
                     <ChevronRight className="w-3 h-3 text-muted-foreground" />
@@ -115,26 +153,24 @@ export function SubagentCards({ cards }: SubagentCardsProps) {
               )}
             </button>
 
-            {/* Thinking content */}
-            {hasThinking && !isCollapsed && (
+            {hasOutput && !isCollapsed && (
               <div className="border-t border-inherit/40 px-3 py-2">
                 <div className="flex items-center gap-1.5 mb-1">
-                  <Brain className="w-3 h-3 text-muted-foreground/60" />
                   <span className="text-[10px] text-muted-foreground/60 font-medium">
-                    Thinking
+                    Output
                   </span>
-                  {card.thinkingStreaming && (
+                  {card.outputStreaming && (
                     <span className="inline-block w-1 h-1 rounded-full bg-blue-500 animate-pulse" />
                   )}
                 </div>
                 <textarea
                   readOnly
-                  aria-label={`${card.label} thinking`}
+                  aria-label={`${card.label} output`}
                   className={cn(
                     "block w-full h-32 resize-none border-0 bg-transparent p-0 text-[11px] text-muted-foreground/80 leading-relaxed focus:outline-none overflow-y-auto",
-                    card.thinkingStreaming && "animate-pulse",
+                    card.outputStreaming && "animate-pulse",
                   )}
-                  value={card.thinking}
+                  value={card.output}
                 />
               </div>
             )}

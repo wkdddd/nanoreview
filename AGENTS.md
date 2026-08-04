@@ -2,31 +2,11 @@
 
 本文件是本仓库中 AI 编码代理的首要工作约束。
 
-`.agents/` 包含按主题拆分的补充说明：开始工作时先阅读本文件；任务涉及架构、安全或运行时行为时，再阅读对应主题文件。不要让主题文件与本文件重复或产生冲突。
+`.agents/` 包含按主题拆分的补充说明：开始工作时先阅读本文件；任务涉及架构、安全或运行时行为时，再阅读对应主题文件。根文件只保留入口级约束和仓库定位，专题文件负责展开具体规则；两者不得冲突。
 
-## 项目与数据流
+## 项目定位
 
-NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主体为 Python，配套 React/TypeScript WebUI。核心链路如下：
-
-1. `nanobot/channels/` 接收外部消息并向 `nanobot/bus/` 发布入站事件。
-2. `nanobot/agent/loop.py` 构建上下文、恢复会话并协调一次任务。
-3. `nanobot/agent/runner.py` 调用 LLM、执行工具调用并生成结果。
-4. `nanobot/agent/subagent.py` 按需调度代码审查子代理；`nanobot/review/` 负责审查计划、结果校验和报告。
-5. 出站结果通过消息总线返回对应渠道；`review-webui/` 展示用户可见状态和报告。
-
-重要目录：
-
-- `nanobot/agent/`：AgentLoop、AgentRunner、子代理、上下文、记忆与工具。
-- `nanobot/review/`：代码审查目标解析、计划、子代理提交和报告生成。
-- `nanobot/channels/`：外部平台适配层。
-- `nanobot/providers/`：LLM Provider、注册表和工厂。
-- `nanobot/session/`：会话、上下文压缩和目标状态。
-- `nanobot/config/`：Pydantic 配置模型、配置加载与环境变量解析。
-- `nanobot/templates/`、`nanobot/skills/`：影响模型行为的提示词和技能。
-- `nanobot/agent/tools/`：文件系统、执行、检索、MCP、审查和子代理工具。
-- `nanobot/security/`：网络安全边界。
-- `review-webui/`：Vite + React + Tailwind 审查界面。
-- `tests/`：镜像 `nanobot/` 结构的 Python 测试。
+NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主体为 Python，配套 React/TypeScript WebUI。涉及消息链路、模块归属和跨边界改动时，阅读 `.agents/architecture.md`；涉及扩展点、抽象与最小改动时，阅读 `.agents/design.md`。
 
 ## 常用命令
 
@@ -63,16 +43,8 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 - 不做无关重构，不批量格式化，不回滚或覆盖已有用户改动。
 - 日志记录关键状态变化和错误上下文，避免循环内高频噪音；不要记录密钥、令牌、完整会话或不必要的敏感元数据。
 
-## 变更原则
+## 实现约定
 
-- 先阅读相邻实现、测试和调用链，再修改；不猜测可从代码确认的事实。
-- 保持核心小而清晰。新能力优先落在 `channels/`、`agent/tools/`、`skills/`、Provider 或 MCP 扩展中，不要内联进核心循环。
-- `nanobot/agent/loop.py` 和 `nanobot/agent/runner.py` 是关键路径。改动必须聚焦、最小且说明原因；运行时事件可通用发布，渠道和 WebUI 的协议细节保留在各自适配层。
-- 优先使用简单、可读且显式的代码。仅在消除真实复杂度、保护明确边界或匹配既有模式时新增抽象。
-- 允许channel和 Provider 存在小范围重复；不要为了消除重复而引入复杂基类或共享框架。
-- Bug 修复只改保护该不变量所需的最小表面，并添加最近的回归测试。行为变更、重构和清理不要混在同一改动中。
-- 配置必须显式定义在 `nanobot/config/schema.py` 的 Pydantic 模型中；错误应清晰暴露，Provider 解析路径必须可追踪。
-- 提示词模板、工具描述、技能和会话回放内容都是运行时行为的一部分。变更应窄，并在可行时补充聚焦测试。
 - Python 使用 `pathlib.Path`，异步路径使用 `async`/`await`，不得在事件循环中执行长时间阻塞操作。
 - 在实现新模块或功能时，项目的日志打印需要完整（错误信息和关键节点的成功info）,但不要泛滥，方便调试
 - 调整代码时不需要兼容旧配置或旧参数，除非用户明确要求。
@@ -81,17 +53,18 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 - 整体地审视代码，不要忽视前后端细节、相关文档、配置等问题
 - 设计不合理时说明具体位置、影响和可执行建议。
-- 信息不足且会影响正确性时先提问；能从本地代码确认的内容不得猜测。
 - 变更代码时，要说明具体修改位置和修改思路
+- 介绍或分析代码时要结合具体位置，不能泛泛而谈
+- 信息不足且会影响正确性时先提问；能从本地代码确认的内容不得猜测。
 - 交付时说明改动、验证结果，以及未执行的验证和原因。
 - 所有输出、文件写入、命令执行和字符串内容必须使用 UTF-8，不能使用 GBK/GB2312。
 
 ## 项目具体说明
 
-- Architecture constraints：`.agent/design.md`
-- Security boundaries：`.agent/security.md`
-- Common gotchas：`.agent/gotchas.md`
-- Design principle:`.agent/design.md`
-- 
-任务涉及对应约束时，先阅读相关文件再执行。若对应约束文件与 `AGENTS.md` 冲突，以`AGENTS.md` 为准，并在同一次改动中消除冲突。
+- Architecture constraints：`.agents/architecture.md`
+- Security boundaries：`.agents/security.md`
+- Common gotchas：`.agents/gotchas.md`
+- Design principle:`.agents/design.md`
+
+任务涉及对应说明时，先阅读相关文件再执行。若对应约束文件与 `AGENTS.md` 冲突，以`AGENTS.md` 为准，并在同一次改动中消除冲突。
 

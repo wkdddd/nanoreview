@@ -17,12 +17,10 @@ from loguru import logger
 from pydantic import Field
 
 from nanobot.config.schema import Base
-from nanobot.rag.review_service import DEFAULT_BINARY_EXTS
+from nanobot.review.file_filter import review_file_filter_reason
 from nanobot.review.source.utils import changed_lines_from_patch, parse_repo
+from nanobot.review.types import GitHubDiffEvidence
 from nanobot.utils.log_style import log_event
-
-_DEFAULT_BINARY_EXTS = DEFAULT_BINARY_EXTS
-
 
 class GitHubRepoConfig(Base):
     """GitHub repo reader configuration used by repo_review."""
@@ -515,8 +513,7 @@ class GitHubRepoReader:
             if item.get("type") != "blob":
                 continue
             path = str(item.get("path", ""))
-            suffix = Path(path).suffix.lower()
-            if suffix in _DEFAULT_BINARY_EXTS:
+            if review_file_filter_reason(path) is not None:
                 continue
             if pattern and not fnmatch.fnmatch(path, pattern):
                 continue
@@ -542,7 +539,7 @@ class GitHubRepoReader:
                     return path, content
 
             for path, content in await asyncio.gather(*(fetch(path) for path in candidates)):
-                if content is not None:
+                if content is not None and review_file_filter_reason(path, content) is None:
                     files[path] = content
         log_event(
             logger,
@@ -564,7 +561,7 @@ class GitHubRepoReader:
         *,
         pr_number: int,
         trace_id: str = "no-trace",
-    ) -> tuple[str, dict[str, str], dict[str, list[int]]]:
+    ) -> GitHubDiffEvidence:
         pygithub_result = await asyncio.to_thread(
             self._fetch_pr_files_pygithub,
             repo,
@@ -576,33 +573,29 @@ class GitHubRepoReader:
 
         owner, repo_name = parse_repo(repo)
         pr_data = await self._api_get(f"repos/{owner}/{repo_name}/pulls/{pr_number}", trace_id=trace_id)
-        head_ref = None
+        head_sha = ""
         if isinstance(pr_data, dict):
             head = pr_data.get("head")
             if isinstance(head, dict):
-                head_ref = head.get("sha")
+                head_sha = str(head.get("sha") or "")
         data = await self._api_get(f"repos/{owner}/{repo_name}/pulls/{pr_number}/files", trace_id=trace_id)
         if isinstance(data, str):
             raise RuntimeError(data)
         files: dict[str, str] = {}
         touched: dict[str, list[int]] = {}
+        changed_files: list[str] = []
+        unavailable: dict[str, str] = {}
         for item in data[: self.config.max_patch_files]:
             filename = str(item.get("filename", ""))
-            if not filename or Path(filename).suffix.lower() in _DEFAULT_BINARY_EXTS:
+            if review_file_filter_reason(filename) is not None:
                 continue
             patch = item.get("patch") or ""
-            touched[filename] = changed_lines_from_patch(filename, patch)
-            content = await self._fetch_file_text(
-                owner,
-                repo_name,
-                filename,
-                head_ref,
-                trace_id=trace_id,
-            )
-            if content is None and patch:
-                content = patch
-            if content is not None:
-                files[filename] = content
+            changed_files.append(filename)
+            if patch:
+                files[filename] = patch
+                touched[filename] = changed_lines_from_patch(filename, patch)
+            else:
+                unavailable[filename] = "patch_unavailable"
         log_event(
             logger,
             "info",
@@ -614,7 +607,14 @@ class GitHubRepoReader:
             files=len(files),
             touched_files=len(touched),
         )
-        return f"{owner}/{repo_name}#{pr_number}", files, touched
+        return GitHubDiffEvidence(
+            snapshot=f"{owner}/{repo_name}#{pr_number}",
+            head_sha=head_sha,
+            patches=files,
+            changed_files=changed_files,
+            touched_lines=touched,
+            patch_unavailable_files=unavailable,
+        )
 
     def _github_client(self) -> Any | None:
         try:
@@ -652,7 +652,7 @@ class GitHubRepoReader:
                 path = str(getattr(item, "path", ""))
                 if getattr(item, "type", "") != "blob":
                     continue
-                if Path(path).suffix.lower() in _DEFAULT_BINARY_EXTS:
+                if review_file_filter_reason(path) is not None:
                     continue
                 if pattern and not fnmatch.fnmatch(path, pattern):
                     continue
@@ -663,7 +663,8 @@ class GitHubRepoReader:
                 if isinstance(content_file, list):
                     continue
                 decoded = content_file.decoded_content.decode("utf-8", errors="replace")
-                files[path] = decoded
+                if review_file_filter_reason(path, decoded) is None:
+                    files[path] = decoded
                 if len(files) >= limit:
                     break
             log_event(
@@ -686,7 +687,7 @@ class GitHubRepoReader:
         repo: str,
         pr_number: int,
         trace_id: str = "no-trace",
-    ) -> tuple[str, dict[str, str], dict[str, list[int]]] | None:
+    ) -> GitHubDiffEvidence | None:
         client = self._github_client()
         if client is None:
             return None
@@ -697,20 +698,19 @@ class GitHubRepoReader:
             pr = gh_repo.get_pull(pr_number)
             files: dict[str, str] = {}
             touched: dict[str, list[int]] = {}
+            changed_files: list[str] = []
+            unavailable: dict[str, str] = {}
             for item in list(pr.get_files())[: self.config.max_patch_files]:
                 filename = str(getattr(item, "filename", ""))
-                if not filename or Path(filename).suffix.lower() in _DEFAULT_BINARY_EXTS:
+                if review_file_filter_reason(filename) is not None:
                     continue
                 patch = str(getattr(item, "patch", "") or "")
-                touched[filename] = changed_lines_from_patch(filename, patch)
-                try:
-                    content_file = gh_repo.get_contents(filename, ref=pr.head.sha)
-                    if isinstance(content_file, list):
-                        continue
-                    files[filename] = content_file.decoded_content.decode("utf-8", errors="replace")
-                except Exception:
-                    if patch:
-                        files[filename] = patch
+                changed_files.append(filename)
+                if patch:
+                    files[filename] = patch
+                    touched[filename] = changed_lines_from_patch(filename, patch)
+                else:
+                    unavailable[filename] = "patch_unavailable"
             log_event(
                 logger,
                 "info",
@@ -722,7 +722,14 @@ class GitHubRepoReader:
                 files=len(files),
                 touched_files=len(touched),
             )
-            return f"{repo_slug}#{pr_number}", files, touched
+            return GitHubDiffEvidence(
+                snapshot=f"{repo_slug}#{pr_number}",
+                head_sha=str(getattr(getattr(pr, "head", None), "sha", "") or ""),
+                patches=files,
+                changed_files=changed_files,
+                touched_lines=touched,
+                patch_unavailable_files=unavailable,
+            )
         except Exception as exc:
             logger.warning("repo_review PyGithub PR fallback repo={} pr={} reason={}", repo, pr_number, exc)
             return None

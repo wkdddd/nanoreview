@@ -259,37 +259,6 @@ class ReviewJudgeSettings(Base):
     )
 
 
-class ReviewAutoTaskSettings(Base):
-    """GitHub PR auto-review task configuration."""
-
-    enabled: bool = True
-    github_webhook_secret: str = Field(
-        default="",
-        validation_alias=AliasChoices("githubWebhookSecret", "github_webhook_secret"),
-        serialization_alias="githubWebhookSecret",
-    )
-    allowed_actions: list[str] = Field(
-        default_factory=lambda: ["opened", "reopened", "synchronize", "ready_for_review"],
-        validation_alias=AliasChoices("allowedActions", "allowed_actions"),
-        serialization_alias="allowedActions",
-    )
-    ignore_drafts: bool = Field(
-        default=True,
-        validation_alias=AliasChoices("ignoreDrafts", "ignore_drafts"),
-        serialization_alias="ignoreDrafts",
-    )
-    default_mode: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("defaultMode", "default_mode"),
-        serialization_alias="defaultMode",
-    )
-    default_focus: list[str] | None = Field(
-        default=None,
-        validation_alias=AliasChoices("defaultFocus", "default_focus"),
-        serialization_alias="defaultFocus",
-    )
-
-
 class ReviewConfig(Base):
     """Code review configuration defaults."""
 
@@ -297,7 +266,7 @@ class ReviewConfig(Base):
     default_focus: list[str] = Field(default_factory=lambda: [
         "security", "tests", "architecture", "performance"
     ])
-    max_subagents: int = Field(default=4, ge=1, le=10)
+    max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None
     rag_enable: bool = True
     rag_max_results: int = Field(default=8, ge=1, le=30)
@@ -311,11 +280,6 @@ class ReviewConfig(Base):
     subagent_reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = None
     github_diff_enable: bool = True
     judge: ReviewJudgeSettings = Field(default_factory=ReviewJudgeSettings)
-    auto_tasks: ReviewAutoTaskSettings = Field(
-        default_factory=ReviewAutoTaskSettings,
-        validation_alias=AliasChoices("autoTasks", "auto_tasks"),
-        serialization_alias="autoTasks",
-    )
 
 
 class Config(BaseSettings):

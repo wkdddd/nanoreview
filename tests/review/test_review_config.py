@@ -20,3 +20,9 @@ def test_review_token_budget_fields_accept_camel_case() -> None:
 def test_review_config_accepts_subagent_reasoning_effort() -> None:
     config = Config.model_validate({"review": {"subagentReasoningEffort": "medium"}})
     assert config.review.subagent_reasoning_effort == "medium"
+
+
+def test_review_config_uses_per_review_concurrency_field() -> None:
+    config = Config.model_validate({"review": {"maxConcurrentSubagents": 3}})
+
+    assert config.review.max_concurrent_subagents == 3

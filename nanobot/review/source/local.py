@@ -10,7 +10,8 @@ from pathlib import Path
 from loguru import logger
 
 from nanobot.agent.tools.path_utils import WORKSPACE_BOUNDARY_NOTE, is_under
-from nanobot.rag.review_service import DEFAULT_BINARY_EXTS, RepositoryRAGOptions
+from nanobot.rag.review_service import RepositoryRAGOptions
+from nanobot.review.file_filter import review_file_filter_reason
 
 _KEY_FILES = (
     "README.md",
@@ -186,7 +187,7 @@ class LocalRepoReader:
                 | set(repo.git.diff("--name-only", "--cached").splitlines())
                 | set(str(path) for path in repo.untracked_files)
             )
-            changed = [path for path in changed if path and Path(path).suffix.lower() not in DEFAULT_BINARY_EXTS]
+            changed = [path for path in changed if review_file_filter_reason(path) is None]
             lines = ["Local Diff:", "-" * 40, f"Changed text files: {len(changed)}"]
             lines.extend(f"- {path}" for path in changed[:200])
             if len(changed) > 200:
@@ -228,7 +229,13 @@ class LocalRepoReader:
             return "", "", "", "unknown"
 
     def _iter_files(self, root: Path) -> list[Path]:
-        return [item for item in self._walk(root) if item.is_file() and item.suffix.lower() not in self.options.binary_extensions]
+        return [
+            item
+            for item in self._walk(root)
+            if item.is_file()
+            and review_file_filter_reason(item.relative_to(root).as_posix()) is None
+            and item.suffix.lower() not in self.options.binary_extensions
+        ]
 
     def _walk(self, root: Path) -> list[Path]:
         results: list[Path] = []
@@ -259,6 +266,8 @@ class LocalRepoReader:
         try:
             rel_parts = path.relative_to(base).parts
         except ValueError:
+            return True
+        if review_file_filter_reason(path.relative_to(base).as_posix()) is not None:
             return True
         if self._ignored_dir_parts(rel_parts):
             return True

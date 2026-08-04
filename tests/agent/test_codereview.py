@@ -53,7 +53,7 @@ def test_review_role_sets() -> None:
     assert len(ALL_REVIEW_ROLES) == 7
 
 
-def test_build_code_review_context_quick_mode_caps_subagents() -> None:
+def test_build_code_review_context_keeps_subagent_limit_independent_of_mode() -> None:
     prompt = build_code_review_context(
         target="https://github.com/test/repo",
         focus="security,tests",
@@ -63,7 +63,8 @@ def test_build_code_review_context_quick_mode_caps_subagents() -> None:
 
     assert "QUICK review" in prompt
     assert "critical and high" in prompt
-    assert "up to 2 total" in prompt
+    assert "up to 6 total" in prompt
+    assert "Subagent limit: 6; it is configured independently of review depth." in prompt
 
 
 def test_build_code_review_context_deep_mode_mentions_thorough() -> None:
@@ -203,9 +204,9 @@ async def test_resolved_github_prompt_does_not_refetch_after_empty_prefetch() ->
         },
     )
 
-    assert "GitHub evidence prefetch was already attempted" in prompt
-    assert "Do not call `github_review` again" in prompt
-    assert "MUST call github_review" not in prompt
+    assert "submit_review_plan" in prompt
+    assert "no program-authorized evidence references" in prompt
+    assert "spawn" in prompt
 
 
 def test_build_code_review_context_uses_user_requirements() -> None:

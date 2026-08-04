@@ -30,9 +30,6 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
-from nanobot.review.auto_tasks.github import parse_pull_request_event, verify_github_signature
-from nanobot.review.auto_tasks.service import AutoTaskService
-from nanobot.review.auto_tasks.store import AutoTaskStore
 from nanobot.bus.events import OUTBOUND_META_AGENT_UI, InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -42,7 +39,6 @@ from nanobot.config.schema import Base, Config
 from nanobot.review import normalize_review_action, normalize_review_target_type
 from nanobot.review.input import parse_repo_target
 from nanobot.utils.helpers import safe_filename
-from nanobot.utils.log_style import log_event
 from nanobot.utils.media_decode import (
     FileSizeExceeded,
     save_base64_data_url,
@@ -553,15 +549,6 @@ class WebSocketChannel(BaseChannel):
         self._runtime_model_name = runtime_model_name
         self._runtime_usage = runtime_usage
         self._root_config = root_config
-        self._auto_tasks = (
-            AutoTaskService(
-                root_config,
-                AutoTaskStore(),
-                review_starter=self.start_review_task,
-            )
-            if root_config is not None
-            else None
-        )
         # Process-local secret used to HMAC-sign media URLs. The signed URL is
         # the capability — anyone who holds a valid URL can fetch that one
         # file, nothing else. The secret regenerates on restart so links
@@ -1310,7 +1297,7 @@ class WebSocketChannel(BaseChannel):
         cache_root = workspace / ".nanobot" / "review_github"
         if not cache_root.is_dir():
             raise CodeContextError(404, "review snapshot not found")
-        raw_target = str(metadata.get("review_target") or metadata.get("github_repo") or "").strip()
+        raw_target = str(metadata.get("review_target") or "").strip()
         target = parse_repo_target(raw_target) or raw_target
         candidates: list[Path] = []
         for manifest in cache_root.glob("*/.nanobot_snapshot.json"):
@@ -1413,141 +1400,6 @@ class WebSocketChannel(BaseChannel):
         deleted = self._session_manager.delete_session(key)
         delete_webui_thread(key)
         return bool(deleted)
-
-    def _extract_review_report_markdown(self, chat_id: str) -> str:
-        data = self._webui_thread_payload(f"websocket:{chat_id}")
-        if not isinstance(data, dict):
-            return ""
-        messages = data.get("messages")
-        if not isinstance(messages, list):
-            return ""
-        for item in reversed(messages):
-            if not isinstance(item, dict):
-                continue
-            if item.get("role") != "assistant":
-                continue
-            content = item.get("content")
-            if isinstance(content, str) and content.strip():
-                return content
-        return ""
-
-    def _is_auto_task_chat(self, chat_id: str) -> bool:
-        if self._session_manager is None or not _is_valid_chat_id(chat_id):
-            return False
-        row = self._session_manager.read_session_file(f"websocket:{chat_id}")
-        meta = row.get("metadata", {}) if isinstance(row, dict) else {}
-        return isinstance(meta, dict) and isinstance(meta.get("auto_task_run_id"), str)
-
-    def _complete_auto_task_run_from_chat(self, chat_id: str) -> None:
-        if self._auto_tasks is None or self._session_manager is None:
-            return
-        session = self._session_manager.get_or_create(f"websocket:{chat_id}")
-        run_id = session.metadata.get("auto_task_run_id")
-        task_id = session.metadata.get("auto_task_id")
-        if not isinstance(run_id, str) or not isinstance(task_id, str):
-            return
-        run = self._auto_tasks.get_run(task_id, run_id)
-        if run is None or run.status in {"completed", "failed", "skipped"}:
-            return
-        report = self._extract_review_report_markdown(chat_id)
-        run.report_markdown = report
-        run.status = "completed" if report.strip() else "failed"
-        if not report.strip():
-            run.reason = "review report not found"
-        run.completed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self._auto_tasks.store.save_run(run)
-        log_event(
-            logger,
-            "info" if run.status == "completed" else "warning",
-            "auto_task.run.completed",
-            status=run.status,
-            task_id=task_id,
-            run_id=run_id,
-            session=f"websocket:{chat_id}",
-            report_chars=len(report),
-        )
-
-    async def start_review_task(self, payload: dict[str, Any]) -> dict[str, str]:
-        """Start a WebUI-backed review turn without requiring a browser client."""
-        if self._session_manager is None:
-            raise RuntimeError("session manager unavailable")
-        chat_id = str(uuid.uuid4())
-        session_key = f"websocket:{chat_id}"
-        target = str(payload.get("target") or "").strip()
-        if not target:
-            raise ValueError("review target is required")
-        action = normalize_review_action(str(payload.get("action") or "diff")).value
-        target_type = normalize_review_target_type(str(payload.get("target_type") or "github"), target)
-        mode = str(payload.get("mode") or "full").strip().lower()
-        if mode not in {"quick", "full", "deep"}:
-            mode = "full"
-        focus_raw = payload.get("focus")
-        focus = [str(item).strip() for item in focus_raw if str(item).strip()] if isinstance(focus_raw, list) else []
-        extra_meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-
-        session = self._session_manager.get_or_create(session_key)
-        session.metadata.update(
-            {
-                "review_mode": True,
-                "review_target": target,
-                "review_target_type": target_type or "github",
-                "review_action": action,
-                "review_mode_variant": mode,
-                **extra_meta,
-            }
-        )
-        if focus:
-            session.metadata["review_focus"] = focus
-        self._session_manager.save(session)
-        if isinstance(extra_meta.get("auto_task_run_id"), str):
-            log_event(
-                logger,
-                "info",
-                "auto_task.session.marked",
-                status="success",
-                task_id=extra_meta.get("auto_task_id"),
-                run_id=extra_meta.get("auto_task_run_id"),
-                session=session_key,
-                target=target,
-                target_type=target_type or "github",
-                action=action,
-                mode=mode,
-            )
-
-        metadata: dict[str, Any] = {
-            "webui": True,
-            "review_target": target,
-            "review_target_type": target_type or "github",
-            "review_action": action,
-            "review_mode_variant": mode,
-            **extra_meta,
-        }
-        if focus:
-            metadata["review_focus"] = focus
-
-        content = str(payload.get("content") or "Review").strip() or "Review"
-        await self._handle_message(
-            sender_id="auto-task",
-            chat_id=chat_id,
-            content=content,
-            media=None,
-            metadata=metadata,
-            session_key=session_key,
-            is_dm=False,
-        )
-        log_event(
-            logger,
-            "info",
-            "auto_task.review.started",
-            status="success",
-            session=session_key,
-            task_id=extra_meta.get("auto_task_id"),
-            run_id=extra_meta.get("auto_task_run_id"),
-            target=target,
-            action=action,
-            mode=mode,
-        )
-        return {"chat_id": chat_id, "session_key": session_key}
 
     def _try_append_webui_transcript(self, chat_id: str, wire: dict[str, Any]) -> None:
         sk = f"websocket:{chat_id}"
@@ -2038,136 +1890,6 @@ class WebSocketChannel(BaseChannel):
             },
         )
 
-    async def _aiohttp_auto_tasks(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        return web.json_response({"tasks": [task.to_dict() for task in self._auto_tasks.list_tasks()]})
-
-    async def _json_body(self, request: web.Request) -> dict[str, Any]:
-        if request.can_read_body:
-            try:
-                data = await request.json()
-            except Exception as exc:
-                raise ValueError("invalid JSON body") from exc
-            if not isinstance(data, dict):
-                raise ValueError("JSON body must be an object")
-            return data
-        return {}
-
-    async def _aiohttp_auto_task_create(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        try:
-            task = self._auto_tasks.create_task(await self._json_body(request))
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-        return web.json_response({"task": task.to_dict()}, status=201)
-
-    async def _aiohttp_auto_task_update(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        try:
-            task = self._auto_tasks.update_task(request.match_info["task_id"], await self._json_body(request))
-        except ValueError as exc:
-            return web.json_response({"error": str(exc)}, status=400)
-        if task is None:
-            return web.json_response({"error": "task not found"}, status=404)
-        return web.json_response({"task": task.to_dict()})
-
-    async def _aiohttp_auto_task_delete(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        deleted = self._auto_tasks.delete_task(request.match_info["task_id"])
-        return web.json_response({"deleted": bool(deleted)})
-
-    async def _aiohttp_auto_task_runs(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        task_id = request.match_info["task_id"]
-        return web.json_response({"runs": [run.to_dict() for run in self._auto_tasks.list_runs(task_id)]})
-
-    async def _aiohttp_auto_task_run_now(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        task_id = request.match_info["task_id"]
-        task = self._auto_tasks.store.get_task(task_id)
-        if task is None:
-            return web.json_response({"error": "task not found"}, status=404)
-        try:
-            body = await self._json_body(request)
-            pr_number = int(body.get("pr_number") or body.get("prNumber") or 0)
-        except (ValueError, TypeError):
-            return web.json_response({"error": "pr_number is required"}, status=400)
-        if pr_number <= 0:
-            return web.json_response({"error": "pr_number is required"}, status=400)
-        from nanobot.review.auto_tasks.github import GitHubPullRequestEvent
-
-        event = GitHubPullRequestEvent(
-            action="manual",
-            repo=task.repo,
-            pr_number=pr_number,
-            pr_title=str(body.get("pr_title") or body.get("prTitle") or ""),
-            pr_url=str(body.get("pr_url") or body.get("prUrl") or f"https://github.com/{task.repo}/pull/{pr_number}"),
-            draft=False,
-        )
-        run = await self._auto_tasks.run_task(task, event)
-        return web.json_response({"run": run.to_dict()})
-
-    async def _aiohttp_auto_task_report(self, request: web.Request) -> web.Response:
-        if not self._check_aiohttp_api_token(request):
-            return web.json_response({"error": "Unauthorized"}, status=401)
-        if self._auto_tasks is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        run = self._auto_tasks.get_run(request.match_info["task_id"], request.match_info["run_id"])
-        if run is None:
-            return web.json_response({"error": "run not found"}, status=404)
-        if not run.report_markdown.strip():
-            return web.json_response({"error": "report not available"}, status=404)
-        filename = run.report_filename or f"review-{run.repo.replace('/', '-')}-pr-{run.pr_number}.md"
-        return web.Response(
-            text=run.report_markdown,
-            content_type="text/markdown",
-            charset="utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-
-    async def _aiohttp_github_webhook(self, request: web.Request) -> web.Response:
-        if self._auto_tasks is None or self._root_config is None:
-            return web.json_response({"error": "auto tasks unavailable"}, status=503)
-        secret = self._root_config.review.auto_tasks.github_webhook_secret.strip()
-        if not secret:
-            log_event(logger, "warning", "auto_task.webhook.rejected", status="failed", reason="secret_missing")
-            return web.json_response({"error": "github webhook secret is not configured"}, status=503)
-        body = await request.read()
-        signature = request.headers.get("X-Hub-Signature-256")
-        if not verify_github_signature(secret=secret, body=body, signature=signature):
-            log_event(logger, "warning", "auto_task.webhook.rejected", status="failed", reason="bad_signature")
-            return web.json_response({"error": "invalid signature"}, status=401)
-        event_name = request.headers.get("X-GitHub-Event", "")
-        if event_name != "pull_request":
-            log_event(logger, "info", "auto_task.webhook.skip", status="skipped", reason="event_not_supported", event=event_name)
-            return web.json_response({"accepted": True, "runs": [], "reason": "event_not_supported"})
-        try:
-            payload = json.loads(body.decode("utf-8"))
-            event = parse_pull_request_event(payload)
-        except Exception as exc:
-            log_event(logger, "warning", "auto_task.webhook.bad_payload", status="failed", reason=exc)
-            return web.json_response({"error": "invalid pull_request payload"}, status=400)
-        runs = await self._auto_tasks.trigger_for_event(event)
-        return web.json_response({"accepted": True, "runs": [run.to_dict() for run in runs]})
-
     async def _aiohttp_ws_handler(self, request: web.Request) -> web.StreamResponse:
         if not _is_aiohttp_websocket_upgrade(request):
             if self._static_dist_path is not None:
@@ -2264,16 +1986,6 @@ class WebSocketChannel(BaseChannel):
         app.router.add_post("/api/sessions/{key}/delete", self._aiohttp_session_delete)
         app.router.add_get("/api/sessions/{key}/delete", self._aiohttp_session_delete)
         app.router.add_get("/api/sessions/{key}/update", self._aiohttp_session_update)
-        app.router.add_get("/api/auto-tasks", self._aiohttp_auto_tasks)
-        app.router.add_post("/api/auto-tasks", self._aiohttp_auto_task_create)
-        app.router.add_post("/api/auto-tasks/create", self._aiohttp_auto_task_create)
-        app.router.add_patch("/api/auto-tasks/{task_id}", self._aiohttp_auto_task_update)
-        app.router.add_post("/api/auto-tasks/{task_id}/update", self._aiohttp_auto_task_update)
-        app.router.add_post("/api/auto-tasks/{task_id}/delete", self._aiohttp_auto_task_delete)
-        app.router.add_post("/api/auto-tasks/{task_id}/run", self._aiohttp_auto_task_run_now)
-        app.router.add_get("/api/auto-tasks/{task_id}/runs", self._aiohttp_auto_task_runs)
-        app.router.add_get("/api/auto-tasks/{task_id}/runs/{run_id}/report", self._aiohttp_auto_task_report)
-        app.router.add_post("/api/webhooks/github", self._aiohttp_github_webhook)
         app.router.add_get("/api/media/{sig}/{payload}", self._aiohttp_media_fetch)
         app.router.add_get(self._expected_path(), self._aiohttp_ws_handler)
         if self._static_dist_path is not None:
@@ -2331,12 +2043,6 @@ class WebSocketChannel(BaseChannel):
             self.config.host,
             self.config.port,
             self.config.path,
-        )
-        self.logger.info(
-            "GitHub auto-task webhook route enabled at {}://{}:{}/api/webhooks/github",
-            scheme,
-            self.config.host,
-            self.config.port,
         )
         if self.config.token_issue_path:
             self.logger.info(
@@ -2769,7 +2475,6 @@ class WebSocketChannel(BaseChannel):
             raise
 
     async def send(self, msg: OutboundMessage) -> None:
-        auto_task_backed = self._is_auto_task_chat(msg.chat_id)
         if msg.metadata.get("_runtime_model_updated"):
             await self.send_runtime_model_updated(
                 model_name=msg.metadata.get("model"),
@@ -2793,7 +2498,7 @@ class WebSocketChannel(BaseChannel):
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.
         conns = list(self._subs.get(msg.chat_id, ()))
         persist_without_subscribers = False
-        if not conns and not auto_task_backed:
+        if not conns:
             if (
                 msg.metadata.get("_turn_end")
                 or msg.metadata.get("_session_updated")
@@ -2830,7 +2535,6 @@ class WebSocketChannel(BaseChannel):
                 latency_ms=lat_i,
                 turn_trace=trace_items,
             )
-            self._complete_auto_task_run_from_chat(msg.chat_id)
             return
         if msg.metadata.get("_session_updated"):
             await self.send_session_updated(msg.chat_id)
@@ -2904,8 +2608,7 @@ class WebSocketChannel(BaseChannel):
             body["subagent_label"] = subagent_label
         self._try_append_webui_transcript(chat_id, body)
         conns = list(self._subs.get(chat_id, ()))
-        auto_task_backed = self._is_auto_task_chat(chat_id)
-        if not conns and not auto_task_backed:
+        if not conns:
             return
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
@@ -2933,8 +2636,7 @@ class WebSocketChannel(BaseChannel):
             body["subagent_label"] = subagent_label
         self._try_append_webui_transcript(chat_id, body)
         conns = list(self._subs.get(chat_id, ()))
-        auto_task_backed = self._is_auto_task_chat(chat_id)
-        if not conns and not auto_task_backed:
+        if not conns:
             return
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
@@ -2947,7 +2649,6 @@ class WebSocketChannel(BaseChannel):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         conns = list(self._subs.get(chat_id, ()))
-        auto_task_backed = self._is_auto_task_chat(chat_id)
         meta = metadata or {}
         if meta.get("_stream_end"):
             body: dict[str, Any] = {"event": "stream_end", "chat_id": chat_id}
@@ -2968,7 +2669,7 @@ class WebSocketChannel(BaseChannel):
         if subagent_label is not None:
             body["subagent_label"] = subagent_label
         self._try_append_webui_transcript(chat_id, body)
-        if not conns and not auto_task_backed:
+        if not conns:
             return
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
@@ -2997,8 +2698,7 @@ class WebSocketChannel(BaseChannel):
         }
         self._try_append_webui_transcript(chat_id, body)
         conns = list(self._subs.get(chat_id, ()))
-        auto_task_backed = self._is_auto_task_chat(chat_id)
-        if not conns and not auto_task_backed:
+        if not conns:
             return
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:
@@ -3019,8 +2719,7 @@ class WebSocketChannel(BaseChannel):
             body["turn_trace"] = turn_trace
         self._try_append_webui_transcript(chat_id, body)
         conns = list(self._subs.get(chat_id, ()))
-        auto_task_backed = self._is_auto_task_chat(chat_id)
-        if not conns and not auto_task_backed:
+        if not conns:
             return
         raw = json.dumps(body, ensure_ascii=False)
         for connection in conns:

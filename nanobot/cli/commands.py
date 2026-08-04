@@ -632,7 +632,13 @@ def gateway(
             filter=lambda record: record["extra"].setdefault("channel", "-") or True,
         )
     cfg = _load_runtime_config(config, workspace)
-    _run_gateway(cfg, port=port)
+    from nanobot.utils.gateway_logging import configure_gateway_file_logging
+
+    gateway_log = configure_gateway_file_logging(cfg.workspace_path)
+    try:
+        _run_gateway(cfg, port=port)
+    finally:
+        gateway_log.close()
 
 
 def _run_gateway(
@@ -866,7 +872,11 @@ def review(
     mode: str = typer.Option("full", "--mode", help="Review mode: quick, deep, or full"),
     target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto, github, or local"),
     action: str = typer.Option("repo", "--action", help="Review action: repo or diff"),
-    max_subagents: int | None = typer.Option(None, "--max-subagents", help="Maximum concurrent subagents"),
+    max_concurrent_subagents: int | None = typer.Option(
+        None,
+        "--max-concurrent-subagents",
+        help="Maximum concurrent review subagents",
+    ),
     fail_on: str | None = typer.Option(None, "--fail-on", help="Exit non-zero if findings at or above: critical|high|medium|low"),
     workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
@@ -918,7 +928,10 @@ def review(
     async def run_once() -> None:
         try:
             normalize_focus(focus)
-            effective_max_subagents = max_subagents or loaded.review.max_subagents
+            effective_max_subagents = (
+                max_concurrent_subagents
+                or loaded.review.max_concurrent_subagents
+            )
 
             session_key = "cli:review"
             session = agent_loop.sessions.get_or_create(session_key)

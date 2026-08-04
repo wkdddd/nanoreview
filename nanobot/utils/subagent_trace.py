@@ -22,7 +22,6 @@ import hashlib
 import json
 import os
 import queue
-import re
 import threading
 import time
 from collections import defaultdict
@@ -32,6 +31,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.config.paths import get_webui_dir
+from nanobot.utils.log_sanitization import sanitize_persisted_log_text
 
 # ---------------------------------------------------------------------------
 # Limits
@@ -45,31 +45,6 @@ _FLUSH_TIMEOUT = 5.0  # seconds
 _QUEUE_MAX = 512  # max items in queue; excess events are dropped
 
 # ---------------------------------------------------------------------------
-# Credential / control-marker patterns for trace sanitisation
-# ---------------------------------------------------------------------------
-
-_BEARER_TOKEN = re.compile(r"(Bearer\s+)([A-Za-z0-9\-._~+/=]+)", re.IGNORECASE)
-_API_KEY_OPENAI = re.compile(r"sk-[A-Za-z0-9]{20,}")
-_GITHUB_TOKEN = re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}")
-_SLACK_TOKEN = re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}")
-_PRIVATE_KEY_BLOCK = re.compile(
-    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----"
-    r".*?"
-    r"-----END (?:RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----",
-    re.DOTALL,
-)
-_URL_PASSWORD = re.compile(r"(://[^:/\s]+:)([^@\s]+)(@)")
-
-# DSML / model control markers
-_DSML_PATTERNS = [
-    re.compile(r"<\|[^|]*\|>"),  # <|im_start|>, <|endoftext|>, ...
-    re.compile(r"</?think(?:ing)?>", re.IGNORECASE),
-    re.compile(r"</?reflection>", re.IGNORECASE),
-]
-
-_REDACTED = "***REDACTED***"
-
-
 def sanitize_trace_text(text: str) -> str:
     """Sanitize text for trace persistence.
 
@@ -77,17 +52,7 @@ def sanitize_trace_text(text: str) -> str:
     (Bearer tokens, OpenAI / GitHub / Slack tokens, private-key blocks,
     URL passwords).
     """
-    if not text:
-        return text
-    for pattern in _DSML_PATTERNS:
-        text = pattern.sub("", text)
-    text = _BEARER_TOKEN.sub(rf"\1{_REDACTED}", text)
-    text = _API_KEY_OPENAI.sub(_REDACTED, text)
-    text = _GITHUB_TOKEN.sub(_REDACTED, text)
-    text = _SLACK_TOKEN.sub(_REDACTED, text)
-    text = _PRIVATE_KEY_BLOCK.sub("***REDACTED PRIVATE KEY***", text)
-    text = _URL_PASSWORD.sub(rf"\1{_REDACTED}\3", text)
-    return text
+    return sanitize_persisted_log_text(text)
 
 
 # ---------------------------------------------------------------------------
