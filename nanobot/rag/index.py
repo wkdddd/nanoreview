@@ -69,7 +69,7 @@ class RAGIndex:
         dimensions: int = 1024,
     ) -> None:
         self.workspace = workspace.expanduser().resolve()
-        self.db_path = db_path or self.workspace / ".nanobot" / "context_index.sqlite"
+        self.db_path = db_path or self.workspace / ".nanoreview" / "context_index.sqlite"
         self.embedding_client = embedding_client
         self.rerank_client = rerank_client
         self.vector_store = vector_store

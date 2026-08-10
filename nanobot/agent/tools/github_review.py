@@ -101,7 +101,7 @@ class GitHubReviewTool(ReviewToolBase):
             "GitHub repository reader and review evidence tool. Use meta/tree/file for "
             "read-only GitHub API inspection, repo for RAG-backed full or scoped remote evidence retrieval, "
             "and diff for programmatically filtered GitHub pull request patches. Do not clone repositories; repo/diff "
-            "actions use fixed snapshots under workspace/.nanobot/review_github."
+            "actions use fixed snapshots under workspace/.nanoreview/review_github."
         )
 
     async def execute(

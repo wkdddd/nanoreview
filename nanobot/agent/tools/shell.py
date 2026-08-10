@@ -24,7 +24,7 @@ _IS_WINDOWS = sys.platform == "win32"
 _CLONE_COMMAND_ERROR = (
     "Error: Command blocked by safety guard (repository clone commands are disabled). "
     "Use github_review for GitHub repositories; remote review snapshots are saved only "
-    "under workspace/.nanobot/review_github."
+    "under workspace/.nanoreview/review_github."
 )
 
 

@@ -183,9 +183,9 @@ class QQChannel(BaseChannel):
             try:
                 root = Path(get_media_dir("qq"))
             except Exception:
-                root = Path.home() / ".nanobot" / "media" / "qq"
+                root = Path.home() / ".nanoreview" / "media" / "qq"
         else:
-            root = Path.home() / ".nanobot" / "media" / "qq"
+            root = Path.home() / ".nanoreview" / "media" / "qq"
 
         root.mkdir(parents=True, exist_ok=True)
         self.logger.info("media directory: {}", str(root))

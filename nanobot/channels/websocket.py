@@ -1294,13 +1294,13 @@ class WebSocketChannel(BaseChannel):
 
     def _resolve_github_snapshot_file(self, metadata: dict[str, Any], rel_path: str) -> Path:
         workspace = self._workspace_root()
-        cache_root = workspace / ".nanobot" / "review_github"
+        cache_root = workspace / ".nanoreview" / "review_github"
         if not cache_root.is_dir():
             raise CodeContextError(404, "review snapshot not found")
         raw_target = str(metadata.get("review_target") or "").strip()
         target = parse_repo_target(raw_target) or raw_target
         candidates: list[Path] = []
-        for manifest in cache_root.glob("*/.nanobot_snapshot.json"):
+        for manifest in cache_root.glob("*/.nanoreview_snapshot.json"):
             snapshot_dir = manifest.parent
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))

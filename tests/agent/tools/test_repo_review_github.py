@@ -14,6 +14,7 @@ from nanobot.agent.tools.context import (
 from nanobot.agent.tools.filesystem import ReadFileTool
 from nanobot.agent.tools.github_review import GitHubReviewTool
 from nanobot.agent.tools.local_review import LocalReviewTool
+from nanobot.config import loader
 from nanobot.config.schema import Config
 from nanobot.rag.review_service import rrf_merge
 from nanobot.rag.utils import IndexedChunk, IndexedHit
@@ -368,8 +369,11 @@ async def test_github_review_blocked_for_local_review_context(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_read_file_blocks_workspace_files_for_github_review_context(tmp_path: Path) -> None:
-    target = tmp_path / ".nanobot" / "tool-results" / "session" / "call.txt"
+async def test_read_file_blocks_workspace_files_for_github_review_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loader, "_current_config_path", tmp_path / "config.json")
+    target = tmp_path / ".nanoreview" / "tool-results" / "session" / "call.txt"
     target.parent.mkdir(parents=True)
     target.write_text("remote output cache\n", encoding="utf-8")
     token = set_current_request_context(

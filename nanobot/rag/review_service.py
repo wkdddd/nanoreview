@@ -716,7 +716,7 @@ class RepositoryRAGService:
             return True
         if rel_parts[:3] == ("references", "web", "pages"):
             return True
-        return bool(rel_parts and rel_parts[0] == ".nanobot")
+        return bool(rel_parts and rel_parts[0] == ".nanoreview")
 
     def related_test_paths(self, rel_path: str) -> list[str]:
         source = PureRepoPath(rel_path)
@@ -744,7 +744,7 @@ class RepositoryRAGService:
         scope_digest = _snapshot_scope_digest(snapshot_name, files)
         cache_root = (
             self.workspace
-            / ".nanobot"
+            / ".nanoreview"
             / "review_github"
             / f"{_safe_slug(snapshot_name)}_{scope_digest}"
         )
@@ -766,7 +766,7 @@ class RepositoryRAGService:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8", newline="\n")
-        (cache_root / ".nanobot_snapshot.json").write_text(
+        (cache_root / ".nanoreview_snapshot.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
             newline="\n",

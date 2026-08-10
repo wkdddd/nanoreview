@@ -44,7 +44,7 @@ class Nanobot:
 
         Args:
             config_path: Path to ``config.json``.  Defaults to
-                ``~/.nanobot/config.json``.
+                ``~/.nanoreview/config.json``.
             workspace: Override the workspace directory from config.
         """
         from nanobot.config.loader import load_config, resolve_config_env_vars

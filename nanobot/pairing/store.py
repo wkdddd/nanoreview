@@ -1,6 +1,6 @@
 """Pairing store for DM sender approval.
 
-Persistent storage at ``~/.nanobot/pairing.json`` keeps approved senders
+Persistent storage at ``~/.nanoreview/pairing.json`` keeps approved senders
 and pending pairing codes per channel.  The store is designed for
 private-assistant scale: small JSON file, simple locking, no external DB.
 """

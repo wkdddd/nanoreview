@@ -46,7 +46,7 @@ DEFAULT_REVIEW_IGNORE_GLOBS = (
     "*.gif",
     "*.ico",
     "*.lock",
-    ".nanobot_snapshot.json",
+    ".nanoreview_snapshot.json",
 )
 
 _LOCK_FILENAMES = frozenset(

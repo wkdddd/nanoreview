@@ -278,4 +278,4 @@ class LocalRepoReader:
             return True
         if rel_parts[:3] == ("references", "web", "pages"):
             return True
-        return bool(rel_parts and rel_parts[0] == ".nanobot")
+        return bool(rel_parts and rel_parts[0] == ".nanoreview")

@@ -110,5 +110,6 @@ review-webui/node_modules/
 nanobot-competition-post/
 
 .nanobot/
+.nanoreview/
 
 .trae-html-share-packages/

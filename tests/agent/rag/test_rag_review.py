@@ -459,7 +459,7 @@ def test_repository_rag_snapshot_cache_is_scoped_by_file_set(tmp_path: Path) -> 
     assert [path.relative_to(narrow).as_posix() for path in service.iter_candidate_files(narrow)] == [
         "review-webui/index.html"
     ]
-    manifest = (narrow / ".nanobot_snapshot.json").read_text(encoding="utf-8")
+    manifest = (narrow / ".nanoreview_snapshot.json").read_text(encoding="utf-8")
     assert '"scope_digest"' in manifest
     assert '"files_count": 1' in manifest
 
