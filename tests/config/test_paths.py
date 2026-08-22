@@ -1,14 +1,14 @@
 from pathlib import Path
 
-from nanobot.config import loader
-from nanobot.config.paths import (
+from nanoreview.config import loader
+from nanoreview.config.paths import (
     get_bridge_install_dir,
     get_cli_history_path,
     get_legacy_sessions_dir,
     get_workspace_path,
     is_default_workspace,
 )
-from nanobot.config.schema import Config
+from nanoreview.config.schema import Config
 
 
 def test_default_paths_use_nanoreview_data_directory(monkeypatch, tmp_path: Path) -> None:

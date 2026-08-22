@@ -6,10 +6,10 @@ import json
 import pytest
 from loguru import logger
 
-from nanobot.agent.hooks import AgentHookContext, ReviewFinalizerHook
-from nanobot.review.input import policy_for_depth
-from nanobot.review.output.finalizer import ReviewFinalizer
-from nanobot.review.types import (
+from nanoreview.agent.hooks import AgentHookContext, ReviewFinalizerHook
+from nanoreview.review.input import policy_for_depth
+from nanoreview.review.output.finalizer import ReviewFinalizer
+from nanoreview.review.types import (
     ReviewJudgeDecision,
     ReviewJudgeVerdict,
     normalize_review_dimension,

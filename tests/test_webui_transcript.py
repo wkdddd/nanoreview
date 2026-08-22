@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nanobot.utils.webui_transcript import (
+from nanoreview.utils.webui_transcript import (
     append_transcript_object,
     read_transcript_lines,
     replay_transcript_to_subagent_cards,
@@ -84,7 +84,7 @@ def test_subagent_content_is_replayed_in_its_card_not_main_messages() -> None:
 def test_transcript_persistence_sanitizes_nested_text_and_enforces_total_limit(
     monkeypatch, tmp_path
 ) -> None:
-    import nanobot.utils.webui_transcript as transcript
+    import nanoreview.utils.webui_transcript as transcript
 
     monkeypatch.setattr(transcript, "get_webui_dir", lambda: tmp_path)
     monkeypatch.setattr(transcript, "_MAX_TRANSCRIPT_FILE_BYTES", 180)

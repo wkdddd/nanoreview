@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from nanobot.bus.events import InboundMessage
-from nanobot.command.builtin import cmd_stop
-from nanobot.command.router import CommandContext
+from nanoreview.bus.events import InboundMessage
+from nanoreview.command.builtin import cmd_stop
+from nanoreview.command.router import CommandContext
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
-from nanobot.rag.review_service import (
+from nanoreview.rag.review_service import (
     REMOTE_SOURCE_TYPE,
     RepoReviewHit,
     RepositoryRAGOptions,
@@ -14,14 +14,14 @@ from nanobot.rag.review_service import (
     RepositoryRAGService,
     rrf_merge,
 )
-from nanobot.rag.utils import IndexedChunk, IndexedHit
-from nanobot.review.planning.evidence import ReviewEvidenceService
-from nanobot.review.source.utils import (
+from nanoreview.rag.utils import IndexedChunk, IndexedHit
+from nanoreview.review.planning.evidence import ReviewEvidenceService
+from nanoreview.review.source.utils import (
     changed_lines_from_patch,
     parse_pr_target,
     parse_repo,
 )
-from nanobot.review.types import GitHubDiffEvidence, LocalReviewScope
+from nanoreview.review.types import GitHubDiffEvidence, LocalReviewScope
 
 
 class _GitHub:

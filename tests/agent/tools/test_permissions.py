@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.config.schema import Config
+from nanoreview.agent.tools.shell import ExecTool
+from nanoreview.config.schema import Config
 
 
 def _guard(tool: ExecTool, command: str, cwd: Path) -> str | None:

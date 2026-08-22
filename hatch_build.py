@@ -1,4 +1,4 @@
-"""Hatch build hook that bundles the review webui (Vite) into nanobot/web/dist.
+"""Hatch build hook that bundles the review webui (Vite) into nanoreview/web/dist.
 
 Triggered automatically by `python -m build` (and any other hatch-driven build)
 so published wheels and sdists ship a fresh review webui without requiring developers
@@ -10,9 +10,9 @@ Behaviour:
   development; webui contributors use `cd review-webui && bun run dev` (Vite HMR) and
   do not need a packaged `dist/`.
 - No-op when `review-webui/package.json` is absent (e.g. installing from an sdist that
-  already contains a prebuilt `nanobot/web/dist/`).
+  already contains a prebuilt `nanoreview/web/dist/`).
 - Skips when `NANOBOT_SKIP_WEBUI_BUILD=1` is set.
-- Skips when `nanobot/web/dist/index.html` already exists, unless
+- Skips when `nanoreview/web/dist/index.html` already exists, unless
   `NANOBOT_FORCE_WEBUI_BUILD=1` is set.
 - Uses `bun` when available, otherwise falls back to `npm`. The chosen tool
   performs `install` followed by `run build`.
@@ -35,7 +35,7 @@ class WebUIBuildHook(BuildHookInterface):
         root = Path(self.root)
         webui_dir = root / "review-webui"
         package_json = webui_dir / "package.json"
-        dist_dir = root / "nanobot" / "web" / "dist"
+        dist_dir = root / "nanoreview" / "web" / "dist"
         index_html = dist_dir / "index.html"
 
         # `pip install -e .` builds an editable wheel; skip the (slow) webui
@@ -54,7 +54,7 @@ class WebUIBuildHook(BuildHookInterface):
 
         if not package_json.is_file():
             self.app.display_info(
-                "[webui-build] no review-webui/ source tree, assuming prebuilt nanobot/web/dist/"
+                "[webui-build] no review-webui/ source tree, assuming prebuilt nanoreview/web/dist/"
             )
             return
 

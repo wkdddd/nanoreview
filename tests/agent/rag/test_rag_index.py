@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from loguru import logger
 
-from nanobot.rag.index import RAGIndex
-from nanobot.rag.qdrant_store import QdrantVectorHit, QdrantVectorStore, stable_point_id
-from nanobot.rag.utils import IndexedChunk, IndexedHit
+from nanoreview.rag.index import RAGIndex
+from nanoreview.rag.qdrant_store import QdrantVectorHit, QdrantVectorStore, stable_point_id
+from nanoreview.rag.utils import IndexedChunk, IndexedHit
 
 
 class _EmbeddingClient:

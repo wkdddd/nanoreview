@@ -1,7 +1,7 @@
 import pytest
 
-from nanobot.agent.hooks import AgentHookContext, AgentProgressHook
-from nanobot.utils.helpers import strip_think
+from nanoreview.agent.hooks import AgentHookContext, AgentProgressHook
+from nanoreview.utils.helpers import strip_think
 
 
 def test_strip_think_removes_leaked_dsml_tool_calls() -> None:

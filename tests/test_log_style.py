@@ -6,10 +6,10 @@ from pathlib import Path
 
 from loguru import logger
 
-import nanobot.utils.gateway_logging as gateway_logging
-from nanobot.utils.gateway_logging import configure_gateway_file_logging, gateway_log_path
-from nanobot.utils.log_style import event_message
-from nanobot.utils.logging_bridge import redirect_lib_logging
+import nanoreview.utils.gateway_logging as gateway_logging
+from nanoreview.utils.gateway_logging import configure_gateway_file_logging, gateway_log_path
+from nanoreview.utils.log_style import event_message
+from nanoreview.utils.logging_bridge import redirect_lib_logging
 
 
 class _LogSink:
@@ -39,7 +39,7 @@ def test_log_event_message_uses_status_symbol_and_key_values() -> None:
 
 
 def test_logging_bridge_routes_stdlib_once_with_structured_event() -> None:
-    name = "nanobot.test.bridge"
+    name = "nanoreview.test.bridge"
     lib_logger = logging.getLogger(name)
     lib_logger.handlers = []
     lib_logger.propagate = True

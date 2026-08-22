@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import nanobot.review.planning.planner as planner
+import nanoreview.review.planning.planner as planner
 
-from nanobot.review.planning.planner import build_review_plan
-from nanobot.review.planning.prefetch import maybe_prefetch_review_context
-from nanobot.review.types import LocalReviewScope, ReviewAction, ReviewPlan
+from nanoreview.review.planning.planner import build_review_plan
+from nanoreview.review.planning.prefetch import maybe_prefetch_review_context
+from nanoreview.review.types import LocalReviewScope, ReviewAction, ReviewPlan
 
 
 class _EvidenceService:
@@ -43,7 +43,7 @@ async def test_prefetch_calls_review_evidence_service_and_compacts_evidence() ->
         action=ReviewAction.REPO,
         depth="full",
         roles=[],
-        forced_focus=False,
+        forced_dimensions=False,
         max_subagents=1,
         user_requirements="review auth",
     )
@@ -83,7 +83,7 @@ async def test_prefetch_emits_progress_events() -> None:
         action=ReviewAction.REPO,
         depth="full",
         roles=[],
-        forced_focus=False,
+        forced_dimensions=False,
         max_subagents=1,
         user_requirements="review auth",
     )
@@ -129,7 +129,7 @@ async def test_diff_prefetch_preserves_filtered_patch_body() -> None:
         action=ReviewAction.DIFF,
         depth="full",
         roles=[],
-        forced_focus=False,
+        forced_dimensions=False,
         max_subagents=1,
     )
     result = await maybe_prefetch_review_context(

@@ -25,7 +25,7 @@ export default defineConfig(({ mode }) => {
   const hmrPort = Number(env.VITE_HMR_PORT ?? port + 1);
 
   return {
-    // 使用相对路径，便于在非域名根路径下部署（如 /nanobot/）
+    // 使用相对路径，便于在非域名根路径下部署（如 /nanoreview/）
     base: "./",
     root: process.cwd(),
     plugins: [react()],
@@ -35,7 +35,7 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
-      outDir: path.resolve(__dirname, "../nanobot/web/dist"),
+      outDir: path.resolve(__dirname, "../nanoreview/web/dist"),
       emptyOutDir: true,
       sourcemap: false,
     },

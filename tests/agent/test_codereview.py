@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
-from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider, LLMResponse
-from nanobot.review import (
+from nanoreview.agent.loop import AgentLoop
+from nanoreview.bus.queue import MessageBus
+from nanoreview.providers.base import LLMProvider, LLMResponse
+from nanoreview.review import (
     ALL_REVIEW_ROLES,
     DEFAULT_REVIEW_ROLES,
     OPTIONAL_REVIEW_ROLES,

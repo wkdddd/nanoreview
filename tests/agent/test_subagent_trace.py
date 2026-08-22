@@ -6,9 +6,9 @@ import hashlib
 
 import pytest
 
-from nanobot.session.manager import SessionManager
-from nanobot.utils import subagent_trace
-from nanobot.utils.subagent_trace import (
+from nanoreview.session.manager import SessionManager
+from nanoreview.utils import subagent_trace
+from nanoreview.utils.subagent_trace import (
     append_subagent_trace,
     close_subagent_trace_writer,
     delete_subagent_trace,
@@ -276,7 +276,7 @@ def test_sanitize_strips_think_tags() -> None:
 
 def test_reasoning_char_limit_per_subagent() -> None:
     """Reasoning beyond _MAX_REASONING_CHARS is truncated; state events still pass."""
-    from nanobot.utils.subagent_trace import _MAX_REASONING_CHARS
+    from nanoreview.utils.subagent_trace import _MAX_REASONING_CHARS
 
     session_key = "websocket:limit-1"
     append_subagent_trace(
@@ -307,7 +307,7 @@ def test_reasoning_char_limit_per_subagent() -> None:
 
 def test_reasoning_char_limit_independent_per_subagent() -> None:
     """Each subagent gets its own char budget."""
-    from nanobot.utils.subagent_trace import _MAX_REASONING_CHARS
+    from nanoreview.utils.subagent_trace import _MAX_REASONING_CHARS
 
     session_key = "websocket:limit-2"
     append_subagent_trace(
@@ -346,7 +346,7 @@ def test_sidecar_byte_limit_drops_reasoning_and_tool_keeps_state() -> None:
     Uses multiple subagents to bypass the per-subagent char limit and truly
     exceed the 256 KiB session-level byte budget.
     """
-    from nanobot.utils.subagent_trace import _MAX_REASONING_CHARS, _MAX_SIDECAR_BYTES
+    from nanoreview.utils.subagent_trace import _MAX_REASONING_CHARS, _MAX_SIDECAR_BYTES
 
     session_key = "websocket:limit-3"
     # Use enough subagents that their combined reasoning exceeds 256 KiB.
@@ -408,7 +408,7 @@ def test_sidecar_byte_limit_drops_reasoning_and_tool_keeps_state() -> None:
 
 def test_merge_reasoning_deltas_pure_function() -> None:
     """_merge_reasoning_deltas merges consecutive deltas for the same subagent."""
-    from nanobot.utils.subagent_trace import _merge_reasoning_deltas
+    from nanoreview.utils.subagent_trace import _merge_reasoning_deltas
 
     events = [
         {"event": "started", "subagent_id": "a", "label": "sec"},
@@ -448,7 +448,7 @@ def test_close_exits_writer_cleanly() -> None:
 
 def test_close_with_saturated_queue_still_exits() -> None:
     """If the queue is full when close() is called, the writer must still exit."""
-    from nanobot.utils.subagent_trace import _TraceWriter
+    from nanoreview.utils.subagent_trace import _TraceWriter
 
     writer = _TraceWriter(subagent_trace_path("websocket:close-full"))
     writer.start()

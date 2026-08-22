@@ -1,5 +1,5 @@
 [project]
-name = "nanobot-ai"
+name = "nanoreview"
 version = "0.2.0"
 description = "A lightweight personal AI assistant framework"
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -101,7 +101,7 @@ dev = [
 ]
 
 [project.scripts]
-nanobot = "nanobot.cli.commands:app"
+nanoreview = "nanoreview.cli.commands:app"
 
 [build-system]
 requires = ["hatchling"]
@@ -114,25 +114,25 @@ allow-direct-references = true
 
 [tool.hatch.build]
 include = [
-    "nanobot/**/*.py",
-    "nanobot/templates/**/*.md",
-    "nanobot/skills/**/*.md",
-    "nanobot/skills/**/*.sh",
-    "nanobot/web/dist/**/*",
+    "nanoreview/**/*.py",
+    "nanoreview/templates/**/*.md",
+    "nanoreview/skills/**/*.md",
+    "nanoreview/skills/**/*.sh",
+    "nanoreview/web/dist/**/*",
 ]
-artifacts = ["nanobot/web/dist/**/*"]
+artifacts = ["nanoreview/web/dist/**/*"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["nanobot"]
+packages = ["nanoreview"]
 
 [tool.hatch.build.targets.wheel.sources]
-"nanobot" = "nanobot"
+"nanoreview" = "nanoreview"
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "nanobot/",
+    "nanoreview/",
     "review-webui/",
-    "nanobot/web/dist/",
+    "nanoreview/web/dist/",
     "hatch_build.py",
     "README.md",
     "pyproject.toml",
@@ -152,7 +152,7 @@ addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["nanobot"]
+source = ["nanoreview"]
 omit = ["tests/*", "**/tests/*"]
 
 [tool.coverage.report]

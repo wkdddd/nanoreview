@@ -1,8 +1,8 @@
 """Tests for the fixed Markdown report renderer."""
 from __future__ import annotations
 
-from nanobot.review.output.report import render_review_report
-from nanobot.review.types import (
+from nanoreview.review.output.report import render_review_report
+from nanoreview.review.types import (
     FindingVerdict,
     ReviewDimensionResult,
     ReviewFindingCandidate,

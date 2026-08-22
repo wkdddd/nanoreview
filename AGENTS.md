@@ -16,7 +16,7 @@ NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主
 # Python 测试与静态检查
 pytest
 pytest tests/agent/test_codereview.py -v
-ruff check nanobot/
+ruff check nanoreview/
 
 # WebUI
 cd review-webui && bun run dev

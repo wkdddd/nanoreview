@@ -366,7 +366,7 @@ export class NanobotClient {
       if (wsInboundDebugEnabled()) {
         const raw = typeof ev.data === "string" ? ev.data : String(ev.data);
         console.warn(
-          "%c⚠ nanobot.ws.inbound.invalid_json",
+          "%c⚠ nanoreview.ws.inbound.invalid_json",
           LOG_STYLE_WARN,
           raw.length > 400 ? `${raw.slice(0, 400)}… (${raw.length} chars)` : raw,
         );
@@ -376,7 +376,7 @@ export class NanobotClient {
 
     if (wsInboundDebugEnabled()) {
       console.log(
-        "%c▶ nanobot.ws.inbound",
+        "%c▶ nanoreview.ws.inbound",
         LOG_STYLE_START,
         summarizeInboundWsPayload(parsed),
       );

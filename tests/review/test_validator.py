@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from nanobot.review.output.validator import ReviewValidator, ValidationContext
-from nanobot.review.types import GitHubDiffEvidence, ReviewFindingCandidate
+from nanoreview.review.output.validator import ReviewValidator, ValidationContext
+from nanoreview.review.types import GitHubDiffEvidence, ReviewFindingCandidate
 
 
 @pytest.fixture

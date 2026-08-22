@@ -4,10 +4,10 @@ from typing import Any
 
 import pytest
 
-from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import Consolidator, MemoryStore
-from nanobot.providers.base import LLMProvider, LLMResponse
-from nanobot.session.manager import Session, SessionManager
+from nanoreview.agent.context import ContextBuilder
+from nanoreview.agent.memory import Consolidator, MemoryStore
+from nanoreview.providers.base import LLMProvider, LLMResponse
+from nanoreview.session.manager import Session, SessionManager
 
 
 class SummaryProvider(LLMProvider):

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from nanobot.agent.tools.context import RequestContext, ToolContext
-from nanobot.agent.tools.loader import ToolLoader
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.config.schema import ToolsConfig
-from nanobot.review.types import ReviewMetaKey
+from nanoreview.agent.tools.context import RequestContext, ToolContext
+from nanoreview.agent.tools.loader import ToolLoader
+from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.agent.tools.spawn import SpawnTool
+from nanoreview.config.schema import ToolsConfig
+from nanoreview.review.types import ReviewMetaKey
 
 
 class FakeSubagentManager:

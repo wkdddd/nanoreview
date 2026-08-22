@@ -6,21 +6,21 @@ import httpx
 import pytest
 from loguru import logger
 
-from nanobot.agent.tools.context import (
+from nanoreview.agent.tools.context import (
     RequestContext,
     reset_current_request_context,
     set_current_request_context,
 )
-from nanobot.agent.tools.filesystem import ReadFileTool
-from nanobot.agent.tools.github_review import GitHubReviewTool
-from nanobot.agent.tools.local_review import LocalReviewTool
-from nanobot.config import loader
-from nanobot.config.schema import Config
-from nanobot.rag.review_service import rrf_merge
-from nanobot.rag.utils import IndexedChunk, IndexedHit
-from nanobot.review.source.github import GitHubRepoConfig
-from nanobot.review.source.utils import changed_lines_from_patch, parse_pr_target, parse_repo
-from nanobot.review.types import ReviewMetaKey
+from nanoreview.agent.tools.filesystem import ReadFileTool
+from nanoreview.agent.tools.github_review import GitHubReviewTool
+from nanoreview.agent.tools.local_review import LocalReviewTool
+from nanoreview.config import loader
+from nanoreview.config.schema import Config
+from nanoreview.rag.review_service import rrf_merge
+from nanoreview.rag.utils import IndexedChunk, IndexedHit
+from nanoreview.review.source.github import GitHubRepoConfig
+from nanoreview.review.source.utils import changed_lines_from_patch, parse_pr_target, parse_repo
+from nanoreview.review.types import ReviewMetaKey
 
 
 class _LogSink:

@@ -4,11 +4,11 @@ from typing import Any
 
 import pytest
 
-from nanobot.agent.hooks.lifecycle import AgentHook, AgentHookContext
-from nanobot.agent.runner import AgentRunner, AgentRunSpec
-from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.agent.runner import AgentRunner, AgentRunSpec
+from nanoreview.agent.tools.base import Tool
+from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 class DummyProvider(LLMProvider):
@@ -174,7 +174,7 @@ async def test_run_tool_logs_exception_and_preserves_model_error_payload(monkeyp
     def capture_exception(message: str, tool_name: str, call_id: str) -> None:
         log_calls.append((message.format(tool_name, call_id), call_id))
 
-    monkeypatch.setattr("nanobot.agent.runner.logger.exception", capture_exception)
+    monkeypatch.setattr("nanoreview.agent.runner.logger.exception", capture_exception)
 
     tools = ToolRegistry()
     tools.register(FailingTool())
@@ -200,7 +200,7 @@ async def test_run_tool_logs_exception_and_preserves_model_error_payload(monkeyp
 
 @pytest.mark.asyncio
 async def test_run_tool_soft_error_tool_overrides_fail_on_tool_error(monkeypatch) -> None:
-    monkeypatch.setattr("nanobot.agent.runner.logger.exception", lambda *args, **kwargs: None)
+    monkeypatch.setattr("nanoreview.agent.runner.logger.exception", lambda *args, **kwargs: None)
 
     tools = ToolRegistry()
     tools.register(FailingTool())
@@ -225,7 +225,7 @@ async def test_run_tool_soft_error_tool_overrides_fail_on_tool_error(monkeypatch
 
 @pytest.mark.asyncio
 async def test_run_tool_fail_on_tool_error_remains_strict_by_default(monkeypatch) -> None:
-    monkeypatch.setattr("nanobot.agent.runner.logger.exception", lambda *args, **kwargs: None)
+    monkeypatch.setattr("nanoreview.agent.runner.logger.exception", lambda *args, **kwargs: None)
 
     tools = ToolRegistry()
     tools.register(FailingTool())
@@ -305,7 +305,7 @@ async def test_drain_injections_falls_back_when_signature_is_unavailable(monkeyp
             return [{"role": "user", "content": f"limit={limit}"}]
 
     monkeypatch.setattr(
-        "nanobot.agent.runner.inspect.signature",
+        "nanoreview.agent.runner.inspect.signature",
         lambda _callback: (_ for _ in ()).throw(ValueError("opaque")),
     )
 

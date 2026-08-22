@@ -1,5 +1,5 @@
-from nanobot.review.input import apply_policy_to_roles, policy_for_depth
-from nanobot.review.types import ALL_REVIEW_ROLES
+from nanoreview.review.input import apply_policy_to_roles, policy_for_depth
+from nanoreview.review.types import ALL_REVIEW_ROLES
 
 
 def test_quick_policy_preserves_requested_subagent_limit() -> None:
@@ -36,7 +36,7 @@ def test_forced_focus_is_not_replaced_by_quick_policy() -> None:
     policy = policy_for_depth("quick", requested_max_subagents=6)
     roles = apply_policy_to_roles(
         roles=[ALL_REVIEW_ROLES["dependency"]],
-        forced_focus=True,
+        forced_dimensions=True,
         policy=policy,
     )
 

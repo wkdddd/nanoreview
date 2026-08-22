@@ -4,8 +4,8 @@ import pytest
 from loguru import logger
 from pydantic import ValidationError
 
-from nanobot.rag.config import EmbeddingConfig
-from nanobot.rag.embedding import EmbeddingClient, create_embedding_client_from_config
+from nanoreview.rag.config import EmbeddingConfig
+from nanoreview.rag.embedding import EmbeddingClient, create_embedding_client_from_config
 
 
 class _Embedding:

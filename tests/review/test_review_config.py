@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nanobot.config.schema import Config
+from nanoreview.config.schema import Config
 
 
 def test_review_token_budget_fields_accept_camel_case() -> None:

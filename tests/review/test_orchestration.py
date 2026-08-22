@@ -4,14 +4,14 @@ import asyncio
 
 import pytest
 
-from nanobot.agent.runner import AgentRunResult
-from nanobot.bus.events import InboundMessage
-from nanobot.agent.orchestration import (
+from nanoreview.agent.runner import AgentRunResult
+from nanoreview.bus.events import InboundMessage
+from nanoreview.agent.orchestration import (
     ReviewExecutionContext,
     ReviewOrchestrator,
     ReviewPlanningError,
 )
-from nanobot.review.types import (
+from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     EvidenceReference,
     ReviewAction,
@@ -28,7 +28,7 @@ def _plan(*roles: str) -> ReviewPlan:
         action=ReviewAction.REPO,
         depth="full",
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
-        forced_focus=False,
+        forced_dimensions=False,
         max_subagents=1,
     )
 

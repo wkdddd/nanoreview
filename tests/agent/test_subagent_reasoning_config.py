@@ -13,10 +13,10 @@ from typing import Any
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop
-from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ReviewConfig
-from nanobot.providers.base import LLMProvider, LLMResponse
+from nanoreview.agent.loop import AgentLoop
+from nanoreview.bus.queue import MessageBus
+from nanoreview.config.schema import ReviewConfig
+from nanoreview.providers.base import LLMProvider, LLMResponse
 
 
 class _DummyProvider(LLMProvider):
@@ -112,10 +112,10 @@ class _RecordingProvider(LLMProvider):
 @pytest.mark.asyncio
 async def test_reasoning_effort_high_reaches_provider() -> None:
     """Verify that reasoning_effort='high' reaches the actual LLM request."""
-    from nanobot.agent.hooks import AgentHookContext
-    from nanobot.agent.hooks.subagent import SubagentHook
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
-    from nanobot.agent.tools.registry import ToolRegistry
+    from nanoreview.agent.hooks import AgentHookContext
+    from nanoreview.agent.hooks.subagent import SubagentHook
+    from nanoreview.agent.runner import AgentRunner, AgentRunSpec
+    from nanoreview.agent.tools.registry import ToolRegistry
 
     provider = _RecordingProvider()
     runner = AgentRunner(provider)
@@ -137,10 +137,10 @@ async def test_reasoning_effort_high_reaches_provider() -> None:
 @pytest.mark.asyncio
 async def test_reasoning_effort_none_reaches_provider() -> None:
     """Verify that explicit reasoning_effort='none' reaches the actual LLM request."""
-    from nanobot.agent.hooks import AgentHookContext
-    from nanobot.agent.hooks.subagent import SubagentHook
-    from nanobot.agent.runner import AgentRunner, AgentRunSpec
-    from nanobot.agent.tools.registry import ToolRegistry
+    from nanoreview.agent.hooks import AgentHookContext
+    from nanoreview.agent.hooks.subagent import SubagentHook
+    from nanoreview.agent.runner import AgentRunner, AgentRunSpec
+    from nanoreview.agent.tools.registry import ToolRegistry
 
     provider = _RecordingProvider()
     runner = AgentRunner(provider)

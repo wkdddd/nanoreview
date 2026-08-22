@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from nanobot.agent.tools.review_submit import SubmitReviewFindingsTool, review_submit
+from nanoreview.agent.tools.review_submit import SubmitReviewFindingsTool, review_submit
 
 
 def test_review_submit_normalizes_valid_findings() -> None:

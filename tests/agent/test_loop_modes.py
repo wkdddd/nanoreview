@@ -7,19 +7,19 @@ from typing import Any
 
 import pytest
 
-from nanobot.agent.hooks import AgentHookContext
-from nanobot.agent.hooks.subagent import SubagentHook, SubagentStatus
-from nanobot.agent.loop import AgentLoop, TurnContext, TurnState, _is_consumed_subagent_result
-from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
-from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tools.context import current_request_context
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.review.planning.planner import ReviewPreparation
-from nanobot.review.types import ReviewMetaKey
-from nanobot.session.manager import Session
+from nanoreview.agent.hooks import AgentHookContext
+from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
+from nanoreview.agent.loop import AgentLoop, TurnContext, TurnState, _is_consumed_subagent_result
+from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from nanoreview.agent.subagent import SubagentManager
+from nanoreview.agent.tools.context import current_request_context
+from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.bus.queue import MessageBus
+from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
+from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanoreview.review.planning.planner import ReviewPreparation
+from nanoreview.review.types import ReviewMetaKey
+from nanoreview.session.manager import Session
 
 
 class DummyProvider(LLMProvider):
@@ -55,7 +55,7 @@ class SpawnExecutingRunner:
         self.result: Any | None = None
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        from nanobot.agent.hooks import AgentHookContext
+        from nanoreview.agent.hooks import AgentHookContext
 
         call = ToolCallRequest(
             id="call_spawn",
@@ -268,7 +268,7 @@ def _inbound(
     sender_id: str = "subagent",
     metadata: dict[str, Any] | None = None,
 ) -> Any:
-    from nanobot.bus.events import InboundMessage
+    from nanoreview.bus.events import InboundMessage
 
     return InboundMessage(
         channel="system" if sender_id == "subagent" else "websocket",
@@ -347,7 +347,7 @@ async def test_agent_loop_always_injects_review_context(
     async def mock_review(*args: Any, **kwargs: Any) -> ReviewPreparation:
         return ReviewPreparation(None, "review system prompt")
 
-    monkeypatch.setattr("nanobot.agent.loop.prepare_code_review_context", mock_review)
+    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", mock_review)
 
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
@@ -392,7 +392,7 @@ async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_p
     session = Session(key="test:pending")
     session.metadata["review_target"] = "target"
     monkeypatch.setattr(
-        "nanobot.agent.loop.prepare_code_review_context",
+        "nanoreview.agent.loop.prepare_code_review_context",
         lambda *_args, **_kwargs: _review_fallback_preparation(),
     )
     pending: asyncio.Queue = asyncio.Queue()
@@ -421,7 +421,7 @@ async def test_agent_loop_drain_waits_on_subagent_manager_result_queue(tmp_path,
     session = Session(key="test:pending")
     session.metadata["review_target"] = "target"
     monkeypatch.setattr(
-        "nanobot.agent.loop.prepare_code_review_context",
+        "nanoreview.agent.loop.prepare_code_review_context",
         lambda *_args, **_kwargs: _review_fallback_preparation(),
     )
     pending: asyncio.Queue = asyncio.Queue()
@@ -447,7 +447,7 @@ def test_invalid_max_concurrent_requests_falls_back_to_default(monkeypatch) -> N
         warnings.append(message.format(raw))
 
     monkeypatch.setenv("NANOBOT_MAX_CONCURRENT_REQUESTS", "not-an-int")
-    monkeypatch.setattr("nanobot.agent.loop.logger.warning", capture_warning)
+    monkeypatch.setattr("nanoreview.agent.loop.logger.warning", capture_warning)
 
     assert AgentLoop._parse_max_concurrent_requests() == 3
     assert warnings == ["Invalid NANOBOT_MAX_CONCURRENT_REQUESTS='not-an-int'; using default 3"]
@@ -1182,7 +1182,7 @@ async def test_agent_loop_review_mode_injects_code_review_context(tmp_path, monk
     runner = CapturingRunner()
     loop.runner = runner
     monkeypatch.setattr(
-        "nanobot.agent.loop.prepare_code_review_context",
+        "nanoreview.agent.loop.prepare_code_review_context",
         lambda *_args, **_kwargs: _review_coordinator_preparation(),
     )
     session = Session(key="test:review")
@@ -1202,7 +1202,7 @@ async def test_agent_loop_review_mode_injects_code_review_context(tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path, monkeypatch) -> None:
-    from nanobot.bus.events import InboundMessage
+    from nanoreview.bus.events import InboundMessage
 
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
@@ -1220,7 +1220,7 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
             "- Name: https://github.com/test/repo\n- Type: github\nDependency Reviewer",
         )
 
-    monkeypatch.setattr("nanobot.agent.loop.prepare_code_review_context", mock_review)
+    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", mock_review)
     session = Session(key="websocket:review")
     msg = InboundMessage(
         channel="websocket",
@@ -1265,7 +1265,7 @@ async def test_agent_loop_keeps_manual_spawn_tool_registered(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_process_system_message_accepts_agent_loop_return_shape(tmp_path) -> None:
-    from nanobot.bus.events import InboundMessage
+    from nanoreview.bus.events import InboundMessage
 
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()

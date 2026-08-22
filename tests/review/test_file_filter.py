@@ -1,4 +1,4 @@
-from nanobot.review.file_filter import review_file_filter_reason
+from nanoreview.review.file_filter import review_file_filter_reason
 
 
 def test_review_file_filter_excludes_common_non_source_inputs() -> None:
