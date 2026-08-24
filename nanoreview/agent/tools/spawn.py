@@ -1,4 +1,4 @@
-"""Spawn tool for dedicated review subagents."""
+"""Spawn tool for profile-driven subagents."""
 
 from __future__ import annotations
 
@@ -8,42 +8,19 @@ from typing import TYPE_CHECKING, Any
 from nanoreview.agent.tools.base import Tool, tool_parameters
 from nanoreview.agent.tools.context import ContextAware, RequestContext
 from nanoreview.agent.tools.schema import StringSchema, tool_parameters_schema
-from nanoreview.review.types import ReviewMetaKey, normalize_review_dimension
 
 if TYPE_CHECKING:
     from nanoreview.agent.subagent import SubagentManager
 
-# Metadata keys that are safe to forward to subagent runtime.
-# Excludes EVIDENCE_PROVIDER and other internal objects that are not
-# JSON-serializable or should not leak across the subagent boundary.
-_SAFE_METADATA_KEYS = frozenset(
-    {
-        ReviewMetaKey.MODE,
-        ReviewMetaKey.TARGET,
-        ReviewMetaKey.TARGET_TYPE,
-        ReviewMetaKey.MODE_VARIANT,
-        ReviewMetaKey.ACTION,
-        ReviewMetaKey.REQUESTED_DIMENSIONS,
-        ReviewMetaKey.TARGET_REF,
-        ReviewMetaKey.LOCAL_ROOT,
-        ReviewMetaKey.LOCAL_TARGET,
-        ReviewMetaKey.LOCAL_SCOPE_KIND,
-        ReviewMetaKey.MAX_SUBAGENTS,
-        ReviewMetaKey.ALLOWED_DIMENSIONS,
-        ReviewMetaKey.GITHUB_PREFETCH_READY,
-    }
-)
-
-
 @tool_parameters(
     tool_parameters_schema(
-        task=StringSchema("The review task for the dedicated review subagent."),
-        label=StringSchema("Review dimension key or label, such as security or Security Reviewer."),
+        task=StringSchema("The focused task for the subagent."),
+        label=StringSchema("A short task label."),
         required=["task", "label"],
     )
 )
 class SpawnTool(Tool, ContextAware):
-    """Spawn a dedicated review subagent with structured finding submission."""
+    """Forward a focused task to the configured subagent manager."""
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
@@ -86,22 +63,11 @@ class SpawnTool(Tool, ContextAware):
     @property
     def description(self) -> str:
         return (
-            "Spawn a dedicated code-review subagent. Use only during review mode. "
-            "The subagent submits findings through review_submit."
+            "Spawn a focused subagent using the execution profile supplied by the runtime."
         )
 
     async def execute(self, task: str, label: str, **kwargs: Any) -> str:
-        metadata = self._metadata.get()
-        allowed = self._normalize_allowed_review_dimensions(metadata)
-        if allowed is None:
-            return "Error: dimensions is missing"
-        dimension = normalize_review_dimension(label)
-        if dimension is None or dimension not in allowed:
-            return (
-                "Error: Cannot spawn review subagent: dimension "
-                f"'{label}' is not allowed. Allowed dimensions: "
-                f"{', '.join(sorted(allowed))}."
-            )
+        metadata = dict(self._metadata.get())
         running = self._manager.get_running_count()
         limit = self._manager.max_concurrent_subagents
         if running >= limit:
@@ -110,25 +76,12 @@ class SpawnTool(Tool, ContextAware):
                 f"({running}/{limit} running). Wait for a running subagent "
                 f"to complete before spawning a new one."
             )
-        origin_metadata = {
-            key: value for key, value in metadata.items() if key in _SAFE_METADATA_KEYS
-        }
         return await self._manager.spawn(
             task=task,
-            label=dimension,
+            label=label,
             origin_channel=self._origin_channel.get(),
             origin_chat_id=self._origin_chat_id.get(),
             session_key=self._session_key.get(),
             origin_message_id=self._origin_message_id.get(),
-            origin_metadata=origin_metadata,
+            origin_metadata=metadata,
         )
-
-    @staticmethod
-    def _normalize_allowed_review_dimensions(metadata: dict[str, Any]) -> set[str] | None:
-        raw = metadata.get(ReviewMetaKey.ALLOWED_DIMENSIONS)
-        if not isinstance(raw, list):
-            return None
-        allowed = {
-            dimension for item in raw if (dimension := normalize_review_dimension(str(item)))
-        }
-        return allowed or None

@@ -90,7 +90,14 @@ class ToolLoader:
         self._plugins = plugins
         return plugins
 
-    def load(self, ctx: Any, registry: ToolRegistry, *, scope: str = "core") -> list[str]:
+    def load(
+        self,
+        ctx: Any,
+        registry: ToolRegistry,
+        *,
+        scope: str = "core",
+        allowed_names: frozenset[str] | set[str] | None = None,
+    ) -> list[str]:
         registered: list[str] = []
         builtin_names: set[str] = set()
         sources = [(self.discover(), False), (self._discover_plugins().values(), True)]
@@ -103,6 +110,8 @@ class ToolLoader:
                     if not tool_cls.enabled(ctx):
                         continue
                     tool = tool_cls.create(ctx)
+                    if allowed_names is not None and tool.name not in allowed_names:
+                        continue
                     if registry.has(tool.name):
                         if is_plugin_source and tool.name in builtin_names:
                             logger.warning(

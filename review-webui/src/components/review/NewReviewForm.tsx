@@ -6,7 +6,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { TargetInput } from "./TargetInput";
 import { ReviewConfig } from "./ReviewConfig";
-import type { ReviewAction, ReviewDepth, ReviewFocus } from "@/lib/types";
+import type { ReviewerProfile, ReviewAction, ReviewDepth, ReviewFocus, ReviewRoutingMode } from "@/lib/types";
 
 export interface NewReviewSubmit {
   target: string;
@@ -20,6 +20,7 @@ export interface NewReviewFormProps {
   submitting: boolean;
   defaultDepth?: ReviewDepth;
   defaultFocus?: ReviewFocus[];
+  profiles: ReviewerProfile[];
 }
 
 const ACTION_OPTIONS = [
@@ -81,11 +82,15 @@ export function NewReviewForm({
   submitting,
   defaultDepth = "full",
   defaultFocus = [],
+  profiles,
 }: NewReviewFormProps) {
   const [target, setTarget] = useState("");
   const [action, setAction] = useState<ReviewAction>("repo");
   const [depth, setDepth] = useState<ReviewDepth>(defaultDepth);
   const [focus, setFocus] = useState<ReviewFocus[]>(defaultFocus);
+  const [routingMode, setRoutingMode] = useState<ReviewRoutingMode>(
+    defaultFocus.length > 0 ? "explicit" : "auto",
+  );
   const [error, setError] = useState<string | null>(null);
   const trimmedTarget = target.trim();
   const isGithubTarget = GITHUB_URL_RE.test(trimmedTarget);
@@ -94,6 +99,7 @@ export function NewReviewForm({
   useEffect(() => {
     setDepth(defaultDepth);
     setFocus(defaultFocus);
+    setRoutingMode(defaultFocus.length > 0 ? "explicit" : "auto");
   }, [defaultDepth, defaultFocus]);
 
   useEffect(() => {
@@ -107,6 +113,10 @@ export function NewReviewForm({
     const trimmed = trimmedTarget;
     if (!trimmed || submitting) return;
     const effectiveAction: ReviewAction = isGithubPrTarget ? "diff" : action;
+    if (routingMode === "explicit" && focus.length === 0) {
+      setError("Select at least one reviewer for Custom routing.");
+      return;
+    }
     if (isGithubTarget && effectiveAction === "diff" && !isGithubPrTarget) {
       setError("GitHub Diff review requires a pull request URL, for example https://github.com/owner/repo/pull/123.");
       return;
@@ -116,9 +126,9 @@ export function NewReviewForm({
       target: trimmed,
       action: effectiveAction,
       depth,
-      focus,
+      focus: routingMode === "auto" ? [] : focus,
     });
-  }, [trimmedTarget, submitting, isGithubPrTarget, action, isGithubTarget, depth, focus, onSubmit]);
+  }, [trimmedTarget, submitting, isGithubPrTarget, action, isGithubTarget, depth, focus, routingMode, onSubmit]);
 
   const handleTargetChange = useCallback((value: string) => {
     setTarget(value);
@@ -180,8 +190,11 @@ export function NewReviewForm({
               <ReviewConfig
                 depth={depth}
                 onDepthChange={setDepth}
+                routingMode={routingMode}
+                onRoutingModeChange={setRoutingMode}
                 focus={focus}
                 onFocusChange={setFocus}
+                profiles={profiles}
               />
 
               <Separator className="bg-border/50" />

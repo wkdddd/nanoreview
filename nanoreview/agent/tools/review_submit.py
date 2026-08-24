@@ -18,6 +18,7 @@ _REQUIRED_FINDING_FIELDS = (
     "evidence",
     "impact",
     "recommendation",
+    "details",
 )
 
 
@@ -37,6 +38,11 @@ _FINDING_SCHEMA = ObjectSchema(
         ),
         "impact": StringSchema("What can go wrong.", min_length=1),
         "recommendation": StringSchema("How to fix or mitigate the issue.", min_length=1),
+        "details": ObjectSchema(
+            {},
+            description="Reviewer-specific causal details required by the assigned profile.",
+            additional_properties=True,
+        ),
     },
     required=[
         "severity",
@@ -46,6 +52,7 @@ _FINDING_SCHEMA = ObjectSchema(
         "evidence",
         "impact",
         "recommendation",
+        "details",
     ],
     additional_properties=True,
 )
@@ -113,7 +120,11 @@ def review_submit(findings: list[dict[str, Any]]) -> ReviewSubmitResult:
             "evidence": str(raw.get("evidence", "")).strip(),
             "impact": str(raw.get("impact", "")).strip(),
             "recommendation": str(raw.get("recommendation", "")).strip(),
+            "details": raw.get("details"),
         }
+        if not isinstance(finding["details"], dict):
+            errors.append(f"{path}.details must be an object")
+            continue
         empty_text_fields = [
             field
             for field in ("file", "title", "evidence", "impact", "recommendation")

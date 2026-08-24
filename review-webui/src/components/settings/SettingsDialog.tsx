@@ -10,12 +10,6 @@ import {
 } from "@/components/ui/tooltip";
 import {
   Shield,
-  FlaskConical,
-  Building2,
-  Gauge,
-  Bug,
-  Wrench,
-  Package,
   X,
   RotateCcw,
   Check,
@@ -23,7 +17,7 @@ import {
   Moon,
   Monitor,
 } from "lucide-react";
-import type { ReviewDepth, ReviewFocus } from "@/lib/types";
+import type { ReviewerProfile, ReviewDepth, ReviewFocus } from "@/lib/types";
 
 export type ThemeMode = "light" | "dark" | "system";
 
@@ -35,15 +29,7 @@ export interface ReviewSettings {
 
 const DEFAULT_SETTINGS: ReviewSettings = {
   defaultDepth: "full",
-  defaultFocus: [
-    "security",
-    "tests",
-    "architecture",
-    "performance",
-    "bug-risk",
-    "maintainability",
-    "dependency",
-  ],
+  defaultFocus: [],
   theme: "light",
 };
 
@@ -64,61 +50,12 @@ const THEME_OPTIONS: {
   { value: "system", label: "System", description: "跟随操作系统自动切换", icon: Monitor },
 ];
 
-const DIMENSIONS: {
-  key: ReviewFocus;
-  label: string;
-  icon: React.ElementType;
-  description: string;
-}[] = [
-  {
-    key: "security",
-    label: "Security",
-    icon: Shield,
-    description: "Auth, injection, data exposure, unsafe inputs, and other security risks.",
-  },
-  {
-    key: "tests",
-    label: "Tests",
-    icon: FlaskConical,
-    description: "Coverage, brittle assertions, missing edge cases, and verification gaps.",
-  },
-  {
-    key: "architecture",
-    label: "Architecture",
-    icon: Building2,
-    description: "Module boundaries, coupling, abstractions, and long-term design risks.",
-  },
-  {
-    key: "performance",
-    label: "Performance",
-    icon: Gauge,
-    description: "I/O hotspots, algorithmic cost, caching, concurrency, and resource use.",
-  },
-  {
-    key: "bug-risk",
-    label: "Bug Risk",
-    icon: Bug,
-    description: "Logic errors, state inconsistencies, null handling, and race conditions.",
-  },
-  {
-    key: "maintainability",
-    label: "Maintainability",
-    icon: Wrench,
-    description: "Readability, duplication, complexity, naming, and maintainability issues.",
-  },
-  {
-    key: "dependency",
-    label: "Dependencies",
-    icon: Package,
-    description: "Dependency health, vulnerabilities, licensing, and supply-chain concerns.",
-  },
-];
-
 interface SettingsDialogProps {
   open: boolean;
   onClose: () => void;
   settings: ReviewSettings;
   onSettingsChange: (s: ReviewSettings) => void;
+  profiles: ReviewerProfile[];
 }
 
 export function SettingsDialog({
@@ -126,6 +63,7 @@ export function SettingsDialog({
   onClose,
   settings,
   onSettingsChange,
+  profiles,
 }: SettingsDialogProps) {
   const handleDepthChange = (depth: ReviewDepth) => {
     onSettingsChange({ ...settings, defaultDepth: depth });
@@ -266,15 +204,15 @@ export function SettingsDialog({
             <h3 className="text-sm font-medium text-foreground">Default Focus</h3>
             <TooltipProvider delayDuration={200}>
               <div className="flex flex-wrap gap-2">
-                {DIMENSIONS.map((dim) => {
-                  const active = settings.defaultFocus.includes(dim.key);
-                  const Icon = dim.icon;
+                {profiles.map((dim) => {
+                  const active = settings.defaultFocus.includes(dim.id);
+                  const Icon = Shield;
                   return (
-                    <Tooltip key={dim.key}>
+                    <Tooltip key={dim.id}>
                       <TooltipTrigger asChild>
                         <button
                           type="button"
-                          onClick={() => toggleDimension(dim.key)}
+                          onClick={() => toggleDimension(dim.id)}
                           className={cn(
                             "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors",
                             active

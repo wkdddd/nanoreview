@@ -140,7 +140,7 @@ def build_review_plan(
         )
         return None
 
-    roles, forced_dimensions = normalize_requested_dimensions(focus)
+    roles, routing_mode = normalize_requested_dimensions(focus)
     normalized_type = normalize_review_target_type(target_type, target)
     if normalized_type not in {"github", "local"}:
         normalized_type = normalize_review_target_type(None, target) or "auto"
@@ -170,20 +170,13 @@ def build_review_plan(
     if target_type_value == "local":
         local_scope, scope_reason = _resolve_local_scope(target)
 
-    try:
-        max_subagents_int = int(max_subagents)
-    except (TypeError, ValueError):
-        max_subagents_int = 4
-    max_subagents_int = min(max(max_subagents_int, 1), 10)
-
     depth_value = normalize_mode(depth)
-    policy = policy_for_depth(depth_value, requested_max_subagents=max_subagents_int)
+    policy = policy_for_depth(depth_value)
     roles = apply_policy_to_roles(
         roles=roles,
-        forced_dimensions=forced_dimensions,
+        routing_mode=routing_mode,
         policy=policy,
     )
-    max_subagents_int = policy.max_subagents
 
     plan = ReviewPlan(
         target=target,
@@ -192,8 +185,7 @@ def build_review_plan(
         action=resolved_action,
         depth=depth_value,
         roles=roles,
-        forced_dimensions=forced_dimensions,
-        max_subagents=max_subagents_int,
+        routing_mode=routing_mode,
         user_requirements=user_content.strip(),
         target_repo=target_repo,
         pr_number=pr_number,
@@ -204,7 +196,7 @@ def build_review_plan(
         prefetch_summary=prefetch_summary,
     )
     logger.info(
-        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} target_subpath={} forced_dimensions={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
+        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} target_subpath={} routing_mode={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
         trace_id,
         plan.action.value,
         plan.target_type,
@@ -212,7 +204,7 @@ def build_review_plan(
         scope_reason,
         plan.local_scope.review_root if plan.local_scope else "",
         plan.target_subpath or "",
-        plan.forced_dimensions,
+        plan.routing_mode == "explicit",
         focus,
         [role.name for role in plan.roles],
         [role.name for role in plan.roles],
@@ -278,7 +270,7 @@ async def prepare_code_review_context(
         user_content=user_content,
         focus=session_meta.get(ReviewMetaKey.REQUESTED_DIMENSIONS),
         depth=session_meta.get(ReviewMetaKey.MODE_VARIANT) or session_meta.get("review_mode_name") or "full",
-        max_subagents=session_meta.get(ReviewMetaKey.MAX_SUBAGENTS) or 4,
+        max_subagents=session_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS) or 4,
         target_type=session_meta.get(ReviewMetaKey.TARGET_TYPE) if isinstance(session_meta.get(ReviewMetaKey.TARGET_TYPE), str) else None,
         action=session_meta.get(ReviewMetaKey.ACTION) if isinstance(session_meta.get(ReviewMetaKey.ACTION), str) else None,
         target_ref=session_meta.get(ReviewMetaKey.TARGET_REF) if isinstance(session_meta.get(ReviewMetaKey.TARGET_REF), str) else None,

@@ -31,7 +31,6 @@ class MemoryStore:
     def __init__(self, workspace: Path):
         self.workspace = workspace
         self.soul_file = workspace / "SOUL.md"
-        self.user_file = workspace / "USER.md"
 
     @staticmethod
     def read_file(path: Path) -> str:
@@ -45,12 +44,6 @@ class MemoryStore:
 
     def write_soul(self, content: str) -> None:
         self.soul_file.write_text(content, encoding="utf-8")
-
-    def read_user(self) -> str:
-        return self.read_file(self.user_file)
-
-    def write_user(self, content: str) -> None:
-        self.user_file.write_text(content, encoding="utf-8")
 
 
 _RAW_ARCHIVE_MAX_CHARS = 16_000

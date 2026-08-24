@@ -6,7 +6,6 @@ from typing import Any
 from nanoreview.review.input.targets import infer_review_target_type
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
-    DEFAULT_REVIEW_ROLES,
     ReviewAction,
     ReviewDepth,
     ReviewRole,
@@ -16,16 +15,18 @@ from nanoreview.review.types import (
 
 def normalize_requested_dimensions(
     raw: str | list[str] | None,
-) -> tuple[list[ReviewRole], bool]:
-    forced_dimensions = True
+) -> tuple[list[ReviewRole], str]:
     if not raw:
-        forced_dimensions = False
-        return list(DEFAULT_REVIEW_ROLES.values()), forced_dimensions
+        return list(ALL_REVIEW_ROLES.values()), "auto"
 
     selected: list[ReviewRole] = []
     items = raw if isinstance(raw, list) else raw.split(",")
-    for item in items:
-        key = item.strip().lower()
+    normalized_items = [str(item).strip().lower() for item in items if str(item).strip()]
+    if "auto" in normalized_items:
+        if len(normalized_items) != 1:
+            raise ValueError("Review dimension 'auto' cannot be combined with explicit dimensions")
+        return list(ALL_REVIEW_ROLES.values()), "auto"
+    for key in normalized_items:
         if not key:
             continue
         role = ALL_REVIEW_ROLES.get(key)
@@ -36,7 +37,7 @@ def normalize_requested_dimensions(
             )
         if role not in selected:
             selected.append(role)
-    return selected or list(DEFAULT_REVIEW_ROLES.values()), forced_dimensions
+    return (selected, "explicit") if selected else (list(ALL_REVIEW_ROLES.values()), "auto")
 
 
 def normalize_review_target_type(raw: str | None, target: str | None = None) -> str | None:

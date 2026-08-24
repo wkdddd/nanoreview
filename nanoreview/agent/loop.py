@@ -43,6 +43,7 @@ from nanoreview.agent.orchestration import (
 )
 from nanoreview.review.planning.planner import prepare_code_review_context
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
+from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.session.manager import Session, SessionManager
 from nanoreview.utils.artifacts import generated_image_paths_from_messages
@@ -326,6 +327,7 @@ class AgentLoop:
             ),
             reasoning_effort=self._resolve_subagent_reasoning_effort(),
             llm_wall_timeout_for_session=lambda sk: None,
+            execution_profiles=reviewer_execution_profiles(),
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -1012,7 +1014,7 @@ class AgentLoop:
 
             review_meta = dict(_session_meta)
             review_meta.setdefault(
-                ReviewMetaKey.MAX_SUBAGENTS,
+                ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS,
                 getattr(self.review_config, "max_concurrent_subagents", 4),
             )
             review_meta[ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS] = self.context_window_tokens
@@ -1135,7 +1137,7 @@ class AgentLoop:
             if review_preparation.plan is not None and review_preparation.evidence is not None:
                 orchestrator = ReviewOrchestrator(
                     runner=self.runner,
-                    subagents=self.subagents,
+                    subagentmanager=self.subagents,
                     model=self.model,
                     workspace=self.workspace,
                     max_tool_result_chars=self.max_tool_result_chars,
@@ -1152,7 +1154,10 @@ class AgentLoop:
                             session_key=active_session_key,
                             message_id=message_id,
                             metadata=updated_tool_meta if review_meta else dict(metadata or {}),
-                            concurrency=review_preparation.plan.max_subagents,
+                            max_concurrency=int(
+                                review_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS)
+                                or getattr(self.review_config, "max_concurrent_subagents", 4)
+                            ),
                             result_callback=_persist_automatic_subagent_result,
                         ),
                         validation_workspace=validation_workspace,

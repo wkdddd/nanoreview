@@ -18,6 +18,8 @@ from nanoreview.review.types import (
     ReviewFindingVerdict,
     GitHubDiffEvidence,
 )
+from nanoreview.agent.tools.base import Schema
+from nanoreview.review.profiles import get_reviewer_profile
 
 
 @dataclass
@@ -92,8 +94,23 @@ class ReviewValidator:
             ), c
         self._seen_fingerprints.add(fp)
 
+        profile = get_reviewer_profile(dimension)
+        if profile is None:
+            return ReviewFindingVerdict(
+                verdict=FindingVerdict.REJECTED,
+                reason=f"unknown reviewer profile: {dimension}",
+            ), c
+        detail_errors = Schema.validate_json_schema_value(
+            c.details, profile.details_schema, "details"
+        )
+        if detail_errors:
+            return ReviewFindingVerdict(
+                verdict=FindingVerdict.REJECTED,
+                reason="invalid reviewer details: " + "; ".join(detail_errors),
+            ), c
+
         if self._remote_diff is not None:
-            return self._validate_remote_diff(c)
+            return self._validate_remote_diff(c, dimension)
 
         file_path = self._resolve_candidate_path(c.file)
         if file_path is None:
@@ -157,7 +174,7 @@ class ReviewValidator:
         return ReviewFindingVerdict(verdict=FindingVerdict.ACCEPTED), c
 
     def _validate_remote_diff(
-        self, c: ReviewFindingCandidate
+        self, c: ReviewFindingCandidate, dimension: str
     ) -> tuple[ReviewFindingVerdict, ReviewFindingCandidate]:
         normalized = self._normalize_rel_path(c.file)
         changed = {self._normalize_rel_path(path) for path in self._remote_diff.changed_files}

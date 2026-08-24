@@ -19,7 +19,7 @@ from nanoreview.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["SOUL.md", "USER.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["SOUL.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 

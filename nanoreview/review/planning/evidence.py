@@ -522,7 +522,7 @@ class ReviewEvidenceService:
     ) -> str:
         started = time.perf_counter()
         if not review_query or not review_query.strip():
-            review_query = "code review security architecture tests performance entry points config"
+            review_query = "code review bug security performance maintainability entry points config"
         scoped_path = (target_subpath or "").strip().strip("/")
         effective_pattern = tree_pattern
         if scoped_path:

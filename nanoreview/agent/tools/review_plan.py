@@ -31,6 +31,7 @@ class ReviewPlanReceiver:
 
     allowed_dimensions: set[str]
     evidence_ids: set[str]
+    routing_mode: str = "auto"
     submission: tuple[ReviewAssignment, ...] | None = None
 
     def submit(self, assignments: list[dict]) -> tuple[bool, str]:
@@ -61,6 +62,17 @@ class ReviewPlanReceiver:
                     evidence_ids=evidence_ids,
                 )
             )
+        if self.routing_mode == "auto" and not normalized:
+            return False, "invalid review plan: auto must select between 1 and 4 reviewers"
+        if len(normalized) > 4:
+            return False, "invalid review plan: at most 4 reviewers may be selected"
+        if self.routing_mode == "explicit" and seen_dimensions != self.allowed_dimensions:
+            missing = sorted(self.allowed_dimensions - seen_dimensions)
+            unexpected = sorted(seen_dimensions - self.allowed_dimensions)
+            return False, (
+                "invalid review plan: explicit assignments must exactly cover requested dimensions; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
         self.submission = tuple(normalized)
         return True, "review plan accepted"
 
@@ -85,8 +97,8 @@ _ASSIGNMENT_SCHEMA = ObjectSchema(
         {
             "assignments": ArraySchema(
                 _ASSIGNMENT_SCHEMA,
-                description="Coordinator assignments. Omitted dimensions receive program defaults.",
-                max_items=10,
+                description="Reviewer assignments selected for this review.",
+                max_items=4,
             ),
         },
         required=["assignments"],

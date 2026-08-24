@@ -9,7 +9,6 @@ always: true
 ## Structure
 
 - `SOUL.md` — Bot personality and communication style.
-- `USER.md` — User profile and preferences.
 - `sessions/*.jsonl` — per-session conversation history, metadata, and compact summaries.
 
 ## Session Memory
@@ -31,5 +30,5 @@ Examples (replace `keyword`):
 ## Important
 
 - Do not write durable cross-session memory.
-- Treat `SOUL.md` and `USER.md` as user-editable personalization files.
+- Treat `SOUL.md` as a user-editable personalization file.
 - Compact summaries live in session metadata and must stay scoped to that session.

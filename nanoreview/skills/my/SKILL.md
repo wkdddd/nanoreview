@@ -66,7 +66,6 @@ always: true
 | Need | Use | Persists? |
 |------|-----|-----------|
 | Per-session temp state | `my(action="set", key="...", value=...)` | No |
-| User preferences | Edit `USER.md` | Yes |
 | Permanent config change | Edit config file | Yes |
 
-**Rule of thumb:** Stable preference? `USER.md`. This turn only? My.
+**Rule of thumb:** Persistent config change? Edit config file. This turn only? My.

@@ -1,97 +1,51 @@
-import {
-  ShieldCheck,
-  FlaskConical,
-  Blocks,
-  Gauge,
-  Bug,
-  Wrench,
-  Package,
-  CheckCheck,
-} from "lucide-react";
+import { Bug, Gauge, ShieldCheck, Wrench } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { ReviewDepth, ReviewFocus } from "@/lib/types";
+import type {
+  ReviewerProfile,
+  ReviewDepth,
+  ReviewFocus,
+  ReviewRoutingMode,
+} from "@/lib/types";
 
 export interface ReviewConfigProps {
   depth: ReviewDepth;
-  onDepthChange: (d: ReviewDepth) => void;
+  onDepthChange: (depth: ReviewDepth) => void;
+  routingMode: ReviewRoutingMode;
+  onRoutingModeChange: (mode: ReviewRoutingMode) => void;
   focus: ReviewFocus[];
-  onFocusChange: (f: ReviewFocus[]) => void;
+  onFocusChange: (focus: ReviewFocus[]) => void;
+  profiles: ReviewerProfile[];
 }
 
 const DEPTH_OPTIONS = [
-  { value: "quick", label: "Quick", description: "Surface-level scan" },
+  { value: "quick", label: "Quick", description: "High-severity scan" },
   { value: "full", label: "Full", description: "Standard review" },
-  { value: "deep", label: "Deep", description: "Exhaustive analysis" },
+  { value: "deep", label: "Deep", description: "Broader evidence budget" },
 ] as const;
 
-interface FocusOption {
-  value: ReviewFocus;
-  label: string;
-  icon: React.ElementType;
-}
-
-const BASIC_FOCUS: FocusOption[] = [
-  { value: "security", label: "Security", icon: ShieldCheck },
-  { value: "tests", label: "Tests", icon: FlaskConical },
-  { value: "bug-risk", label: "Bug Risk", icon: Bug },
-  { value: "performance", label: "Performance", icon: Gauge },
-];
-
-const ADVANCED_FOCUS: FocusOption[] = [
-  { value: "architecture", label: "Architecture", icon: Blocks },
-  { value: "maintainability", label: "Maintainability", icon: Wrench },
-  { value: "dependency", label: "Dependencies", icon: Package },
-];
-
-const BASIC_VALUES = BASIC_FOCUS.map((option) => option.value);
-const ADVANCED_VALUES = ADVANCED_FOCUS.map((option) => option.value);
+const PROFILE_ICONS = {
+  bug: Bug,
+  security: ShieldCheck,
+  performance: Gauge,
+  maintainability: Wrench,
+} as const;
 
 export function ReviewConfig({
   depth,
   onDepthChange,
+  routingMode,
+  onRoutingModeChange,
   focus,
   onFocusChange,
+  profiles,
 }: ReviewConfigProps) {
-  const toggleFocus = (value: ReviewFocus) => {
-    if (focus.includes(value)) {
-      onFocusChange(focus.filter((item) => item !== value));
-    } else {
-      onFocusChange([...focus, value]);
-    }
+  const toggleFocus = (value: string) => {
+    onFocusChange(
+      focus.includes(value)
+        ? focus.filter((item) => item !== value)
+        : [...focus, value],
+    );
   };
-
-  const allSelected = (values: ReviewFocus[]) =>
-    values.every((value) => focus.includes(value));
-
-  const toggleGroup = (values: ReviewFocus[]) => {
-    if (allSelected(values)) {
-      onFocusChange(focus.filter((item) => !values.includes(item)));
-    } else {
-      onFocusChange([...focus, ...values.filter((value) => !focus.includes(value))]);
-    }
-  };
-
-  const renderChips = (options: FocusOption[]) =>
-    options.map((option) => {
-      const isActive = focus.includes(option.value);
-      const Icon = option.icon;
-      return (
-        <button
-          key={option.value}
-          type="button"
-          onClick={() => toggleFocus(option.value)}
-          className={cn(
-            "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-all duration-200",
-            isActive
-              ? "border-primary/30 bg-primary/10 text-primary"
-              : "border-border/60 bg-background/60 text-muted-foreground hover:border-primary/20 hover:text-foreground",
-          )}
-        >
-          <Icon className="h-3.5 w-3.5" strokeWidth={1.8} />
-          {option.label}
-        </button>
-      );
-    });
 
   return (
     <div className="flex flex-col gap-6">
@@ -99,23 +53,21 @@ export function ReviewConfig({
         <legend className="mb-2.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground/70">
           Review Depth
         </legend>
-        <div className="flex gap-2">
+        <div className="grid grid-cols-3 gap-2">
           {DEPTH_OPTIONS.map((option) => (
             <button
               key={option.value}
               type="button"
               onClick={() => onDepthChange(option.value)}
               className={cn(
-                "flex min-w-[88px] flex-col items-center gap-1 rounded-lg border px-4 py-2.5 transition-all duration-200",
+                "flex min-w-0 flex-col items-center gap-1 rounded-md border px-3 py-2.5 transition-colors",
                 depth === option.value
-                  ? "border-primary/40 bg-primary/8 text-primary shadow-[0_0_0_1px_hsl(var(--primary)/0.15)]"
-                  : "border-border/60 bg-background/60 text-muted-foreground hover:border-primary/20 hover:bg-primary/4",
+                  ? "border-primary/40 bg-primary/10 text-primary"
+                  : "border-border/60 text-muted-foreground hover:bg-secondary/60",
               )}
             >
               <span className="text-sm font-semibold">{option.label}</span>
-              <span className="text-[11px] leading-tight opacity-70">
-                {option.description}
-              </span>
+              <span className="text-center text-[11px] leading-tight opacity-70">{option.description}</span>
             </button>
           ))}
         </div>
@@ -123,57 +75,50 @@ export function ReviewConfig({
 
       <fieldset>
         <legend className="mb-2.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground/70">
-          Focus Areas
+          Reviewer Routing
         </legend>
-        <div className="flex flex-col gap-3">
-          <div>
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="text-[11px] font-medium text-muted-foreground/60">
-                Core
-              </span>
-              <button
-                type="button"
-                onClick={() => toggleGroup(BASIC_VALUES)}
-                className={cn(
-                  "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors",
-                  allSelected(BASIC_VALUES)
-                    ? "text-primary"
-                    : "text-muted-foreground/50 hover:text-foreground",
-                )}
-              >
-                <CheckCheck className="h-3 w-3" strokeWidth={2} />
-                {allSelected(BASIC_VALUES) ? "All selected" : "Select all"}
-              </button>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {renderChips(BASIC_FOCUS)}
-            </div>
-          </div>
-
-          <div>
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="text-[11px] font-medium text-muted-foreground/60">
-                Advanced
-              </span>
-              <button
-                type="button"
-                onClick={() => toggleGroup(ADVANCED_VALUES)}
-                className={cn(
-                  "inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors",
-                  allSelected(ADVANCED_VALUES)
-                    ? "text-primary"
-                    : "text-muted-foreground/50 hover:text-foreground",
-                )}
-              >
-                <CheckCheck className="h-3 w-3" strokeWidth={2} />
-                {allSelected(ADVANCED_VALUES) ? "All selected" : "Select all"}
-              </button>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {renderChips(ADVANCED_FOCUS)}
-            </div>
-          </div>
+        <div className="mb-3 grid grid-cols-2 rounded-md border border-border/70 p-0.5">
+          {(["auto", "explicit"] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => onRoutingModeChange(mode)}
+              className={cn(
+                "h-8 rounded-[5px] text-xs font-medium capitalize transition-colors",
+                routingMode === mode
+                  ? "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-secondary/70",
+              )}
+            >
+              {mode === "explicit" ? "Custom" : "Auto"}
+            </button>
+          ))}
         </div>
+        {routingMode === "explicit" && (
+          <div className="grid grid-cols-2 gap-2">
+            {profiles.map((profile) => {
+              const active = focus.includes(profile.id);
+              const Icon = PROFILE_ICONS[profile.id as keyof typeof PROFILE_ICONS] ?? Bug;
+              return (
+                <button
+                  key={profile.id}
+                  type="button"
+                  onClick={() => toggleFocus(profile.id)}
+                  title={profile.description}
+                  className={cn(
+                    "flex min-h-10 items-center gap-2 rounded-md border px-3 py-2 text-left text-xs font-medium transition-colors",
+                    active
+                      ? "border-primary/40 bg-primary/10 text-primary"
+                      : "border-border/60 text-muted-foreground hover:bg-secondary/60",
+                  )}
+                >
+                  <Icon className="h-4 w-4 shrink-0" />
+                  <span className="min-w-0 break-words">{profile.label.replace(" Reviewer", "")}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </fieldset>
     </div>
   );

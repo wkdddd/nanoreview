@@ -9,6 +9,7 @@ from nanoreview.review.types import (
     ReviewFindingVerdict,
     ReviewModePolicy,
 )
+from nanoreview.review.profiles import get_reviewer_profile
 
 
 def _clean_text(value: object) -> str:
@@ -50,6 +51,8 @@ def render_review_report(
     dimensions: list[ReviewDimensionResult],
     *,
     policy: ReviewModePolicy | None = None,
+    routing_mode: str = "explicit",
+    selected_dimensions: tuple[str, ...] | list[str] = (),
 ) -> str:
     """Render final Markdown report from validated dimension results."""
     all_accepted = _collect_accepted(dimensions)
@@ -71,6 +74,7 @@ def render_review_report(
     sections: list[str] = []
     sections.append(f"## Code Review Report: {_escape_markdown_inline(target_name)}\n")
     sections.append(f"### Executive Summary\n\n{summary}\n")
+    sections.append(_render_selected_reviewers(routing_mode, selected_dimensions))
     sections.append(_render_findings(
         all_accepted,
         uncertain_count=len(all_uncertain),
@@ -240,6 +244,31 @@ def _render_findings(
         lines.append(f"{i}. **{_escape_markdown_inline(f.title)}** (`{_clean_text(loc)}`)")
         lines.append(f"   - Impact: {_escape_markdown_inline(f.impact)}")
         lines.append(f"   - Recommendation: {_escape_markdown_inline(f.recommendation)}")
+        profile = get_reviewer_profile(f.dimension)
+        if profile is not None:
+            for key, label in profile.report_fields:
+                value = f.details.get(key)
+                if isinstance(value, list):
+                    value = ", ".join(str(item) for item in value)
+                lines.append(
+                    f"   - {_escape_markdown_inline(label)}: {_escape_markdown_inline(value)}"
+                )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_selected_reviewers(
+    routing_mode: str,
+    selected_dimensions: tuple[str, ...] | list[str],
+) -> str:
+    lines = ["### Selected Reviewers\n"]
+    lines.append(f"- Routing: {_escape_markdown_inline(routing_mode)}")
+    for dimension in selected_dimensions:
+        profile = get_reviewer_profile(dimension)
+        label = profile.label if profile is not None else dimension
+        lines.append(f"- {_escape_markdown_inline(label)}")
+    if not selected_dimensions:
+        lines.append("- None")
     lines.append("")
     return "\n".join(lines)
 

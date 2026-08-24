@@ -37,6 +37,7 @@ from nanoreview.command.builtin import builtin_command_palette
 from nanoreview.config.paths import get_media_dir
 from nanoreview.config.schema import Base, Config
 from nanoreview.review import normalize_review_action, normalize_review_target_type
+from nanoreview.review.profiles import public_reviewer_profiles
 from nanoreview.review.input import parse_repo_target
 from nanoreview.utils.helpers import safe_filename
 from nanoreview.utils.media_decode import (
@@ -107,7 +108,7 @@ def _clear_review_metadata(meta: dict[str, Any]) -> None:
         "review_action",
         "review_mode_variant",
         "review_mode_name",
-        "review_max_subagents",
+        "max_concurrent_subagents",
     ):
         meta.pop(key, None)
 
@@ -742,6 +743,11 @@ class WebSocketChannel(BaseChannel):
         # 3. REST handlers co-located with this channel (sessions, settings, …).
         if got == "/api/sessions":
             return self._handle_sessions_list(request)
+
+        if got == "/api/review/profiles":
+            if not self._check_api_token(request):
+                return _http_error(401, "Unauthorized")
+            return _http_json_response({"profiles": public_reviewer_profiles()})
 
         if got == "/api/settings":
             return self._handle_settings(request)
@@ -1753,6 +1759,11 @@ class WebSocketChannel(BaseChannel):
         except RuntimeError as exc:
             return web.json_response({"error": str(exc)}, status=503)
 
+    async def _aiohttp_review_profiles(self, request: web.Request) -> web.Response:
+        if not self._check_aiohttp_api_token(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        return web.json_response({"profiles": public_reviewer_profiles()})
+
     async def _aiohttp_session_messages(self, request: web.Request) -> web.Response:
         if not self._check_aiohttp_api_token(request):
             return web.json_response({"error": "Unauthorized"}, status=401)
@@ -1980,6 +1991,7 @@ class WebSocketChannel(BaseChannel):
             app.router.add_get(_normalize_config_path(self.config.token_issue_path), self._aiohttp_token_issue)
         app.router.add_get("/webui/bootstrap", self._aiohttp_bootstrap)
         app.router.add_get("/api/sessions", self._aiohttp_sessions)
+        app.router.add_get("/api/review/profiles", self._aiohttp_review_profiles)
         app.router.add_get("/api/sessions/{key}/messages", self._aiohttp_session_messages)
         app.router.add_get("/api/sessions/{key}/webui-thread", self._aiohttp_webui_thread)
         app.router.add_get("/api/sessions/{key}/code-context", self._aiohttp_code_context)

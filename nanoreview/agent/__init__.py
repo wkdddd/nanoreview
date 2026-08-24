@@ -6,6 +6,7 @@ from nanoreview.agent.loop import AgentLoop
 from nanoreview.agent.memory import MemoryStore
 from nanoreview.agent.skills import SkillsLoader
 from nanoreview.agent.subagent import SubagentManager
+from nanoreview.agent.subagent_profiles import SubagentExecutionProfile
 
 __all__ = [
     "AgentHook",
@@ -16,4 +17,5 @@ __all__ = [
     "MemoryStore",
     "SkillsLoader",
     "SubagentManager",
+    "SubagentExecutionProfile",
 ]

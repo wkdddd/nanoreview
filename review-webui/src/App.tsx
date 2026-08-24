@@ -25,13 +25,14 @@ import {
   loadSavedSecret,
   saveSecret,
 } from "@/lib/bootstrap";
-import { fetchSessionMessages, fetchWebuiThread } from "@/lib/api";
+import { fetchReviewerProfiles, fetchSessionMessages, fetchWebuiThread } from "@/lib/api";
 import { NanobotClient } from "@/lib/nanobot-client";
 import type {
   ChatSummary,
   ConnectionStatus,
   ReviewDepth,
   ReviewFocus,
+  ReviewerProfile,
   ReviewTargetType,
   UIMessage,
 } from "@/lib/types";
@@ -332,6 +333,19 @@ function ReviewAppShell({
   const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<ReviewSettings>(DEFAULT_SETTINGS);
+  const [reviewerProfiles, setReviewerProfiles] = useState<ReviewerProfile[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchReviewerProfiles({ token, refreshAuth })
+      .then((profiles) => {
+        if (!cancelled) setReviewerProfiles(profiles);
+      })
+      .catch((error) => console.error("Failed to load reviewer profiles", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [token, refreshAuth]);
 
   // Apply theme whenever settings.theme changes
   useEffect(() => {
@@ -628,6 +642,7 @@ function ReviewAppShell({
               <NewReviewForm
                 defaultDepth={settings.defaultDepth}
                 defaultFocus={settings.defaultFocus}
+                profiles={reviewerProfiles}
                 onSubmit={handleSubmitReview}
                 submitting={state.phase === "submitting"}
               />
@@ -695,6 +710,7 @@ function ReviewAppShell({
         onClose={() => setSettingsOpen(false)}
         settings={settings}
         onSettingsChange={setSettings}
+        profiles={reviewerProfiles}
       />
     </>
   );

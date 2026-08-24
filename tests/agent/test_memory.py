@@ -29,7 +29,6 @@ class SummaryProvider(LLMProvider):
 
 def test_system_prompt_uses_personalization_without_long_term_memory(tmp_path) -> None:
     (tmp_path / "SOUL.md").write_text("soul voice", encoding="utf-8")
-    (tmp_path / "USER.md").write_text("user preference", encoding="utf-8")
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
     (memory_dir / "MEMORY.md").write_text("old global fact", encoding="utf-8")
@@ -41,7 +40,6 @@ def test_system_prompt_uses_personalization_without_long_term_memory(tmp_path) -
     prompt = ContextBuilder(tmp_path).build_system_prompt()
 
     assert "soul voice" in prompt
-    assert "user preference" in prompt
     assert "old global fact" not in prompt
     assert "old review" not in prompt
     assert "Recent History" not in prompt

@@ -26,6 +26,12 @@ from nanoreview.review.types import (
 _COORDINATOR_RETRIES = 3
 
 
+def validation_repository_root(plan: ReviewPlan, fallback: Path) -> str:
+    if plan.local_scope is not None:
+        return plan.local_scope.review_root
+    return str(fallback.resolve())
+
+
 class ReviewPlanningError(RuntimeError):
     """Raised when no validated coordinator plan can be obtained."""
 
@@ -37,7 +43,7 @@ class ReviewExecutionContext:
     session_key: str
     message_id: str | None
     metadata: dict[str, Any]
-    concurrency: int
+    max_concurrency: int
     result_callback: Callable[[Any], Awaitable[None]] | None = None
 
 
@@ -48,14 +54,14 @@ class ReviewOrchestrator:
         self,
         *,
         runner: AgentRunner,
-        subagents: SubagentManager,
+        subagentmanager: SubagentManager,
         model: str,
         workspace: Path,
         max_tool_result_chars: int,
         judge: ReviewJudge | None,
     ) -> None:
         self._runner = runner
-        self._subagents = subagents
+        self._subagentmanager = subagentmanager
         self._model = model
         self._workspace = workspace
         self._max_tool_result_chars = max_tool_result_chars
@@ -85,11 +91,10 @@ class ReviewOrchestrator:
         finalizer = ReviewFinalizer(
             validation_workspace,
             changed_files,
-            policy=policy_for_depth(
-                plan.depth,
-                requested_max_subagents=plan.max_subagents,
-            ),
-            allowed_dimensions=[role.name for role in plan.roles],
+            policy=policy_for_depth(plan.depth),
+            allowed_dimensions=[assignment.dimension for assignment in assignments],
+            routing_mode=plan.routing_mode,
+            selected_dimensions=[assignment.dimension for assignment in assignments],
             local_target=local_target,
             remote_diff=remote_diff,
         )
@@ -114,7 +119,7 @@ class ReviewOrchestrator:
         evidence_ids = set(evidence.by_id())
         failure = "coordinator did not submit a review plan"
         for attempt in range(1, _COORDINATOR_RETRIES + 2):
-            receiver = ReviewPlanReceiver(allowed, evidence_ids)
+            receiver = ReviewPlanReceiver(allowed, evidence_ids, plan.routing_mode)
             tools = ToolRegistry()
             tools.register(SubmitReviewPlanTool(receiver))
             result = await self._runner.run(
@@ -162,46 +167,42 @@ class ReviewOrchestrator:
         context: ReviewExecutionContext,
         finalizer: ReviewFinalizer,
     ) -> None:
-        by_dimension = {assignment.dimension: assignment for assignment in assignments}
-        pending = list(plan.roles)
+        pending = list(assignments)
         active = 0
         reference_map = evidence.by_id()
-        per_review_limit = max(1, context.concurrency)
+        per_review_limit = max(1, context.max_concurrency)
 
         while pending or active:
             global_available = max(
                 0,
-                self._subagents.max_concurrent_subagents - self._subagents.get_running_count(),
+                self._subagentmanager.max_concurrent_subagents - self._subagentmanager.get_running_count(),
             )
             while pending and active < per_review_limit and global_available > 0:
-                role = pending.pop(0)
-                assignment = by_dimension.get(
-                    role.name,
-                    ReviewAssignment(
-                        dimension=role.name,
-                        focus=role.description,
-                        evidence_ids=tuple(reference_map),
-                    ),
-                )
+                assignment = pending.pop(0)
                 evidence_ids = assignment.evidence_ids or tuple(reference_map)
                 task = self._build_subagent_task(
                     plan=plan,
                     assignment=assignment,
                     references=[reference_map[item] for item in evidence_ids],
                 )
-                started = await self._subagents.spawn(
+                started = await self._subagentmanager.spawn(
                     task=task,
-                    label=role.name,
+                    label=assignment.dimension,
                     origin_channel=context.channel,
                     origin_chat_id=context.chat_id,
                     session_key=context.session_key,
                     origin_message_id=context.message_id,
-                    origin_metadata=context.metadata,
+                    origin_metadata={
+                        **context.metadata,
+                        "task_kind": "reviewer",
+                        "profile_id": assignment.dimension,
+                        "repository_root": validation_repository_root(plan, self._workspace),
+                    },
                     deliver_to_bus=False,
                 )
                 if started.startswith("Error:"):
-                    finalizer.ingest_subagent_output(role.name, started)
-                    logger.warning("review.dispatch.failed dimension={} reason={}", role.name, started)
+                    finalizer.ingest_subagent_output(assignment.dimension, started)
+                    logger.warning("review.dispatch.failed dimension={} reason={}", assignment.dimension, started)
                 else:
                     active += 1
                     global_available -= 1
@@ -209,7 +210,7 @@ class ReviewOrchestrator:
                 if pending:
                     await asyncio.sleep(0.05)
                 continue
-            result = await self._subagents.wait_for_session_result(context.session_key, timeout=0.5)
+            result = await self._subagentmanager.wait_for_session_result(context.session_key, timeout=0.5)
             if result is None:
                 continue
             active -= 1

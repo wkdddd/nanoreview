@@ -195,8 +195,8 @@ async def maybe_prefetch_review_context(
 
     trace_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
-    policy = policy_for_depth(plan.depth, requested_max_subagents=plan.max_subagents)
-    query = plan.user_requirements or "code review security architecture tests performance entry points config"
+    policy = policy_for_depth(plan.depth)
+    query = plan.user_requirements or "code review bug security performance maintainability entry points config"
     logger.info(
         "review.prefetch.start trace_id={} action={} target_type={} target={} target_repo={} scope_kind={} review_root={} target_subpath={} query_chars={} max_results={}",
         trace_id,

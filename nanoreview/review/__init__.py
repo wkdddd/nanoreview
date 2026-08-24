@@ -17,6 +17,12 @@ from nanoreview.review.planning.planner import (
     latest_user_text,
     resolve_code_review_context,
 )
+from nanoreview.review.profiles import (
+    REVIEWER_PROFILES,
+    ReviewerProfile,
+    get_reviewer_profile,
+    public_reviewer_profiles,
+)
 from nanoreview.review.source.github import GitHubRepoConfig, GitHubRepoReader
 from nanoreview.review.source.local import LocalRepoReader
 from nanoreview.review.types import (
@@ -69,6 +75,8 @@ __all__ = [
     "ReviewPlan",
     "ReviewReport",
     "ReviewRole",
+    "ReviewerProfile",
+    "REVIEWER_PROFILES",
     "apply_review_metadata_from_message",
     "build_code_review_context",
     "build_review_plan",
@@ -82,4 +90,6 @@ __all__ = [
     "policy_for_depth",
     "resolve_code_review_context",
     "review_action_values",
+    "get_reviewer_profile",
+    "public_reviewer_profiles",
 ]

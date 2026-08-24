@@ -263,9 +263,7 @@ class ReviewConfig(Base):
     """Code review configuration defaults."""
 
     default_mode: str = "full"
-    default_focus: list[str] = Field(default_factory=lambda: [
-        "security", "tests", "architecture", "performance"
-    ])
+    default_focus: list[str] = Field(default_factory=list)
     max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None
     rag_enable: bool = True

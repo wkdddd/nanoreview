@@ -65,6 +65,8 @@ class ReviewFinalizer:
         allowed_dimensions: list[str] | set[str] | None = None,
         local_target: str | None = None,
         remote_diff: GitHubDiffEvidence | None = None,
+        routing_mode: str = "explicit",
+        selected_dimensions: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self._workspace = workspace
         self._changed_files = list(changed_files or [])
@@ -80,6 +82,8 @@ class ReviewFinalizer:
         self._errors: list[str] = []
         self._policy = policy or policy_for_depth("full")
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
+        self._routing_mode = routing_mode
+        self._selected_dimensions = tuple(selected_dimensions or ())
 
     def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
@@ -268,7 +272,13 @@ class ReviewFinalizer:
         self._apply_judged_defaults()
         needs_confirmation = self.get_needs_confirmation()
         try:
-            report = render_review_report(target_name, self._dimensions, policy=self._policy)
+            report = render_review_report(
+                target_name,
+                self._dimensions,
+                policy=self._policy,
+                routing_mode=self._routing_mode,
+                selected_dimensions=self._selected_dimensions,
+            )
         except Exception as exc:
             logger.error("report rendering failed: {}", exc)
             report = f"## Code Review Report: {target_name}\n\n### Error\n\nReport rendering failed: {exc}\n"
@@ -365,6 +375,7 @@ class ReviewFinalizer:
             evidence=str(d.get("evidence", "")),
             impact=str(d.get("impact", "")),
             recommendation=str(d.get("recommendation", "")),
+            details=dict(d.get("details") or {}),
             confidence=str(d.get("confidence", "high")),
             source=str(d.get("source", "")),
         )

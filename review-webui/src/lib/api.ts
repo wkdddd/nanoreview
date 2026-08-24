@@ -4,6 +4,7 @@ import type {
   ReviewAction,
   ReviewDepth,
   ReviewTargetType,
+  ReviewerProfile,
   SessionMessagesPayload,
   WebuiThreadPersistedPayload,
 } from "./types";
@@ -125,6 +126,11 @@ export async function listSessions(auth: ApiAuth): Promise<ChatSummary[]> {
       customTitle: stringField(metadata, "custom_title"),
     };
   });
+}
+
+export async function fetchReviewerProfiles(auth: ApiAuth): Promise<ReviewerProfile[]> {
+  const body = await request<{ profiles: ReviewerProfile[] }>("/api/review/profiles", auth);
+  return Array.isArray(body.profiles) ? body.profiles : [];
 }
 
 export async function fetchWebuiThread(

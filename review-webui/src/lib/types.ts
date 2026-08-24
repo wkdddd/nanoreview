@@ -328,14 +328,13 @@ export interface OutboundImageGeneration {
 export type ReviewDepth = "quick" | "full" | "deep";
 export type ReviewTargetType = "auto" | "github" | "local";
 export type ReviewAction = "repo" | "diff";
-export type ReviewFocus =
-  | "security"
-  | "tests"
-  | "architecture"
-  | "performance"
-  | "bug-risk"
-  | "maintainability"
-  | "dependency";
+export type ReviewFocus = string;
+export type ReviewRoutingMode = "auto" | "explicit";
+export interface ReviewerProfile {
+  id: string;
+  label: string;
+  description: string;
+}
 
 export interface OutboundReviewContext {
   mode?: ReviewDepth;

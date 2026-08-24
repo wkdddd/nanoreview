@@ -867,7 +867,7 @@ def review(
         None,
         "--focus",
         "-f",
-        help="Comma-separated review focus, e.g. security,tests,architecture,performance",
+        help="Comma-separated reviewer dimensions (bug,security,performance,maintainability), or auto",
     ),
     mode: str = typer.Option("full", "--mode", help="Review mode: quick, deep, or full"),
     target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto, github, or local"),
@@ -944,7 +944,7 @@ def review(
             session.metadata["review_focus"] = focus
             session.metadata["review_mode_variant"] = mode
             session.metadata["review_action"] = normalized_action
-            session.metadata["review_max_subagents"] = effective_max_subagents
+            session.metadata["max_concurrent_subagents"] = effective_max_subagents
             agent_loop.sessions.save(session)
 
             collected: list[str] = []

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from nanoreview.review.profiles import REVIEWER_PROFILES
 
 SEVERITY_ORDER = ("critical", "high", "medium", "low")
 
@@ -21,7 +23,7 @@ class ReviewMetaKey:
     LOCAL_ROOT = "review_local_root"
     LOCAL_TARGET = "review_local_target"
     LOCAL_SCOPE_KIND = "review_local_scope_kind"
-    MAX_SUBAGENTS = "review_max_subagents"
+    MAX_CONCURRENT_SUBAGENTS = "max_concurrent_subagents"
     ALLOWED_DIMENSIONS = "allowed_review_dimensions"
     EVIDENCE_PROVIDER = "_review_evidence_service"
     GITHUB_PREFETCH_READY = "_review_github_prefetch_ready"
@@ -32,6 +34,7 @@ class ReviewMetaKey:
 ReviewTargetType = Literal["auto", "github", "local"]
 ReviewDepth = Literal["quick", "full", "deep"]
 ReviewScopeKind = Literal["file", "directory", "repo"]
+ReviewRoutingMode = Literal["auto", "explicit"]
 
 
 class ReviewAction(StrEnum):
@@ -93,92 +96,17 @@ class ReviewReport:
         return None
 
 
-DEFAULT_REVIEW_ROLES: dict[str, ReviewRole] = {
-    "security": ReviewRole(
-        name="security",
-        label="Security Reviewer",
-        description=(
-            "Review authentication, authorization, injection risks, secret handling, "
-            "unsafe deserialization, path traversal, SSRF, dependency risks, and data exposure."
-        ),
+ALL_REVIEW_ROLES: dict[str, ReviewRole] = {
+    key: ReviewRole(
+        name=profile.id,
+        label=profile.label,
+        description=profile.planner_description,
         evidence_required=True,
-    ),
-    "tests": ReviewRole(
-        name="tests",
-        label="Test Reviewer",
-        description=(
-            "Review test coverage, missing edge cases, brittle tests, regression risk, "
-            "testability, and suggested verification commands."
-        ),
-    ),
-    "architecture": ReviewRole(
-        name="architecture",
-        label="Architecture Reviewer",
-        description=(
-            "Review module boundaries, coupling, maintainability, data flow, abstractions, "
-            "configuration shape, and long-term design risks."
-        ),
-    ),
-    "performance": ReviewRole(
-        name="performance",
-        label="Performance Reviewer",
-        description=(
-            "Review algorithmic complexity, I/O hot paths, concurrency, caching, memory use, "
-            "database/query behavior, and scalability risks."
-        ),
-    ),
+    )
+    for key, profile in REVIEWER_PROFILES.items()
 }
-
-OPTIONAL_REVIEW_ROLES: dict[str, ReviewRole] = {
-    "bug-risk": ReviewRole(
-        name="bug-risk",
-        label="Bug Risk Reviewer",
-        description=(
-            "Review logic errors, boundary conditions, null/undefined handling, exception paths, "
-            "state inconsistency, race conditions, and off-by-one errors."
-        ),
-        evidence_required=True,
-    ),
-    "maintainability": ReviewRole(
-        name="maintainability",
-        label="Maintainability Reviewer",
-        description=(
-            "Review code duplication, function complexity, unclear abstractions, naming clarity, "
-            "readability, and long-term maintenance burden."
-        ),
-    ),
-    "dependency": ReviewRole(
-        name="dependency",
-        label="Dependency Reviewer",
-        description=(
-            "Review dependency versions, known vulnerabilities, license risks, supply chain "
-            "security, unnecessary dependencies, and version pinning."
-        ),
-    ),
-}
-
-ALL_REVIEW_ROLES: dict[str, ReviewRole] = {**DEFAULT_REVIEW_ROLES, **OPTIONAL_REVIEW_ROLES}
-
-_DIMENSION_PREFIX_ALIASES: dict[str, str] = {
-    "arch": "architecture",
-    "architecture": "architecture",
-    "bug": "bug-risk",
-    "bug-risk": "bug-risk",
-    "bugrisk": "bug-risk",
-    "dep": "dependency",
-    "dependency": "dependency",
-    "dependencies": "dependency",
-    "deps": "dependency",
-    "maint": "maintainability",
-    "maintainability": "maintainability",
-    "perf": "performance",
-    "performance": "performance",
-    "sec": "security",
-    "security": "security",
-    "test": "tests",
-    "testing": "tests",
-    "tests": "tests",
-}
+DEFAULT_REVIEW_ROLES = ALL_REVIEW_ROLES
+OPTIONAL_REVIEW_ROLES: dict[str, ReviewRole] = {}
 
 
 def normalize_review_dimension(value: str | None) -> str | None:
@@ -186,17 +114,8 @@ def normalize_review_dimension(value: str | None) -> str | None:
     raw = (value or "").strip().lower()
     if not raw:
         return None
-    simplified = raw.replace("_", "-")
-    if simplified in ALL_REVIEW_ROLES:
-        return simplified
-    dashed = " ".join(simplified.split()).replace(" ", "-")
-    for alias, dimension in sorted(
-        _DIMENSION_PREFIX_ALIASES.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    ):
-        if dashed == alias or dashed.startswith(f"{alias}-"):
-            return dimension
+    if raw in ALL_REVIEW_ROLES:
+        return raw
     for key, role in ALL_REVIEW_ROLES.items():
         label = role.label.strip().lower()
         short_label = label.removesuffix(" reviewer").strip()
@@ -209,11 +128,8 @@ def normalize_review_dimension(value: str | None) -> str | None:
             or raw.startswith(label + " ")
             or raw.startswith(short_label + " review ")
             or raw.startswith(short_label + " reviewer ")
-            or dashed == dashed_label
-            or dashed == dashed_short_label
-            or dashed.startswith(dashed_label + "-")
-            or dashed.startswith(dashed_short_label + "-review-")
-            or dashed.startswith(dashed_short_label + "-reviewer-")
+            or raw.replace(" ", "-") == dashed_label
+            or raw.replace(" ", "-") == dashed_short_label
         ):
             return key
     return None
@@ -238,8 +154,7 @@ class ReviewPlan:
     action: ReviewAction
     depth: ReviewDepth
     roles: list[ReviewRole]
-    forced_dimensions: bool
-    max_subagents: int
+    routing_mode: ReviewRoutingMode
     user_requirements: str = ""
     target_repo: str | None = None
     pr_number: int | None = None
@@ -297,6 +212,7 @@ class ReviewFindingCandidate:
     evidence: str
     impact: str
     recommendation: str
+    details: dict[str, Any] = field(default_factory=dict)
     confidence: str = "high"
     source: str = ""
 
@@ -357,8 +273,6 @@ class ReviewModePolicy:
     """Programmatic behavior policy for a review depth."""
 
     depth: ReviewDepth
-    roles: list[ReviewRole]
-    max_subagents: int
     severities: tuple[str, ...]
     judge_enabled: bool
     evidence_max_results: int
