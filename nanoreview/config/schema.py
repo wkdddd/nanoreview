@@ -22,14 +22,11 @@ class Base(BaseModel):
 
 
 class ChannelsConfig(Base):
-    """Configuration for chat channels.
+    """Shared delivery settings and the bundled WebSocket transport config."""
 
-    Built-in and plugin channel configs are stored as extra fields (dicts).
-    Each channel parses its own config in __init__.
-    Per-channel "streaming": true enables streaming output (requires send_delta impl).
-    """
-
-    model_config = ConfigDict(extra="allow")
+    # WebSocketConfig lives in ``channels.websocket`` and imports Config for
+    # WebUI request handling, so it is validated by the channel at startup.
+    websocket: dict[str, Any] = Field(default_factory=dict)
 
     send_progress: bool = True  # stream agent's text progress to the channel
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))

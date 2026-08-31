@@ -441,6 +441,12 @@ export function sessionMessageToUIMessage(
   };
 }
 
+function extractReviewError(content: string): string | null {
+  const match = content.match(/^#{1,6}\s+(?:error|错误)\s*\n+([\s\S]*)/im);
+  const detail = match?.[1]?.trim();
+  return detail || null;
+}
+
 function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -480,6 +486,12 @@ function formatReviewPrefetchEvent(event: ToolProgressEvent): string | null {
   }
   if (event.phase === "end") {
     const elapsed = formatElapsed(metadata.elapsed_ms);
+    if (event.result === "empty") {
+      if (action === "diff" && targetType === "local") {
+        return "No changed files found for this local target. Switch Scope to Repo to review the current file, or choose a target with uncommitted changes.";
+      }
+      return "Review context did not contain usable evidence.";
+    }
     if (event.result === "ok" || event.result === "no_summary") {
       const rawChars = typeof metadata.raw_chars === "number" ? metadata.raw_chars : null;
       const chars = rawChars !== null ? `, ${rawChars} chars` : "";
@@ -1042,6 +1054,7 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
           if (!ev.kind && ev.text?.trim()) {
             const content = ev.text;
             const isReport = isLikelyReviewReport(content);
+            const reviewError = isReport ? extractReviewError(content) : null;
             const existingId = hasMessage(prev.messages, assistantCarrierRef.current)
               ? assistantCarrierRef.current
               : findAssistantCarrierId(prev.messages);
@@ -1063,7 +1076,8 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
               return isReport ? stateWithReport({
                 ...prev,
                 logs,
-                phase: isReport ? "completed" : prev.phase,
+                phase: reviewError ? "error" : "completed",
+                error: reviewError,
                 messages: updated,
               }, content) : {
                 ...prev,
@@ -1083,7 +1097,8 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
             return isReport ? stateWithReport({
               ...prev,
               logs,
-              phase: isReport ? "completed" : prev.phase,
+              phase: reviewError ? "error" : "completed",
+              error: reviewError,
               messages: [...markAllStreamingComplete(prev.messages), ordinaryMessage],
             }, content) : {
               ...prev,
@@ -1125,6 +1140,13 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
                   timestamp: Date.now(),
                 },
               ],
+            };
+          }
+          if (prev.phase === "error") {
+            return {
+              ...prev,
+              messages,
+              subagentCards,
             };
           }
           const phase = completedOrStoppedPhase(messages);

@@ -32,7 +32,6 @@ dependencies = [
     "readability-lxml>=0.8.4,<1.0.0",
     "rich>=14.0.0,<15.0.0",
     "croniter>=6.0.0,<7.0.0",
-    "qq-botpy>=1.2.0,<2.0.0",
     "prompt-toolkit>=3.0.50,<4.0.0",
     "questionary>=2.0.0,<3.0.0",
     "mcp>=1.26.0,<2.0.0",
@@ -67,10 +66,6 @@ lang-all = [
     "tree-sitter-typescript>=0.23.0",
     "tree-sitter-go>=0.23.0",
     "tree-sitter-rust>=0.23.0",
-]
-weixin = [
-    "qrcode[pil]>=8.0",
-    "pycryptodome>=3.20.0",
 ]
 langsmith = ["langsmith>=0.1.0"]
 pdf = ["pymupdf>=1.25.0"]

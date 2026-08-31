@@ -45,8 +45,8 @@ class ChannelManager:
     Manages chat channels and coordinates message routing.
 
     Responsibilities:
-    - Initialize enabled channels (Telegram, WhatsApp, etc.)
-    - Start/stop channels
+    - Initialize the optional WebSocket transport
+    - Start/stop the transport
     - Route outbound messages
     """
 
@@ -71,49 +71,45 @@ class ChannelManager:
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels discovered via pkgutil scan + entry_points plugins."""
-        from nanoreview.channels.registry import discover_all
+        """Initialize the WebSocket channel when it is enabled in config."""
+        from nanoreview.channels.websocket import WebSocketChannel
 
-        for name, cls in discover_all().items():
-            section = getattr(self.config.channels, name, None)
-            if section is None:
-                continue
-            enabled = (
-                section.get("enabled", False)
-                if isinstance(section, dict)
-                else getattr(section, "enabled", False)
+        section = getattr(self.config.channels, "websocket", None)
+        if section is None:
+            return
+        enabled = (
+            section.get("enabled", False)
+            if isinstance(section, dict)
+            else getattr(section, "enabled", False)
+        )
+        if not enabled:
+            return
+
+        try:
+            kwargs: dict[str, Any] = {"root_config": self.config}
+            if self._session_manager is not None:
+                kwargs["session_manager"] = self._session_manager
+                static_path = _default_webui_dist()
+                if static_path is not None:
+                    kwargs["static_dist_path"] = static_path
+            if self._webui_runtime_model_name is not None:
+                kwargs["runtime_model_name"] = self._webui_runtime_model_name
+            if self._webui_runtime_usage is not None:
+                kwargs["runtime_usage"] = self._webui_runtime_usage
+            channel = WebSocketChannel(section, self.bus, **kwargs)
+            channel.send_progress = self._resolve_bool_override(
+                section, "send_progress", self.config.channels.send_progress,
             )
-            if not enabled:
-                continue
-            try:
-                kwargs: dict[str, Any] = {}
-                # Only the WebSocket channel currently hosts the embedded webui
-                # surface; other channels stay oblivious to these knobs.
-                if cls.name == "websocket":
-                    kwargs["root_config"] = self.config
-                    if self._session_manager is not None:
-                        kwargs["session_manager"] = self._session_manager
-                        static_path = _default_webui_dist()
-                        if static_path is not None:
-                            kwargs["static_dist_path"] = static_path
-                    if self._webui_runtime_model_name is not None:
-                        kwargs["runtime_model_name"] = self._webui_runtime_model_name
-                    if self._webui_runtime_usage is not None:
-                        kwargs["runtime_usage"] = self._webui_runtime_usage
-                channel = cls(section, self.bus, **kwargs)
-                channel.send_progress = self._resolve_bool_override(
-                    section, "send_progress", self.config.channels.send_progress,
-                )
-                channel.send_tool_hints = self._resolve_bool_override(
-                    section, "send_tool_hints", self.config.channels.send_tool_hints,
-                )
-                channel.show_reasoning = self._resolve_bool_override(
-                    section, "show_reasoning", self.config.channels.show_reasoning,
-                )
-                self.channels[name] = channel
-                logger.info("{} channel enabled", cls.display_name)
-            except Exception as e:
-                logger.warning("{} channel not available: {}", name, e)
+            channel.send_tool_hints = self._resolve_bool_override(
+                section, "send_tool_hints", self.config.channels.send_tool_hints,
+            )
+            channel.show_reasoning = self._resolve_bool_override(
+                section, "show_reasoning", self.config.channels.show_reasoning,
+            )
+            self.channels[WebSocketChannel.name] = channel
+            logger.info("{} channel enabled", WebSocketChannel.display_name)
+        except Exception as e:
+            logger.warning("websocket channel not available: {}", e)
 
         self._validate_allow_from()
 
@@ -274,11 +270,9 @@ class ChannelManager:
                     or msg.metadata.get("_reasoning_end")
                     or msg.metadata.get("_reasoning")
                 ):
-                    # Reasoning rides its own plugin channel: only delivered
-                    # when the destination channel opts in via ``show_reasoning``
-                    # and overrides the streaming primitives. Channels without
-                    # a low-emphasis UI affordance keep the base no-op and the
-                    # content silently drops here. ``_reasoning`` (one-shot)
+                    # Reasoning is delivered only when the destination opts in
+                    # via ``show_reasoning`` and overrides the streaming
+                    # primitives. ``_reasoning`` (one-shot)
                     # is accepted for backward compatibility with hooks that
                     # haven't migrated to delta/end yet.
                     channel = self.channels.get(msg.channel)
@@ -455,20 +449,6 @@ class ChannelManager:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation during sleep
-
-    def get_channel(self, name: str) -> BaseChannel | None:
-        """Get a channel by name."""
-        return self.channels.get(name)
-
-    def get_status(self) -> dict[str, Any]:
-        """Get status of all channels."""
-        return {
-            name: {
-                "enabled": True,
-                "running": channel.is_running
-            }
-            for name, channel in self.channels.items()
-        }
 
     @property
     def enabled_channels(self) -> list[str]:

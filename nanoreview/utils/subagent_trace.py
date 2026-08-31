@@ -49,7 +49,7 @@ def sanitize_trace_text(text: str) -> str:
     """Sanitize text for trace persistence.
 
     Cleans DSML / model control markers and masks common credentials
-    (Bearer tokens, OpenAI / GitHub / Slack tokens, private-key blocks,
+    (Bearer tokens, OpenAI / GitHub tokens, private-key blocks,
     URL passwords).
     """
     return sanitize_persisted_log_text(text)

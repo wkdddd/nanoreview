@@ -41,7 +41,7 @@ def review_result_kind(result: str, *, status: str) -> str:
 
 
 class ReviewToolBase(Tool):
-    _scopes = {"core", "subagent"}
+    _scopes = {"core", "reviewer"}
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:

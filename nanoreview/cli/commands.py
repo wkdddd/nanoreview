@@ -410,8 +410,6 @@ def onboard(
             console.print(f"[red]✗[/red] Error during configuration: {e}")
             console.print("[yellow]Please run 'nanoreview onboard' again to complete setup.[/yellow]")
             raise typer.Exit(1)
-    _onboard_plugins(config_path)
-
     # Create workspace, preferring the configured workspace path.
     workspace_path = get_workspace_path(config.workspace_path)
     if not workspace_path.exists():
@@ -435,47 +433,6 @@ def onboard(
         console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
         console.print("     Get one at: https://openrouter.ai/keys")
         console.print(f"  2. Chat: [cyan]{agent_cmd}[/cyan]")
-    console.print(
-        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
-    )
-
-
-def _merge_missing_defaults(existing: Any, defaults: Any) -> Any:
-    """Recursively fill in missing values from defaults without overwriting user config."""
-    if not isinstance(existing, dict) or not isinstance(defaults, dict):
-        return existing
-
-    merged = dict(existing)
-    for key, value in defaults.items():
-        if key not in merged:
-            merged[key] = value
-        else:
-            merged[key] = _merge_missing_defaults(merged[key], value)
-    return merged
-
-
-def _onboard_plugins(config_path: Path) -> None:
-    """Inject default config for all discovered channels (built-in + plugins)."""
-    import json
-
-    from nanoreview.channels.registry import discover_all
-
-    all_channels = discover_all()
-    if not all_channels:
-        return
-
-    with open(config_path, encoding="utf-8") as f:
-        data = json.load(f)
-
-    channels = data.setdefault("channels", {})
-    for name, cls in all_channels.items():
-        if name not in channels:
-            channels[name] = cls.default_config()
-        else:
-            channels[name] = _merge_missing_defaults(channels[name], cls.default_config())
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def _model_display(config: Config) -> tuple[str, str]:
@@ -1248,126 +1205,6 @@ def _check_fail_on(report_content: str, threshold: str) -> int:
         if re.search(rf"(#{2,4}\s.*{sev}|severity:\s*{sev})", content_lower):
             return 1
     return 0
-# ============================================================================
-# Channel Commands
-# ============================================================================
-
-
-channels_app = typer.Typer(help="Manage channels")
-app.add_typer(channels_app, name="channels")
-
-
-@channels_app.command("status")
-def channels_status(
-    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-):
-    """Show channel status."""
-    from nanoreview.channels.registry import discover_all
-    from nanoreview.config.loader import load_config, set_config_path
-
-    resolved_config_path = Path(config_path).expanduser().resolve() if config_path else None
-    if resolved_config_path is not None:
-        set_config_path(resolved_config_path)
-
-    config = load_config(resolved_config_path)
-
-    table = Table(title="Channel Status")
-    table.add_column("Channel", style="cyan")
-    table.add_column("Enabled")
-
-    for name, cls in sorted(discover_all().items()):
-        section = getattr(config.channels, name, None)
-        if section is None:
-            enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
-        else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            "[green]\u2713[/green]" if enabled else "[dim]\u2717[/dim]",
-        )
-
-    console.print(table)
-
-
-@channels_app.command("login")
-def channels_login(
-    channel_name: str = typer.Argument(..., help="Channel name (e.g. weixin, whatsapp)"),
-    force: bool = typer.Option(False, "--force", "-f", help="Force re-authentication even if already logged in"),
-    config_path: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
-):
-    """Authenticate with a channel via QR code or other interactive login."""
-    from nanoreview.channels.registry import discover_all
-    from nanoreview.config.loader import load_config, set_config_path
-
-    resolved_config_path = Path(config_path).expanduser().resolve() if config_path else None
-    if resolved_config_path is not None:
-        set_config_path(resolved_config_path)
-
-    config = load_config(resolved_config_path)
-    channel_cfg = getattr(config.channels, channel_name, None) or {}
-
-    # Validate channel exists
-    all_channels = discover_all()
-    if channel_name not in all_channels:
-        available = ", ".join(all_channels.keys())
-        console.print(f"[red]Unknown channel: {channel_name}[/red]  Available: {available}")
-        raise typer.Exit(1)
-
-    console.print(f"{__logo__} {all_channels[channel_name].display_name} Login\n")
-
-    channel_cls = all_channels[channel_name]
-    channel = channel_cls(channel_cfg, bus=None)
-
-    success = asyncio.run(channel.login(force=force))
-
-    if not success:
-        raise typer.Exit(1)
-
-
-# ============================================================================
-# Plugin Commands
-# ============================================================================
-
-plugins_app = typer.Typer(help="Manage channel plugins")
-app.add_typer(plugins_app, name="plugins")
-
-
-@plugins_app.command("list")
-def plugins_list():
-    """List all discovered channels (built-in and plugins)."""
-    from nanoreview.channels.registry import discover_all, discover_channel_names
-    from nanoreview.config.loader import load_config
-
-    config = load_config()
-    builtin_names = set(discover_channel_names())
-    all_channels = discover_all()
-
-    table = Table(title="Channel Plugins")
-    table.add_column("Name", style="cyan")
-    table.add_column("Source", style="magenta")
-    table.add_column("Enabled")
-
-    for name in sorted(all_channels):
-        cls = all_channels[name]
-        source = "builtin" if name in builtin_names else "plugin"
-        section = getattr(config.channels, name, None)
-        if section is None:
-            enabled = False
-        elif isinstance(section, dict):
-            enabled = section.get("enabled", False)
-        else:
-            enabled = getattr(section, "enabled", False)
-        table.add_row(
-            cls.display_name,
-            source,
-            "[green]yes[/green]" if enabled else "[dim]no[/dim]",
-        )
-
-    console.print(table)
-
-
 # ============================================================================
 # Status Commands
 # ============================================================================

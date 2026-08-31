@@ -80,6 +80,11 @@ class ReviewOrchestrator:
         remote_diff: Any | None = None,
     ) -> str:
         if not evidence.references:
+            if plan.action.value == "diff" and plan.target_type == "local":
+                raise ReviewPlanningError(
+                    "Diff review cannot start: no changed files were found for the selected local target. "
+                    "Switch Scope to Repo to review the current file, or select a target with uncommitted changes."
+                )
             raise ReviewPlanningError(
                 "Review evidence unavailable: no program-authorized evidence references were produced."
             )

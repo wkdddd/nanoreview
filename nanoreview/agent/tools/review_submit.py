@@ -158,7 +158,7 @@ def review_submit(findings: list[dict[str, Any]]) -> ReviewSubmitResult:
 class SubmitReviewFindingsTool(Tool):
     """Submit final structured findings for a review subagent."""
 
-    _scopes = {"subagent"}
+    _scopes = {"subagent", "reviewer"}
 
     @property
     def name(self) -> str:

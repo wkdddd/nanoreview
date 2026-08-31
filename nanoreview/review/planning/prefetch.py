@@ -274,16 +274,20 @@ async def maybe_prefetch_review_context(
         len(summary),
         elapsed_ms,
     )
+    progress_status = "ok"
+    if not evidence.references:
+        progress_status = "no_summary" if not summary else "empty"
     await _emit_prefetch_progress(
         progress_callback,
         phase="end",
         trace_id=trace_id,
         action=plan.action,
         target_type=plan.target_type,
-        status="ok" if summary else "no_summary",
+        status=progress_status,
         elapsed_ms=elapsed_ms,
         raw_chars=len(raw),
         summary_chars=len(summary),
+        metadata={"evidence_references": len(evidence.references)},
     )
     if not summary:
         return ReviewPrefetchResult(True, "no_summary", evidence=evidence)

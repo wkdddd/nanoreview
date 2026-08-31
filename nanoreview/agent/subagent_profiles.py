@@ -33,7 +33,7 @@ class SubagentExecutionProfile:
     """Declarative runtime policy consumed by :class:`SubagentManager`."""
 
     id: str
-    tool_names: frozenset[str]
+    scope: str
     terminal_tools: frozenset[str] = frozenset()
     soft_tool_error_tools: frozenset[str] = frozenset()
     prompt_builder: Callable[[dict[str, Any], Path], str] | None = None
@@ -44,5 +44,5 @@ class SubagentExecutionProfile:
 
 GENERIC_SUBAGENT_PROFILE = SubagentExecutionProfile(
     id="generic",
-    tool_names=frozenset({"read_file", "list_dir", "grep"}),
+    scope="subagent",
 )

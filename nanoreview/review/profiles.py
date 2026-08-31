@@ -13,8 +13,6 @@ from nanoreview.agent.subagent_profiles import (
 )
 from nanoreview.utils.prompt_templates import render_template
 
-_BASE_TOOLS = frozenset({"read_file", "list_dir", "grep", "review_submit"})
-_EVIDENCE_TOOLS = frozenset({"local_review", "github_review"})
 _SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep", "local_review", "github_review"})
 
 
@@ -27,8 +25,6 @@ class ReviewerProfile:
     context_policy: str
     details_schema: dict[str, object]
     report_fields: tuple[tuple[str, str], ...]
-    base_tools: frozenset[str] = _BASE_TOOLS
-    extra_tools: frozenset[str] = frozenset()
 
     def public_dict(self) -> dict[str, str]:
         return {
@@ -40,7 +36,7 @@ class ReviewerProfile:
     def execution_profile(self) -> SubagentExecutionProfile:
         return SubagentExecutionProfile(
             id=self.id,
-            tool_names=self.base_tools | self.extra_tools | _EVIDENCE_TOOLS,
+            scope="reviewer",
             terminal_tools=frozenset({"review_submit"}),
             soft_tool_error_tools=_SOFT_TOOLS,
             prompt_builder=lambda metadata, workspace: _build_reviewer_prompt(

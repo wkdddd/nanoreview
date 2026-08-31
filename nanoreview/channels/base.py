@@ -19,10 +19,7 @@ from nanoreview.pairing import (
 
 class BaseChannel(ABC):
     """
-    Abstract base class for chat channel implementations.
-
-    Each channel (Telegram, Discord, etc.) should implement this interface
-    to integrate with the nanobot message bus.
+    Base interface for the WebSocket transport and message bus.
     """
 
     name: str = "base"
@@ -43,22 +40,6 @@ class BaseChannel(ABC):
         self.logger = logger.bind(channel=self.name)
         self.bus = bus
         self._running = False
-
-    async def transcribe_audio(self, _file_path: str) -> str:
-        """Transcribe audio — stub, transcription provider has been removed."""
-        return ""
-
-    async def login(self, force: bool = False) -> bool:
-        """
-        Perform channel-specific interactive login (e.g. QR code scan).
-
-        Args:
-            force: If True, ignore existing credentials and force re-authentication.
-
-        Returns True if already authenticated or login succeeds.
-        Override in subclasses that support interactive login.
-        """
-        return True
 
     @abstractmethod
     async def start(self) -> None:
@@ -107,9 +88,7 @@ class BaseChannel(ABC):
     ) -> None:
         """Stream a chunk of model reasoning/thinking content.
 
-        Default is no-op. Channels with a native low-emphasis primitive
-        (Slack context block, Telegram expandable blockquote, Discord
-        subtext, WebUI italic bubble, ...) override to render reasoning
+        Default is no-op. The WebSocket UI overrides this to render reasoning
         as a subordinate trace that updates in place as the model thinks.
 
         Streaming contract mirrors :meth:`send_delta`: ``_reasoning_delta``
@@ -124,7 +103,7 @@ class BaseChannel(ABC):
     ) -> None:
         """Mark the end of a reasoning stream segment.
 
-        Default is no-op. Channels that buffer ``send_reasoning_delta``
+        Default is no-op. Transports that buffer ``send_reasoning_delta``
         chunks for in-place updates use this signal to flush and freeze
         the rendered group; one-shot channels can ignore it entirely.
         """
@@ -133,7 +112,7 @@ class BaseChannel(ABC):
     async def send_reasoning(self, msg: OutboundMessage) -> None:
         """Deliver a complete reasoning block.
 
-        Default implementation reuses the streaming pair so plugins only
+        Default implementation reuses the streaming pair so transports only
         need to override the delta/end methods. Equivalent to one delta
         with the full content followed immediately by an end marker —
         keeps a single rendering path for both streamed and one-shot
@@ -159,7 +138,7 @@ class BaseChannel(ABC):
     ) -> None:
         """Notify the frontend that a subagent started or finished.
 
-        Default is no-op. Channels with a rich UI (WebSocket) override
+        Default is no-op. The WebSocket transport overrides
         to render per-subagent status cards. ``status`` is one of
         ``"running"``, ``"completed"``, or ``"error"``.
         """
@@ -236,11 +215,6 @@ class BaseChannel(ABC):
         )
 
         await self.bus.publish_inbound(msg)
-
-    @classmethod
-    def default_config(cls) -> dict[str, Any]:
-        """Return default config for onboard. Override in plugins to auto-populate config.json."""
-        return {"enabled": False}
 
     @property
     def is_running(self) -> bool:

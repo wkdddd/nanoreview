@@ -49,6 +49,14 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 - 在实现新模块或功能时，项目的日志打印需要完整（错误信息和关键节点的成功info）,但不要泛滥，方便调试
 - 调整代码时不需要兼容旧配置或旧参数，除非用户明确要求。
 
+## 参数命名规范
+
+- 参数名应表达数据的职责和语义，不要仅因代码位于 review 模块就统一添加 `review_` 前缀。
+- review 模块内部的函数、方法和数据结构优先使用简洁语义名，例如：`target`、`target_type`、`action`、`query`、`root`、`path`、`scope`、`depth`、`dimensions`。只有同一作用域存在歧义或确实需要区分不同领域对象时，才使用领域前缀。
+- `review_` 前缀保留给跨模块或持久化的 review 命名空间键，例如会话 metadata、WebUI/API 事件和其他稳定 wire contract：`review_target`、`review_action`、`review_mode_variant`。私有的临时 metadata 可使用 `_review_` 前缀。
+- 工具和公共函数的新参数应按调用语义命名；review 专用工具中的“审查查询”使用 `query`，除非同一接口中同时存在多种查询而必须区分。已有外部参数名属于稳定契约，不能只为统一风格随意改名；如需修改，必须检查完整调用链、文档和测试。
+- 名称应体现类型和约束：布尔值使用 `is_`、`has_`、`include_` 或 `enable_`；数量使用 `*_count`、`*_limit`；路径使用 `*_path` 或 `*_root`；标识符使用 `*_id`；类型使用 `*_type`。避免使用无语义的 `data`、`info`、`value` 或缩写。
+
 ## 协作要求
 
 - 整体地审视代码，不要忽视前后端细节、相关文档、配置等问题
@@ -58,13 +66,20 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 - 信息不足且会影响正确性时先提问；能从本地代码确认的内容不得猜测。
 - 交付时说明改动、验证结果，以及未执行的验证和原因。
 - 所有输出、文件写入、命令执行和字符串内容必须使用 UTF-8，不能使用 GBK/GB2312。
+- 本项目用于展示用户的开发能力并有明确交付时限。初步建议必须以可落地、可维护、可验证的完整方案为目标，至少评估边界情况、错误处理、安全、性能、可观测性、测试、文档和用户体验；不要默认把范围压缩为仅能运行的 MVP。
+- 当有新模块或功能被调整或修改时，可选择性地更新`.agents`文件夹中的项目约束。
 
 ## 项目具体说明
 
 - Architecture constraints：`.agents/architecture.md`
 - Security boundaries：`.agents/security.md`
 - Common gotchas：`.agents/gotchas.md`
+- Debug constraints：`.agents/debug.md`
 - Design principle:`.agents/design.md`
 
-任务涉及对应说明时，先阅读相关文件再执行。若对应约束文件与 `AGENTS.md` 冲突，以`AGENTS.md` 为准，并在同一次改动中消除冲突。
+## 参考项目open-code-review
+
+需要借鉴open-code-review 时，参考项目地址为 `C:\Users\Administrator\Desktop\open-code-review`；先读取索引摘要 [`.agents/reference-summary.md`](.agents/reference-summary.md)。
+
+任务涉及对应说明时，先阅读相关文件再执行。若对应约束文件与 `AGENTS.md` 冲突，以 `AGENTS.md` 为准，并在同一次改动中消除冲突。
 

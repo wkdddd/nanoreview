@@ -861,23 +861,10 @@ def _configure_providers(config: Config) -> None:
 
 @lru_cache(maxsize=1)
 def _get_channel_info() -> dict[str, tuple[str, type[BaseModel]]]:
-    """Get channel info (display name + config class) from channel modules."""
-    import importlib
+    """Return the only transport configurable by the gateway wizard."""
+    from nanoreview.channels.websocket import WebSocketConfig
 
-    from nanoreview.channels.registry import discover_all
-
-    result: dict[str, tuple[str, type[BaseModel]]] = {}
-    for name, channel_cls in discover_all().items():
-        try:
-            mod = importlib.import_module(f"nanoreview.channels.{name}")
-            config_name = channel_cls.__name__.replace("Channel", "Config")
-            config_cls = getattr(mod, config_name, None)
-            if config_cls and isinstance(config_cls, type) and issubclass(config_cls, BaseModel):
-                display_name = getattr(channel_cls, "display_name", name.capitalize())
-                result[name] = (display_name, config_cls)
-        except Exception:
-            logger.warning("Failed to load channel module: {}", name)
-    return result
+    return {"websocket": ("WebSocket", WebSocketConfig)}
 
 
 def _get_channel_names() -> dict[str, str]:

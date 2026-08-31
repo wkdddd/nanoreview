@@ -143,7 +143,7 @@ def _parse_page_range(pages: str, total: int) -> tuple[int, int]:
 )
 class ReadFileTool(_FsTool):
     """Read file contents with optional line-based pagination."""
-    _scopes = {"core", "subagent", "memory"}
+    _scopes = {"core", "subagent", "reviewer", "memory"}
 
     _MAX_CHARS = 128_000
     _DEFAULT_LIMIT = 2000
@@ -377,7 +377,7 @@ class ReadFileTool(_FsTool):
 )
 class WriteFileTool(_FsTool):
     """Write content to a file."""
-    _scopes = {"core", "subagent", "memory"}
+    _scopes = {"core", "memory"}
 
     @property
     def name(self) -> str:
@@ -685,7 +685,7 @@ def _find_match(content: str, old_text: str) -> tuple[str | None, int]:
 )
 class EditFileTool(_FsTool):
     """Edit a file by replacing text with fallback matching."""
-    _scopes = {"core", "subagent", "memory"}
+    _scopes = {"core", "memory"}
 
     _MAX_EDIT_FILE_SIZE = 1024 * 1024 * 1024  # 1 GiB
     _MARKDOWN_EXTS = frozenset({".md", ".mdx", ".markdown"})
@@ -872,7 +872,7 @@ class EditFileTool(_FsTool):
 )
 class ListDirTool(_FsTool):
     """List directory contents with optional recursion."""
-    _scopes = {"core", "subagent"}
+    _scopes = {"core", "subagent", "reviewer"}
 
     _DEFAULT_MAX = 200
     _IGNORE_DIRS = {

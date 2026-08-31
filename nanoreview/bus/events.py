@@ -14,7 +14,7 @@ OUTBOUND_META_AGENT_UI = "_agent_ui"
 class InboundMessage:
     """Message received from a chat channel."""
 
-    channel: str  # qq, weixin, websocket
+    channel: str  # websocket or cli
     sender_id: str  # User identifier
     chat_id: str  # Chat/channel identifier
     content: str  # Message text

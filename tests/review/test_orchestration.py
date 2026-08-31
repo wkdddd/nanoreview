@@ -156,3 +156,33 @@ async def test_program_dispatches_missing_dimensions_without_bus_injection(tmp_p
     assert [call["label"] for call in subagents.calls] == ["security", "tests"]
     assert all(call["deliver_to_bus"] is False for call in subagents.calls)
     assert "No actionable issues found" in report
+
+
+@pytest.mark.asyncio
+async def test_local_diff_without_evidence_explains_how_to_continue(tmp_path) -> None:
+    plan = ReviewPlan(
+        target=str(tmp_path / "app.py"),
+        target_name="app.py",
+        target_type="local",
+        action=ReviewAction.DIFF,
+        depth="full",
+        roles=[ALL_REVIEW_ROLES["security"]],
+        routing_mode="auto",
+    )
+    orchestrator = ReviewOrchestrator(
+        runner=_NoPlanRunner(),
+        subagentmanager=_Subagents(),
+        model="test",
+        workspace=tmp_path,
+        max_tool_result_chars=1000,
+        judge=None,
+    )
+
+    with pytest.raises(ReviewPlanningError, match="Switch Scope to Repo"):
+        await orchestrator.execute(
+            coordinator_messages=[],
+            plan=plan,
+            evidence=ReviewEvidenceBundle(),
+            context=ReviewExecutionContext("cli", "review", "cli:review", None, {}, 1),
+            validation_workspace=str(tmp_path),
+        )

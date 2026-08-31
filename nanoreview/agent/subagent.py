@@ -119,21 +119,21 @@ class SubagentManager:
         profile: SubagentExecutionProfile | None = None,
         target_type: str = "",
     ) -> ToolRegistry:
-        """Build an isolated, profile-allowlisted tool registry."""
+        """Build an isolated tool registry authorized by the profile scope."""
         profile = profile or GENERIC_SUBAGENT_PROFILE
-        allowed_names = set(profile.tool_names)
+        denied_names: set[str] = set()
         # Review profiles declare both transport tools, but only the active
         # target transport is exposed to the model at runtime.
         if target_type == "github":
-            allowed_names.discard("local_review")
+            denied_names.add("local_review")
         elif target_type == "local":
-            allowed_names.discard("github_review")
+            denied_names.add("github_review")
         registry = ToolRegistry()
         ToolLoader().load(
             self._build_tool_context(workspace=workspace, tools_config=tools_config),
             registry,
-            scope="subagent",
-            allowed_names=allowed_names,
+            scope=profile.scope,
+            denied_names=denied_names,
         )
         return registry
 

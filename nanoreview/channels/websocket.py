@@ -655,10 +655,6 @@ class WebSocketChannel(BaseChannel):
         except Exception as e:
             self.logger.warning("failed to send {} event: {}", event, e)
 
-    @classmethod
-    def default_config(cls) -> dict[str, Any]:
-        return WebSocketConfig().model_dump(by_alias=True)
-
     def _expected_path(self) -> str:
         return _normalize_config_path(self.config.path)
 
@@ -904,8 +900,8 @@ class WebSocketChannel(BaseChannel):
         if self._session_manager is None:
             return _http_error(503, "session manager unavailable")
         sessions = self._session_manager.list_sessions()
-        # Sidebar/chat listing for WS-backed sessions only — CLI / Slack / etc.
-        # keys are not intended for resume over this HTTP surface.
+        # Sidebar/chat listing is limited to WS-backed sessions; CLI sessions
+        # are not intended for resume over this HTTP surface.
         cleaned = [
             {k: v for k, v in s.items() if k != "path"}
             for s in sessions
@@ -1102,7 +1098,7 @@ class WebSocketChannel(BaseChannel):
         if decoded_key is None:
             return _http_error(400, "invalid session key")
         # Only ``websocket:…`` sessions are listed/served here — same boundary as
-        # ``/api/sessions``. Block handcrafted URLs from probing CLI / Slack / etc.
+        # ``/api/sessions``. Block handcrafted URLs from probing CLI sessions.
         if not self._is_websocket_channel_session_key(decoded_key):
             return _http_error(404, "session not found")
         data = self._session_manager.read_session_file(decoded_key)

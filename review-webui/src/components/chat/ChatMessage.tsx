@@ -2,7 +2,7 @@ import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FindingDetail } from "@/components/findings/FindingDetail";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { AlertCircle, ChevronDown, ChevronRight } from "lucide-react";
 import { Children, Fragment, isValidElement, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Finding } from "@/hooks/useReviewSession";
 
@@ -47,6 +47,12 @@ function normalizeSeverity(value: string): string | null {
   if (text.includes("medium")) return "medium";
   if (text.includes("low")) return "low";
   return null;
+}
+
+function extractReviewError(content: string): string | null {
+  const match = content.match(/^#{1,6}\s+(?:error|错误)\s*\n+([\s\S]*)/im);
+  const detail = match?.[1]?.trim();
+  return detail || null;
 }
 
 function parseNeedsConfirmationFindings(markdown: string): Finding[] {
@@ -148,9 +154,17 @@ function isFindingsTable(headers: string[]): boolean {
 
 export function ChatMessage({ message, onSelectFinding, findings, afterThinking }: ChatMessageProps) {
   const isUser = message.role === "user";
+  const reviewError = !isUser && message.type === "report"
+    ? extractReviewError(message.content)
+    : null;
+  const isErrorMessage = !isUser && (
+    (message.type === "text" && /^error:/i.test(message.content.trim()))
+    || reviewError !== null
+  );
   const isOutputMessage = !isUser
     && message.type === "text"
-    && message.content.trim().length > 0;
+    && message.content.trim().length > 0
+    && !isErrorMessage;
   const [userToggledOutput, setUserToggledOutput] = useState(false);
   const [showOutput, setShowOutput] = useState(() => Boolean(message.streaming));
   const collapseTimerRef = useRef<number | null>(null);
@@ -230,10 +244,19 @@ export function ChatMessage({ message, onSelectFinding, findings, afterThinking 
             "text-xs leading-relaxed",
             isUser
               ? "px-3 py-2 bg-primary/10 rounded-xl rounded-tr-sm text-foreground max-w-[65%]"
-              : "max-w-[90%]"
+              : isErrorMessage
+                ? "flex max-w-[90%] items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-destructive"
+                : "max-w-[90%]"
           )}
         >
-          {message.type === "finding" && message.finding ? (
+          {isErrorMessage ? (
+            <>
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="whitespace-pre-wrap">
+                {reviewError ?? message.content.replace(/^error:\s*/i, "")}
+              </span>
+            </>
+          ) : message.type === "finding" && message.finding ? (
             <div
               className="cursor-pointer"
               onClick={() => onSelectFinding?.(message.finding!)}

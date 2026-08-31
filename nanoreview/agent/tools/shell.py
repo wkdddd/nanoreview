@@ -67,7 +67,7 @@ class ExecToolConfig(Base):
 )
 class ExecTool(Tool):
     """Tool to execute shell commands."""
-    _scopes = {"core", "subagent"}
+    _scopes = {"core"}
 
     config_key = "exec"
 

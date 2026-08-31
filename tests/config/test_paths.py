@@ -2,7 +2,6 @@ from pathlib import Path
 
 from nanoreview.config import loader
 from nanoreview.config.paths import (
-    get_bridge_install_dir,
     get_cli_history_path,
     get_legacy_sessions_dir,
     get_workspace_path,
@@ -20,7 +19,6 @@ def test_default_paths_use_nanoreview_data_directory(monkeypatch, tmp_path: Path
     assert loader.get_config_path() == data_dir / "config.json"
     assert get_workspace_path() == data_dir / "workspace"
     assert get_cli_history_path() == data_dir / "history" / "cli_history"
-    assert get_bridge_install_dir() == data_dir / "bridge"
     assert get_legacy_sessions_dir() == data_dir / "sessions"
     assert is_default_workspace(data_dir / "workspace")
 

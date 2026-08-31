@@ -18,6 +18,7 @@ from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanoreview.review.planning.planner import ReviewPreparation
+from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.session.manager import Session
 
@@ -529,6 +530,34 @@ def test_review_subagent_tools_include_structured_submitter(tmp_path) -> None:
     assert tools.has("review_submit")
     assert not tools.has("spawn")
     assert not tools.has("message")
+
+
+def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
+    )
+
+    generic = manager._build_tools()
+    reviewer_profile = manager.resolve_profile({"profile_id": "security"})
+    reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="local")
+
+    assert generic.tool_names == ["grep", "list_dir", "read_file", "review_submit"]
+    assert reviewer.tool_names == [
+        "grep",
+        "list_dir",
+        "local_review",
+        "read_file",
+        "review_submit",
+    ]
+    assert not reviewer.has("github_review")
+    assert not reviewer.has("shell")
+    assert not reviewer.has("write_file")
+    assert not reviewer.has("edit_file")
+    assert not reviewer.has("spawn")
 
 
 def test_review_subagent_inherits_subagent_tool_config(tmp_path) -> None:

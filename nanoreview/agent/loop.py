@@ -1209,8 +1209,8 @@ class AgentLoop:
         self._accumulate_total_usage(result.usage)
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
-            # Push final content through stream so streaming channels (e.g. Feishu)
-            # update the card instead of leaving it empty.
+            # Push final content through stream so the WebSocket UI does not
+            # leave the final response empty.
             if on_stream and on_stream_end:
                 await on_stream(result.final_content or "")
                 await on_stream_end(resuming=False)
