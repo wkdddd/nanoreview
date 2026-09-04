@@ -8,12 +8,17 @@ from pathlib import Path
 from typing import Any
 
 from nanoreview.agent.subagent_profiles import (
+    BUG_REVIEWER_SCOPE,
+    MAINTAINABILITY_REVIEWER_SCOPE,
+    PERFORMANCE_REVIEWER_SCOPE,
+    SECURITY_REVIEWER_SCOPE,
     SubagentCompletion,
     SubagentExecutionProfile,
 )
 from nanoreview.utils.prompt_templates import render_template
 
 _SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep", "local_review", "github_review"})
+_REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep", "review_submit"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,9 +39,16 @@ class ReviewerProfile:
         }
 
     def execution_profile(self) -> SubagentExecutionProfile:
+        scope_by_id = {
+            "bug": BUG_REVIEWER_SCOPE,
+            "security": SECURITY_REVIEWER_SCOPE,
+            "performance": PERFORMANCE_REVIEWER_SCOPE,
+            "maintainability": MAINTAINABILITY_REVIEWER_SCOPE,
+        }
         return SubagentExecutionProfile(
             id=self.id,
-            scope="reviewer",
+            scope=scope_by_id[self.id],
+            required_tools=_REVIEWER_REQUIRED_TOOLS,
             terminal_tools=frozenset({"review_submit"}),
             soft_tool_error_tools=_SOFT_TOOLS,
             prompt_builder=lambda metadata, workspace: _build_reviewer_prompt(

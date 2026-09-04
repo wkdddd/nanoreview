@@ -4,6 +4,7 @@ from __future__ import annotations
 from nanoreview.review.types import (
     SEVERITY_ORDER,
     FindingVerdict,
+    ReviewBudgetSkip,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
@@ -53,6 +54,7 @@ def render_review_report(
     policy: ReviewModePolicy | None = None,
     routing_mode: str = "explicit",
     selected_dimensions: tuple[str, ...] | list[str] = (),
+    budget_skipped: tuple[ReviewBudgetSkip, ...] | list[ReviewBudgetSkip] = (),
 ) -> str:
     """Render final Markdown report from validated dimension results."""
     all_accepted = _collect_accepted(dimensions)
@@ -60,7 +62,7 @@ def render_review_report(
     all_rejected = _collect_rejected(dimensions)
 
     stats = _severity_stats(all_accepted)
-    incomplete = _has_incomplete_checks(dimensions)
+    incomplete = bool(budget_skipped) or _has_incomplete_checks(dimensions)
     quick_clean = _is_quick_scoped_clean(policy, dimensions, incomplete)
     summary = _build_summary(
         stats,
@@ -75,6 +77,8 @@ def render_review_report(
     sections.append(f"## Code Review Report: {_escape_markdown_inline(target_name)}\n")
     sections.append(f"### Executive Summary\n\n{summary}\n")
     sections.append(_render_selected_reviewers(routing_mode, selected_dimensions))
+    if budget_skipped:
+        sections.append(_render_budget_skipped(budget_skipped))
     sections.append(_render_findings(
         all_accepted,
         uncertain_count=len(all_uncertain),
@@ -269,6 +273,20 @@ def _render_selected_reviewers(
         lines.append(f"- {_escape_markdown_inline(label)}")
     if not selected_dimensions:
         lines.append("- None")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_budget_skipped(skipped: tuple[ReviewBudgetSkip, ...] | list[ReviewBudgetSkip]) -> str:
+    lines = ["### Skipped Reviewers\n"]
+    lines.append("The following selected reviewers were not started because the subagent budget was insufficient:\n")
+    for item in skipped:
+        profile = get_reviewer_profile(item.dimension)
+        label = profile.label if profile is not None else item.dimension
+        lines.append(
+            f"- {_escape_markdown_inline(label)} - budget-skipped "
+            f"(estimated quota: {item.quota_tokens} tokens; input: {item.input_tokens} tokens)"
+        )
     lines.append("")
     return "\n".join(lines)
 

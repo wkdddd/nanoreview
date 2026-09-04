@@ -201,6 +201,16 @@ class ReviewAssignment:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewBudgetSkip:
+    """A selected reviewer omitted by the orchestration budget gate."""
+
+    dimension: str
+    input_tokens: int
+    quota_tokens: int
+    reason: str = "budget"
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewFindingCandidate:
     """A candidate finding produced by a dimension subagent."""
 

@@ -8,6 +8,34 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from nanoreview.agent.runner import AgentRunResult
 
+SUBAGENT_SCOPE = "subagent"
+BUG_REVIEWER_SCOPE = "reviewer.bug"
+SECURITY_REVIEWER_SCOPE = "reviewer.security"
+PERFORMANCE_REVIEWER_SCOPE = "reviewer.performance"
+MAINTAINABILITY_REVIEWER_SCOPE = "reviewer.maintainability"
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentExecutionLimits:
+    """Per-task runtime limits supplied by a controlling orchestrator."""
+
+    max_iterations: int | None = None
+    max_tokens: int | None = None
+    timeout_seconds: float | None = None
+    input_tokens: int | None = None
+    quota_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentExecutionLimits:
+    """Per-task runtime limits supplied by a controlling orchestrator."""
+
+    max_iterations: int | None = None
+    max_tokens: int | None = None
+    timeout_seconds: float | None = None
+    input_tokens: int | None = None
+    quota_tokens: int | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class SubagentCompletion:
@@ -34,6 +62,7 @@ class SubagentExecutionProfile:
 
     id: str
     scope: str
+    required_tools: frozenset[str] = frozenset()
     terminal_tools: frozenset[str] = frozenset()
     soft_tool_error_tools: frozenset[str] = frozenset()
     prompt_builder: Callable[[dict[str, Any], Path], str] | None = None
@@ -44,5 +73,5 @@ class SubagentExecutionProfile:
 
 GENERIC_SUBAGENT_PROFILE = SubagentExecutionProfile(
     id="generic",
-    scope="subagent",
+    scope=SUBAGENT_SCOPE,
 )

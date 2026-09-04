@@ -12,6 +12,7 @@ from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanoreview.agent.loop import AgentLoop, TurnContext, TurnState, _is_consumed_subagent_result
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent import SubagentManager
+from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.context import current_request_context
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.queue import MessageBus
@@ -19,7 +20,13 @@ from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_r
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanoreview.review.planning.planner import ReviewPreparation
 from nanoreview.review.profiles import reviewer_execution_profiles
-from nanoreview.review.types import ReviewMetaKey
+from nanoreview.review.types import (
+    EvidenceReference,
+    ReviewAction,
+    ReviewEvidenceBundle,
+    ReviewMetaKey,
+    ReviewPlan,
+)
 from nanoreview.session.manager import Session
 
 
@@ -49,6 +56,21 @@ class CapturingRunner:
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         self.initial_messages = list(spec.initial_messages)
         return AgentRunResult(final_content="ok", messages=spec.initial_messages)
+
+
+class SpecCapturingRunner:
+    def __init__(self) -> None:
+        self.specs: list[AgentRunSpec] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        return AgentRunResult(final_content="ok", messages=list(spec.initial_messages))
+
+
+class SlowRunner:
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        await asyncio.sleep(0.05)
+        return AgentRunResult(final_content="late", messages=list(spec.initial_messages))
 
 
 class SpawnExecutingRunner:
@@ -517,17 +539,19 @@ def test_consumed_subagent_result_helper_matches_consumed_task() -> None:
     assert _is_consumed_subagent_result(msg, set()) is False
 
 
-def test_review_subagent_tools_include_structured_submitter(tmp_path) -> None:
+def test_generic_subagent_tools_are_read_only(tmp_path) -> None:
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
 
     tools = manager._build_tools()
 
-    assert tools.has("review_submit")
+    assert tools.tool_names == ["grep", "list_dir", "read_file"]
+    assert not tools.has("review_submit")
     assert not tools.has("spawn")
     assert not tools.has("message")
 
@@ -544,8 +568,9 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
     generic = manager._build_tools()
     reviewer_profile = manager.resolve_profile({"profile_id": "security"})
     reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="local")
+    github_reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="github")
 
-    assert generic.tool_names == ["grep", "list_dir", "read_file", "review_submit"]
+    assert generic.tool_names == ["grep", "list_dir", "read_file"]
     assert reviewer.tool_names == [
         "grep",
         "list_dir",
@@ -553,7 +578,15 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
         "read_file",
         "review_submit",
     ]
+    assert github_reviewer.tool_names == [
+        "github_review",
+        "grep",
+        "list_dir",
+        "read_file",
+        "review_submit",
+    ]
     assert not reviewer.has("github_review")
+    assert not github_reviewer.has("local_review")
     assert not reviewer.has("shell")
     assert not reviewer.has("write_file")
     assert not reviewer.has("edit_file")
@@ -579,6 +612,89 @@ def test_review_subagent_inherits_subagent_tool_config(tmp_path) -> None:
     assert ctx.config.exec.timeout == 123
     assert ctx.config.restrict_to_workspace is True
     assert ctx.config.github_repo.token == "gh-test-token"
+
+
+@pytest.mark.asyncio
+async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> None:
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    runner = SpecCapturingRunner()
+    manager.runner = runner  # type: ignore[assignment]
+    limits = SubagentExecutionLimits(
+        max_iterations=13,
+        max_tokens=777,
+        timeout_seconds=30,
+        input_tokens=120,
+        quota_tokens=12_240,
+    )
+    status = SubagentStatus(
+        task_id="task-limits",
+        label="generic",
+        task_description="bounded task",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task-limits",
+        "bounded task",
+        "generic",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+        execution_limits=limits,
+    )
+
+    assert len(runner.specs) == 1
+    assert runner.specs[0].max_iterations == 13
+    assert runner.specs[0].max_tokens == 777
+    result = manager.drain_session_results("cli:direct", limit=1)[0]
+    assert result.metadata["subagent_input_tokens"] == 120
+    assert result.metadata["subagent_quota_tokens"] == 12_240
+    assert result.metadata["subagent_max_rounds"] == 13
+    assert result.metadata["subagent_max_tokens"] == 777
+    assert result.metadata["subagent_timeout_seconds"] == 30
+
+
+@pytest.mark.asyncio
+async def test_subagent_timeout_announces_error_with_budget_metadata(tmp_path) -> None:
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    manager.runner = SlowRunner()  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task-timeout",
+        label="generic",
+        task_description="slow task",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task-timeout",
+        "slow task",
+        "generic",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+        execution_limits=SubagentExecutionLimits(
+            max_iterations=10,
+            max_tokens=100,
+            timeout_seconds=0.001,
+            input_tokens=10,
+            quota_tokens=12_000,
+        ),
+    )
+
+    assert status.phase == "error"
+    assert status.stop_reason == "timeout"
+    result = manager.drain_session_results("cli:direct", limit=1)[0]
+    assert result.metadata["subagent_status"] == "error"
+    assert "timed out" in result.metadata["subagent_result"]
+    assert result.metadata["subagent_quota_tokens"] == 12_000
 
 
 @pytest.mark.asyncio
@@ -688,6 +804,7 @@ async def test_review_subagent_finalization_retry_forces_review_submit(tmp_path)
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
     runner = ReviewSubmitRetryRunner()
     manager.runner = runner  # type: ignore[assignment]
@@ -704,6 +821,7 @@ async def test_review_subagent_finalization_retry_forces_review_submit(tmp_path)
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": "security"},
     )
 
     assert len(runner.specs) == 2
@@ -776,6 +894,7 @@ async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
     runner = MaxIterationsThenSubmitRunner()
     manager.runner = runner  # type: ignore[assignment]
@@ -792,6 +911,7 @@ async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": "security"},
     )
 
     assert len(runner.specs) == 2
@@ -821,6 +941,7 @@ async def test_review_subagent_retry_failure_announces_error_not_success(tmp_pat
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
     runner = AlwaysNoSubmitRunner()
     manager.runner = runner  # type: ignore[assignment]
@@ -837,6 +958,7 @@ async def test_review_subagent_retry_failure_announces_error_not_success(tmp_pat
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": "security"},
     )
 
     assert len(runner.specs) == 2
@@ -926,6 +1048,7 @@ async def test_subagent_workspace_uses_local_root(tmp_path) -> None:
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
 
     captured: list[ToolRegistry] = []
@@ -962,6 +1085,7 @@ async def test_subagent_workspace_uses_local_root(tmp_path) -> None:
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
         origin_metadata={
+            "profile_id": "security",
             ReviewMetaKey.TARGET_TYPE: "local",
             ReviewMetaKey.LOCAL_ROOT: str(subdir),
         },
@@ -1066,6 +1190,7 @@ async def test_empty_findings_without_evidence_is_incomplete(tmp_path) -> None:
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
 
     class NoEvidenceSubmitRunner:
@@ -1097,7 +1222,7 @@ async def test_empty_findings_without_evidence_is_incomplete(tmp_path) -> None:
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
-        origin_metadata={ReviewMetaKey.TARGET_TYPE: "local"},
+        origin_metadata={"profile_id": "security", ReviewMetaKey.TARGET_TYPE: "local"},
     )
 
     assert status.phase == "error"
@@ -1115,6 +1240,7 @@ async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
 
     class EvidenceSubmitRunner:
@@ -1283,6 +1409,86 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
     assert session.metadata["allowed_review_dimensions"] == ["dependency"]
     assert "Dependency Reviewer" in runner.initial_messages[0]["content"]
     assert "Security Reviewer" not in runner.initial_messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, monkeypatch) -> None:
+    from nanoreview.bus.events import InboundMessage
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def execute(self, **_kwargs: Any) -> str:
+            return "## Code Review Report: app.py\n\nNo actionable issues found."
+
+    plan = ReviewPlan(
+        target="app.py",
+        target_name="app.py",
+        target_type="local",
+        action=ReviewAction.REPO,
+        depth="full",
+        roles=[],
+        routing_mode="auto",
+    )
+    evidence = ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(
+                id="ev-1",
+                path="app.py",
+                start_line=1,
+                end_line=1,
+                excerpt="value = 1",
+            ),
+        ),
+    )
+
+    async def fake_prepare(*_args: Any, **_kwargs: Any) -> ReviewPreparation:
+        return ReviewPreparation(plan, "review prompt", evidence)
+
+    monkeypatch.setattr("nanoreview.agent.loop.ReviewOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", fake_prepare)
+
+    bus = MessageBus()
+    loop = AgentLoop(bus, DummyProvider(), tmp_path)
+    session = Session(key="websocket:review-report")
+    session.metadata[ReviewMetaKey.TARGET] = "app.py"
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="review-report",
+        content="审查",
+        metadata={
+            "_wants_stream": True,
+            ReviewMetaKey.TARGET: "app.py",
+            ReviewMetaKey.TARGET_TYPE: "local",
+        },
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key=session.key,
+        state=TurnState.RUN,
+        turn_id="turn-report",
+        session=session,
+    )
+    ctx.initial_messages = [{"role": "user", "content": "审查"}]
+
+    await loop._state_run(ctx)
+
+    assert ctx.content_replaced is True
+    while bus.outbound_size:
+        await bus.consume_outbound()
+
+    await loop._state_respond(ctx)
+    events = []
+    while bus.outbound_size:
+        events.append(await bus.consume_outbound())
+
+    assert len(events) == 2
+    assert events[0].metadata["_stream_kind"] == "review_report"
+    assert events[0].metadata["_stream_delta"] is True
+    assert events[1].metadata["_stream_kind"] == "review_report"
+    assert events[1].metadata["_stream_end"] is True
 
 
 @pytest.mark.asyncio

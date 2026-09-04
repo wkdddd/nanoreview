@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -11,6 +12,7 @@ from loguru import logger
 
 from nanoreview.agent.runner import AgentRunSpec, AgentRunner
 from nanoreview.agent.subagent import SubagentManager
+from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
 from nanoreview.review.output.finalizer import ReviewFinalizer
@@ -19,6 +21,7 @@ from nanoreview.review.input import policy_for_depth
 from nanoreview.review.types import (
     EvidenceReference,
     ReviewAssignment,
+    ReviewBudgetSkip,
     ReviewEvidenceBundle,
     ReviewPlan,
 )
@@ -45,6 +48,7 @@ class ReviewExecutionContext:
     metadata: dict[str, Any]
     max_concurrency: int
     result_callback: Callable[[Any], Awaitable[None]] | None = None
+    token_budget: int = 100_000
 
 
 class ReviewOrchestrator:
@@ -54,14 +58,19 @@ class ReviewOrchestrator:
         self,
         *,
         runner: AgentRunner,
-        subagentmanager: SubagentManager,
+        subagentmanager: SubagentManager | None = None,
+        subagents: Any | None = None,
         model: str,
         workspace: Path,
         max_tool_result_chars: int,
         judge: ReviewJudge | None,
     ) -> None:
         self._runner = runner
-        self._subagentmanager = subagentmanager
+        self._subagentmanager = (
+            subagentmanager if subagentmanager is not None else subagents
+        )
+        if self._subagentmanager is None:
+            raise ValueError("subagentmanager is required")
         self._model = model
         self._workspace = workspace
         self._max_tool_result_chars = max_tool_result_chars
@@ -93,6 +102,14 @@ class ReviewOrchestrator:
             plan=plan,
             evidence=evidence,
         )
+        admitted, skipped = await self._admit_assignments(
+            plan=plan,
+            evidence=evidence,
+            assignments=assignments,
+            validation_workspace=validation_workspace,
+            local_target=local_target,
+            token_budget=max(0, context.token_budget),
+        )
         finalizer = ReviewFinalizer(
             validation_workspace,
             changed_files,
@@ -102,16 +119,113 @@ class ReviewOrchestrator:
             selected_dimensions=[assignment.dimension for assignment in assignments],
             local_target=local_target,
             remote_diff=remote_diff,
+            budget_skipped=skipped,
         )
         await self._dispatch_and_collect(
             plan=plan,
             evidence=evidence,
-            assignments=assignments,
+            assignments=tuple(item[0] for item in admitted),
+            limits_by_dimension={item[0].dimension: item[1] for item in admitted},
             context=context,
             finalizer=finalizer,
         )
         await finalizer.apply_judge(self._judge)
         return finalizer.finalize(plan.target_name or plan.target or "target").report_markdown
+
+    async def _admit_assignments(
+        self,
+        *,
+        plan: ReviewPlan,
+        evidence: ReviewEvidenceBundle,
+        assignments: tuple[ReviewAssignment, ...],
+        validation_workspace: str,
+        local_target: str | None,
+        token_budget: int,
+    ) -> tuple[tuple[tuple[ReviewAssignment, SubagentExecutionLimits], ...], tuple[ReviewBudgetSkip, ...]]:
+        """Make one deterministic budget decision before spawning reviewers."""
+        reference_map = evidence.by_id()
+        ordered = list(assignments)
+        if plan.routing_mode == "auto":
+            priority = {"bug": 0, "security": 1, "performance": 2, "maintainability": 3}
+            ordered.sort(key=lambda item: priority.get(item.dimension, len(priority)))
+
+        budgeted: list[tuple[ReviewAssignment, int, int, int]] = []
+        for assignment in ordered:
+            evidence_ids = assignment.evidence_ids or tuple(reference_map)
+            references = [reference_map[item] for item in evidence_ids if item in reference_map]
+            input_tokens = await self._estimate_input_tokens(
+                plan=plan,
+                references=references,
+                validation_workspace=validation_workspace,
+                local_target=local_target,
+            )
+            quota = max(12_000, min(30_000, 8_000 + 2 * input_tokens))
+            max_rounds = max(10, min(30, 10 + math.ceil(input_tokens / 4_000)))
+            budgeted.append((assignment, input_tokens, quota, max_rounds))
+
+        admitted: list[tuple[ReviewAssignment, SubagentExecutionLimits]] = []
+        skipped: list[ReviewBudgetSkip] = []
+        used = 0
+        for assignment, input_tokens, quota, max_rounds in budgeted:
+            if token_budget > 0 and used + quota > token_budget:
+                skipped.append(
+                    ReviewBudgetSkip(
+                        dimension=assignment.dimension,
+                        input_tokens=input_tokens,
+                        quota_tokens=quota,
+                    )
+                )
+                continue
+            admitted.append(
+                (
+                    assignment,
+                    SubagentExecutionLimits(
+                        max_iterations=max_rounds,
+                        max_tokens=2_048,
+                        timeout_seconds=180,
+                        input_tokens=input_tokens,
+                        quota_tokens=quota,
+                    ),
+                )
+            )
+            used += quota
+        logger.info(
+            "review.subagent.budget.admitted total_budget={} admitted={} skipped={} reserved_tokens={}",
+            token_budget,
+            len(admitted),
+            len(skipped),
+            used,
+        )
+        return tuple(admitted), tuple(skipped)
+
+    async def _estimate_input_tokens(
+        self,
+        *,
+        plan: ReviewPlan,
+        references: list[EvidenceReference],
+        validation_workspace: str,
+        local_target: str | None,
+    ) -> int:
+        """Estimate target/evidence input without blocking the event loop."""
+        target_text = ""
+        target_path = local_target
+        if target_path is None and plan.local_scope is not None and plan.local_scope.kind == "file":
+            target_path = plan.local_scope.target_path
+        if target_path:
+            try:
+                path = Path(target_path).expanduser().resolve()
+                root = Path(validation_workspace).expanduser().resolve()
+                path.relative_to(root)
+                target_text = await asyncio.to_thread(path.read_text, encoding="utf-8")
+            except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
+                target_text = ""
+        evidence_text = "\n".join(reference.excerpt for reference in references)
+        from nanoreview.utils.helpers import estimate_prompt_tokens
+
+        estimate = estimate_prompt_tokens([
+            {"role": "user", "content": "\n".join((target_text, evidence_text))}
+        ])
+        return max(1, int(estimate or 0))
 
     async def _collect_plan(
         self,
@@ -169,6 +283,7 @@ class ReviewOrchestrator:
         plan: ReviewPlan,
         evidence: ReviewEvidenceBundle,
         assignments: tuple[ReviewAssignment, ...],
+        limits_by_dimension: dict[str, SubagentExecutionLimits],
         context: ReviewExecutionContext,
         finalizer: ReviewFinalizer,
     ) -> None:
@@ -204,6 +319,7 @@ class ReviewOrchestrator:
                         "repository_root": validation_repository_root(plan, self._workspace),
                     },
                     deliver_to_bus=False,
+                    execution_limits=limits_by_dimension.get(assignment.dimension),
                 )
                 if started.startswith("Error:"):
                     finalizer.ingest_subagent_output(assignment.dimension, started)
@@ -225,6 +341,7 @@ class ReviewOrchestrator:
             finalizer.ingest_subagent_output(dimension, raw)
             if context.result_callback is not None:
                 await context.result_callback(result)
+
 
     @staticmethod
     def _build_subagent_task(

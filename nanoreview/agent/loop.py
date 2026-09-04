@@ -1158,6 +1158,9 @@ class AgentLoop:
                                 review_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS)
                                 or getattr(self.review_config, "max_concurrent_subagents", 4)
                             ),
+                            token_budget=int(
+                                getattr(self.review_config, "token_budget", 100_000)
+                            ),
                             result_callback=_persist_automatic_subagent_result,
                         ),
                         validation_workspace=validation_workspace,
@@ -1168,6 +1171,7 @@ class AgentLoop:
                     result = AgentRunResult(
                         final_content=final_content,
                         messages=list(initial_messages),
+                        content_replaced=True,
                     )
                 except ReviewPlanningError as exc:
                     logger.warning("review.orchestration.failed reason={}", exc)

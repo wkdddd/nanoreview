@@ -3,6 +3,7 @@
 import asyncio
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,6 +14,7 @@ from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent_profiles import (
     GENERIC_SUBAGENT_PROFILE,
     SubagentCompletion,
+    SubagentExecutionLimits,
     SubagentExecutionProfile,
 )
 from nanoreview.agent.tools.context import ToolContext
@@ -81,6 +83,11 @@ class SubagentManager:
             GENERIC_SUBAGENT_PROFILE.id: GENERIC_SUBAGENT_PROFILE,
             **(execution_profiles or {}),
         }
+        # Validate profiles before any task can be dispatched.  A typo in a
+        # scope should fail configuration at startup rather than silently
+        # producing an agent with no capabilities.
+        for profile in self._execution_profiles.values():
+            self._validate_profile_scope(profile)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -121,6 +128,7 @@ class SubagentManager:
     ) -> ToolRegistry:
         """Build an isolated tool registry authorized by the profile scope."""
         profile = profile or GENERIC_SUBAGENT_PROFILE
+        target_type = str(target_type or "").strip().lower()
         denied_names: set[str] = set()
         # Review profiles declare both transport tools, but only the active
         # target transport is exposed to the model at runtime.
@@ -129,16 +137,69 @@ class SubagentManager:
         elif target_type == "local":
             denied_names.add("github_review")
         registry = ToolRegistry()
-        ToolLoader().load(
+        loader = ToolLoader()
+        loader.load(
             self._build_tool_context(workspace=workspace, tools_config=tools_config),
             registry,
             scope=profile.scope,
             denied_names=denied_names,
         )
+        loaded_names = frozenset(registry.tool_names)
+        required_tools = frozenset(getattr(profile, "required_tools", frozenset()))
+        # Reviewer profiles share a base tool contract but must also expose
+        # the evidence tool for the active transport target.
+        if profile.scope.startswith("reviewer."):
+            if target_type == "local":
+                required_tools |= frozenset({"local_review"})
+            elif target_type == "github":
+                required_tools |= frozenset({"github_review"})
+        missing_tools = required_tools - loaded_names
+        if missing_tools:
+            missing = ", ".join(sorted(missing_tools))
+            raise ValueError(
+                "Subagent profile {!r} (scope={!r}) is missing required tools: {} "
+                "for target_type={!r}".format(
+                    profile.id,
+                    profile.scope,
+                    missing,
+                    target_type or "unknown",
+                )
+            )
+        logger.info(
+            "subagent.tools.loaded profile_id={} scope={} target_type={} tools={}",
+            profile.id,
+            profile.scope,
+            target_type or "unknown",
+            sorted(loaded_names),
+        )
         return registry
 
     def register_execution_profile(self, profile: SubagentExecutionProfile) -> None:
+        self._validate_profile_scope(profile)
         self._execution_profiles[profile.id] = profile
+
+    @staticmethod
+    def _validate_profile_scope(profile: SubagentExecutionProfile) -> None:
+        """Reject profiles whose scope is not declared by any tool class."""
+        loader = ToolLoader()
+        validate_scope = getattr(loader, "validate_scope", None)
+        if callable(validate_scope):
+            validate_scope(profile.scope)
+            return
+
+        # Keep this fallback for loaders that do not yet expose the explicit
+        # validation helper (for example, lightweight test doubles).
+        declared_scopes: set[str] = set()
+        for tool_cls in loader.discover():
+            declared_scopes.update(getattr(tool_cls, "_scopes", {"core"}))
+        discover_plugins = getattr(loader, "_discover_plugins", None)
+        if callable(discover_plugins):
+            for tool_cls in discover_plugins().values():
+                declared_scopes.update(getattr(tool_cls, "_scopes", {"core"}))
+        if profile.scope not in declared_scopes:
+            raise ValueError(
+                f"Unknown subagent scope {profile.scope!r} for profile {profile.id!r}"
+            )
 
     def resolve_profile(self, metadata: dict[str, Any]) -> SubagentExecutionProfile:
         profile_id = str(metadata.get("profile_id") or "generic").strip()
@@ -194,6 +255,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
         deliver_to_bus: bool = True,
+        execution_limits: SubagentExecutionLimits | None = None,
     ) -> str:
         """Start a dedicated subagent for same-turn result integration."""
         if session_key:
@@ -227,7 +289,14 @@ class SubagentManager:
 
         bg_task = asyncio.create_task(
             self._run_subagent(
-                task_id, task, label, origin, status, origin_message_id, origin_metadata
+                task_id,
+                task,
+                label,
+                origin,
+                status,
+                origin_message_id,
+                origin_metadata,
+                execution_limits,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -263,9 +332,11 @@ class SubagentManager:
         status: SubagentStatus,
         origin_message_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
+        execution_limits: SubagentExecutionLimits | None = None,
     ) -> None:
         """Execute one profile-configured subagent and announce its result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        lifecycle_started_at = time.monotonic()
         session_key = (
             origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         )
@@ -279,6 +350,7 @@ class SubagentManager:
             status.iteration = payload.get("iteration", status.iteration)
 
         lifecycle_status = "error"
+        result: AgentRunResult | None = None
         try:
             metadata = dict(origin_metadata or {})
             profile = self.resolve_profile(metadata)
@@ -398,71 +470,126 @@ class SubagentManager:
                 if self._llm_wall_timeout_for_session
                 else None
             )
-            result = await self.runner.run(
-                AgentRunSpec(
-                    initial_messages=messages,
-                    tools=tools,
-                    model=self.model,
-                    max_iterations=self.max_iterations,
-                    max_tool_result_chars=self.max_tool_result_chars,
-                    reasoning_effort=self.reasoning_effort,
-                    hook=hook,
-                    max_iterations_message=profile.max_iterations_message,
-                    error_message=None,
-                    fail_on_tool_error=True,
-                    soft_tool_error_tools=self.soft_tool_error_tools(profile),
-                    terminal_tools=self.terminal_tools(profile),
-                    checkpoint_callback=_on_checkpoint,
-                    session_key=sess_key,
-                    llm_timeout_s=llm_timeout,
-                )
+            effective_iterations = (
+                execution_limits.max_iterations
+                if execution_limits and execution_limits.max_iterations is not None
+                else self.max_iterations
             )
-            status.stop_reason = result.stop_reason
+            effective_max_tokens = execution_limits.max_tokens if execution_limits else None
+            timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
+            timeout_scope = (
+                asyncio.timeout(
+                    max(0.0, timeout_seconds - (time.monotonic() - lifecycle_started_at))
+                )
+                if timeout_seconds is not None and timeout_seconds > 0
+                else nullcontext()
+            )
+            async with timeout_scope:
+                result = await self.runner.run(
+                    AgentRunSpec(
+                        initial_messages=messages,
+                        tools=tools,
+                        model=self.model,
+                        max_iterations=effective_iterations,
+                        max_tokens=effective_max_tokens,
+                        max_tool_result_chars=self.max_tool_result_chars,
+                        reasoning_effort=self.reasoning_effort,
+                        hook=hook,
+                        max_iterations_message=profile.max_iterations_message,
+                        error_message=None,
+                        fail_on_tool_error=True,
+                        soft_tool_error_tools=self.soft_tool_error_tools(profile),
+                        terminal_tools=self.terminal_tools(profile),
+                        checkpoint_callback=_on_checkpoint,
+                        session_key=sess_key,
+                        llm_timeout_s=llm_timeout,
+                    )
+                )
+                status.stop_reason = result.stop_reason
 
-            if result.stop_reason == "tool_error":
-                status.phase = "error"
-                status.tool_events = list(result.tool_events)
-                final_result = self._format_partial_progress(result)
+                if result.stop_reason == "tool_error":
+                    status.phase = "error"
+                    status.tool_events = list(result.tool_events)
+                    final_result = self._format_partial_progress(result)
+                    await self._announce_result(
+                        task_id,
+                        label,
+                        task,
+                        final_result,
+                        origin,
+                        "error",
+                        origin_message_id,
+                        usage=result.usage,
+                        execution_limits=execution_limits,
+                    )
+                    return
+                if result.stop_reason == "error":
+                    status.phase = "error"
+                    await self._announce_result(
+                        task_id,
+                        label,
+                        task,
+                        result.error or "Error: subagent execution failed.",
+                        origin,
+                        "error",
+                        origin_message_id,
+                        usage=result.usage,
+                        execution_limits=execution_limits,
+                    )
+                    return
+
+                completion = await self.handle_completed_result(
+                    profile=profile,
+                    result=result,
+                    tools=tools,
+                    hook=hook,
+                    session_key=sess_key,
+                    llm_timeout=llm_timeout,
+                    target_type=target_type,
+                    retry_max_tokens=effective_max_tokens,
+                )
+                final_result = completion.content
+                status.stop_reason = completion.stop_reason or status.stop_reason
+
+                logger.info("Subagent [{}] completed status={}", task_id, completion.status)
+                # A reviewer that submitted empty findings without evidence is
+                # an execution failure; missing terminal submission is still a
+                # completed lifecycle with an error result for compatibility.
+                status.phase = (
+                    "error"
+                    if completion.status == "error"
+                    and completion.content.startswith("Error: Review incomplete")
+                    else "done"
+                )
+                lifecycle_status = "completed" if completion.status == "ok" else "error"
                 await self._announce_result(
                     task_id,
                     label,
                     task,
                     final_result,
                     origin,
-                    "error",
+                    completion.status,
                     origin_message_id,
+                    usage=result.usage,
+                    execution_limits=execution_limits,
                 )
-                return
-            if result.stop_reason == "error":
-                status.phase = "error"
-                await self._announce_result(
-                    task_id,
-                    label,
-                    task,
-                    result.error or "Error: subagent execution failed.",
-                    origin,
-                    "error",
-                    origin_message_id,
-                )
-                return
 
-            completion = await self.handle_completed_result(
-                profile=profile,
-                result=result,
-                tools=tools,
-                hook=hook,
-                session_key=sess_key,
-                llm_timeout=llm_timeout,
-                target_type=target_type,
-            )
-            final_result = completion.content
-            status.stop_reason = completion.stop_reason or status.stop_reason
-
-            logger.info("Subagent [{}] completed status={}", task_id, completion.status)
-            status.phase = "done"
-            lifecycle_status = "completed" if completion.status == "ok" else "error"
+        except TimeoutError:
+            status.phase = "error"
+            status.stop_reason = "timeout"
+            timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
+            message = f"Error: subagent execution timed out after {timeout_seconds or 0:g}s"
+            logger.warning("Subagent [{}] timed out after {}s", task_id, timeout_seconds)
             await self._announce_result(
-                task_id, label, task, final_result, origin, completion.status, origin_message_id
+                task_id,
+                label,
+                task,
+                message,
+                origin,
+                "error",
+                origin_message_id,
+                usage=result.usage if result is not None else None,
+                execution_limits=execution_limits,
             )
 
         except Exception as e:
@@ -470,7 +597,15 @@ class SubagentManager:
             status.error = str(e)
             logger.exception("Subagent [{}] failed", task_id)
             await self._announce_result(
-                task_id, label, task, f"Error: {e}", origin, "error", origin_message_id
+                task_id,
+                label,
+                task,
+                f"Error: {e}",
+                origin,
+                "error",
+                origin_message_id,
+                usage=result.usage if result is not None else None,
+                execution_limits=execution_limits,
             )
         finally:
             await self._publish_subagent_lifecycle(
@@ -491,6 +626,7 @@ class SubagentManager:
         session_key: str | None,
         llm_timeout: float | None,
         target_type: str,
+        retry_max_tokens: int | None = None,
     ) -> SubagentCompletion:
         if profile.result_handler is None:
             return SubagentCompletion(
@@ -507,6 +643,7 @@ class SubagentManager:
                 hook=hook,
                 session_key=session_key,
                 llm_timeout=llm_timeout,
+                max_tokens=retry_max_tokens,
             )
 
         return await profile.result_handler(
@@ -524,6 +661,7 @@ class SubagentManager:
         hook: SubagentHook,
         session_key: str | None,
         llm_timeout: float | None,
+        max_tokens: int | None = None,
     ) -> tuple[str | None, str]:
         """Give a profile one bounded retry to call its terminal tool."""
         if len(profile.terminal_tools) != 1:
@@ -544,6 +682,7 @@ class SubagentManager:
                 tools=tools,
                 model=self.model,
                 max_iterations=2,
+                max_tokens=max_tokens or 2_048,
                 max_tool_result_chars=self.max_tool_result_chars,
                 reasoning_effort=self.reasoning_effort,
                 hook=hook,
@@ -559,6 +698,8 @@ class SubagentManager:
                 llm_timeout_s=llm_timeout,
             )
         )
+        for key, value in retry.usage.items():
+            result.usage[key] = result.usage.get(key, 0) + value
         extracted = self._extract_terminal_result(retry, terminal_tool)
         return extracted, retry.stop_reason
 
@@ -576,6 +717,32 @@ class SubagentManager:
                     return content
         return None
 
+    @staticmethod
+    def _extract_review_submit_result(
+        messages: list[dict[str, Any]],
+        tool_events: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        """Extract a successfully processed structured review submission."""
+        candidates: list[Any] = []
+        for event in reversed(tool_events or []):
+            if event.get("name") == "review_submit" and event.get("status") == "ok":
+                candidates.append(event.get("raw_result"))
+        for message in reversed(messages):
+            if message.get("role") == "tool" and message.get("name") == "review_submit":
+                candidates.append(message.get("content"))
+        import json
+
+        for raw in candidates:
+            if not isinstance(raw, str):
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("submitted") is True and isinstance(payload.get("findings"), list):
+                return json.dumps(payload, ensure_ascii=False)
+        return None
+
     async def _announce_result(
         self,
         task_id: str,
@@ -585,6 +752,8 @@ class SubagentManager:
         origin: dict[str, str],
         status: str,
         origin_message_id: str | None = None,
+        usage: dict[str, int] | None = None,
+        execution_limits: SubagentExecutionLimits | None = None,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         session_key = (
@@ -622,6 +791,19 @@ class SubagentManager:
             "subagent_status": status,
             "subagent_result": result,
         }
+        if usage:
+            metadata["subagent_usage"] = dict(usage)
+        if execution_limits is not None:
+            if execution_limits.input_tokens is not None:
+                metadata["subagent_input_tokens"] = execution_limits.input_tokens
+            if execution_limits.quota_tokens is not None:
+                metadata["subagent_quota_tokens"] = execution_limits.quota_tokens
+            if execution_limits.max_iterations is not None:
+                metadata["subagent_max_rounds"] = execution_limits.max_iterations
+            if execution_limits.max_tokens is not None:
+                metadata["subagent_max_tokens"] = execution_limits.max_tokens
+            if execution_limits.timeout_seconds is not None:
+                metadata["subagent_timeout_seconds"] = execution_limits.timeout_seconds
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
         msg = InboundMessage(
@@ -705,6 +887,10 @@ class SubagentManager:
 
     def _task_state(self, session_key: str, label: str) -> str | None:
         return self._session_task_state.get(session_key, {}).get(label)
+
+    def _dimension_state(self, session_key: str, label: str) -> str | None:
+        """Compatibility alias for the session task lifecycle lookup."""
+        return self._task_state(session_key, label)
 
     def _set_task_state(self, session_key: str, label: str, state: str) -> None:
         self._session_task_state.setdefault(session_key, {})[label] = state

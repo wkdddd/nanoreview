@@ -41,7 +41,11 @@ def review_result_kind(result: str, *, status: str) -> str:
 
 
 class ReviewToolBase(Tool):
-    _scopes = {"core", "reviewer"}
+    _scopes = {
+        "core",
+        "reviewer.bug", "reviewer.security",
+        "reviewer.performance", "reviewer.maintainability",
+    }
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:

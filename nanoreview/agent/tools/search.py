@@ -111,7 +111,11 @@ class _SearchTool(_FsTool):
 
 class GrepTool(_SearchTool):
     """Search file contents using a regex-like pattern."""
-    _scopes = {"core", "subagent", "reviewer"}
+    _scopes = {
+        "core", "subagent",
+        "reviewer.bug", "reviewer.security",
+        "reviewer.performance", "reviewer.maintainability",
+    }
 
     _MAX_RESULT_CHARS = 128_000
     _MAX_FILE_BYTES = 2_000_000

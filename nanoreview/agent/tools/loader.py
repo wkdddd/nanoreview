@@ -90,6 +90,19 @@ class ToolLoader:
         self._plugins = plugins
         return plugins
 
+    def available_scopes(self) -> frozenset[str]:
+        """Return scopes declared by built-in and plugin tools."""
+        scopes: set[str] = set()
+        for tool_cls in [*self.discover(), *self._discover_plugins().values()]:
+            scopes.update(getattr(tool_cls, "_scopes", {"core"}))
+        return frozenset(scopes)
+
+    def validate_scope(self, scope: str) -> None:
+        """Reject profiles targeting a scope no tool can provide."""
+        if scope not in self.available_scopes():
+            known = ", ".join(sorted(self.available_scopes())) or "<none>"
+            raise ValueError(f"Unknown tool scope '{scope}'. Declared scopes: {known}")
+
     def load(
         self,
         ctx: Any,
@@ -99,6 +112,7 @@ class ToolLoader:
         denied_names: frozenset[str] | set[str] | None = None,
     ) -> list[str]:
         """Load enabled tools in ``scope``, excluding targeted deny entries."""
+        self.validate_scope(scope)
         registered: list[str] = []
         builtin_names: set[str] = set()
         sources = [(self.discover(), False), (self._discover_plugins().values(), True)]
@@ -130,4 +144,9 @@ class ToolLoader:
                         builtin_names.add(tool.name)
                 except Exception:
                     logger.exception("Failed to register tool: {}", cls_label)
+        logger.info(
+            "tool_loader.load scope={} tools={}",
+            scope,
+            sorted(registered),
+        )
         return registered

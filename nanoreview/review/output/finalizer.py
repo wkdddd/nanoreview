@@ -13,12 +13,13 @@ from nanoreview.review.output.report import render_review_report
 from nanoreview.review.output.validator import ReviewValidator, ValidationContext
 from nanoreview.review.types import (
     FindingVerdict,
+    GitHubDiffEvidence,
+    ReviewBudgetSkip,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
     ReviewJudgedFinding,
     ReviewModePolicy,
-    GitHubDiffEvidence,
     normalize_review_dimension,
 )
 
@@ -67,6 +68,7 @@ class ReviewFinalizer:
         remote_diff: GitHubDiffEvidence | None = None,
         routing_mode: str = "explicit",
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
+        budget_skipped: list[ReviewBudgetSkip] | tuple[ReviewBudgetSkip, ...] = (),
     ) -> None:
         self._workspace = workspace
         self._changed_files = list(changed_files or [])
@@ -84,6 +86,7 @@ class ReviewFinalizer:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
         self._routing_mode = routing_mode
         self._selected_dimensions = tuple(selected_dimensions or ())
+        self._budget_skipped = tuple(budget_skipped)
 
     def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
@@ -278,6 +281,7 @@ class ReviewFinalizer:
                 policy=self._policy,
                 routing_mode=self._routing_mode,
                 selected_dimensions=self._selected_dimensions,
+                budget_skipped=self._budget_skipped,
             )
         except Exception as exc:
             logger.error("report rendering failed: {}", exc)
