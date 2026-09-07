@@ -50,6 +50,11 @@ class ReviewPlanReceiver:
                 return False, f"invalid review plan: duplicate dimension {dimension!r}"
             seen_dimensions.add(dimension)
             evidence_ids = tuple(item.evidence_ids)
+            if not evidence_ids:
+                return False, (
+                    f"invalid review plan: {dimension!r} requires a non-empty evidence_ids "
+                    "list referencing authorized evidence IDs"
+                )
             if len(set(evidence_ids)) != len(evidence_ids):
                 return False, f"invalid review plan: duplicate evidence IDs for {dimension!r}"
             unknown = sorted(set(evidence_ids) - self.evidence_ids)
@@ -83,11 +88,15 @@ _ASSIGNMENT_SCHEMA = ObjectSchema(
         "focus": StringSchema("Concrete risk or interaction to investigate.", min_length=1),
         "evidence_ids": ArraySchema(
             StringSchema("Authorized evidence ID, such as ev-001.", min_length=1),
-            description="Evidence references selected for this dimension.",
+            description=(
+                "Non-empty list of authorized evidence IDs for this dimension. "
+                "IDs must come from the Authorized Evidence manifest."
+            ),
+            min_items=1,
             max_items=20,
         ),
     },
-    required=["dimension", "focus"],
+    required=["dimension", "focus", "evidence_ids"],
     additional_properties=False,
 )
 

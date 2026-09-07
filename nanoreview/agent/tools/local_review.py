@@ -90,7 +90,7 @@ class LocalReviewTool(ReviewToolBase):
     def description(self) -> str:
         return (
             "Local repository reader and review evidence tool. Use meta/tree/file for "
-            "read-only local repository inspection, repo for RAG-backed full or scoped evidence retrieval, "
+            "read-only local repository inspection, repo for programmatic full or scoped evidence preparation, "
             "and diff for programmatically filtered current local git patches."
         )
 
@@ -143,12 +143,12 @@ class LocalReviewTool(ReviewToolBase):
                     action_value,
                 )
                 return result_text
-            if self._blocks_rag_repo_action(action_value):
+            if self._blocks_repo_action_during_diff(action_value):
                 result_text = (
-                    "Error: local_review action='repo' is unavailable during diff review because "
-                    "it uses RAG. Use local_review(action='meta'/'tree'/'file') or read_file."
+                    "Error: local_review action='repo' is unavailable during diff review. "
+                    "Use local_review(action='meta'/'tree'/'file') or read_file."
                 )
-                logger.warning("local_review.rag_repo_blocked trace_id={}", trace_id)
+                logger.warning("local_review.repo_blocked_during_diff trace_id={}", trace_id)
                 return result_text
             if action_value in READER_ACTIONS:
                 path = repo_path or target

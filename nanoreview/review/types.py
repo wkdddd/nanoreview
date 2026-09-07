@@ -29,7 +29,6 @@ class ReviewMetaKey:
     GITHUB_PREFETCH_READY = "_review_github_prefetch_ready"
     DIFF_CONTEXT_WINDOW_TOKENS = "_review_diff_context_window_tokens"
     GITHUB_PR_HEAD_REF = "_review_github_pr_head_ref"
-    EVIDENCE_BUNDLE = "_review_evidence_bundle"
 
 ReviewTargetType = Literal["auto", "github", "local"]
 ReviewDepth = Literal["quick", "full", "deep"]
@@ -44,7 +43,7 @@ class ReviewAction(StrEnum):
 
 @dataclass(slots=True)
 class GitHubDiffEvidence:
-    """Non-RAG evidence collected from one GitHub pull request."""
+    """Evidence collected from one GitHub pull request."""
 
     snapshot: str
     head_sha: str
@@ -176,6 +175,54 @@ class EvidenceReference:
     source: str = "prefetch"
     tags: tuple[str, ...] = ()
     excerpt: str = ""
+    # Semantic unit metadata: file/module/class/function/diff/document/config/
+    # syntax_diagnostic. Related chunks supplement the main chunk they link to.
+    kind: str = "file"
+    parent_id: str | None = None
+    token_count: int = 0
+    preview: str = ""
+
+    @property
+    def is_related(self) -> bool:
+        return "related" in self.tags
+
+
+# Reasons accepted for SkippedReviewUnit.reason.
+SKIPPED_REASON_UNSUPPORTED = "unsupported_code_type"
+SKIPPED_REASON_MISSING_GRAMMAR = "missing_grammar"
+SKIPPED_REASON_PARSE_ERROR = "parse_error"
+SKIPPED_REASON_TOKEN_LIMIT = "token_limit_exceeded"
+SKIPPED_REASON_BUDGET = "budget_exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedReviewUnit:
+    """One file-level or line-range unit excluded from the review pipeline."""
+
+    path: str
+    reason: str
+    start_line: int | None = None
+    end_line: int | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class FileSkipSummary:
+    """Per-file aggregation of skipped units: one path, merged ranges."""
+
+    path: str
+    reasons: tuple[str, ...]
+    ranges: tuple[tuple[int, int], ...] = ()
+    whole_file: bool = True
+
+    def describe(self) -> str:
+        parts = [self.path]
+        if not self.whole_file and self.ranges:
+            parts.append(" (unreviewed lines " + ", ".join(f"{start}-{end}" for start, end in self.ranges) + ")")
+        elif self.whole_file:
+            parts.append(" (whole file)")
+        parts.append(f" - {', '.join(self.reasons)}")
+        return "".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,9 +233,32 @@ class ReviewEvidenceBundle:
     summary: str = ""
     status: str = "ok"
     reason: str = ""
+    skipped: tuple[SkippedReviewUnit, ...] = ()
 
     def by_id(self) -> dict[str, EvidenceReference]:
         return {reference.id: reference for reference in self.references}
+
+    def skipped_by_file(self) -> dict[str, FileSkipSummary]:
+        """Aggregate skipped units per file path, merging line ranges."""
+        grouped: dict[str, list[SkippedReviewUnit]] = {}
+        for unit in self.skipped:
+            grouped.setdefault(unit.path, []).append(unit)
+        summaries: dict[str, FileSkipSummary] = {}
+        for path, units in grouped.items():
+            reasons = tuple(dict.fromkeys(unit.reason for unit in units))
+            has_range = any(unit.start_line is not None for unit in units)
+            ranges = tuple(
+                (unit.start_line or 1, unit.end_line or unit.start_line or 1)
+                for unit in sorted(units, key=lambda item: item.start_line or 0)
+                if unit.start_line is not None
+            )
+            summaries[path] = FileSkipSummary(
+                path=path,
+                reasons=reasons,
+                ranges=ranges,
+                whole_file=not has_range,
+            )
+        return summaries
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +391,7 @@ class ReviewEvidenceProvider(Protocol):
         max_results: int,
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
+        context_window_tokens: int | None = None,
     ) -> str: ...
 
     async def local_changed_context(
@@ -343,6 +414,7 @@ class ReviewEvidenceProvider(Protocol):
         max_results: int,
         include_tests: bool | None,
         trace_id: str,
+        context_window_tokens: int | None = None,
     ) -> str: ...
 
     async def github_diff_context(

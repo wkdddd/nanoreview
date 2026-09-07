@@ -59,10 +59,24 @@ _COMPACTABLE_TOOLS = frozenset(
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 _STREAM_OUTER_TIMEOUT_MULTIPLIER = 3.0
 _TOOL_ERROR_PREFIXES = ("Error:", "Error executing ")
+# Reason recorded when the model answers with prose instead of submitting
+# through its required terminal tool.
+_TERMINAL_PROSE_MISS_REASON = (
+    "model returned a prose response without calling the required terminal tool"
+)
 
 
 def _is_tool_error_result(result: Any) -> bool:
     return isinstance(result, str) and result.startswith(_TOOL_ERROR_PREFIXES)
+
+
+def _build_terminal_submission_prompt(terminal_tools: frozenset[str]) -> str:
+    """Fixed prompt injected when the model skips its terminal tool."""
+    names = ", ".join(f"`{name}`" for name in sorted(terminal_tools))
+    return (
+        f"You did not call the required terminal tool ({names}). "
+        "Call it now with JSON-compatible structured arguments and no prose."
+    )
 
 
 @dataclass(slots=True)
@@ -99,6 +113,9 @@ class AgentRunSpec:
     permission_request_callback: Any | None = None
     soft_tool_error_tools: frozenset[str] = field(default_factory=frozenset)
     terminal_tools: frozenset[str] = field(default_factory=frozenset)
+    # Max terminal-tool submission attempts (failed submissions and prose
+    # answers both count) before the run fails with terminal_tool_failed.
+    terminal_retry_limit: int = 5
 
 
 @dataclass(slots=True)
@@ -114,6 +131,10 @@ class AgentRunResult:
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     had_injections: bool = False
     content_replaced: bool = False
+    # Terminal-tool diagnostics: how many submission attempts were made and
+    # the last concrete failure reason when the run ended terminal_tool_failed.
+    terminal_attempts: int = 0
+    terminal_error: str | None = None
 
 
 class AgentRunner:
@@ -274,6 +295,11 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        # Terminal-tool submission tracking: attempts count every failed or
+        # successful terminal submission (and prose answers while the terminal
+        # tool is still pending); terminal_error keeps the last concrete error.
+        terminal_attempts = 0
+        terminal_error: str | None = None
 
         for iteration in range(spec.max_iterations):
             try:
@@ -343,6 +369,16 @@ class AgentRunner:
 
                 await hook.before_execute_tools(context)
 
+                if spec.terminal_tools:
+                    for tool_call in response.tool_calls:
+                        if tool_call.name in spec.terminal_tools:
+                            logger.info(
+                                "terminal_tool.start tool={} attempt={}/{}",
+                                tool_call.name,
+                                terminal_attempts + 1,
+                                spec.terminal_retry_limit,
+                            )
+
                 results, new_events, fatal_error = await self._execute_tools(
                     spec,
                     response.tool_calls,
@@ -400,19 +436,62 @@ class AgentRunner:
                 )
                 # Terminal tools (e.g. review_submit) signal completion: once
                 # executed successfully, break immediately instead of giving the
-                # LLM another turn that could re-invoke them in a loop.
+                # LLM another turn that could re-invoke them in a loop. A failed
+                # terminal submission stays inside this AgentRun: the assistant
+                # and tool messages (including the error) are kept so the model
+                # can correct its submission with full context, up to
+                # spec.terminal_retry_limit attempts.
                 if spec.terminal_tools:
-                    terminal_called = any(
-                        tc.name in spec.terminal_tools
-                        for tc, result in zip(response.tool_calls, results)
-                        if not _is_tool_error_result(result)
-                    )
-                    if terminal_called:
+                    terminal_success: str | None = None
+                    terminal_failure: tuple[str, str] | None = None
+                    for tool_call, result in zip(response.tool_calls, results):
+                        if tool_call.name not in spec.terminal_tools:
+                            continue
+                        if _is_tool_error_result(result):
+                            terminal_failure = (tool_call.name, str(result))
+                        else:
+                            terminal_success = tool_call.name
+                            break
+                    if terminal_success is not None:
+                        terminal_attempts += 1
+                        logger.info(
+                            "terminal_tool.completed tool={} attempts={}",
+                            terminal_success,
+                            terminal_attempts,
+                        )
                         stop_reason = "completed"
                         final_content = ""
                         context.stop_reason = stop_reason
                         await hook.after_iteration(context)
                         break
+                    if terminal_failure is not None:
+                        failure_name, failure_text = terminal_failure
+                        terminal_attempts += 1
+                        terminal_error = failure_text
+                        if terminal_attempts >= spec.terminal_retry_limit:
+                            error = terminal_error
+                            final_content = error
+                            stop_reason = "terminal_tool_failed"
+                            self._append_final_message(messages, final_content)
+                            context.final_content = final_content
+                            context.error = error
+                            context.stop_reason = stop_reason
+                            logger.info(
+                                "terminal_tool.failed tool={} attempts={} reason={}",
+                                failure_name,
+                                terminal_attempts,
+                                failure_text[:200],
+                            )
+                            await hook.after_iteration(context)
+                            break
+                        logger.info(
+                            "terminal_tool.retry tool={} attempt={} reason={}",
+                            failure_name,
+                            terminal_attempts,
+                            failure_text[:200],
+                        )
+                        # Continue the current AgentRun so the same context,
+                        # plan, and tool definitions remain available.
                 empty_content_retries = 0
                 length_recovery_count = 0
                 # Checkpoint 1: drain injections after tools, before next LLM call
@@ -564,6 +643,56 @@ class AgentRunner:
                     continue
                 break
 
+            # A terminal-tool run that answers with prose instead of submitting
+            # keeps the same AgentRun: inject one fixed prompt asking for the
+            # terminal tool and count this as a terminal submission attempt.
+            if spec.terminal_tools and not context.content_replaced:
+                messages.append(
+                    assistant_message
+                    or build_assistant_message(
+                        clean,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    )
+                )
+                terminal_attempts += 1
+                terminal_error = _TERMINAL_PROSE_MISS_REASON
+                terminal_names = ",".join(sorted(spec.terminal_tools))
+                if terminal_attempts >= spec.terminal_retry_limit:
+                    error = terminal_error
+                    final_content = error
+                    stop_reason = "terminal_tool_failed"
+                    context.final_content = final_content
+                    context.error = error
+                    context.stop_reason = stop_reason
+                    logger.info(
+                        "terminal_tool.failed tool={} attempts={} reason={}",
+                        terminal_names,
+                        terminal_attempts,
+                        terminal_error,
+                    )
+                    await hook.after_iteration(context)
+                    break
+                logger.info(
+                    "terminal_tool.retry tool={} attempt={} reason={}",
+                    terminal_names,
+                    terminal_attempts,
+                    _TERMINAL_PROSE_MISS_REASON,
+                )
+                self._append_injected_messages(
+                    messages,
+                    [
+                        {
+                            "role": "user",
+                            "content": _build_terminal_submission_prompt(
+                                spec.terminal_tools
+                            ),
+                        }
+                    ],
+                )
+                await hook.after_iteration(context)
+                continue
+
             messages.append(
                 assistant_message
                 or build_assistant_message(
@@ -626,6 +755,8 @@ class AgentRunner:
             tool_events=tool_events,
             had_injections=had_injections,
             content_replaced=context.content_replaced,
+            terminal_attempts=terminal_attempts,
+            terminal_error=terminal_error,
         )
 
     def _build_request_kwargs(
@@ -847,6 +978,19 @@ class AgentRunner:
                 fatal_error = error
         return results, events, fatal_error
 
+    @staticmethod
+    def _is_fatal_tool_error(spec: AgentRunSpec, tool_name: str) -> bool:
+        """Whether a failed tool call should abort the run.
+
+        Terminal-tool failures never abort: they are retried inside the same
+        AgentRun by the terminal retry loop, keeping the error in context.
+        """
+        return (
+            spec.fail_on_tool_error
+            and tool_name not in spec.soft_tool_error_tools
+            and tool_name not in spec.terminal_tools
+        )
+
     async def _run_tool(
         self,
         spec: AgentRunSpec,
@@ -866,7 +1010,7 @@ class AgentRunner:
                 "status": "error",
                 "detail": "repeated external lookup blocked",
             }
-            if spec.fail_on_tool_error and tool_call.name not in spec.soft_tool_error_tools:
+            if self._is_fatal_tool_error(spec, tool_call.name):
                 return lookup_error + hint, event, RuntimeError(lookup_error)
             return lookup_error + hint, event, None
         prepare_call = getattr(spec.tools, "prepare_call", None)
@@ -892,7 +1036,7 @@ class AgentRunner:
             if handled is not None:
                 return handled
             error = None
-            if spec.fail_on_tool_error and tool_call.name not in spec.soft_tool_error_tools:
+            if self._is_fatal_tool_error(spec, tool_call.name):
                 error = RuntimeError(prep_error)
             return prep_error + hint, event, error
         try:
@@ -956,7 +1100,7 @@ class AgentRunner:
             )
             if handled is not None:
                 return handled
-            if spec.fail_on_tool_error and tool_call.name not in spec.soft_tool_error_tools:
+            if self._is_fatal_tool_error(spec, tool_call.name):
                 return payload, event, exc
             return payload, event, None
 
@@ -975,7 +1119,7 @@ class AgentRunner:
             )
             if handled is not None:
                 return handled
-            if spec.fail_on_tool_error and tool_call.name not in spec.soft_tool_error_tools:
+            if self._is_fatal_tool_error(spec, tool_call.name):
                 return result + hint, event, RuntimeError(result)
             return result + hint, event, None
 

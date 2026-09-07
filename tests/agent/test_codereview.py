@@ -14,7 +14,7 @@ from nanoreview.review import (
     ReviewReport,
     build_code_review_context,
     build_review_plan,
-    normalize_focus,
+    normalize_requested_dimensions,
     normalize_review_action,
     resolve_code_review_context,
 )
@@ -28,43 +28,42 @@ class DummyProvider(LLMProvider):
         return "dummy"
 
 
-def test_normalize_focus_defaults_to_four_roles_without_forcing() -> None:
-    roles, forced = normalize_focus(None)
+def test_normalize_requested_dimensions_defaults_to_all_roles_in_auto_mode() -> None:
+    roles, mode = normalize_requested_dimensions(None)
 
-    assert [role.name for role in roles] == ["security", "tests", "architecture", "performance"]
-    assert forced is False
-
-
-def test_normalize_focus_selects_requested_roles_and_deduplicates() -> None:
-    roles, forced = normalize_focus("security, tests, security")
-
-    assert [role.name for role in roles] == ["security", "tests"]
-    assert forced is True
+    assert [role.name for role in roles] == list(ALL_REVIEW_ROLES)
+    assert mode == "auto"
 
 
-def test_normalize_focus_rejects_unknown_focus() -> None:
-    with pytest.raises(ValueError, match="Unknown review focus 'bogus'"):
-        normalize_focus("security,bogus")
+def test_normalize_requested_dimensions_selects_requested_roles_and_deduplicates() -> None:
+    roles, mode = normalize_requested_dimensions("security, bug, security")
+
+    assert [role.name for role in roles] == ["security", "bug"]
+    assert mode == "explicit"
+
+
+def test_normalize_requested_dimensions_rejects_unknown_dimension() -> None:
+    with pytest.raises(ValueError, match="Unknown review dimension 'bogus'"):
+        normalize_requested_dimensions("security,bogus")
 
 
 def test_review_role_sets() -> None:
     assert len(DEFAULT_REVIEW_ROLES) == 4
-    assert len(OPTIONAL_REVIEW_ROLES) == 3
-    assert len(ALL_REVIEW_ROLES) == 7
+    assert len(OPTIONAL_REVIEW_ROLES) == 0
+    assert len(ALL_REVIEW_ROLES) == 4
 
 
 def test_build_code_review_context_keeps_subagent_limit_independent_of_mode() -> None:
     prompt = build_code_review_context(
         target="https://github.com/test/repo",
-        focus="security,tests",
+        focus="security,bug",
         max_subagents=6,
         mode="quick",
     )
 
     assert "QUICK review" in prompt
     assert "critical and high" in prompt
-    assert "up to 6 total" in prompt
-    assert "Subagent limit: 6; it is configured independently of review depth." in prompt
+    assert "Focus only on critical and high severity issues" in prompt
 
 
 def test_build_code_review_context_deep_mode_mentions_thorough() -> None:
@@ -184,8 +183,8 @@ def test_build_code_review_context_requires_local_review_without_prefetch() -> N
     )
 
     assert "No prefetched evidence" in prompt
-    assert "MUST call local_review" in prompt
-    assert "local_review(action='diff'" in prompt
+    assert "use precise reader calls before spawning reviewers" in prompt
+    assert "Action diff: review current local git changes" in prompt
     assert "repo_review" not in prompt
 
 
@@ -223,38 +222,38 @@ def test_dimension_contract_uses_forced_focus_dimensions() -> None:
     prompt = build_code_review_context(
         target="https://github.com/test/repo",
         target_type="github",
-        focus="security,tests",
+        focus="security,maintainability",
     )
 
     assert "Cover ONLY these dimensions" in prompt
     assert "Security Reviewer" in prompt
-    assert "Test Reviewer" in prompt
-    assert "Architecture Reviewer" not in prompt
+    assert "Maintainability Reviewer" in prompt
+    assert "Bug Reviewer" not in prompt
     assert "Performance Reviewer" not in prompt
 
 
-def test_quick_forced_dependency_focus_keeps_dependency_dimension() -> None:
+def test_quick_forced_performance_focus_keeps_performance_dimension() -> None:
     plan = build_review_plan(
         target="https://github.com/test/repo",
         target_type="github",
-        focus="dependency",
+        focus="performance",
         depth="quick",
     )
 
     assert plan is not None
-    assert [role.name for role in plan.roles] == ["dependency"]
+    assert [role.name for role in plan.roles] == ["performance"]
 
     prompt = build_code_review_context(
         target="https://github.com/test/repo",
         target_type="github",
-        focus="dependency",
+        focus="performance",
         mode="quick",
     )
 
-    assert "Dependency Reviewer" in prompt
+    assert "Performance Reviewer" in prompt
     assert "Security Reviewer" not in prompt
-    assert "Bug Risk Reviewer" not in prompt
-    assert "Test Reviewer" not in prompt
+    assert "Bug Reviewer" not in prompt
+    assert "Maintainability Reviewer" not in prompt
 
 
 def test_review_plan_resolves_pr_url_to_diff() -> None:

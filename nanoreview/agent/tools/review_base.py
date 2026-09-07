@@ -10,15 +10,11 @@ from loguru import logger
 
 from nanoreview.agent.tools.base import Tool
 from nanoreview.agent.tools.context import current_request_context
-from nanoreview.rag import create_rag_runtime
-from nanoreview.rag.config import RAGConfig
-from nanoreview.rag.review_service import (
-    SOURCE_TYPE,
-    RepositoryRAGOptions,
-    RepositoryRAGService,
-)
-from nanoreview.rag.runtime import RAGRuntime
 from nanoreview.review.planning.evidence import ReviewEvidenceService
+from nanoreview.review.planning.preprocessor import (
+    ProgrammaticEvidenceOptions,
+    ProgrammaticEvidenceService,
+)
 from nanoreview.review.source.github import GitHubRepoConfig, GitHubRepoReader
 from nanoreview.review.source.local import LocalRepoReader
 from nanoreview.review.types import ReviewAction, ReviewMetaKey
@@ -49,47 +45,31 @@ class ReviewToolBase(Tool):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        rag_config = getattr(ctx, "rag_config", None) or RAGConfig()
-        runtime = create_rag_runtime(rag_config)
         tools_config = ctx.config if ctx.config else None
-        review_config = getattr(ctx, "review_config", None)
         return cls(
             workspace=Path(ctx.workspace),
-            runtime=runtime,
             github_config=getattr(tools_config, "github_repo", None),
-            dense_backfill_limit=getattr(review_config, "prefetch_dense_backfill_limit", 256),
+            review_config=getattr(ctx, "review_config", None),
         )
 
     def __init__(
         self,
         workspace: Path,
-        embedding_client: Any | None = None,
-        rerank_client: Any | None = None,
-        vector_store: Any | None = None,
-        runtime: RAGRuntime | None = None,
         github_config: GitHubRepoConfig | None = None,
-        dense_backfill_limit: int = 256,
+        review_config: Any | None = None,
     ) -> None:
         self.workspace = workspace.expanduser().resolve()
-        if runtime is None:
-            runtime = RAGRuntime(
-                embedding_client=embedding_client,
-                rerank_client=rerank_client,
-                vector_store=vector_store,
-            )
-        self.runtime = runtime
-        options = RepositoryRAGOptions.from_retrieval_config(runtime.retrieval)
-        options.dense_backfill_limit = max(0, int(dense_backfill_limit))
-        self.repository_rag = RepositoryRAGService(
-            workspace,
-            runtime=runtime,
-            options=options,
-            source_type=SOURCE_TYPE,
+        # Budget knobs come from the user's review config; the provider context
+        # window stays a per-request parameter so scale assessment follows the
+        # model actually serving the turn.
+        self.preprocessor = ProgrammaticEvidenceService(
+            self.workspace,
+            options=ProgrammaticEvidenceOptions.from_review_config(review_config),
         )
-        self.local = LocalRepoReader(self.workspace, options=options)
+        self.local = LocalRepoReader(self.workspace)
         self.github = GitHubRepoReader(github_config, workspace=workspace)
         self.evidence_service = ReviewEvidenceService(
-            self.repository_rag,
+            self.preprocessor,
             self.github,
             workspace=self.workspace,
         )
@@ -107,7 +87,7 @@ class ReviewToolBase(Tool):
         return f"Error: unknown {self.name} action '{action}'. Use {allowed}."
 
     @staticmethod
-    def _blocks_rag_repo_action(action: str) -> bool:
+    def _blocks_repo_action_during_diff(action: str) -> bool:
         ctx = current_request_context()
         metadata = ctx.metadata if ctx is not None else {}
         return (

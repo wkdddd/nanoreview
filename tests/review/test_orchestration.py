@@ -4,13 +4,13 @@ import asyncio
 
 import pytest
 
-from nanoreview.agent.runner import AgentRunResult
-from nanoreview.bus.events import InboundMessage
 from nanoreview.agent.orchestration import (
     ReviewExecutionContext,
     ReviewOrchestrator,
     ReviewPlanningError,
 )
+from nanoreview.agent.runner import AgentRunResult
+from nanoreview.bus.events import InboundMessage
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     EvidenceReference,
@@ -28,8 +28,7 @@ def _plan(*roles: str) -> ReviewPlan:
         action=ReviewAction.REPO,
         depth="full",
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
-        forced_dimensions=False,
-        max_subagents=1,
+        routing_mode="explicit",
     )
 
 
@@ -71,7 +70,12 @@ class _PlanRunner:
                     "dimension": "security",
                     "focus": "authentication state",
                     "evidence_ids": ["ev-001"],
-                }
+                },
+                {
+                    "dimension": "bug",
+                    "focus": "exception paths",
+                    "evidence_ids": ["ev-001"],
+                },
             ]
         )
         assert result == "review plan accepted"
@@ -133,7 +137,7 @@ async def test_coordinator_plan_retries_three_times_before_failure(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_program_dispatches_missing_dimensions_without_bus_injection(tmp_path) -> None:
+async def test_program_dispatches_planned_dimensions_without_bus_injection(tmp_path) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
     orchestrator = ReviewOrchestrator(
@@ -147,13 +151,13 @@ async def test_program_dispatches_missing_dimensions_without_bus_injection(tmp_p
 
     report = await orchestrator.execute(
         coordinator_messages=[{"role": "system", "content": "plan"}],
-        plan=_plan("security", "tests"),
+        plan=_plan("security", "bug"),
         evidence=_evidence(),
         context=ReviewExecutionContext("cli", "review", "cli:review", None, {}, 1),
         validation_workspace=str(tmp_path),
     )
 
-    assert [call["label"] for call in subagents.calls] == ["security", "tests"]
+    assert [call["label"] for call in subagents.calls] == ["security", "bug"]
     assert all(call["deliver_to_bus"] is False for call in subagents.calls)
     assert "No actionable issues found" in report
 

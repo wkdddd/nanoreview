@@ -10,8 +10,8 @@ from pathlib import Path
 from loguru import logger
 
 from nanoreview.agent.tools.path_utils import WORKSPACE_BOUNDARY_NOTE, is_under
-from nanoreview.rag.review_service import RepositoryRAGOptions
 from nanoreview.review.file_filter import review_file_filter_reason
+from nanoreview.review.planning.preprocessor import ProgrammaticEvidenceOptions
 
 _KEY_FILES = (
     "README.md",
@@ -28,9 +28,9 @@ _KEY_FILES = (
 class LocalRepoReader:
     """Read the current workspace through a GitHub-reader-like interface."""
 
-    def __init__(self, workspace: Path, options: RepositoryRAGOptions | None = None) -> None:
+    def __init__(self, workspace: Path, options: ProgrammaticEvidenceOptions | None = None) -> None:
         self.workspace = workspace.expanduser().resolve()
-        self.options = options or RepositoryRAGOptions()
+        self.options = options or ProgrammaticEvidenceOptions()
 
     async def execute(
         self,

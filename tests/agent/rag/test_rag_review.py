@@ -16,6 +16,12 @@ from nanoreview.rag.review_service import (
 )
 from nanoreview.rag.utils import IndexedChunk, IndexedHit
 from nanoreview.review.planning.evidence import ReviewEvidenceService
+from nanoreview.review.planning.preprocessor import (
+    CodeUnit,
+    ProgrammaticEvidenceRequest,
+    ProgrammaticEvidenceResult,
+    ProgrammaticEvidenceService,
+)
 from nanoreview.review.source.utils import (
     changed_lines_from_patch,
     parse_pr_target,
@@ -98,20 +104,31 @@ def test_rrf_merge_combines_ranked_lists() -> None:
 
 @pytest.mark.asyncio
 async def test_review_evidence_uses_local_file_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "auth.py").write_text("token = 'x'\n", encoding="utf-8")
     captured: dict[str, object] = {}
 
-    class _Result:
-        hits: list[object] = [object()]
-        context = "context"
-
-    async def fake_retrieve(request: RepositoryRAGRequest) -> _Result:
+    async def fake_retrieve(request: ProgrammaticEvidenceRequest) -> ProgrammaticEvidenceResult:
         captured["request"] = request
-        return _Result()
+        return ProgrammaticEvidenceResult(
+            units=[
+                CodeUnit(
+                    path="src/auth.py",
+                    kind="file",
+                    start_line=1,
+                    end_line=1,
+                    text="token = 'x'\n",
+                    token_count=2,
+                    unit_id="ev-1",
+                )
+            ],
+            skipped=[],
+            context="context",
+            mode="direct",
+        )
 
-    monkeypatch.setattr(service.repository_rag, "retrieve", fake_retrieve)
+    monkeypatch.setattr(service.preprocessor, "retrieve", fake_retrieve)
 
     result = await service.local_context(
         review_query="auth",
@@ -128,14 +145,14 @@ async def test_review_evidence_uses_local_file_scope(tmp_path: Path, monkeypatch
 
     assert result == "context"
     request = captured["request"]
-    assert isinstance(request, RepositoryRAGRequest)
+    assert isinstance(request, ProgrammaticEvidenceRequest)
     assert request.review_query == "auth"
     assert [path.relative_to(tmp_path).as_posix() for path in request.files or []] == ["src/auth.py"]
 
 
 @pytest.mark.asyncio
 async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     monkeypatch.setattr(
         service,
         "local_changed_patches",
@@ -146,9 +163,9 @@ async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, 
     )
 
     async def fail_retrieve(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("diff review must not call RAG retrieval")
+        raise AssertionError("diff review must not call programmatic file retrieval")
 
-    monkeypatch.setattr(service.repository_rag, "retrieve", fail_retrieve)
+    monkeypatch.setattr(service.preprocessor, "retrieve", fail_retrieve)
 
     result = await service.local_changed_context(
         review_query="regression",
@@ -163,7 +180,7 @@ async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, 
         ),
     )
 
-    assert result.startswith("[Local Diff Review Context]")
+    assert result.startswith("[Repository Review References")
     assert "src/auth.py" in result
     assert "docs/readme.md" not in result
     assert "+new" in result
@@ -173,11 +190,11 @@ async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, 
 async def test_local_diff_skips_single_patch_over_context_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     monkeypatch.setattr(
         service,
         "local_changed_patches",
-        lambda _workspace=None: ({"src/large.py": "+" + ("x" * 200)}, {}),
+        lambda _workspace=None: ({"src/large.py": "+" + ("x" * 4_000)}, {}),
     )
 
     result = await service.local_changed_context(
@@ -187,8 +204,12 @@ async def test_local_diff_skips_single_patch_over_context_threshold(
         context_window_tokens=8,
     )
 
-    assert "token_threshold_exceeded" in result
-    assert "## File: src/large.py" not in result
+    assert service.last_result is not None
+    assert service.last_result.units == []
+    assert [(unit.path, unit.reason) for unit in service.last_result.skipped] == [
+        ("src/large.py", "token_limit_exceeded")
+    ]
+    assert "src/large.py" not in result
 
 
 def test_local_changed_summary_parses_staged_unstaged_and_untracked_lines(tmp_path: Path) -> None:
@@ -207,7 +228,7 @@ def test_local_changed_summary_parses_staged_unstaged_and_untracked_lines(tmp_pa
     untracked = tmp_path / "src" / "new_file.py"
     untracked.write_text("alpha\nbeta\n", encoding="utf-8")
 
-    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     summary = service.local_changed_summary()
 
     assert summary.files == ["src/app.py", "src/new_file.py"]
@@ -335,22 +356,22 @@ async def test_repository_rag_quality_filter_returns_no_hits_when_all_low_value(
 
 
 @pytest.mark.asyncio
-async def test_review_evidence_local_context_logs_no_hits(
+async def test_review_evidence_local_context_logs_no_units(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     sink = _LogSink()
     handler_id = logger.add(sink, level="INFO", format="{message}")
 
-    class _Result:
-        hits: list[object] = []
-        context = "No relevant repository review references found."
+    async def fake_retrieve(*_args: object, **_kwargs: object) -> ProgrammaticEvidenceResult:
+        return ProgrammaticEvidenceResult(
+            units=[],
+            skipped=[],
+            context="No relevant repository review references found.",
+        )
 
-    async def fake_retrieve(*_args: object, **_kwargs: object) -> _Result:
-        return _Result()
-
-    monkeypatch.setattr(service.repository_rag, "retrieve", fake_retrieve)
+    monkeypatch.setattr(service.preprocessor, "retrieve", fake_retrieve)
     try:
         result = await service.local_context(
             review_query="auth",
@@ -362,7 +383,159 @@ async def test_review_evidence_local_context_logs_no_hits(
 
     assert result == "No relevant repository review references found."
     assert "review.evidence.local.done" in sink.text
-    assert "status=no_hits" in sink.text
+    assert "status=no_units" in sink.text
+
+
+def _unit(path: str = "src/auth.py", text: str = "token = 'x'\n") -> CodeUnit:
+    return CodeUnit(
+        path=path,
+        kind="file",
+        start_line=1,
+        end_line=1,
+        text=text,
+        token_count=2,
+        unit_id="ev-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_local_repo_forwards_context_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    captured: dict[str, object] = {}
+
+    async def fake_retrieve(request: ProgrammaticEvidenceRequest) -> ProgrammaticEvidenceResult:
+        captured["request"] = request
+        return ProgrammaticEvidenceResult(units=[_unit()], skipped=[], context="context", mode="direct")
+
+    monkeypatch.setattr(service.preprocessor, "retrieve", fake_retrieve)
+
+    result = await service.dispatch(
+        target_type="local",
+        action="repo",
+        review_query="auth",
+        max_results=5,
+        include_tests=True,
+        context_window_tokens=32_768,
+    )
+
+    assert result == "context"
+    request = captured["request"]
+    assert isinstance(request, ProgrammaticEvidenceRequest)
+    assert request.context_window_tokens == 32_768
+
+
+@pytest.mark.asyncio
+async def test_dispatch_github_repo_forwards_context_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    captured: dict[str, object] = {}
+
+    async def fake_fetch_text_files(*_args: object, **_kwargs: object):
+        return "test/repo@main", {"src/auth.py": "token = 'x'\n"}
+
+    async def fake_retrieve(request: ProgrammaticEvidenceRequest) -> ProgrammaticEvidenceResult:
+        captured["request"] = request
+        return ProgrammaticEvidenceResult(units=[_unit()], skipped=[], context="context", mode="direct")
+
+    monkeypatch.setattr(service.github, "fetch_text_files", fake_fetch_text_files)
+    monkeypatch.setattr(service.preprocessor, "retrieve", fake_retrieve)
+
+    result = await service.dispatch(
+        target_type="github",
+        action="repo",
+        repo="test/repo",
+        review_query="auth",
+        max_results=5,
+        include_tests=True,
+        trace_id="trace-1",
+        context_window_tokens=131_072,
+    )
+
+    assert result == "context"
+    request = captured["request"]
+    assert isinstance(request, ProgrammaticEvidenceRequest)
+    assert request.context_window_tokens == 131_072
+
+
+@pytest.mark.asyncio
+async def test_dispatch_local_diff_forwards_context_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    monkeypatch.setattr(
+        service,
+        "local_changed_patches",
+        lambda _workspace=None: ({"src/auth.py": "@@ -1 +1 @@\n-old\n+new"}, {}),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_diff_units(
+        patches: dict[str, str], *, review_query: str, context_window_tokens: int | None = None
+    ) -> ProgrammaticEvidenceResult:
+        captured["window"] = context_window_tokens
+        return ProgrammaticEvidenceResult(
+            units=[_unit(text="+new")], skipped=[], context="context", mode="direct"
+        )
+
+    monkeypatch.setattr(service.preprocessor, "diff_units", fake_diff_units)
+
+    result = await service.dispatch(
+        target_type="local",
+        action="diff",
+        review_query="auth",
+        max_results=5,
+        include_tests=True,
+        context_window_tokens=16_384,
+    )
+
+    assert result == "context"
+    assert captured["window"] == 16_384
+
+
+@pytest.mark.asyncio
+async def test_dispatch_github_diff_forwards_context_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    captured: dict[str, object] = {}
+
+    async def fake_fetch_pr_files(*_args: object, **_kwargs: object):
+        return GitHubDiffEvidence(
+            snapshot="test/repo#42",
+            head_sha="abc123",
+            patches={"src/auth.py": "@@ -1 +1 @@\n-old\n+new"},
+            changed_files=["src/auth.py"],
+            touched_lines={"src/auth.py": [1]},
+        )
+
+    def fake_diff_units(
+        patches: dict[str, str], *, review_query: str, context_window_tokens: int | None = None
+    ) -> ProgrammaticEvidenceResult:
+        captured["window"] = context_window_tokens
+        return ProgrammaticEvidenceResult(
+            units=[_unit(text="+new")], skipped=[], context="context", mode="direct"
+        )
+
+    monkeypatch.setattr(service.github, "fetch_pr_files", fake_fetch_pr_files)
+    monkeypatch.setattr(service.preprocessor, "diff_units", fake_diff_units)
+
+    result = await service.dispatch(
+        target_type="github",
+        action="diff",
+        repo="test/repo",
+        pr_number=42,
+        review_query="auth",
+        max_results=5,
+        include_tests=True,
+        trace_id="trace-1",
+        context_window_tokens=65_536,
+    )
+
+    assert result == "context"
+    assert captured["window"] == 65_536
 
 
 @pytest.mark.asyncio
@@ -370,7 +543,7 @@ async def test_review_evidence_github_diff_uses_patches_without_rag(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    service = ReviewEvidenceService(RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False)))
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     sink = _LogSink()
     handler_id = logger.add(sink, level="INFO", format="{message}")
 
@@ -385,7 +558,7 @@ async def test_review_evidence_github_diff_uses_patches_without_rag(
         )
 
     async def fail_snapshot_context(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("diff review must not create a RAG snapshot")
+        raise AssertionError("diff review must not create a snapshot")
 
     monkeypatch.setattr(service.github, "fetch_pr_files", fake_fetch_pr_files)
     monkeypatch.setattr(service, "retrieve_snapshot_context", fail_snapshot_context)
@@ -402,8 +575,11 @@ async def test_review_evidence_github_diff_uses_patches_without_rag(
         logger.remove(handler_id)
 
     assert "def auth(): pass" in result
-    assert "src/big.py" in result
-    assert "patch_unavailable" in result
+    assert service.last_result is not None
+    assert [unit.path for unit in service.last_result.units] == ["src/auth.py"]
+    assert [(unit.path, unit.reason) for unit in service.last_result.skipped] == [
+        ("src/big.py", "patch_unavailable")
+    ]
     assert "review.evidence.github_diff.done" in sink.text
     assert "status=success" in sink.text
     assert "trace_id=trace-1" in sink.text

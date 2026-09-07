@@ -206,12 +206,25 @@ def _canonical_review_submit(result: Any) -> str | None:
     return None
 
 
-async def _handle_reviewer_result(*, result: Any, retry: Any, target_type: str) -> SubagentCompletion:
+async def _handle_reviewer_result(*, result: Any, target_type: str) -> SubagentCompletion:
+    """Parse the final outcome of the reviewer's single AgentRun.
+
+    Terminal retries (failed review_submit calls, prose answers) already
+    happened inside ``AgentRunner``; this handler only interprets the final
+    result and never starts a compensation run.
+    """
     content = _canonical_review_submit(result)
     stop_reason = result.stop_reason
     if content is None:
-        content, stop_reason = await retry()
-    if content is None:
+        if stop_reason == "terminal_tool_failed":
+            attempts = getattr(result, "terminal_attempts", 0)
+            terminal_error = getattr(result, "terminal_error", None) or "unknown error"
+            return SubagentCompletion(
+                "Error: Review incomplete - review_submit failed after "
+                f"{attempts} attempts: {terminal_error}",
+                status="error",
+                stop_reason=stop_reason,
+            )
         return SubagentCompletion(
             "No structured findings submitted: the reviewer did not produce a review_submit result.",
             status="error",

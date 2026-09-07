@@ -6,6 +6,12 @@ import pytest
 
 from nanoreview.agent.tools.review_submit import SubmitReviewFindingsTool, review_submit
 
+_DETAILS = {
+    "trust_boundary": "Public request reaches the query layer",
+    "attack_preconditions": "Attacker controls the parameter",
+    "attack_path": "request -> handler -> database",
+}
+
 
 def test_review_submit_normalizes_valid_findings() -> None:
     result = review_submit([{
@@ -16,6 +22,7 @@ def test_review_submit_normalizes_valid_findings() -> None:
         "evidence": " line3 ",
         "impact": " bad ",
         "recommendation": " fix ",
+        "details": _DETAILS,
     }])
 
     assert result.submitted is True
@@ -28,6 +35,7 @@ def test_review_submit_normalizes_valid_findings() -> None:
         "evidence": "line3",
         "impact": "bad",
         "recommendation": "fix",
+        "details": _DETAILS,
     }]
 
 
@@ -50,6 +58,7 @@ def test_review_submit_accepts_empty_findings() -> None:
             "evidence": "line1",
             "impact": "bad",
             "recommendation": "fix",
+            "details": _DETAILS,
         }, "severity must be one of"),
         ({
             "severity": "high",
@@ -59,7 +68,18 @@ def test_review_submit_accepts_empty_findings() -> None:
             "evidence": "line1",
             "impact": "bad",
             "recommendation": "fix",
+            "details": _DETAILS,
         }, "line must be >= 1"),
+        ({
+            "severity": "high",
+            "file": "src/app.py",
+            "line": 1,
+            "title": "Issue",
+            "evidence": "line1",
+            "impact": "bad",
+            "recommendation": "fix",
+            "details": "not an object",
+        }, "details must be an object"),
     ],
 )
 def test_review_submit_rejects_invalid_findings(
@@ -85,6 +105,7 @@ async def test_review_submit_tool_returns_canonical_json() -> None:
         "evidence": "证据",
         "impact": "影响",
         "recommendation": "修复",
+        "details": _DETAILS,
     }])
 
     data = json.loads(raw)
@@ -92,3 +113,4 @@ async def test_review_submit_tool_returns_canonical_json() -> None:
     assert data["findings"][0]["severity"] == "high"
     assert data["findings"][0]["line"] is None
     assert data["findings"][0]["title"] == "中文标题"
+    assert data["findings"][0]["details"] == _DETAILS

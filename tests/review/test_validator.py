@@ -30,6 +30,11 @@ def _make_candidate(**overrides) -> ReviewFindingCandidate:
         "evidence": "line2",
         "impact": "Remote code execution",
         "recommendation": "Use parameterized queries",
+        "details": {
+            "trust_boundary": "Public HTTP request reaches the query layer",
+            "attack_preconditions": "Attacker controls the id parameter",
+            "attack_path": "request -> handler -> query builder -> database",
+        },
     }
     defaults.update(overrides)
     return ReviewFindingCandidate(**defaults)
@@ -259,6 +264,14 @@ class TestValidatorRejects:
         c = _make_candidate(file="")
         result = v.validate_candidates([c], "security")
         assert len(result.rejected) == 1
+
+    def test_missing_required_details_rejected(self, workspace):
+        v = ReviewValidator(ValidationContext(workspace=workspace))
+        c = _make_candidate(details={"trust_boundary": "request to database"})
+        result = v.validate_candidates([c], "security")
+        assert len(result.rejected) == 1
+        assert "invalid reviewer details" in result.rejected[0][1].reason
+        assert "attack_preconditions" in result.rejected[0][1].reason
 
     def test_file_not_found_rejected(self, workspace):
         v = ReviewValidator(ValidationContext(workspace=workspace))

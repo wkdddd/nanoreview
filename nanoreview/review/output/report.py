@@ -1,8 +1,10 @@
 """Fixed Markdown report renderer for code review results."""
 from __future__ import annotations
 
+from nanoreview.review.profiles import get_reviewer_profile
 from nanoreview.review.types import (
     SEVERITY_ORDER,
+    FileSkipSummary,
     FindingVerdict,
     ReviewBudgetSkip,
     ReviewDimensionResult,
@@ -10,7 +12,6 @@ from nanoreview.review.types import (
     ReviewFindingVerdict,
     ReviewModePolicy,
 )
-from nanoreview.review.profiles import get_reviewer_profile
 
 
 def _clean_text(value: object) -> str:
@@ -55,6 +56,7 @@ def render_review_report(
     routing_mode: str = "explicit",
     selected_dimensions: tuple[str, ...] | list[str] = (),
     budget_skipped: tuple[ReviewBudgetSkip, ...] | list[ReviewBudgetSkip] = (),
+    skipped_files: tuple[FileSkipSummary, ...] | list[FileSkipSummary] = (),
 ) -> str:
     """Render final Markdown report from validated dimension results."""
     all_accepted = _collect_accepted(dimensions)
@@ -62,7 +64,7 @@ def render_review_report(
     all_rejected = _collect_rejected(dimensions)
 
     stats = _severity_stats(all_accepted)
-    incomplete = bool(budget_skipped) or _has_incomplete_checks(dimensions)
+    incomplete = bool(budget_skipped) or bool(skipped_files) or _has_incomplete_checks(dimensions)
     quick_clean = _is_quick_scoped_clean(policy, dimensions, incomplete)
     summary = _build_summary(
         stats,
@@ -79,6 +81,8 @@ def render_review_report(
     sections.append(_render_selected_reviewers(routing_mode, selected_dimensions))
     if budget_skipped:
         sections.append(_render_budget_skipped(budget_skipped))
+    if skipped_files:
+        sections.append(_render_skipped_files(skipped_files))
     sections.append(_render_findings(
         all_accepted,
         uncertain_count=len(all_uncertain),
@@ -287,6 +291,19 @@ def _render_budget_skipped(skipped: tuple[ReviewBudgetSkip, ...] | list[ReviewBu
             f"- {_escape_markdown_inline(label)} - budget-skipped "
             f"(estimated quota: {item.quota_tokens} tokens; input: {item.input_tokens} tokens)"
         )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_skipped_files(skipped: tuple[FileSkipSummary, ...] | list[FileSkipSummary]) -> str:
+    lines = ["### Scope Not Reviewed\n"]
+    lines.append(
+        "The following files or line ranges were excluded from the review scope by preprocessing "
+        "(oversized units, unsupported code types, missing grammars, parse failures, or budget limits):\n"
+    )
+    for summary in skipped:
+        # describe() renders the path plus unreviewed line ranges and reasons.
+        lines.append(f"- {_escape_markdown_inline(summary.describe())}")
     lines.append("")
     return "\n".join(lines)
 

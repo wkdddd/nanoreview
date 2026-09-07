@@ -99,7 +99,7 @@ class GitHubReviewTool(ReviewToolBase):
     def description(self) -> str:
         return (
             "GitHub repository reader and review evidence tool. Use meta/tree/file for "
-            "read-only GitHub API inspection, repo for RAG-backed full or scoped remote evidence retrieval, "
+            "read-only GitHub API inspection, repo for programmatic full or scoped remote evidence preparation, "
             "and diff for programmatically filtered GitHub pull request patches. Do not clone repositories; repo/diff "
             "actions use fixed snapshots under workspace/.nanoreview/review_github."
         )
@@ -166,12 +166,12 @@ class GitHubReviewTool(ReviewToolBase):
                     repo,
                 )
                 return result_text
-            if self._blocks_rag_repo_action(action_value):
+            if self._blocks_repo_action_during_diff(action_value):
                 result_text = (
-                    "Error: github_review action='repo' is unavailable during diff review because "
-                    "it uses RAG. Use github_review(action='meta'/'tree'/'file')."
+                    "Error: github_review action='repo' is unavailable during diff review. "
+                    "Use github_review(action='meta'/'tree'/'file')."
                 )
-                logger.warning("github_review.rag_repo_blocked trace_id={} repo={}", trace_id, repo)
+                logger.warning("github_review.repo_blocked_during_diff trace_id={} repo={}", trace_id, repo)
                 return result_text
             if not self.github.config.enable:
                 result_text = "Error: GitHub repository access is disabled by tools.githubRepo.enable."

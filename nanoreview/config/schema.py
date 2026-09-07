@@ -8,8 +8,6 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
-from nanoreview.rag.config import RAGConfig
-
 if TYPE_CHECKING:
     from nanoreview.agent.tools.shell import ExecToolConfig
     from nanoreview.review.source.github import GitHubRepoConfig
@@ -263,11 +261,6 @@ class ReviewConfig(Base):
     default_focus: list[str] = Field(default_factory=list)
     max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None
-    rag_enable: bool = True
-    rag_max_results: int = Field(default=8, ge=1, le=30)
-    rag_budget_chars: int = Field(default=16000, ge=1000, le=100000)
-    rag_use_chonkie: bool = True
-    rag_use_rrf: bool = True
     token_budget: int = Field(default=100_000, ge=10_000)
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
     prefetch_dense_backfill_limit: int = Field(default=256, ge=0)
@@ -283,7 +276,6 @@ class Config(BaseSettings):
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
-    rag: RAGConfig = Field(default_factory=RAGConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)

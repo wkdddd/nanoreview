@@ -47,11 +47,7 @@ class ToolContext:
     workspace: str
     provider: Any | None = None
     model: str | None = None
-    rag_config: Any | None = None
     review_config: Any | None = None
-    embedding_config: Any | None = None
-    rerank_config: Any | None = None
-    qdrant_config: Any | None = None
     bus: Any | None = None
     subagent_manager: Any | None = None
     sessions: Any | None = None

@@ -9,17 +9,17 @@ from pathlib import Path
 
 from loguru import logger
 
+from nanoreview.agent.tools.base import Schema
+from nanoreview.review.profiles import get_reviewer_profile
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     SEVERITY_ORDER,
     FindingVerdict,
+    GitHubDiffEvidence,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
-    GitHubDiffEvidence,
 )
-from nanoreview.agent.tools.base import Schema
-from nanoreview.review.profiles import get_reviewer_profile
 
 
 @dataclass

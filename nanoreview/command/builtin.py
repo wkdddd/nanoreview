@@ -74,20 +74,6 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "[n]",
     ),
     BuiltinCommandSpec(
-        "/math-kb",
-        "Manage math knowledge base",
-        "List, add or convert local math knowledge files.",
-        "book-open",
-        "[list|add <path>|convert]",
-    ),
-    BuiltinCommandSpec(
-        "/mistake-add",
-        "Add to mistake book",
-        "Save the latest math QA turn to the mistake book.",
-        "square-pen",
-        "[reason]",
-    ),
-    BuiltinCommandSpec(
         "/goal",
         "Start long-running goal",
         "Tell the agent to treat the request as a long-running goal.",
@@ -357,158 +343,6 @@ async def cmd_history(ctx: CommandContext) -> OutboundMessage:
     )
 
 
-async def cmd_math_kb(ctx: CommandContext) -> OutboundMessage:
-    """List, add or convert files for the lightweight math knowledge base."""
-    from pathlib import Path
-
-    from nanoreview.agent.math_qa import MathKnowledgeBase
-
-    kb = MathKnowledgeBase(
-        ctx.loop.workspace,
-        embedding_config=getattr(ctx.loop, "embedding_config", None),
-        rerank_config=getattr(ctx.loop, "rerank_config", None),
-        qdrant_config=getattr(ctx.loop, "qdrant_config", None),
-    )
-    args = ctx.args.strip()
-    metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
-    if not args or args.lower() == "list":
-        files = kb.list_files()
-        if not files:
-            content = (
-                "Math knowledge base is empty.\n"
-                "Add UTF-8 Markdown/TXT/JSON/JSONL/PDF/image files with `/math-kb add <path>`.\n"
-                "Convert PDF/image files to Markdown with `/math-kb convert`.\n"
-                f"Storage: `{kb.base_dir}`"
-            )
-        else:
-            lines = ["Math knowledge base files:"]
-            for path in files:
-                try:
-                    label = path.relative_to(ctx.loop.workspace).as_posix()
-                except ValueError:
-                    label = str(path)
-                lines.append(f"- `{label}`")
-            content = "\n".join(lines)
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=content,
-            metadata=metadata,
-        )
-
-    parts = args.split(maxsplit=1)
-    action = parts[0].lower()
-    if action == "convert":
-        try:
-            from nanoreview.agent.tools._mathrag.math_knowledge_convert import MathKnowledgeMarkdownConverter
-
-            converter = MathKnowledgeMarkdownConverter(ctx.loop.workspace)
-            results = converter.convert_all(write=True)
-        except Exception as exc:
-            return OutboundMessage(
-                channel=ctx.msg.channel,
-                chat_id=ctx.msg.chat_id,
-                content=f"Could not convert math knowledge files: {exc}",
-                metadata=metadata,
-            )
-
-        if not results:
-            content = (
-                "No math knowledge files found to convert.\n"
-                f"Storage: `{kb.base_dir}`"
-            )
-        else:
-            lines = ["Math knowledge conversion complete:"]
-            for result in results:
-                source = result.source_path.relative_to(ctx.loop.workspace).as_posix()
-                target = (
-                    result.markdown_path.relative_to(ctx.loop.workspace).as_posix()
-                    if result.markdown_path else "(not written)"
-                )
-                status = "ok" if result.ok else "warning"
-                suffix = f" ({len(result.warnings)} warning(s))" if result.warnings else ""
-                lines.append(f"- `{source}` -> `{target}` [{status}]{suffix}")
-                for warning in result.warnings[:3]:
-                    lines.append(f"  - {warning}")
-            try:
-                await kb.async_sync_index()
-                lines.append("")
-                lines.append("Math RAG index refreshed.")
-            except Exception as exc:
-                lines.append("")
-                lines.append(f"Math RAG index refresh skipped: {exc}")
-            content = "\n".join(lines)
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=content,
-            metadata=metadata,
-        )
-
-    if action != "add" or len(parts) != 2:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content="Usage: `/math-kb [list|add <path>|convert]`",
-            metadata=metadata,
-        )
-
-    raw_path = parts[1].strip().strip('"')
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        path = (ctx.loop.workspace / path).resolve()
-    try:
-        target = kb.add_file(path)
-    except Exception as exc:
-        return OutboundMessage(
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            content=f"Could not add knowledge file: {exc}",
-            metadata=metadata,
-        )
-    try:
-        label = target.relative_to(ctx.loop.workspace).as_posix()
-    except ValueError:
-        label = str(target)
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=f"Added knowledge file: `{label}`",
-        metadata=metadata,
-    )
-
-
-async def cmd_mistake_add(ctx: CommandContext) -> OutboundMessage:
-    """Save the latest math QA turn to the mistake book."""
-    from nanoreview.agent.math_qa import append_mistake_record
-
-    session = ctx.session or ctx.loop.sessions.get_or_create(ctx.key)
-    reason = ctx.args.strip()
-    metadata = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
-    try:
-        record = append_mistake_record(
-            ctx.loop.workspace,
-            session,
-            error_reason=reason,
-        )
-    except Exception as exc:
-        content = f"Could not add to mistake book: {exc}"
-    else:
-        tags = ", ".join(record.get("knowledge_tags") or []) or "未提取"
-        content = (
-            "Added the latest question to the mistake book.\n"
-            f"- 掌握状态：{record['mastery_status']}\n"
-            f"- 错误原因：{record['error_reason'] or '未填写'}\n"
-            f"- 知识点标签：{tags}"
-        )
-    return OutboundMessage(
-        channel=ctx.msg.channel,
-        chat_id=ctx.msg.chat_id,
-        content=content,
-        metadata=metadata,
-    )
-
-
 _GOAL_PROMPT_TEMPLATE = """The user declared a sustained objective for this thread.
 
 Inspect or clarify if needed, then call `long_task` with the refined objective (and optional short ui_summary). Work proceeds as normal assistant turns using your usual tools. When the objective is fully done and verified, call `complete_goal` with a brief recap. If the user later cancels or changes direction, still call `complete_goal` with an honest recap (then `long_task` again only after there is no active goal). Do not use `long_task` / `complete_goal` for trivial one-shot answers.
@@ -628,10 +462,6 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/model ", cmd_model)
     router.exact("/history", cmd_history)
     router.prefix("/history ", cmd_history)
-    router.exact("/math-kb", cmd_math_kb)
-    router.prefix("/math-kb ", cmd_math_kb)
-    router.exact("/mistake-add", cmd_mistake_add)
-    router.prefix("/mistake-add ", cmd_mistake_add)
     router.exact("/goal", cmd_goal)
     router.prefix("/goal ", cmd_goal)
     router.exact("/help", cmd_help)

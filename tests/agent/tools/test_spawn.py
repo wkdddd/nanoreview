@@ -16,7 +16,7 @@ class FakeSubagentManager:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.result = (
-            "Review subagent [dependency] started (id: test). "
+            "Review subagent [security] started (id: test). "
             "The coordinator will wait for and integrate its result before finalizing."
         )
 
@@ -26,6 +26,11 @@ class FakeSubagentManager:
     async def spawn(self, **kwargs: object) -> str:
         self.calls.append({"method": "spawn", **kwargs})
         return self.result
+
+
+class BusySubagentManager(FakeSubagentManager):
+    def get_running_count(self) -> int:
+        return self.max_concurrent_subagents
 
 
 def test_core_tools_expose_spawn_not_review_submitter(tmp_path) -> None:
@@ -45,79 +50,43 @@ def test_core_tools_expose_spawn_not_review_submitter(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_requires_review_context() -> None:
-    manager = FakeSubagentManager()
+async def test_spawn_rejects_when_concurrency_limit_reached() -> None:
+    manager = BusySubagentManager()
     tool = SpawnTool(manager)  # type: ignore[arg-type]
     tool.set_context(RequestContext(channel="websocket", chat_id="chat", metadata={}))
 
-    result = await tool.execute(task="review dependencies", label="dependency")
+    result = await tool.execute(task="review security", label="security")
 
-    assert "dimensions is missing" in result
+    assert "concurrency limit reached" in result
+    assert "4/4" in result
     assert manager.calls == []
 
 
 @pytest.mark.asyncio
-async def test_spawn_normalizes_allowed_dimension_label() -> None:
+async def test_spawn_surfaces_manager_error_result() -> None:
     manager = FakeSubagentManager()
+    manager.result = (
+        "Error: Cannot spawn review subagent: dimension 'security' has already "
+        "completed for this review."
+    )
     tool = SpawnTool(manager)  # type: ignore[arg-type]
     tool.set_context(
         RequestContext(
             channel="websocket",
             chat_id="chat",
-            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
+            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["security"]},
         )
     )
 
-    result = await tool.execute(task="review dependencies", label="Dependency Reviewer")
-
-    assert "started" in result
-    assert "wait for and integrate" in result
-    assert "notify you when it completes" not in result
-    assert manager.calls[0]["method"] == "spawn"
-    assert manager.calls[0]["label"] == "dependency"
-
-
-@pytest.mark.asyncio
-async def test_spawn_rejects_unselected_dimension() -> None:
-    manager = FakeSubagentManager()
-    tool = SpawnTool(manager)  # type: ignore[arg-type]
-    tool.set_context(
-        RequestContext(
-            channel="websocket",
-            chat_id="chat",
-            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
-        )
-    )
-
-    result = await tool.execute(task="review security", label="Security Reviewer")
-
-    assert "not allowed" in result
-    assert "dependency" in result
-    assert manager.calls == []
-
-
-@pytest.mark.asyncio
-async def test_spawn_surfaces_duplicate_dimension_rejection() -> None:
-    manager = FakeSubagentManager()
-    manager.result = "Error: Cannot spawn review subagent: dimension 'dependency' has already completed for this review."
-    tool = SpawnTool(manager)  # type: ignore[arg-type]
-    tool.set_context(
-        RequestContext(
-            channel="websocket",
-            chat_id="chat",
-            metadata={ReviewMetaKey.ALLOWED_DIMENSIONS: ["dependency"]},
-        )
-    )
-
-    result = await tool.execute(task="review dependencies again", label="dependency")
+    result = await tool.execute(task="review security again", label="security")
 
     assert "already completed" in result
-    assert manager.calls[0]["label"] == "dependency"
+    assert manager.calls[0]["label"] == "security"
 
 
 @pytest.mark.asyncio
-async def test_spawn_passes_filtered_review_metadata() -> None:
-    """SpawnTool forwards safe review metadata to SubagentManager.spawn()."""
+async def test_spawn_passes_review_metadata_through() -> None:
+    """SpawnTool forwards request metadata to SubagentManager.spawn()."""
     manager = FakeSubagentManager()
     tool = SpawnTool(manager)  # type: ignore[arg-type]
     tool.set_context(
@@ -140,27 +109,3 @@ async def test_spawn_passes_filtered_review_metadata() -> None:
     assert forwarded[ReviewMetaKey.LOCAL_ROOT] == "/some/path"
     assert forwarded[ReviewMetaKey.ACTION] == "review"
     assert forwarded[ReviewMetaKey.ALLOWED_DIMENSIONS] == ["security"]
-
-
-@pytest.mark.asyncio
-async def test_spawn_excludes_evidence_provider() -> None:
-    """EVIDENCE_PROVIDER and other internal objects must not leak to subagents."""
-    manager = FakeSubagentManager()
-    tool = SpawnTool(manager)  # type: ignore[arg-type]
-    sentinel = object()
-    tool.set_context(
-        RequestContext(
-            channel="websocket",
-            chat_id="chat",
-            metadata={
-                ReviewMetaKey.ALLOWED_DIMENSIONS: ["security"],
-                ReviewMetaKey.EVIDENCE_PROVIDER: sentinel,
-            },
-        )
-    )
-
-    await tool.execute(task="review security", label="security")
-
-    forwarded = manager.calls[0]["origin_metadata"]
-    assert ReviewMetaKey.EVIDENCE_PROVIDER not in forwarded
-    assert ReviewMetaKey.ALLOWED_DIMENSIONS in forwarded

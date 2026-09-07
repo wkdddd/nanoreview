@@ -1,9 +1,11 @@
 ---
 name: rag
-description: 当需要从本地代码或外部网页中检索相关证据来辅助回答时，使用此技能。指导 local_review 的本地 RAG 检索，以及 web_search / web_fetch 的外部资料检索；适用于代码问题、文档查证、API 用法、错误信息和需要证据支撑的实现任务。
+description: 未来启用检索增强能力时使用。当前代码审查链路不加载此技能。
 ---
 
 # RAG (Retrieval-Augmented Generation)
+
+This subsystem is retained for future use but is currently disabled in the code-review runtime. Review evidence is prepared deterministically under `review/planning`.
 
 ## When to Use
 
@@ -31,7 +33,7 @@ Do not use this skill when:
 ## local_review
 
 - Local review retrieves relevant files, symbols, snippets, and likely related tests from the workspace.
-- Local review uses the repository RAG index with lexical search, optional embedding search, and optional reranking.
+- Local review currently uses deterministic programmatic evidence preparation.
 - Example: `local_review(review_query="authentication middleware")`
 - Always read matched files before editing them.
 

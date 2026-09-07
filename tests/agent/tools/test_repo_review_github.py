@@ -49,6 +49,40 @@ def test_repo_review_github_token_loads_from_tools_config() -> None:
     assert config.tools.github_repo.token == "ghp_config_token"
 
 
+def test_create_wires_review_config_into_preprocessor_options(tmp_path: Path) -> None:
+    from nanoreview.agent.tools.context import ToolContext
+    from nanoreview.config.schema import ReviewConfig
+
+    review_config = ReviewConfig(
+        token_budget=50_000,
+        subagent_evidence_budget_chars=12_000,
+        prefetch_budget_chars=8_000,
+        prefetch_dense_backfill_limit=64,
+    )
+    ctx = ToolContext(config=None, workspace=str(tmp_path), review_config=review_config)
+
+    tool = LocalReviewTool.create(ctx)
+
+    options = tool.preprocessor.options
+    assert options.token_budget == 50_000
+    assert options.subagent_evidence_budget_chars == 12_000
+    assert options.prefetch_budget_chars == 8_000
+    assert options.prefetch_dense_backfill_limit == 64
+    # The context window stays a per-request parameter, not a static option.
+    assert tool.evidence_service.preprocessor.options is options
+
+
+def test_create_without_review_config_keeps_default_options(tmp_path: Path) -> None:
+    from nanoreview.agent.tools.context import ToolContext
+
+    ctx = ToolContext(config=None, workspace=str(tmp_path))
+
+    tool = GitHubReviewTool.create(ctx)
+
+    assert tool.preprocessor.options.token_budget == 100_000
+    assert tool.preprocessor.options.subagent_evidence_budget_chars == 24_000
+
+
 def test_parse_github_repo_from_url_and_owner_repo() -> None:
     assert parse_repo("https://github.com/test/repo.") == ("test", "repo")
     assert parse_repo("test/repo.git") == ("test", "repo")

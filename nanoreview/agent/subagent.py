@@ -44,8 +44,6 @@ class SubagentManager:
         max_tool_result_chars: int,
         model: str | None = None,
         tools_config: ToolsConfig | None = None,
-        embedding_config: Any | None = None,
-        rerank_config: Any | None = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
@@ -61,8 +59,6 @@ class SubagentManager:
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.tools_config = tools_config or ToolsConfig()
-        self.embedding_config = embedding_config
-        self.rerank_config = rerank_config
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
@@ -114,8 +110,6 @@ class SubagentManager:
         return ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
-            embedding_config=self.embedding_config,
-            rerank_config=self.rerank_config,
             file_state_store=FileStates(),
         )
 
@@ -541,12 +535,7 @@ class SubagentManager:
                 completion = await self.handle_completed_result(
                     profile=profile,
                     result=result,
-                    tools=tools,
-                    hook=hook,
-                    session_key=sess_key,
-                    llm_timeout=llm_timeout,
                     target_type=target_type,
-                    retry_max_tokens=effective_max_tokens,
                 )
                 final_result = completion.content
                 status.stop_reason = completion.stop_reason or status.stop_reason
@@ -621,101 +610,21 @@ class SubagentManager:
         *,
         profile: SubagentExecutionProfile,
         result: AgentRunResult,
-        tools: ToolRegistry,
-        hook: SubagentHook,
-        session_key: str | None,
-        llm_timeout: float | None,
         target_type: str,
-        retry_max_tokens: int | None = None,
     ) -> SubagentCompletion:
+        """Normalize the final result of the single completed AgentRun.
+
+        Terminal-tool retries already happened inside ``AgentRunner``; no
+        compensation run is started here. The profile's result handler only
+        parses the final structured outcome of the finished run.
+        """
         if profile.result_handler is None:
             return SubagentCompletion(
                 result.final_content or result.error or "",
                 status="ok" if result.stop_reason != "error" else "error",
                 stop_reason=result.stop_reason,
             )
-
-        async def retry() -> tuple[str | None, str]:
-            return await self._retry_terminal_submission(
-                result=result,
-                profile=profile,
-                tools=tools,
-                hook=hook,
-                session_key=session_key,
-                llm_timeout=llm_timeout,
-                max_tokens=retry_max_tokens,
-            )
-
-        return await profile.result_handler(
-            result=result,
-            retry=retry,
-            target_type=target_type,
-        )
-
-    async def _retry_terminal_submission(
-        self,
-        *,
-        result: AgentRunResult,
-        profile: SubagentExecutionProfile,
-        tools: ToolRegistry,
-        hook: SubagentHook,
-        session_key: str | None,
-        llm_timeout: float | None,
-        max_tokens: int | None = None,
-    ) -> tuple[str | None, str]:
-        """Give a profile one bounded retry to call its terminal tool."""
-        if len(profile.terminal_tools) != 1:
-            return None, result.stop_reason
-        terminal_tool = next(iter(profile.terminal_tools))
-        retry_messages = list(result.messages) + [
-            {
-                "role": "user",
-                "content": (
-                    f"You did not call the required terminal tool `{terminal_tool}`. "
-                    "Call it now with JSON-compatible structured arguments and no prose."
-                ),
-            }
-        ]
-        retry = await self.runner.run(
-            AgentRunSpec(
-                initial_messages=retry_messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=2,
-                max_tokens=max_tokens or 2_048,
-                max_tool_result_chars=self.max_tool_result_chars,
-                reasoning_effort=self.reasoning_effort,
-                hook=hook,
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": terminal_tool},
-                },
-                response_format={"type": "json_object"},
-                error_message=None,
-                fail_on_tool_error=False,
-                terminal_tools=profile.terminal_tools,
-                session_key=session_key,
-                llm_timeout_s=llm_timeout,
-            )
-        )
-        for key, value in retry.usage.items():
-            result.usage[key] = result.usage.get(key, 0) + value
-        extracted = self._extract_terminal_result(retry, terminal_tool)
-        return extracted, retry.stop_reason
-
-    @staticmethod
-    def _extract_terminal_result(result: AgentRunResult, tool_name: str) -> str | None:
-        for event in reversed(result.tool_events or []):
-            if event.get("name") == tool_name and event.get("status") == "ok":
-                raw = event.get("raw_result")
-                if isinstance(raw, str):
-                    return raw
-        for message in reversed(result.messages):
-            if message.get("role") == "tool" and message.get("name") == tool_name:
-                content = message.get("content")
-                if isinstance(content, str):
-                    return content
-        return None
+        return await profile.result_handler(result=result, target_type=target_type)
 
     @staticmethod
     def _extract_review_submit_result(

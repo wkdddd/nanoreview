@@ -12,6 +12,7 @@ from nanoreview.review.output.judge import ReviewJudge
 from nanoreview.review.output.report import render_review_report
 from nanoreview.review.output.validator import ReviewValidator, ValidationContext
 from nanoreview.review.types import (
+    FileSkipSummary,
     FindingVerdict,
     GitHubDiffEvidence,
     ReviewBudgetSkip,
@@ -69,6 +70,7 @@ class ReviewFinalizer:
         routing_mode: str = "explicit",
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
         budget_skipped: list[ReviewBudgetSkip] | tuple[ReviewBudgetSkip, ...] = (),
+        skipped_files: list[FileSkipSummary] | tuple[FileSkipSummary, ...] = (),
     ) -> None:
         self._workspace = workspace
         self._changed_files = list(changed_files or [])
@@ -87,6 +89,7 @@ class ReviewFinalizer:
         self._routing_mode = routing_mode
         self._selected_dimensions = tuple(selected_dimensions or ())
         self._budget_skipped = tuple(budget_skipped)
+        self._skipped_files = tuple(skipped_files)
 
     def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
@@ -282,6 +285,7 @@ class ReviewFinalizer:
                 routing_mode=self._routing_mode,
                 selected_dimensions=self._selected_dimensions,
                 budget_skipped=self._budget_skipped,
+                skipped_files=self._skipped_files,
             )
         except Exception as exc:
             logger.error("report rendering failed: {}", exc)

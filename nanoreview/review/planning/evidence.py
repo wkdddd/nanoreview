@@ -11,13 +11,13 @@ from pathlib import Path
 
 from loguru import logger
 
-from nanoreview.rag.review_service import (
-    REMOTE_SOURCE_TYPE,
-    SOURCE_TYPE,
-    RepositoryRAGRequest,
-    RepositoryRAGService,
-)
 from nanoreview.review.file_filter import review_file_filter_reason
+from nanoreview.review.planning.preprocessor import (
+    ProgrammaticEvidenceRequest,
+    ProgrammaticEvidenceResult,
+    ProgrammaticEvidenceService,
+    SkippedUnit,
+)
 from nanoreview.review.source.github import GitHubRepoReader
 from nanoreview.review.source.utils import (
     changed_lines_from_patch,
@@ -26,7 +26,8 @@ from nanoreview.review.source.utils import (
 )
 from nanoreview.review.types import GitHubDiffEvidence, LocalReviewScope
 from nanoreview.utils.log_style import event_message, log_event
-from nanoreview.utils.helpers import estimate_message_tokens
+
+_DEFAULT_DIFF_QUERY = "code review bug security performance maintainability changed lines"
 
 
 @dataclass(slots=True)
@@ -36,21 +37,24 @@ class LocalChangedSummary:
 
 
 class ReviewEvidenceService:
-    """Compose local/git/GitHub inputs with repository RAG retrieval."""
+    """Compose local/git/GitHub inputs with deterministic evidence preparation."""
 
     def __init__(
         self,
-        rag_service: RepositoryRAGService,
+        preprocessor: ProgrammaticEvidenceService,
         github: GitHubRepoReader | None = None,
         *,
         workspace: Path | None = None,
     ) -> None:
-        self.repository_rag = rag_service
-        self.workspace = (workspace or rag_service.workspace).expanduser().resolve()
+        self.preprocessor = preprocessor
+        self.workspace = (workspace or preprocessor.workspace).expanduser().resolve()
         self.github = github or GitHubRepoReader(workspace=self.workspace)
         self.last_cache_root: Path | None = None
         self.last_changed_files: list[str] = []
         self.last_diff_evidence: GitHubDiffEvidence | None = None
+        # Structured preprocessing output of the most recent dispatch; the
+        # prefetch layer builds the evidence bundle from it when present.
+        self.last_result: ProgrammaticEvidenceResult | None = None
 
     async def dispatch(
         self,
@@ -74,6 +78,7 @@ class ReviewEvidenceService:
         self.last_cache_root = None
         self.last_changed_files = []
         self.last_diff_evidence = None
+        self.last_result = None
         if target_type == "github":
             if action == "diff":
                 return await self.github_diff_context(
@@ -95,6 +100,7 @@ class ReviewEvidenceService:
                 max_results=max_results,
                 include_tests=include_tests,
                 trace_id=trace_id,
+                context_window_tokens=context_window_tokens,
             )
         if action == "diff":
             return await self.local_changed_context(
@@ -109,24 +115,20 @@ class ReviewEvidenceService:
             max_results=max_results,
             include_tests=include_tests,
             local_scope=local_scope,
+            context_window_tokens=context_window_tokens,
         )
 
-    def _rag_for_scope(self, local_scope: LocalReviewScope | None) -> RepositoryRAGService:
+    def _preprocessor_for_scope(self, local_scope: LocalReviewScope | None) -> ProgrammaticEvidenceService:
         if local_scope is None:
-            return self.repository_rag
+            return self.preprocessor
         review_root = Path(local_scope.review_root).expanduser().resolve()
-        if review_root == self.repository_rag.workspace:
-            return self.repository_rag
-        return RepositoryRAGService(
-            review_root,
-            runtime=self.repository_rag.runtime,
-            options=self.repository_rag.options,
-            source_type=SOURCE_TYPE,
-        )
+        if review_root == self.preprocessor.workspace:
+            return self.preprocessor
+        return ProgrammaticEvidenceService(review_root, options=self.preprocessor.options)
 
     def _scope_files(
         self,
-        rag_service: RepositoryRAGService,
+        preprocessor: ProgrammaticEvidenceService,
         local_scope: LocalReviewScope | None,
         candidate_paths: list[str] | None = None,
     ) -> list[Path]:
@@ -136,17 +138,17 @@ class ReviewEvidenceService:
         files: list[Path] = []
         if scopes:
             for rel in scopes:
-                candidate = (rag_service.workspace / rel).resolve()
+                candidate = (preprocessor.workspace / rel).resolve()
                 try:
-                    candidate.relative_to(rag_service.workspace)
+                    candidate.relative_to(preprocessor.workspace)
                 except ValueError:
                     raise PermissionError(f"target path is outside review root: {rel}") from None
                 if candidate.is_file() and review_file_filter_reason(rel) is None:
                     files.append(candidate)
                 elif candidate.is_dir():
-                    files.extend(rag_service.iter_candidate_files(candidate))
+                    files.extend(preprocessor.iter_candidate_files(candidate))
             return list(dict.fromkeys(files))
-        return list(rag_service.iter_candidate_files())
+        return list(preprocessor.iter_candidate_files())
 
     async def local_context(
         self,
@@ -155,6 +157,7 @@ class ReviewEvidenceService:
         max_results: int,
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
+        context_window_tokens: int | None = None,
     ) -> str:
         trace_id = "local"
         started = time.perf_counter()
@@ -170,27 +173,30 @@ class ReviewEvidenceService:
             )
             return "Error: review_query is required."
 
-        rag_service = self._rag_for_scope(local_scope)
-        files = self._scope_files(rag_service, local_scope)
-        result = await rag_service.retrieve(
-            RepositoryRAGRequest(
-                source_type=SOURCE_TYPE,
+        preprocessor = self._preprocessor_for_scope(local_scope)
+        files = self._scope_files(preprocessor, local_scope)
+        result = await preprocessor.retrieve(
+            ProgrammaticEvidenceRequest(
+                source_type="local",
                 review_query=review_query.strip(),
                 files=files,
                 max_results=max_results,
                 include_tests=include_tests,
                 related_tests=False,
+                context_window_tokens=context_window_tokens,
             )
         )
-        if not result.hits:
+        self.last_result = result
+        if not result.units:
             log_event(
                 logger,
                 "info",
                 "review.evidence.local.done",
-                status="no_hits",
+                status="no_units",
                 trace_id=trace_id,
                 files_count=len(files),
-                hits_count=0,
+                units_count=0,
+                skipped_count=len(result.skipped),
                 context_chars=len(result.context),
                 elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
             )
@@ -202,7 +208,9 @@ class ReviewEvidenceService:
             status="success",
             trace_id=trace_id,
             files_count=len(files),
-            hits_count=len(result.hits),
+            units_count=len(result.units),
+            skipped_count=len(result.skipped),
+            mode=result.mode,
             context_chars=len(result.context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
@@ -218,19 +226,24 @@ class ReviewEvidenceService:
         context_window_tokens: int | None = None,
     ) -> str:
         started = time.perf_counter()
-        rag_service = self._rag_for_scope(local_scope)
-        patches, skipped = await asyncio.to_thread(self.local_changed_patches, rag_service.workspace)
+        preprocessor = self._preprocessor_for_scope(local_scope)
+        patches, skipped = await asyncio.to_thread(self.local_changed_patches, preprocessor.workspace)
         scopes = clean_scope_paths(local_scope.scope_paths if local_scope else [])
         if scopes:
             patches = {path: patch for path, patch in patches.items() if path_matches_scope(path, scopes)}
             skipped = {path: reason for path, reason in skipped.items() if path_matches_scope(path, scopes)}
-        result = self._render_diff_context(
-            title="Local Diff Review Context",
-            target="local workspace",
-            patches=patches,
-            skipped=skipped,
+        result = await asyncio.to_thread(
+            preprocessor.diff_units,
+            patches,
+            review_query=(review_query or "").strip() or _DEFAULT_DIFF_QUERY,
             context_window_tokens=context_window_tokens,
         )
+        # File-level filter reasons from the patch collector become skipped units.
+        result.skipped.extend(
+            SkippedUnit(path=path, reason=str(reason) or "filtered")
+            for path, reason in sorted(skipped.items())
+        )
+        self.last_result = result
         self.last_changed_files = list(patches)
         log_event(
             logger,
@@ -240,11 +253,13 @@ class ReviewEvidenceService:
             trace_id="local_changed",
             scopes_count=len(scopes),
             changed_files=len(patches),
-            skipped_files=len(skipped),
-            context_chars=len(result),
+            units_count=len(result.units),
+            skipped_count=len(result.skipped),
+            mode=result.mode,
+            context_chars=len(result.context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
-        return result
+        return result.context
 
     def local_changed_patches(self, workspace: Path | None = None) -> tuple[dict[str, str], dict[str, str]]:
         """Read local changed patches without indexing or retrieval."""
@@ -292,35 +307,6 @@ class ReviewEvidenceService:
             else:
                 patches[path] = patch
         return patches, skipped
-
-    @staticmethod
-    def _render_diff_context(
-        *,
-        title: str,
-        target: str,
-        patches: dict[str, str],
-        skipped: dict[str, str],
-        context_window_tokens: int | None,
-    ) -> str:
-        lines = [f"[{title}]", f"- target: {target}", f"- changed files: {len(patches)}"]
-        if skipped:
-            lines.append(f"- filtered or unavailable files: {len(skipped)}")
-        token_limit = int(context_window_tokens * 0.8) if context_window_tokens else None
-        for path, patch in patches.items():
-            token_count = estimate_message_tokens({"role": "tool", "content": patch})
-            if token_limit and token_count > token_limit:
-                skipped[path] = "token_threshold_exceeded"
-                logger.warning(
-                    "review.evidence.diff.file_skipped path={} reason=token_threshold_exceeded tokens={} token_limit={}",
-                    path,
-                    token_count,
-                    token_limit,
-                )
-                continue
-            lines.extend(("", f"## File: {path}", patch.rstrip()))
-        for path, reason in skipped.items():
-            lines.append(f"- skipped: {path} ({reason}; read on demand)")
-        return "\n".join(lines)
 
     def local_changed_summary(self, workspace: Path | None = None) -> LocalChangedSummary:
         root = (workspace or self.workspace).expanduser().resolve()
@@ -476,11 +462,13 @@ class ReviewEvidenceService:
         trace_id: str,
         touched_lines: dict[str, list[int]] | None = None,
         related_tests: bool = True,
-    ) -> tuple[Path | None, str, int]:
+        context_window_tokens: int | None = None,
+    ) -> ProgrammaticEvidenceResult:
+        """Preprocess a remote snapshot into accepted units and skipped records."""
         started = time.perf_counter()
-        result = await self.repository_rag.retrieve(
-            RepositoryRAGRequest(
-                source_type=REMOTE_SOURCE_TYPE,
+        result = await self.preprocessor.retrieve(
+            ProgrammaticEvidenceRequest(
+                source_type="github",
                 snapshot_name=snapshot_name,
                 snapshot_files=files,
                 review_query=review_query,
@@ -489,8 +477,10 @@ class ReviewEvidenceService:
                 touched_lines=touched_lines,
                 related_tests=related_tests,
                 trace_id=trace_id,
+                context_window_tokens=context_window_tokens,
             )
         )
+        self.last_result = result
         self.last_cache_root = result.cache_root
         log_event(
             logger,
@@ -500,12 +490,14 @@ class ReviewEvidenceService:
             trace_id=trace_id,
             snapshot=snapshot_name,
             files_count=len(files),
-            hits_count=len(result.hits),
+            units_count=len(result.units),
+            skipped_count=len(result.skipped),
+            mode=result.mode,
             context_chars=len(result.context),
             cache=result.cache_root,
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
-        return result.cache_root, result.context, len(result.hits)
+        return result
 
     async def github_context(
         self,
@@ -519,6 +511,7 @@ class ReviewEvidenceService:
         max_results: int,
         include_tests: bool | None,
         trace_id: str,
+        context_window_tokens: int | None = None,
     ) -> str:
         started = time.perf_counter()
         if not review_query or not review_query.strip():
@@ -561,13 +554,14 @@ class ReviewEvidenceService:
                 elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
             )
             return "No text files found for GitHub repository context retrieval."
-        cache_root, context, hits_count = await self.retrieve_snapshot_context(
+        result = await self.retrieve_snapshot_context(
             snapshot_name=snapshot,
             files=files,
             review_query=review_query,
             max_results=max_results,
             include_tests=include_tests,
             trace_id=trace_id,
+            context_window_tokens=context_window_tokens,
         )
         log_event(
             logger,
@@ -577,22 +571,23 @@ class ReviewEvidenceService:
             trace_id=trace_id,
             snapshot=snapshot,
             target_subpath=scoped_path,
-            cache=cache_root,
+            cache=result.cache_root,
             files=len(files),
-            hits=hits_count,
+            units=len(result.units),
         )
-        if hits_count <= 0:
+        if not result.units:
             log_event(
                 logger,
                 "info",
                 "review.evidence.github_context.done",
-                status="no_hits",
+                status="no_units",
                 trace_id=trace_id,
                 repo=repo,
                 snapshot=snapshot,
                 files_count=len(files),
-                hits_count=0,
-                context_chars=len(context),
+                units_count=0,
+                skipped_count=len(result.skipped),
+                context_chars=len(result.context),
                 elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
             )
             return "No relevant GitHub repository review references found."
@@ -605,11 +600,13 @@ class ReviewEvidenceService:
             repo=repo,
             snapshot=snapshot,
             files_count=len(files),
-            hits_count=hits_count,
-            context_chars=len(context),
+            units_count=len(result.units),
+            skipped_count=len(result.skipped),
+            mode=result.mode,
+            context_chars=len(result.context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
-        return context
+        return result.context
 
     async def github_diff_context(
         self,
@@ -673,13 +670,18 @@ class ReviewEvidenceService:
                 skipped[path] = reason
             else:
                 usable_patches[path] = patch
-        result = self._render_diff_context(
-            title="GitHub PR Diff Review Context",
-            target=evidence.snapshot,
-            patches=usable_patches,
-            skipped=skipped,
+        result = await asyncio.to_thread(
+            self.preprocessor.diff_units,
+            usable_patches,
+            review_query=(review_query or "").strip() or _DEFAULT_DIFF_QUERY,
             context_window_tokens=context_window_tokens,
         )
+        # File-level filter reasons from the PR collector become skipped units.
+        result.skipped.extend(
+            SkippedUnit(path=path, reason=str(reason) or "filtered")
+            for path, reason in sorted(skipped.items())
+        )
+        self.last_result = result
         evidence.patch_unavailable_files.update(skipped)
         for path in skipped:
             evidence.patches.pop(path, None)
@@ -693,8 +695,10 @@ class ReviewEvidenceService:
             pr=pr_number,
             snapshot=evidence.snapshot,
             files_count=len(usable_patches),
-            skipped_files=len(skipped),
-            context_chars=len(result),
+            units_count=len(result.units),
+            skipped_count=len(result.skipped),
+            mode=result.mode,
+            context_chars=len(result.context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
-        return result
+        return result.context

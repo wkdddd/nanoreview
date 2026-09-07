@@ -13,8 +13,8 @@ from nanoreview.agent.context import ContextBuilder
 from nanoreview.review.input import (
     apply_policy_to_roles,
     extract_review_target,
-    normalize_requested_dimensions,
     normalize_mode,
+    normalize_requested_dimensions,
     normalize_review_action,
     normalize_review_target_type,
     parse_repo_target,
@@ -318,8 +318,6 @@ async def prepare_code_review_context(
         )
     session_meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = [role.name for role in plan.roles]
     evidence = prefetch_summary.evidence
-    if evidence is not None:
-        session_meta[ReviewMetaKey.EVIDENCE_BUNDLE] = evidence
     return ReviewPreparation(
         plan=plan,
         prompt=render_review_coordinator_prompt(plan, evidence),

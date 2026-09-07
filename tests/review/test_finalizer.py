@@ -33,16 +33,52 @@ def workspace(tmp_path):
     return str(tmp_path)
 
 
-def _submit(findings: list[dict[str, object]]) -> str:
+_SECURITY_DETAILS = {
+    "trust_boundary": "Public HTTP request reaches the query layer",
+    "attack_preconditions": "Attacker controls the request parameter",
+    "attack_path": "request -> handler -> query builder -> database",
+}
+
+_PERFORMANCE_DETAILS = {
+    "hot_path": "index.html render path",
+    "scale_condition": "Every page load",
+    "resource_impact": "Blocking network fetch delays first paint",
+}
+
+_MAINTAINABILITY_DETAILS = {
+    "violated_boundary": "webui imports gateway internals directly",
+    "change_amplification": "schema changes require touching every caller",
+    "affected_modules": ["src/app.py"],
+}
+
+_BUG_DETAILS = {
+    "trigger": "Calling the endpoint with an empty payload",
+    "expected_behavior": "The handler rejects empty payloads",
+    "actual_behavior": "The handler crashes with an unhandled error",
+}
+
+
+def _submit(
+    findings: list[dict[str, object]],
+    details: dict[str, object] | None = None,
+) -> str:
+    prepared: list[dict[str, object]] = []
+    for finding in findings:
+        item = dict(finding)
+        item.setdefault(
+            "details", dict(details if details is not None else _SECURITY_DETAILS)
+        )
+        prepared.append(item)
     return json.dumps(
-        {"submitted": True, "findings": findings, "errors": []},
+        {"submitted": True, "findings": prepared, "errors": []},
         ensure_ascii=False,
     )
 
 
 class TestParsingReviewSubmit:
     def test_normalizes_review_label_suffix(self):
-        assert normalize_review_dimension("Architecture Review") == "architecture"
+        assert normalize_review_dimension("Security Review") == "security"
+        assert normalize_review_dimension("Maintainability Review") == "maintainability"
 
     def test_parse_review_submit_result(self, workspace):
         raw = _submit([{
@@ -244,15 +280,15 @@ class TestFinalize:
         assert not any("submit json error" in message for message in errors)
 
     def test_finalizer_skips_disallowed_dimensions(self, workspace):
-        dependency_raw = _submit([{
+        maintainability_raw = _submit([{
             "severity": "high",
             "file": "src/app.py",
             "line": 1,
-            "title": "Unpinned dependency",
+            "title": "Boundary violation",
             "evidence": "line1",
-            "impact": "Supply chain risk",
-            "recommendation": "Pin versions",
-        }])
+            "impact": "Change amplification",
+            "recommendation": "Introduce a stable interface",
+        }], details=_MAINTAINABILITY_DETAILS)
         security_raw = _submit([{
             "severity": "high",
             "file": "src/app.py",
@@ -262,28 +298,28 @@ class TestFinalize:
             "impact": "Bad",
             "recommendation": "Fix",
         }])
-        f = ReviewFinalizer(workspace, allowed_dimensions={"dependency"})
+        f = ReviewFinalizer(workspace, allowed_dimensions={"maintainability"})
 
         skipped = f.ingest_subagent_output("security", security_raw)
-        accepted = f.ingest_subagent_output("Dependency Reviewer", dependency_raw)
+        accepted = f.ingest_subagent_output("Maintainability Reviewer", maintainability_raw)
         result = f.finalize("myproject")
 
         assert skipped.status == "skipped_disallowed"
         assert len(accepted.accepted) == 1
-        assert "Unpinned dependency" in result.report_markdown
+        assert "Boundary violation" in result.report_markdown
         assert "Security finding" not in result.report_markdown
-        assert [dimension.dimension for dimension in result.dimensions] == ["dependency"]
+        assert [dimension.dimension for dimension in result.dimensions] == ["maintainability"]
 
     def test_finalizer_accepts_spawn_labels_with_task_suffix(self, workspace):
         raw = _submit([{
             "severity": "high",
-            "file": "review-webui/index.html",
+            "file": "src/app.py",
             "line": 1,
             "title": "Font loading blocks render",
-            "evidence": "Google Fonts stylesheet",
+            "evidence": "line1",
             "impact": "Slower first paint",
             "recommendation": "Use font-display swap",
-        }])
+        }], details=_PERFORMANCE_DETAILS)
         f = ReviewFinalizer(workspace, allowed_dimensions={"performance"})
 
         accepted = f.ingest_subagent_output(
@@ -297,19 +333,20 @@ class TestFinalize:
         assert "Font loading blocks render" in result.report_markdown
         assert not result.errors
 
-    def test_finalizer_accepts_short_performance_spawn_label(self, workspace):
+    def test_finalizer_accepts_dimension_key_spawn_label(self, workspace):
+        """The orchestrator spawns reviewers with the raw dimension key as label."""
         raw = _submit([{
             "severity": "high",
-            "file": "review-webui/index.html",
+            "file": "src/app.py",
             "line": 1,
             "title": "Blocking external stylesheet",
-            "evidence": "Google Fonts stylesheet",
+            "evidence": "line1",
             "impact": "Slower first paint",
             "recommendation": "Preconnect or self-host critical font assets",
-        }])
+        }], details=_PERFORMANCE_DETAILS)
         f = ReviewFinalizer(workspace, allowed_dimensions={"performance"})
 
-        accepted = f.ingest_subagent_output("perf-review-index.html", raw)
+        accepted = f.ingest_subagent_output("performance", raw)
         result = f.finalize("review-webui/index.html")
 
         assert accepted.status != "skipped_disallowed"
@@ -483,7 +520,7 @@ class TestFinalize:
             }],
         )
         hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
-        hook.set_allowed_dimensions(["dependency"])
+        hook.set_allowed_dimensions(["maintainability"])
 
         content = hook.finalize_content(context, "raw assistant prose")
 
@@ -510,7 +547,7 @@ class TestFinalize:
             "evidence": "line2",
             "impact": "bad",
             "recommendation": "fix",
-        }])
+        }], details=_BUG_DETAILS)
         context = AgentHookContext(
             iteration=1,
             messages=[{
@@ -533,7 +570,7 @@ class TestFinalize:
             "_metadata": {
                 "injected_event": "subagent_result",
                 "subagent_task_id": "second",
-                "subagent_label": "tests",
+                "subagent_label": "bug",
                 "subagent_result": second,
             },
         })

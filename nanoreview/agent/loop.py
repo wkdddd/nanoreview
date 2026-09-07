@@ -20,7 +20,17 @@ from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.hooks.lifecycle import AgentHook, CompositeHook
 from nanoreview.agent.hooks.progress import AgentProgressHook
 from nanoreview.agent.memory import Consolidator
-from nanoreview.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunResult, AgentRunner, AgentRunSpec
+from nanoreview.agent.orchestration import (
+    ReviewExecutionContext,
+    ReviewOrchestrator,
+    ReviewPlanningError,
+)
+from nanoreview.agent.runner import (
+    _MAX_INJECTIONS_PER_TURN,
+    AgentRunner,
+    AgentRunResult,
+    AgentRunSpec,
+)
 from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.tools.file_state import (
     FileStateStore,
@@ -36,13 +46,8 @@ from nanoreview.config.schema import AgentDefaults, ModelPresetConfig
 from nanoreview.providers.base import LLMProvider
 from nanoreview.providers.factory import ProviderSnapshot
 from nanoreview.review import apply_review_metadata_from_message
-from nanoreview.agent.orchestration import (
-    ReviewExecutionContext,
-    ReviewOrchestrator,
-    ReviewPlanningError,
-)
-from nanoreview.review.planning.planner import prepare_code_review_context
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
+from nanoreview.review.planning.planner import prepare_code_review_context
 from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.session.manager import Session, SessionManager
@@ -215,10 +220,6 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
-        embedding_config: Any | None = None,
-        rerank_config: Any | None = None,
-        qdrant_config: Any | None = None,
-        rag_config: Any | None = None,
         review_config: Any | None = None,
         provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
@@ -232,17 +233,8 @@ class AgentLoop:
             ToolsConfig,
             _resolve_tool_config_refs,
         )
-        from nanoreview.rag.config import RAGConfig
-
         _resolve_tool_config_refs()
         _tc = tools_config or ToolsConfig()
-        _rag_config = rag_config if rag_config is not None else RAGConfig()
-        _embedding_config = (
-            embedding_config if embedding_config is not None else _rag_config.embedding
-        )
-        _rerank_config = (
-            rerank_config if rerank_config is not None else _rag_config.rerank
-        )
         defaults = AgentDefaults()
         self.bus = bus
         self.channels_config = channels_config
@@ -281,12 +273,6 @@ class AgentLoop:
         self.tools_config = _tc
         # Permission approval policy currently lives on ToolsConfig.
         self.permissions_config = _tc
-        self.embedding_config = _embedding_config
-        self.rerank_config = _rerank_config
-        self.qdrant_config = (
-            qdrant_config if qdrant_config is not None else _rag_config.qdrant
-        )
-        self.rag_config = _rag_config
         self.review_config = review_config
         self.exec_config = _tc.exec
         self._default_reasoning_effort = default_reasoning_effort
@@ -314,8 +300,6 @@ class AgentLoop:
             bus=bus,
             model=self.model,
             tools_config=_tc,
-            embedding_config=self.embedding_config,
-            rerank_config=self.rerank_config,
             max_tool_result_chars=self.max_tool_result_chars,
             restrict_to_workspace=restrict_to_workspace,
             disabled_skills=disabled_skills,
@@ -423,11 +407,7 @@ class AgentLoop:
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
-            rag_config=config.rag,
             review_config=config.review,
-            embedding_config=config.rag.embedding,
-            rerank_config=config.rag.rerank,
-            qdrant_config=config.rag.qdrant,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
@@ -555,11 +535,7 @@ class AgentLoop:
             workspace=str(self.workspace),
             provider=self.provider,
             model=self.model,
-            rag_config=self.rag_config,
             review_config=self.review_config,
-            embedding_config=self.embedding_config,
-            rerank_config=self.rerank_config,
-            qdrant_config=self.qdrant_config,
             bus=self.bus,
             subagent_manager=self.subagents,
             sessions=self.sessions,

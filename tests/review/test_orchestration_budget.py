@@ -5,15 +5,15 @@ from pathlib import Path
 import pytest
 
 from nanoreview.agent.orchestration import ReviewOrchestrator
+from nanoreview.review.output.report import render_review_report
 from nanoreview.review.types import (
     EvidenceReference,
     ReviewAction,
     ReviewAssignment,
+    ReviewBudgetSkip,
     ReviewEvidenceBundle,
     ReviewPlan,
-    ReviewBudgetSkip,
 )
-from nanoreview.review.output.report import render_review_report
 
 
 def _orchestrator(tmp_path: Path) -> ReviewOrchestrator:
@@ -51,7 +51,7 @@ async def test_budget_scales_rounds_and_clamps_quota(tmp_path: Path) -> None:
     small, _ = await orchestrator._admit_assignments(
         plan=_plan("explicit"),
         evidence=_evidence("x"),
-        assignments=(ReviewAssignment("security", "check"),),
+        assignments=(ReviewAssignment("security", "check", ("ev-1",)),),
         validation_workspace=str(tmp_path),
         local_target=None,
         token_budget=100_000,
@@ -59,7 +59,7 @@ async def test_budget_scales_rounds_and_clamps_quota(tmp_path: Path) -> None:
     large, _ = await orchestrator._admit_assignments(
         plan=_plan("explicit"),
         evidence=_evidence("word " * 100_000),
-        assignments=(ReviewAssignment("security", "check"),),
+        assignments=(ReviewAssignment("security", "check", ("ev-1",)),),
         validation_workspace=str(tmp_path),
         local_target=None,
         token_budget=100_000,
@@ -78,9 +78,9 @@ async def test_explicit_budget_admission_preserves_user_order(tmp_path: Path) ->
         plan=_plan("explicit"),
         evidence=_evidence("word " * 30_000),
         assignments=(
-            ReviewAssignment("performance", "check"),
-            ReviewAssignment("security", "check"),
-            ReviewAssignment("bug", "check"),
+            ReviewAssignment("performance", "check", ("ev-1",)),
+            ReviewAssignment("security", "check", ("ev-1",)),
+            ReviewAssignment("bug", "check", ("ev-1",)),
         ),
         validation_workspace=str(tmp_path),
         local_target=None,
@@ -98,9 +98,9 @@ async def test_auto_budget_admission_uses_review_priority(tmp_path: Path) -> Non
         plan=_plan("auto"),
         evidence=_evidence("word " * 30_000),
         assignments=(
-            ReviewAssignment("maintainability", "check"),
-            ReviewAssignment("bug", "check"),
-            ReviewAssignment("security", "check"),
+            ReviewAssignment("maintainability", "check", ("ev-1",)),
+            ReviewAssignment("bug", "check", ("ev-1",)),
+            ReviewAssignment("security", "check", ("ev-1",)),
         ),
         validation_workspace=str(tmp_path),
         local_target=None,

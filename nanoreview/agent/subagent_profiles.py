@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from nanoreview.agent.runner import AgentRunResult
 
@@ -13,17 +13,6 @@ BUG_REVIEWER_SCOPE = "reviewer.bug"
 SECURITY_REVIEWER_SCOPE = "reviewer.security"
 PERFORMANCE_REVIEWER_SCOPE = "reviewer.performance"
 MAINTAINABILITY_REVIEWER_SCOPE = "reviewer.maintainability"
-
-
-@dataclass(frozen=True, slots=True)
-class SubagentExecutionLimits:
-    """Per-task runtime limits supplied by a controlling orchestrator."""
-
-    max_iterations: int | None = None
-    max_tokens: int | None = None
-    timeout_seconds: float | None = None
-    input_tokens: int | None = None
-    quota_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +40,6 @@ class SubagentResultHandler(Protocol):
         self,
         *,
         result: AgentRunResult,
-        retry: Callable[[], Awaitable[tuple[str | None, str]]],
         target_type: str,
     ) -> SubagentCompletion: ...
 

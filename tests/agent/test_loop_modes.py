@@ -388,26 +388,6 @@ async def test_agent_loop_always_injects_review_context(
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_ignores_legacy_math_qa_mode_metadata(tmp_path) -> None:
-    """Legacy math_qa_mode metadata does not alter behavior — review context is still injected."""
-    loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
-    runner = CapturingRunner()
-    loop.runner = runner
-    session = Session(key="test:math")
-    session.metadata["math_qa_mode"] = True
-
-    await loop._run_agent_loop(
-        [{"role": "user", "content": "求极限"}],
-        session=session,
-        session_key=session.key,
-    )
-
-    # Review context is always injected as the first system message
-    assert runner.initial_messages[0]["role"] == "system"
-    assert runner.initial_messages[1] == {"role": "user", "content": "求极限"}
-
-
-@pytest.mark.asyncio
 async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_path, monkeypatch) -> None:
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     subagents = RunningSubagents(running=1)

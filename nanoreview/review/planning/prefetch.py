@@ -10,6 +10,10 @@ from typing import Any, Awaitable, Callable
 from loguru import logger
 
 from nanoreview.review.input import policy_for_depth
+from nanoreview.review.planning.preprocessor import (
+    ProgrammaticEvidenceResult,
+    preview_text,
+)
 from nanoreview.review.types import (
     EvidenceReference,
     ReviewAction,
@@ -17,6 +21,7 @@ from nanoreview.review.types import (
     ReviewEvidenceProvider,
     ReviewMetaKey,
     ReviewPlan,
+    SkippedReviewUnit,
 )
 
 _PREFETCH_ACTIONS = {
@@ -25,6 +30,12 @@ _PREFETCH_ACTIONS = {
 }
 
 ReviewProgressCallback = Callable[..., Awaitable[None]]
+
+#: Inline excerpt bound per reference (approx. one chunk cap in chars).
+_EXCERPT_CHAR_LIMIT = 16_000
+
+#: Maximum skipped-file descriptions embedded in one progress event.
+_EVENT_SKIPPED_LIMIT = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,8 +52,51 @@ _EVIDENCE_HEADER = re.compile(
 )
 
 
+def _bundle_from_result(
+    result: ProgrammaticEvidenceResult,
+    *,
+    action: ReviewAction,
+) -> ReviewEvidenceBundle:
+    """Build the evidence bundle from accepted units and skipped records."""
+    references = tuple(
+        EvidenceReference(
+            id=unit.unit_id,
+            path=unit.path,
+            start_line=unit.start_line,
+            end_line=unit.end_line,
+            source="diff" if action == ReviewAction.DIFF else "programmatic",
+            tags=unit.tags,
+            excerpt=unit.text[:_EXCERPT_CHAR_LIMIT],
+            kind=unit.kind,
+            parent_id=unit.parent_id,
+            token_count=unit.token_count,
+            preview=preview_text(unit.text),
+        )
+        for unit in result.units
+        if unit.unit_id
+    )
+    skipped = tuple(
+        SkippedReviewUnit(
+            path=unit.path,
+            reason=unit.reason,
+            start_line=unit.start_line,
+            end_line=unit.end_line,
+            detail=unit.detail,
+        )
+        for unit in result.skipped
+    )
+    summary = _compact_evidence(result.context, action=action)
+    return ReviewEvidenceBundle(
+        references=references,
+        summary=summary,
+        status="ok" if references else "empty",
+        reason="" if references else "no_accepted_evidence_units",
+        skipped=skipped,
+    )
+
+
 def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceBundle:
-    """Convert provider output into bounded references before rendering a summary.
+    """Legacy fallback for providers that only return rendered text.
 
     Evidence providers already use stable review-context headers.  Keeping this
     parsing at the prefetch boundary means later dispatch never trusts a model
@@ -78,7 +132,7 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
                 path=path,
                 start_line=start,
                 end_line=end,
-                source="diff" if action == ReviewAction.DIFF else "rag",
+                source="diff" if action == ReviewAction.DIFF else "programmatic",
                 tags=tuple(tags),
                 excerpt=excerpt,
             )
@@ -104,6 +158,7 @@ async def _emit_prefetch_progress(
     elapsed_ms: float | None = None,
     raw_chars: int | None = None,
     summary_chars: int | None = None,
+    files: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
     if progress_callback is None:
@@ -118,7 +173,7 @@ async def _emit_prefetch_progress(
         },
         "result": status,
         "error": reason or None,
-        "files": [],
+        "files": files or [],
         "embeds": [],
         "metadata": {
             "trace_id": trace_id,
@@ -263,20 +318,28 @@ async def maybe_prefetch_review_context(
         )
         return ReviewPrefetchResult(True, "error", reason=str(exc))
     raw = str(result)
-    evidence = _build_evidence_bundle(raw, action=plan.action)
+    structured = getattr(evidence_service, "last_result", None)
+    if isinstance(structured, ProgrammaticEvidenceResult):
+        evidence = _bundle_from_result(structured, action=plan.action)
+    else:
+        evidence = _build_evidence_bundle(raw, action=plan.action)
     summary = evidence.summary
     elapsed_ms = (time.perf_counter() - started) * 1000
     logger.info(
-        "review.prefetch.done trace_id={} status=ok action={} raw_chars={} summary_chars={} elapsed_ms={:.1f}",
+        "review.prefetch.done trace_id={} status=ok action={} raw_chars={} summary_chars={} "
+        "references={} skipped_units={} elapsed_ms={:.1f}",
         trace_id,
         plan.action.value,
         len(raw),
-        len(summary),
+        len(summary or ""),
+        len(evidence.references),
+        len(evidence.skipped),
         elapsed_ms,
     )
     progress_status = "ok"
     if not evidence.references:
         progress_status = "no_summary" if not summary else "empty"
+    skipped_by_file = evidence.skipped_by_file()
     await _emit_prefetch_progress(
         progress_callback,
         phase="end",
@@ -286,8 +349,16 @@ async def maybe_prefetch_review_context(
         status=progress_status,
         elapsed_ms=elapsed_ms,
         raw_chars=len(raw),
-        summary_chars=len(summary),
-        metadata={"evidence_references": len(evidence.references)},
+        summary_chars=len(summary or ""),
+        files=sorted({reference.path for reference in evidence.references}),
+        metadata={
+            "evidence_references": len(evidence.references),
+            "skipped_units": len(evidence.skipped),
+            "skipped_files": [
+                file_summary.describe()
+                for file_summary in list(skipped_by_file.values())[:_EVENT_SKIPPED_LIMIT]
+            ],
+        },
     )
     if not summary:
         return ReviewPrefetchResult(True, "no_summary", evidence=evidence)
