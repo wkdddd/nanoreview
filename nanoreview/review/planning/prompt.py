@@ -272,6 +272,10 @@ You are CodeReviewAgent, the main code review coordinator.
 
 ## Evidence Strategy
 {_action_instruction(plan)}
+- In the evidence manifest, `matched:` lists the user review-query terms found
+  in each unit and `risk_hints:` lists program-generated candidate risk clues
+  (not confirmed findings). Use them together with `preview_coverage:` and file
+  path patterns to route files to the right dimension.
 
 ## Prefetched Evidence Summary
 {evidence}
@@ -290,7 +294,7 @@ Explain your reasoning briefly before spawning subagents.
 ### Phase 3 - Execute
 Spawn review subagents using `spawn`. Each `spawn.task` MUST include:
 - A clear role and review scope with the target path or resolved GitHub target
-- An explicit list of files from the Prefetched Evidence Summary that match its dimension (use the `matched:` tags and file path patterns to route files to the right dimension). Include file paths and line ranges so the subagent reads those files first before any broader exploration
+- An explicit list of files from the Prefetched Evidence Summary that match its dimension (route files using `risk_hints:` candidate clues, `matched:` user-query hit words and file path patterns; `risk_hints` are program-generated suggestions, not confirmed findings). Include file paths and line ranges so the subagent reads those files first before any broader exploration
 - Evidence source restrictions: subagents must use only the provided evidence or precise tool calls (e.g., `read_file` for local targets, `{tool_name}` meta/tree/file for GitHub targets). They must not clone repositories or repeat full-repository retrieval
 - An explicit instruction that the subagent MUST call `review_submit` with structured findings as its final deliverable. This is a subagent-only tool — the coordinator cannot call it
 
@@ -355,7 +359,10 @@ def render_review_coordinator_prompt(
     )
     references = evidence.references if evidence is not None else ()
     evidence_lines = "\n".join(
-        "- {id}: {path}{range_part} [{kind}] tokens={tokens} role={role}\n  {preview}".format(
+        "- {id}: {path}{range_part} [{kind}] tokens={tokens} role={role}\n"
+        "  risk_hints: {hints}\n"
+        "  preview_coverage: {coverage}\n"
+        "  {preview}".format(
             id=reference.id,
             path=reference.path,
             range_part=(
@@ -366,6 +373,8 @@ def render_review_coordinator_prompt(
             kind=reference.kind,
             tokens=reference.token_count or "?",
             role="related" if reference.is_related else "main",
+            hints=", ".join(reference.risk_hints) or "none",
+            coverage=reference.preview_coverage or "unknown",
             preview=reference.preview or "(no preview)",
         )
         for reference in references
@@ -409,6 +418,12 @@ the final report.
 - Use only the exact required dimension keys and authorized evidence IDs.
 - Every assignment MUST include a non-empty `evidence_ids` list referencing
   authorized evidence IDs above; assignments without evidence are invalid.
+- Submit only evidence IDs that appear under Authorized Evidence.
+- `risk_hints` are program-generated candidate routing clues from static term
+  matching. They are NOT confirmed vulnerabilities or findings.
+- Judge each unit by its path, line range, kind, preview and preview_coverage
+  together with `risk_hints` and the review dimensions; units without hints
+  remain valid review scope.
 - Assign main-role evidence chunks to the dimensions that should review them.
   Related-role chunks are supplementary context and may back up any dimension.
 - `focus` must state the concrete risk or interaction to investigate.

@@ -266,9 +266,18 @@ class ReviewConfig(Base):
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
     prefetch_dense_backfill_limit: int = Field(default=256, ge=0)
     subagent_evidence_budget_chars: int = Field(default=24_000, ge=4_000)
+    # Per-unit planner preview budget: soft target and absolute ceiling.
+    preview_target_chars: int = Field(default=600, ge=1)
+    preview_hard_limit: int = Field(default=3_000, ge=1)
     subagent_reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = None
     github_diff_enable: bool = True
     judge: ReviewJudgeSettings = Field(default_factory=ReviewJudgeSettings)
+
+    @model_validator(mode="after")
+    def _validate_preview_limits(self) -> "ReviewConfig":
+        if self.preview_hard_limit < self.preview_target_chars:
+            raise ValueError("preview_hard_limit must be >= preview_target_chars")
+        return self
 
 
 class Config(BaseSettings):

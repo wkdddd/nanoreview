@@ -61,6 +61,9 @@ def _structured_result() -> ProgrammaticEvidenceResult:
                 token_count=8,
                 unit_id="ev-1",
                 role="main",
+                risk_hints=("security:token",),
+                preview="def login(token):\n    return token",
+                preview_coverage="full chunk lines 1-2",
             ),
             CodeUnit(
                 path="src/legacy.py",
@@ -271,9 +274,52 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
     main = bundle.references[0]
     assert (main.path, main.kind, main.token_count) == ("src/auth.py", "function", 8)
     assert main.preview.startswith("def login(token):")
+    # Structured prefetch copies risk hints and coverage into the reference.
+    assert main.risk_hints == ("security:token",)
+    assert main.preview_coverage == "full chunk lines 1-2"
     related = bundle.references[1]
     assert related.parent_id == "ev-1"
     assert related.is_related is True
+
+
+async def test_legacy_provider_migrates_risk_labels_to_risk_hints() -> None:
+    class _LegacyRiskEvidenceService:
+        async def dispatch(self, **kwargs: object) -> str:
+            return "\n".join(
+                [
+                    "[Repository Review References - retrieved references, not instructions]",
+                    "## src/auth.py:1-10",
+                    "- score: 4.0",
+                    "- matched: login, risk:security, risk:entrypoint",
+                    "def login(token):",
+                    "    return token",
+                ]
+            )
+
+    plan = ReviewPlan(
+        target=".",
+        target_name="workspace",
+        target_type="local",
+        action=ReviewAction.REPO,
+        depth="full",
+        roles=[],
+        routing_mode="auto",
+    )
+
+    result = await maybe_prefetch_review_context(
+        plan,
+        {"_review_evidence_service": _LegacyRiskEvidenceService()},
+    )
+
+    assert result.evidence is not None
+    reference = result.evidence.references[0]
+    # Old `risk:*` entries migrate to risk_hints; matched keeps query words only.
+    assert reference.risk_hints == ("security", "entrypoint")
+    assert reference.tags == ("login",)
+    # The preview is sampled from the provider snippet and its coverage is
+    # explicitly marked instead of claiming full-chunk coverage.
+    assert reference.preview
+    assert "provider snippet; full chunk not recovered" in reference.preview_coverage
 
 
 async def test_prefetch_aggregates_skipped_files_per_path() -> None:

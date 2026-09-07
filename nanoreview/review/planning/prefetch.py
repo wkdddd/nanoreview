@@ -11,6 +11,7 @@ from loguru import logger
 
 from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceResult,
+    build_unit_preview,
     preview_text,
 )
 from nanoreview.review.types import (
@@ -74,7 +75,9 @@ def _bundle_from_result(
             kind=unit.kind,
             parent_id=unit.parent_id,
             token_count=unit.token_count,
-            preview=preview_text(unit.text),
+            risk_hints=unit.risk_hints,
+            preview=unit.preview or preview_text(unit.text),
+            preview_coverage=unit.preview_coverage,
         )
         for unit in result.units
         if unit.unit_id
@@ -105,6 +108,12 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
     Evidence providers already use stable review-context headers.  Keeping this
     parsing at the prefetch boundary means later dispatch never trusts a model
     supplied path or attempts to recover authorization from prompt text.
+
+    Compatibility limits: only the provider-rendered snippet is available, so
+    previews are sampled from that block alone and ``preview_coverage`` is
+    explicitly marked as a provider snippet rather than full-chunk coverage.
+    Old ``risk:*`` entries inside ``- matched:`` migrate to ``risk_hints``;
+    ``tags`` keeps only the identifiable query hit words.
     """
     summary = _compact_evidence(raw, action=action)
     references: list[EvidenceReference] = []
@@ -123,13 +132,31 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
         if key in seen_paths:
             continue
         seen_paths.add(key)
-        tags: list[str] = []
+        matched_items: list[str] = []
         for candidate in lines[index + 1 : index + 5]:
             stripped = candidate.strip()
             if stripped.startswith("- matched:"):
-                tags = [tag.strip() for tag in stripped.removeprefix("- matched:").split(",") if tag.strip()]
+                matched_items = [
+                    tag.strip() for tag in stripped.removeprefix("- matched:").split(",") if tag.strip()
+                ]
                 break
+        # Old providers mixed risk labels into `matched`; migrate them to
+        # risk_hints and keep only identifiable query hit words in tags.
+        risk_hints = tuple(
+            item.removeprefix("risk:") for item in matched_items if item.startswith("risk:")
+        )
+        query_tags = tuple(
+            item
+            for item in matched_items
+            if not item.startswith("risk:") and re.fullmatch(r"[A-Za-z0-9_.-]{2,}", item)
+        )
         excerpt = "\n".join(lines[index : index + 8]).strip()[:2_000]
+        preview, coverage = build_unit_preview(
+            excerpt,
+            kind="diff" if action == ReviewAction.DIFF else "file",
+            start_line=start or 1,
+            coverage_note="provider snippet; full chunk not recovered",
+        )
         references.append(
             EvidenceReference(
                 id=f"ev-{len(references) + 1:03d}",
@@ -137,8 +164,11 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
                 start_line=start,
                 end_line=end,
                 source="diff" if action == ReviewAction.DIFF else "programmatic",
-                tags=tuple(tags),
+                tags=query_tags,
                 excerpt=excerpt,
+                risk_hints=risk_hints,
+                preview=preview,
+                preview_coverage=coverage,
             )
         )
     status = "ok" if references else "empty"

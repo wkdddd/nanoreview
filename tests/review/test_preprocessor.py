@@ -10,6 +10,8 @@ from nanoreview.review.planning.preprocessor import (
     EvidenceBudget,
     ProgrammaticEvidenceRequest,
     ProgrammaticEvidenceService,
+    build_unit_preview,
+    detect_risk_hints,
     estimate_tokens,
 )
 
@@ -427,6 +429,8 @@ def test_options_from_review_config_maps_budget_fields() -> None:
             "prefetch_budget_chars": 8_000,
             "subagent_evidence_budget_chars": 12_000,
             "prefetch_dense_backfill_limit": 64,
+            "preview_target_chars": 400,
+            "preview_hard_limit": 2_000,
         },
     )()
 
@@ -436,9 +440,351 @@ def test_options_from_review_config_maps_budget_fields() -> None:
     assert options.prefetch_budget_chars == 8_000
     assert options.subagent_evidence_budget_chars == 12_000
     assert options.prefetch_dense_backfill_limit == 64
+    assert options.preview_target_chars == 400
+    assert options.preview_hard_limit == 2_000
     # The context window stays a per-request dynamic parameter.
     assert options.context_window_tokens == ProgrammaticEvidenceOptions().context_window_tokens
 
     defaults = ProgrammaticEvidenceOptions.from_review_config(None)
     assert defaults.token_budget == 100_000
     assert defaults.subagent_evidence_budget_chars == 24_000
+    assert defaults.preview_target_chars == 600
+    assert defaults.preview_hard_limit == 3_000
+
+
+def test_review_config_rejects_inverted_preview_limits() -> None:
+    from pydantic import ValidationError
+
+    from nanoreview.config.schema import ReviewConfig
+
+    with pytest.raises(ValidationError, match="preview_hard_limit"):
+        ReviewConfig(preview_target_chars=600, preview_hard_limit=300)
+    # Equal limits and well-ordered limits stay valid.
+    assert ReviewConfig(preview_target_chars=600, preview_hard_limit=600).preview_hard_limit == 600
+    assert ReviewConfig().preview_hard_limit == 3_000
+
+
+def test_programmatic_options_reject_inverted_preview_limits() -> None:
+    from nanoreview.review.planning.preprocessor import ProgrammaticEvidenceOptions
+
+    with pytest.raises(ValueError, match="preview_hard_limit"):
+        ProgrammaticEvidenceOptions(preview_target_chars=600, preview_hard_limit=100)
+
+
+# ---------------------------------------------------------------------------
+# Planner preview construction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_small_chunk_preview_keeps_full_text(tmp_path: Path) -> None:
+    text = "def login(token):\n    return token\n"
+    _write(tmp_path / "auth.py", text)
+
+    result = await ProgrammaticEvidenceService(tmp_path).retrieve(_request())
+
+    unit = result.units[0]
+    assert unit.preview == text
+    assert unit.preview_coverage == "full chunk lines 1-2"
+    # The path "auth.py" and the code both contribute risk hints to the manifest.
+    assert "- risk_hints: security:auth, security:token" in result.context
+    assert "- preview_coverage: full chunk lines 1-2" in result.context
+
+
+def test_mid_size_chunk_sampling_keeps_risk_line_without_premature_truncation() -> None:
+    # 600 < len(text) <= 3000: sampling may exceed the 600 target.
+    text = "\n".join(
+        [
+            "def handler(payload):",
+            *[f"    value_{index} = compute_{index}(payload)" for index in range(30)],
+            "    api_token = load_secret()",
+            *[f"    tail_{index} = finalize_{index}(payload)" for index in range(30)],
+            "    return payload",
+        ]
+    )
+    assert 600 < len(text) <= 3_000
+
+    preview, coverage = build_unit_preview(
+        text, kind="function", start_line=10, query_terms=set(), target_chars=600, hard_limit=3_000
+    )
+
+    # The mid-chunk risk line and its local window survive sampling.
+    assert "api_token = load_secret()" in preview
+    assert "... omitted lines" in preview
+    assert len(preview) <= 3_000
+    assert "(truncated)" not in preview  # no premature hard truncation at 600
+    assert coverage.startswith("chunk lines 10-")
+    assert "preview covers lines" in coverage
+
+
+def test_oversized_chunk_is_trimmed_by_priority_with_omission_ranges() -> None:
+    text = "\n".join(
+        [
+            "def handler(payload):",
+            *[f"    value_{index} = compute_{index}(payload)" for index in range(250)],
+            "    password = load_secret()",
+            *[f"    tail_{index} = finalize_{index}(payload)" for index in range(250)],
+            "    return payload",
+        ]
+    )
+    assert len(text) > 3_000
+
+    preview, coverage = build_unit_preview(
+        text, kind="function", start_line=1, query_terms=set(), target_chars=600, hard_limit=3_000
+    )
+
+    assert len(preview) <= 3_000
+    # Priority trim still keeps the signature and the risk line.
+    assert preview.startswith("def handler(payload):")
+    assert "password = load_secret()" in preview
+    assert "... omitted lines" in preview
+    assert "chunk lines 1-" in coverage
+
+
+def test_single_line_preview_respects_hard_limit() -> None:
+    # Minified or generated code may have no safe line boundary to drop.
+    preview, _coverage = build_unit_preview(
+        "x" * 200,
+        kind="function",
+        start_line=1,
+        query_terms=set(),
+        target_chars=10,
+        hard_limit=32,
+    )
+
+    assert len(preview) <= 32
+    assert preview.endswith("\n... (preview truncated)")
+
+
+def test_risk_line_in_chunk_middle_includes_local_context_window() -> None:
+    text = "\n".join(
+        [
+            "def handler(payload):",
+            *[f"    filler_{index} = step(index)" for index in range(40)],
+            "    csrf_token = rotate()",
+            "    before = payload",
+            "    after = csrf_token",
+            "    after2 = payload",
+            *[f"    more_{index} = step(index)" for index in range(40)],
+            "    return payload",
+        ]
+    )
+
+    preview, _coverage = build_unit_preview(
+        text, kind="function", start_line=1, query_terms=set(), target_chars=600, hard_limit=3_000
+    )
+
+    preview_lines = preview.splitlines()
+    hit_index = next(index for index, line in enumerate(preview_lines) if "csrf_token = rotate()" in line)
+    # The ±2 window lines around the risk hit are kept alongside it.
+    assert "before = payload" in preview_lines[hit_index + 1]
+    assert "after = csrf_token" in preview_lines[hit_index + 2]
+
+
+def test_diff_preview_keeps_hunk_headers_and_changed_lines() -> None:
+    patch = "\n".join(
+        [
+            "@@ -10,7 +10,9 @@ def module():",
+            " context_one = 1",
+            " context_two = 2",
+            "-removed_line = compute()",
+            "+def login(token):",
+            "+    return verify(token)",
+            *[f" context_filler_{index} = {index}" for index in range(40)],
+            "+api_key = load_secret()",
+            " trailing_context = 0",
+        ]
+    )
+
+    preview, coverage = build_unit_preview(
+        patch, kind="diff", start_line=10, query_terms=set(), target_chars=600, hard_limit=3_000
+    )
+
+    assert "@@ -10,7 +10,9 @@ def module():" in preview
+    assert "-removed_line = compute()" in preview
+    assert "+def login(token):" in preview
+    assert "+api_key = load_secret()" in preview
+    assert "... omitted lines" in preview
+    assert "hunks span new-file lines 10-18" in coverage
+    assert "preview covers new-file lines" in coverage
+
+
+def test_repo_preview_never_fabricates_diff_markers() -> None:
+    text = "\n".join(
+        [
+            "def handler(payload):",
+            *[f"    filler_{index} = step(index)" for index in range(80)],
+            "    csrf_token = rotate()",
+            *[f"    more_{index} = step(index)" for index in range(80)],
+            "    return payload",
+        ]
+    )
+
+    preview, _coverage = build_unit_preview(
+        text, kind="function", start_line=1, query_terms=set(), target_chars=600, hard_limit=3_000
+    )
+
+    code_lines = [line for line in preview.splitlines() if not line.startswith("...")]
+    assert code_lines
+    assert not any(line.startswith(("+", "-")) for line in code_lines)
+
+
+@pytest.mark.asyncio
+async def test_preview_coverage_lines_align_with_semantic_chunk(tmp_path: Path) -> None:
+    functions = "\n".join(
+        f"def handler_{index}(token):\n    value = compute(token)\n    return value\n"
+        for index in range(120)
+    )
+    source = "MODULE_HEADER = 1\n\n" + functions + "\n"
+    _write(tmp_path / "service.py", source)
+
+    result = await ProgrammaticEvidenceService(tmp_path).retrieve(_request())
+
+    assert result.mode == "chunked"
+    file_lines = source.splitlines()
+    for unit in result.units:
+        if unit.kind == "syntax_diagnostic":
+            continue
+        origin = unit.text_start_line if unit.text_start_line is not None else unit.start_line
+        text_lines = unit.text.splitlines()
+        # Coverage references exactly the lines the (possibly overlap-extended)
+        # text spans in the real file.
+        assert unit.preview_coverage.startswith(f"chunk lines {origin}-{origin + len(text_lines) - 1}")
+        assert origin >= 1 and origin + len(text_lines) - 1 <= len(file_lines)
+
+
+def test_diff_preview_coverage_aligns_with_hunk_new_file_lines() -> None:
+    patch = "\n".join(
+        [
+            "@@ -5,3 +5,4 @@",
+            " ctx = 1",
+            "-old = 2",
+            "+new = 2",
+            "+added = 3",
+        ]
+    )
+
+    _preview, coverage = build_unit_preview(
+        patch, kind="diff", start_line=5, query_terms=set(), target_chars=600, hard_limit=3_000
+    )
+
+    # Small patch keeps full text; hunks address new-file lines 5-8.
+    assert coverage == "full patch; new-file lines 5-8"
+
+
+# ---------------------------------------------------------------------------
+# Risk hints
+# ---------------------------------------------------------------------------
+
+
+def test_risk_hints_use_word_boundaries() -> None:
+    # auth must not match author / authenticate.
+    assert "security:auth" not in detect_risk_hints("def author(credential): pass")
+    assert "security:auth" not in detect_risk_hints("authenticated_user = get_user()")
+    assert "security:auth" in detect_risk_hints("def auth(user): pass")
+    # sql/path style false positives stay silent (not hint terms at all).
+    assert detect_risk_hints("mysql_query(xpath_expr)") == ()
+    # Real hits are detected, including snake_case identifiers.
+    hints = detect_risk_hints("password = get_password()\napi_router = Router()\n")
+    assert "security:password" in hints
+    assert "entrypoint:router" in hints
+
+
+@pytest.mark.asyncio
+async def test_matched_keeps_only_query_hit_words(tmp_path: Path) -> None:
+    _write(tmp_path / "auth.py", "def login(token):\n    password = load_secret()\n    return token\n")
+
+    result = await ProgrammaticEvidenceService(tmp_path).retrieve(_request(query="login"))
+
+    unit = result.units[0]
+    assert unit.matched == ["login"]
+    assert "security:password" in unit.risk_hints
+    assert not any(tag.startswith("risk:") for tag in unit.tags)
+    assert unit.tags == ()  # whole-file direct unit carries no relation tags
+
+
+def test_risk_hints_stay_independent_from_relation_tags(tmp_path: Path) -> None:
+    from nanoreview.review.planning.preprocessor import (
+        CodeUnit,
+        EvidenceBudget,
+        InventoryEntry,
+        classify_path,
+    )
+
+    service = ProgrammaticEvidenceService(Path("."))
+    files = {
+        "src/app.py": "def login(token):\n    return verify(token)\n",
+        "caller.py": "from src.app import login\n\nlogin(token)\n",
+    }
+    inventory = [InventoryEntry(path, len(text), *classify_path(path)) for path, text in files.items()]
+    budgets = EvidenceBudget.from_options(
+        token_budget=100_000,
+        subagent_evidence_budget_chars=24_000,
+        context_window_tokens=SMALL_WINDOW,
+    )
+    mains = [
+        CodeUnit(
+            path="src/app.py",
+            kind="function",
+            name="login",
+            start_line=1,
+            end_line=2,
+            text=files["src/app.py"],
+            token_count=10,
+            unit_id="ev-001",
+        )
+    ]
+    service._score_unit(mains[0], {"login"}, [])
+
+    related = service._supplement_related(
+        mains, files=files, inventory=inventory, budgets=budgets, include_tests=True, related_tests=True
+    )
+
+    # Main unit: risk clues in risk_hints, tags untouched. The path signal
+    # "src/app.py" also yields the entrypoint:handler hint by design.
+    assert mains[0].risk_hints == ("security:token", "entrypoint:handler")
+    assert mains[0].tags == ()
+    # Related unit: relation tags only, no risk labels.
+    assert related[0].tags[:2] == ("related", "caller")
+    assert not any(tag.startswith("risk:") for tag in related[0].tags)
+    assert related[0].risk_hints == ()
+
+
+@pytest.mark.asyncio
+async def test_chunks_without_risk_hints_still_reach_planner(tmp_path: Path) -> None:
+    # Plain code with no risk terms still produces units and manifest entries.
+    _write(tmp_path / "plain.py", "def compute(value):\n    return value * 2\n")
+
+    result = await ProgrammaticEvidenceService(tmp_path).retrieve(_request(query="compute"))
+
+    assert result.units
+    unit = result.units[0]
+    assert unit.risk_hints == ()
+    assert unit.matched == ["compute"]
+    assert "plain.py" in result.context
+    assert "- risk_hints: none" in result.context
+
+
+def test_manifest_keeps_single_budget_truncation() -> None:
+    from nanoreview.review.planning.preprocessor import CodeUnit
+
+    service = ProgrammaticEvidenceService(Path("."))
+    units = [
+        CodeUnit(
+            path=f"src/file_{index}.py",
+            kind="function",
+            start_line=1,
+            end_line=2,
+            text="x",
+            unit_id=f"ev-{index:03d}",
+            preview="def f():\n    pass\n" * 50,
+            preview_coverage="full chunk lines 1-2",
+        )
+        for index in range(1, 30)
+    ]
+
+    context = service.render_manifest(units, [], budget_chars=2_000)
+
+    # The overall manifest cap stays the single safety limit.
+    assert len(context) <= 2_000 + len("\n... (manifest truncated)")
+    assert context.endswith("... (manifest truncated)")

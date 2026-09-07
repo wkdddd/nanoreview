@@ -180,6 +180,13 @@ class EvidenceReference:
     parent_id: str | None = None
     token_count: int = 0
     preview: str = ""
+    # Program-generated candidate risk routing clues (e.g. "security:token").
+    # They suggest where the planner should look; they are never confirmed
+    # findings, and query hit words stay in the manifest `matched:` field.
+    risk_hints: tuple[str, ...] = ()
+    # Human-readable statement of which real lines the preview actually covers,
+    # e.g. "chunk lines 10-80; preview covers lines 10-16, 40-44".
+    preview_coverage: str = ""
 
     @property
     def is_related(self) -> bool:
