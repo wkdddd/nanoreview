@@ -7,7 +7,6 @@ from nanoreview.review.input import (
     normalize_requested_dimensions,
     normalize_review_action,
     normalize_review_target_type,
-    policy_for_depth,
 )
 from nanoreview.review.planning.evidence import ReviewEvidenceService
 from nanoreview.review.planning.planner import (
@@ -43,7 +42,6 @@ from nanoreview.review.types import (
     ReviewJudgeDecision,
     ReviewJudgedFinding,
     ReviewJudgeVerdict,
-    ReviewModePolicy,
     ReviewPlan,
     ReviewReport,
     ReviewRole,
@@ -73,7 +71,6 @@ __all__ = [
     "ReviewJudgeDecision",
     "ReviewJudgedFinding",
     "ReviewJudgeVerdict",
-    "ReviewModePolicy",
     "ReviewPlan",
     "ReviewReport",
     "ReviewRole",
@@ -89,7 +86,6 @@ __all__ = [
     "normalize_review_dimension",
     "normalize_review_action",
     "normalize_review_target_type",
-    "policy_for_depth",
     "resolve_code_review_context",
     "review_action_values",
     "get_reviewer_profile",

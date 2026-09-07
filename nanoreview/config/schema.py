@@ -227,9 +227,12 @@ class ToolsConfig(Base):
         super().__init__(**data)
 
 
-
 class ReviewJudgeSettings(Base):
-    """AI judge configuration for code review findings."""
+    """AI judge configuration for code review findings.
+
+    The judge collects all accepted/uncertain candidates and batches them by
+    the model's context window; there is no fixed candidate cap.
+    """
 
     enabled: bool = True
     model_preset: str | None = Field(
@@ -237,7 +240,6 @@ class ReviewJudgeSettings(Base):
         validation_alias=AliasChoices("modelPreset", "model_preset"),
         serialization_alias="modelPreset",
     )
-    max_candidates: int = Field(default=40, ge=1, le=200)
     timeout_seconds: int = Field(
         default=60,
         ge=1,
@@ -257,7 +259,6 @@ class ReviewJudgeSettings(Base):
 class ReviewConfig(Base):
     """Code review configuration defaults."""
 
-    default_mode: str = "full"
     default_focus: list[str] = Field(default_factory=list)
     max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None

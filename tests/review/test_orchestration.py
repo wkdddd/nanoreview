@@ -26,7 +26,6 @@ def _plan(*roles: str) -> ReviewPlan:
         target_name="repo",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
         routing_mode="explicit",
     )
@@ -113,7 +112,9 @@ class _Subagents:
 
 
 @pytest.mark.asyncio
-async def test_coordinator_plan_retries_three_times_before_failure(tmp_path) -> None:
+async def test_coordinator_plan_failure_raises_planning_error(tmp_path) -> None:
+    """Planning retries happen inside AgentRunner (terminal_retry_limit); the
+    orchestrator runs the planner once and surfaces the concrete failure."""
     runner = _NoPlanRunner()
     orchestrator = ReviewOrchestrator(
         runner=runner,
@@ -124,7 +125,7 @@ async def test_coordinator_plan_retries_three_times_before_failure(tmp_path) -> 
         judge=None,
     )
 
-    with pytest.raises(ReviewPlanningError, match="after 3 retries"):
+    with pytest.raises(ReviewPlanningError, match="not a tool call"):
         await orchestrator.execute(
             coordinator_messages=[{"role": "system", "content": "plan"}],
             plan=_plan("security"),
@@ -133,7 +134,7 @@ async def test_coordinator_plan_retries_three_times_before_failure(tmp_path) -> 
             validation_workspace=str(tmp_path),
         )
 
-    assert runner.calls == 4
+    assert runner.calls == 1
 
 
 @pytest.mark.asyncio
@@ -169,7 +170,6 @@ async def test_local_diff_without_evidence_explains_how_to_continue(tmp_path) ->
         target_name="app.py",
         target_type="local",
         action=ReviewAction.DIFF,
-        depth="full",
         roles=[ALL_REVIEW_ROLES["security"]],
         routing_mode="auto",
     )

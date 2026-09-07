@@ -7,8 +7,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanoreview.review.input import policy_for_depth
-from nanoreview.review.output.judge import ReviewJudge
+from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeStats
 from nanoreview.review.output.report import render_review_report
 from nanoreview.review.output.validator import ReviewValidator, ValidationContext
 from nanoreview.review.types import (
@@ -19,8 +18,9 @@ from nanoreview.review.types import (
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
+    ReviewJudgeDecision,
     ReviewJudgedFinding,
-    ReviewModePolicy,
+    ReviewJudgeVerdict,
     normalize_review_dimension,
 )
 
@@ -63,7 +63,6 @@ class ReviewFinalizer:
         workspace: str,
         changed_files: list[str] | None = None,
         *,
-        policy: ReviewModePolicy | None = None,
         allowed_dimensions: list[str] | set[str] | None = None,
         local_target: str | None = None,
         remote_diff: GitHubDiffEvidence | None = None,
@@ -84,12 +83,12 @@ class ReviewFinalizer:
         self._validator = ReviewValidator(self._ctx)
         self._dimensions: list[ReviewDimensionResult] = []
         self._errors: list[str] = []
-        self._policy = policy or policy_for_depth("full")
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
         self._routing_mode = routing_mode
         self._selected_dimensions = tuple(selected_dimensions or ())
         self._budget_skipped = tuple(budget_skipped)
         self._skipped_files = tuple(skipped_files)
+        self._judge_stats: ReviewJudgeStats | None = None
 
     def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
@@ -162,36 +161,14 @@ class ReviewFinalizer:
             self._upsert_dimension(result)
             return result
         candidates = self._parse_candidates(dimension, raw_output)
-        filtered_count = 0
-        filtered_severities: tuple[str, ...] = ()
-        if self._policy.severities:
-            before = len(candidates)
-            if before > 0:
-                filtered = [c for c in candidates if c.severity not in self._policy.severities]
-                candidates = [c for c in candidates if c.severity in self._policy.severities]
-                filtered_count = len(filtered)
-                if filtered_count > 0:
-                    filtered_severities = tuple(sorted({c.severity for c in filtered}))
-            if before != len(candidates):
-                logger.info(
-                    "review.finalizer.filtered_by_policy dimension={} before={} after={} severities={}",
-                    dimension,
-                    before,
-                    len(candidates),
-                    self._policy.severities,
-                )
         if not candidates:
             result = ReviewDimensionResult(
                 dimension=dimension,
                 status="no_findings",
-                filtered_count=filtered_count,
-                filtered_severities=filtered_severities,
             )
             self._upsert_dimension(result)
             return result
         result = self._validator.validate_candidates(candidates, dimension)
-        result.filtered_count = filtered_count
-        result.filtered_severities = filtered_severities
         self._upsert_dimension(result)
         return result
 
@@ -209,24 +186,68 @@ class ReviewFinalizer:
         self._dimensions.append(result)
 
     def get_needs_confirmation(self) -> list[tuple[ReviewFindingCandidate, ReviewFindingVerdict]]:
-        """Return uncertain candidates that should be shown separately in the report."""
+        """Return candidates whose final verdict requires manual confirmation.
+
+        For dimensions already through the judge this collects judged entries
+        whose final verdict is uncertain (needs_confirmation), surfacing the
+        judge's reason. Uncertain candidates that have not been judged yet
+        fall through from ``d.uncertain``. This keeps
+        ``ReviewFinalizerResult.needs_confirmation`` consistent with the
+        report's Needs Confirmation section.
+        """
         items: list[tuple[ReviewFindingCandidate, ReviewFindingVerdict]] = []
         for d in self._dimensions:
-            items.extend(d.uncertain)
+            if d.judged:
+                for item in d.judged:
+                    if item.final_verdict != FindingVerdict.UNCERTAIN:
+                        continue
+                    reason = item.hard_verdict
+                    if item.judge_verdict is not None:
+                        reason = ReviewFindingVerdict(
+                            verdict=FindingVerdict.UNCERTAIN,
+                            reason=item.judge_verdict.reason,
+                        )
+                    items.append((item.candidate, reason))
+            else:
+                items.extend(d.uncertain)
         return items
 
     async def apply_judge(self, judge: ReviewJudge | None) -> None:
-        if judge is None or not self._policy.judge_enabled:
-            logger.info(
-                "review.finalizer.judge.skip enabled={} has_judge={}",
-                self._policy.judge_enabled,
-                judge is not None,
+        """Apply AI judge verdicts to every accepted/uncertain candidate.
+
+        When the judge is unavailable (not created, disabled, or failing
+        outright), candidates are explicitly marked ``needs_confirmation``
+        instead of silently inheriting their hard verdicts — a candidate must
+        never be presented as having passed the judge without a verdict.
+        """
+        if judge is None:
+            logger.info("review.finalizer.judge.unavailable reason=not_created")
+            self._judge_stats = self._mark_unjudged_needs_confirmation(
+                "AI judge is unavailable; manual verification required"
             )
-            self._apply_judged_defaults()
             return
-        verdicts = await judge.judge_dimensions(self._dimensions)
+        try:
+            verdicts = await judge.judge_dimensions(self._dimensions)
+        except Exception as exc:
+            logger.warning("review.finalizer.judge.failed reason={}", exc)
+            self._judge_stats = self._mark_unjudged_needs_confirmation(
+                "AI judge failed; manual verification required"
+            )
+            return
+        self._judge_stats = getattr(judge, "last_stats", None)
         if not verdicts:
-            self._apply_judged_defaults()
+            total = self._candidate_total()
+            if total > 0:
+                # Defensive: the judge produced no verdicts at all while
+                # candidates exist — surface them for manual verification.
+                logger.warning(
+                    "review.finalizer.judge.no_verdicts candidates={}", total
+                )
+                self._judge_stats = self._mark_unjudged_needs_confirmation(
+                    "AI judge returned no verdicts; manual verification required"
+                )
+            else:
+                self._apply_judged_defaults()
             return
         for dimension in self._dimensions:
             judged: list[ReviewJudgedFinding] = []
@@ -238,19 +259,98 @@ class ReviewFinalizer:
                 judged.append(ReviewJudgedFinding(
                     candidate=candidate,
                     hard_verdict=hard,
-                    judge_verdict=verdicts.get(ReviewJudge.candidate_id(candidate)),
+                    judge_verdict=self._verdict_or_needs_confirmation(
+                        verdicts, candidate,
+                        "AI judge returned no verdict for this candidate",
+                    ),
                 ))
             for candidate, hard in dimension.uncertain:
                 judged.append(ReviewJudgedFinding(
                     candidate=candidate,
                     hard_verdict=hard,
-                    judge_verdict=verdicts.get(ReviewJudge.candidate_id(candidate)),
+                    judge_verdict=self._verdict_or_needs_confirmation(
+                        verdicts, candidate,
+                        "AI judge returned no verdict for this candidate",
+                    ),
                 ))
             dimension.judged = judged
         logger.info("review.finalizer.judge.applied dimensions={}", len(self._dimensions))
 
+    @staticmethod
+    def _verdict_or_needs_confirmation(
+        verdicts: dict[str, ReviewJudgeVerdict],
+        candidate: ReviewFindingCandidate,
+        missing_reason: str,
+    ) -> ReviewJudgeVerdict:
+        """Return the judge verdict, or an explicit needs_confirmation fallback."""
+        verdict = verdicts.get(ReviewJudge.candidate_id(candidate))
+        if verdict is not None:
+            return verdict
+        return ReviewJudgeVerdict(
+            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+            reason=missing_reason,
+            confidence="low",
+            severity=candidate.severity,
+        )
+
+    def _candidate_total(self) -> int:
+        return sum(
+            len(dimension.accepted) + len(dimension.uncertain)
+            for dimension in self._dimensions
+        )
+
+    def _mark_unjudged_needs_confirmation(self, reason: str) -> ReviewJudgeStats | None:
+        """Mark every accepted/uncertain candidate as needs_confirmation.
+
+        Used when the judge cannot run: candidates keep their hard verdicts for
+        traceability but carry an explicit judge verdict requiring manual
+        verification, so the report never presents them as judge-accepted.
+        Returns the judge statistics for the unavailable path (or None when
+        there are no candidates to judge).
+        """
+        total = 0
+        for dimension in self._dimensions:
+            judged: list[ReviewJudgedFinding] = []
+            for candidate in dimension.accepted:
+                judged.append(ReviewJudgedFinding(
+                    candidate=candidate,
+                    hard_verdict=ReviewFindingVerdict(
+                        verdict=FindingVerdict.ACCEPTED,
+                        reason="hard validation accepted",
+                    ),
+                    judge_verdict=ReviewJudgeVerdict(
+                        decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+                        reason=reason,
+                        confidence="low",
+                        severity=candidate.severity,
+                    ),
+                ))
+                total += 1
+            for candidate, hard in dimension.uncertain:
+                judged.append(ReviewJudgedFinding(
+                    candidate=candidate,
+                    hard_verdict=hard,
+                    judge_verdict=ReviewJudgeVerdict(
+                        decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+                        reason=reason,
+                        confidence="low",
+                        severity=candidate.severity,
+                    ),
+                ))
+                total += 1
+            dimension.judged = judged
+        if total == 0:
+            return None
+        return ReviewJudgeStats(
+            total_candidates=total,
+            sent_candidates=0,
+            returned_verdicts=0,
+            needs_confirmation=total,
+            batches=0,
+        )
+
     def _apply_judged_defaults(self) -> None:
-        '''keep review when AIjudge is unenable or fail'''
+        """Fill judged lists with hard verdicts when no judge pass has run."""
         for dimension in self._dimensions:
             if dimension.judged:
                 continue
@@ -281,11 +381,11 @@ class ReviewFinalizer:
             report = render_review_report(
                 target_name,
                 self._dimensions,
-                policy=self._policy,
                 routing_mode=self._routing_mode,
                 selected_dimensions=self._selected_dimensions,
                 budget_skipped=self._budget_skipped,
                 skipped_files=self._skipped_files,
+                judge_stats=self._judge_stats,
             )
         except Exception as exc:
             logger.error("report rendering failed: {}", exc)

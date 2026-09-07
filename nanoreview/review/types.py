@@ -11,12 +11,14 @@ SEVERITY_ORDER = ("critical", "high", "medium", "low")
 
 
 class ReviewMetaKey:
-    """Session metadata keys for code review state."""
+    """Session metadata keys for code review state.
 
-    MODE = "review_mode"
+    Review activation is decided solely by the presence of a valid
+    ``review_target``; the legacy toggle/depth variant has been removed.
+    """
+
     TARGET = "review_target"
     TARGET_TYPE = "review_target_type"
-    MODE_VARIANT = "review_mode_variant"
     ACTION = "review_action"
     REQUESTED_DIMENSIONS = "review_focus"
     TARGET_REF = "review_target_ref"
@@ -31,7 +33,6 @@ class ReviewMetaKey:
     GITHUB_PR_HEAD_REF = "_review_github_pr_head_ref"
 
 ReviewTargetType = Literal["auto", "github", "local"]
-ReviewDepth = Literal["quick", "full", "deep"]
 ReviewScopeKind = Literal["file", "directory", "repo"]
 ReviewRoutingMode = Literal["auto", "explicit"]
 
@@ -78,7 +79,6 @@ class Finding:
 @dataclass
 class ReviewReport:
     target: str
-    mode: str
     dimensions: list[str]
     summary: str
     findings: list[Finding] = field(default_factory=list)
@@ -151,7 +151,6 @@ class ReviewPlan:
     target_name: str | None
     target_type: ReviewTargetType
     action: ReviewAction
-    depth: ReviewDepth
     roles: list[ReviewRole]
     routing_mode: ReviewRoutingMode
     user_requirements: str = ""
@@ -348,18 +347,6 @@ class ReviewJudgedFinding:
         return FindingVerdict.UNCERTAIN
 
 
-@dataclass(frozen=True, slots=True)
-class ReviewModePolicy:
-    """Programmatic behavior policy for a review depth."""
-
-    depth: ReviewDepth
-    severities: tuple[str, ...]
-    judge_enabled: bool
-    evidence_max_results: int
-    include_optional_roles: bool = False
-    report_style: str = "full"
-
-
 @dataclass
 class ReviewDimensionResult:
     """Aggregated result for one review dimension."""
@@ -376,8 +363,6 @@ class ReviewDimensionResult:
     )
     judged: list[ReviewJudgedFinding] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    filtered_count: int = 0
-    filtered_severities: tuple[str, ...] = ()
 
 
 @runtime_checkable

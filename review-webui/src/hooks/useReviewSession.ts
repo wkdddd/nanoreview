@@ -4,7 +4,6 @@ import type { NanobotClient } from "@/lib/nanobot-client";
 import type {
   OutboundReviewContext,
   ReviewAction,
-  ReviewDepth,
   ReviewFocus,
   ReviewTargetType,
   ToolProgressEvent,
@@ -38,7 +37,6 @@ export interface ReviewTask {
   target: string;
   targetType?: ReviewTargetType;
   action?: ReviewAction;
-  depth?: ReviewDepth;
   focus?: ReviewFocus[];
 }
 
@@ -116,7 +114,7 @@ function formatReviewFocus(focus: ReviewFocus[] | undefined): string {
 
 function isReviewTask(review: UIMessage["review"] | ReviewTask): review is ReviewTask {
   if (!review) return false;
-  return "targetType" in review || "depth" in review;
+  return "targetType" in review;
 }
 
 function formatReviewRequestContent(
@@ -127,7 +125,6 @@ function formatReviewRequestContent(
   const task = isReviewTask(review);
   const target = review.target;
   const targetType = task ? review.targetType : review.target_type;
-  const mode = task ? review.depth : review.mode;
   const action = review.action;
   const focus = review.focus;
   const title = content.trim() || "Review";
@@ -135,7 +132,6 @@ function formatReviewRequestContent(
     title,
     `Target: ${labelValue(target, "(not set)")}`,
     `Type: ${labelValue(targetType)}`,
-    `Mode: ${labelValue(mode, "full")}`,
     `Action: ${labelValue(action, "repo")}`,
     `Focus: ${formatReviewFocus(focus)}`,
   ];
@@ -397,22 +393,18 @@ function reviewFromMetadata(metadata: unknown): UIMessage["review"] | undefined 
   const targetType = typeof data.review_target_type === "string"
     ? data.review_target_type as OutboundReviewContext["target_type"]
     : undefined;
-  const mode = typeof data.review_mode_variant === "string"
-    ? data.review_mode_variant as OutboundReviewContext["mode"]
-    : undefined;
   const action = typeof data.review_action === "string"
     ? data.review_action as OutboundReviewContext["action"]
     : undefined;
   const focus = Array.isArray(data.review_focus)
     ? data.review_focus.filter((item): item is ReviewFocus => typeof item === "string")
     : undefined;
-  if (!target && !targetType && !mode && !action && !focus) {
+  if (!target && !targetType && !action && !focus) {
     return undefined;
   }
   return {
     target,
     target_type: targetType,
-    mode,
     action,
     focus,
   };
@@ -1221,10 +1213,6 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
               },
             ],
           };
-        }
-
-        if (ev.event === "review_mode_updated") {
-          return { ...prev };
         }
 
         return prev;

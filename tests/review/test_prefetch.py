@@ -96,7 +96,6 @@ async def test_prefetch_calls_review_evidence_service_and_compacts_evidence() ->
         target_name="workspace",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
         user_requirements="review auth",
@@ -135,7 +134,6 @@ async def test_prefetch_emits_progress_events() -> None:
         target_name="workspace",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
         user_requirements="review auth",
@@ -158,7 +156,6 @@ async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
         target_name="repo",
         target_type="github",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
     )
@@ -179,7 +176,6 @@ async def test_diff_prefetch_preserves_filtered_patch_body() -> None:
         target_name="workspace",
         target_type="local",
         action=ReviewAction.DIFF,
-        depth="full",
         roles=[],
         routing_mode="auto",
     )
@@ -259,7 +255,6 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
         target_name="workspace",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
     )
@@ -294,7 +289,6 @@ async def test_prefetch_aggregates_skipped_files_per_path() -> None:
         target_name="workspace",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
     )

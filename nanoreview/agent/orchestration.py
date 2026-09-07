@@ -15,7 +15,6 @@ from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
-from nanoreview.review.input import policy_for_depth
 from nanoreview.review.output.finalizer import ReviewFinalizer
 from nanoreview.review.output.judge import ReviewJudge
 from nanoreview.review.types import (
@@ -153,7 +152,6 @@ class ReviewOrchestrator:
         finalizer = ReviewFinalizer(
             validation_workspace,
             changed_files,
-            policy=policy_for_depth(plan.depth),
             allowed_dimensions=[assignment.dimension for assignment in assignments],
             routing_mode=plan.routing_mode,
             selected_dimensions=[assignment.dimension for assignment in assignments],

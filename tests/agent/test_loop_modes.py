@@ -115,31 +115,30 @@ class InjectionRunner:
         )
 
 
-class ReviewSubmitRetryRunner:
+class ReviewSubmitRunner:
+    """Runner whose single run ends with a successful review_submit.
+
+    Terminal-tool forcing (prose answers, failed submissions) is handled inside
+    ``AgentRunner`` via ``terminal_retry_limit``; the manager itself never
+    starts a compensation run.
+    """
+
     def __init__(self) -> None:
         self.specs: list[AgentRunSpec] = []
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         self.specs.append(spec)
-        if len(self.specs) == 1:
-            return AgentRunResult(
-                final_content="review prose without tool call",
-                messages=list(spec.initial_messages),
-                stop_reason="completed",
-                tool_events=[
-                    {"name": "read_file", "status": "ok", "detail": "file content"},
-                ],
-            )
         return AgentRunResult(
             final_content=None,
             messages=list(spec.initial_messages),
             tool_events=[
+                {"name": "read_file", "status": "ok", "detail": "file content"},
                 {
                     "name": "review_submit",
                     "status": "ok",
                     "detail": '{"submitted": true, "findings": [], "errors": []}',
                     "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                }
+                },
             ],
         )
 
@@ -778,7 +777,9 @@ def test_review_subagent_ignores_unprocessed_review_submit_arguments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_subagent_finalization_retry_forces_review_submit(tmp_path) -> None:
+async def test_review_subagent_run_uses_terminal_submit_contract(tmp_path) -> None:
+    """Single reviewer run: forcing review_submit is the runner's terminal-tool
+    contract, and a canonical submission completes the dimension."""
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -786,7 +787,7 @@ async def test_review_subagent_finalization_retry_forces_review_submit(tmp_path)
         max_tool_result_chars=1000,
         execution_profiles=reviewer_execution_profiles(),
     )
-    runner = ReviewSubmitRetryRunner()
+    runner = ReviewSubmitRunner()
     manager.runner = runner  # type: ignore[assignment]
     status = SubagentStatus(
         task_id="task1",
@@ -804,71 +805,19 @@ async def test_review_subagent_finalization_retry_forces_review_submit(tmp_path)
         origin_metadata={"profile_id": "security"},
     )
 
-    assert len(runner.specs) == 2
+    assert len(runner.specs) == 1
     assert runner.specs[0].tool_choice is None
     assert "read_file" in runner.specs[0].soft_tool_error_tools
     assert "review_submit" not in runner.specs[0].soft_tool_error_tools
-    assert runner.specs[1].tool_choice == {
-        "type": "function",
-        "function": {"name": "review_submit"},
-    }
-    assert runner.specs[1].response_format == {"type": "json_object"}
-    retry_content = str(runner.specs[1].initial_messages[-1]["content"])
-    assert "JSON" in retry_content
-    assert runner.specs[1].tools.has("review_submit")
+    assert runner.specs[0].terminal_tools == frozenset({"review_submit"})
+    assert runner.specs[0].terminal_retry_limit >= 1
     assert status.phase == "done"
     assert status.stop_reason == "completed"
     assert manager._dimension_state("cli:direct", "security") == "completed"
 
 
-class MaxIterationsThenSubmitRunner:
-    """Runner that hits max_iterations first, then submits on forced retry."""
-
-    def __init__(self) -> None:
-        self.specs: list[AgentRunSpec] = []
-
-    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        self.specs.append(spec)
-        if len(self.specs) == 1:
-            return AgentRunResult(
-                final_content="review prose without tool call",
-                messages=list(spec.initial_messages),
-                stop_reason="max_iterations",
-                tool_events=[
-                    {"name": "read_file", "status": "ok", "detail": "file content"},
-                ],
-            )
-        return AgentRunResult(
-            final_content=None,
-            messages=list(spec.initial_messages),
-            tool_events=[
-                {
-                    "name": "review_submit",
-                    "status": "ok",
-                    "detail": '{"submitted": true, "findings": [], "errors": []}',
-                    "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                }
-            ],
-        )
-
-
-class AlwaysNoSubmitRunner:
-    """Runner that never produces a review_submit result."""
-
-    def __init__(self) -> None:
-        self.specs: list[AgentRunSpec] = []
-
-    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        self.specs.append(spec)
-        return AgentRunResult(
-            final_content="review prose without tool call",
-            messages=list(spec.initial_messages),
-            stop_reason="max_iterations" if len(self.specs) == 1 else "completed",
-        )
-
-
 @pytest.mark.asyncio
-async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_path) -> None:
+async def test_review_subagent_submit_result_is_announced_as_canonical_json(tmp_path) -> None:
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -876,7 +825,7 @@ async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_
         max_tool_result_chars=1000,
         execution_profiles=reviewer_execution_profiles(),
     )
-    runner = MaxIterationsThenSubmitRunner()
+    runner = ReviewSubmitRunner()
     manager.runner = runner  # type: ignore[assignment]
     status = SubagentStatus(
         task_id="task1",
@@ -894,13 +843,8 @@ async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_
         origin_metadata={"profile_id": "security"},
     )
 
-    assert len(runner.specs) == 2
+    assert len(runner.specs) == 1
     assert runner.specs[0].tool_choice is None
-    assert runner.specs[1].tool_choice == {
-        "type": "function",
-        "function": {"name": "review_submit"},
-    }
-    assert runner.specs[1].response_format == {"type": "json_object"}
     assert status.phase == "done"
     assert status.stop_reason == "completed"
     assert manager._dimension_state("cli:direct", "security") == "completed"
@@ -914,8 +858,23 @@ async def test_review_subagent_max_iterations_triggers_forced_review_submit(tmp_
     assert result_json == {"submitted": True, "findings": [], "errors": []}
 
 
+class AlwaysNoSubmitRunner:
+    """Runner whose single run never produces a review_submit result."""
+
+    def __init__(self) -> None:
+        self.specs: list[AgentRunSpec] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        return AgentRunResult(
+            final_content="review prose without tool call",
+            messages=list(spec.initial_messages),
+            stop_reason="max_iterations",
+        )
+
+
 @pytest.mark.asyncio
-async def test_review_subagent_retry_failure_announces_error_not_success(tmp_path) -> None:
+async def test_review_subagent_without_submit_announces_error_not_success(tmp_path) -> None:
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -941,11 +900,7 @@ async def test_review_subagent_retry_failure_announces_error_not_success(tmp_pat
         origin_metadata={"profile_id": "security"},
     )
 
-    assert len(runner.specs) == 2
-    assert runner.specs[1].tool_choice == {
-        "type": "function",
-        "function": {"name": "review_submit"},
-    }
+    assert len(runner.specs) == 1
     # Should NOT be announced as "completed successfully"
     assert status.phase == "done"
     assert manager._dimension_state("cli:direct", "security") == "failed"
@@ -1312,7 +1267,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_review_mode_injects_code_review_context(tmp_path, monkeypatch) -> None:
+async def test_agent_loop_review_target_injects_code_review_context(tmp_path, monkeypatch) -> None:
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     loop.runner = runner
@@ -1321,7 +1276,7 @@ async def test_agent_loop_review_mode_injects_code_review_context(tmp_path, monk
         lambda *_args, **_kwargs: _review_coordinator_preparation(),
     )
     session = Session(key="test:review")
-    session.metadata["review_mode"] = True
+    session.metadata["review_target"] = "https://github.com/test/repo"
 
     await loop._run_agent_loop(
         [{"role": "user", "content": "please review https://github.com/test/repo"}],
@@ -1366,7 +1321,6 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
             "review_target": "https://github.com/test/repo",
             "review_target_type": "github",
             "review_focus": ["dependency"],
-            "review_mode_variant": "quick",
         },
     )
     ctx = TurnContext(
@@ -1407,7 +1361,6 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, mon
         target_name="app.py",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
     )

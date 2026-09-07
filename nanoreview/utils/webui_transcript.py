@@ -411,14 +411,12 @@ def replay_transcript_to_ui_messages(
                 review = {
                     "target": rec.get("review_target"),
                     "target_type": rec.get("review_target_type"),
-                    "mode": rec.get("review_mode_variant"),
                     "action": rec.get("review_action"),
                     "focus": rec.get("review_focus"),
                 }
             if isinstance(review, dict):
                 review_target = review.get("target")
                 review_target_type = review.get("target_type")
-                review_mode = review.get("mode")
                 review_action = review.get("action")
                 review_focus = review.get("focus")
                 review_row: dict[str, Any] = {}
@@ -426,8 +424,6 @@ def replay_transcript_to_ui_messages(
                     review_row["target"] = review_target.strip()
                 if isinstance(review_target_type, str) and review_target_type.strip():
                     review_row["target_type"] = review_target_type.strip()
-                if isinstance(review_mode, str) and review_mode.strip():
-                    review_row["mode"] = review_mode.strip()
                 if isinstance(review_action, str) and review_action.strip():
                     review_row["action"] = review_action.strip()
                 if isinstance(review_focus, list):

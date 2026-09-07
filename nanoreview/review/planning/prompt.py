@@ -7,7 +7,6 @@ import uuid
 
 from loguru import logger
 
-from nanoreview.review.input import policy_for_depth
 from nanoreview.review.types import ReviewAction, ReviewEvidenceBundle, ReviewPlan
 
 _SUBAGENT_CANDIDATE_SCHEMA = """\
@@ -48,24 +47,6 @@ You can also answer questions about code review methodology, explain findings,
 or discuss best practices.
 
 Provide a GitHub URL or local path to start a review."""
-
-
-def _mode_instruction(plan: ReviewPlan) -> str:
-    if plan.depth == "quick":
-        return (
-            "This is a QUICK review. Focus only on critical and high severity issues. "
-            "Review only high-risk dimensions selected by the mode policy. Skip low-risk "
-            "areas and low/medium severity candidates even if they are interesting."
-        )
-    if plan.depth == "deep":
-        return (
-            "This is a DEEP review. Perform thorough analysis of relevant files. "
-            "Examine edge cases, internal interactions, and subtle risks in depth."
-        )
-    return (
-        "This is a FULL review. Cover the requested scope with balanced depth across "
-        "bug, security, performance, and maintainability risks where relevant."
-    )
 
 
 def _review_tool_name(plan: ReviewPlan) -> str:
@@ -248,7 +229,6 @@ def render_review_prompt(plan: ReviewPlan) -> str:
     role_lines = "\n".join(
         f"- **{role.label}** ({role.name}): {role.description}" for role in plan.roles
     )
-    policy = policy_for_depth(plan.depth)
     output_section = _SUBAGENT_CANDIDATE_SCHEMA
     requirements = plan.user_requirements.strip() or "(none)"
     tool_name = _review_tool_name(plan)
@@ -270,7 +250,6 @@ You are CodeReviewAgent, the main code review coordinator.
 
 ## ReviewPlan
 {_target_lines(plan)}
-- Mode: {plan.depth}
 - Routing mode: {plan.routing_mode}
 - User requirements: {requirements}
 
@@ -288,9 +267,8 @@ You are CodeReviewAgent, the main code review coordinator.
 - Treat the review token budget as a soft quality budget: preserve high-signal evidence and findings, but stop broad exploration after useful scope is identified.
 - Do not repeat full-repository review tool calls after prefetched evidence exists. Do not page through the same file repeatedly unless a specific finding needs exact line evidence.
 {evidence_preference_rule}
-## Review Mode
-{_mode_instruction(plan)}
-- Programmatic mode policy: severities={", ".join(policy.severities)}, ai_judge={"enabled" if policy.judge_enabled else "disabled"}.
+- Cover all severity levels (critical, high, medium, low). Do not skip medium/low severity candidates.
+- The AI judge is enabled; every accepted or uncertain candidate will be judged. Focus on actionable, evidence-supported findings.
 
 ## Evidence Strategy
 {_action_instruction(plan)}
@@ -417,7 +395,6 @@ the final report.
 
 ## Target
 {_target_lines(plan)}
-- Mode: {plan.depth}
 - Routing mode: {plan.routing_mode}
 - User requirements: {requirements}
 

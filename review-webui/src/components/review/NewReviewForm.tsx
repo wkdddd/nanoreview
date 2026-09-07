@@ -6,19 +6,17 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { TargetInput } from "./TargetInput";
 import { ReviewConfig } from "./ReviewConfig";
-import type { ReviewerProfile, ReviewAction, ReviewDepth, ReviewFocus, ReviewRoutingMode } from "@/lib/types";
+import type { ReviewerProfile, ReviewAction, ReviewFocus, ReviewRoutingMode } from "@/lib/types";
 
 export interface NewReviewSubmit {
   target: string;
   action: ReviewAction;
-  depth: ReviewDepth;
   focus: ReviewFocus[];
 }
 
 export interface NewReviewFormProps {
   onSubmit: (task: NewReviewSubmit) => void;
   submitting: boolean;
-  defaultDepth?: ReviewDepth;
   defaultFocus?: ReviewFocus[];
   profiles: ReviewerProfile[];
 }
@@ -80,13 +78,11 @@ function SegmentedControl<T extends string>({
 export function NewReviewForm({
   onSubmit,
   submitting,
-  defaultDepth = "full",
   defaultFocus = [],
   profiles,
 }: NewReviewFormProps) {
   const [target, setTarget] = useState("");
   const [action, setAction] = useState<ReviewAction>("repo");
-  const [depth, setDepth] = useState<ReviewDepth>(defaultDepth);
   const [focus, setFocus] = useState<ReviewFocus[]>(defaultFocus);
   const [routingMode, setRoutingMode] = useState<ReviewRoutingMode>(
     defaultFocus.length > 0 ? "explicit" : "auto",
@@ -97,10 +93,9 @@ export function NewReviewForm({
   const isGithubPrTarget = GITHUB_PR_URL_RE.test(trimmedTarget);
 
   useEffect(() => {
-    setDepth(defaultDepth);
     setFocus(defaultFocus);
     setRoutingMode(defaultFocus.length > 0 ? "explicit" : "auto");
-  }, [defaultDepth, defaultFocus]);
+  }, [defaultFocus]);
 
   useEffect(() => {
     if (isGithubPrTarget && action !== "diff") {
@@ -125,10 +120,9 @@ export function NewReviewForm({
     onSubmit({
       target: trimmed,
       action: effectiveAction,
-      depth,
       focus: routingMode === "auto" ? [] : focus,
     });
-  }, [trimmedTarget, submitting, isGithubPrTarget, action, isGithubTarget, depth, focus, routingMode, onSubmit]);
+  }, [trimmedTarget, submitting, isGithubPrTarget, action, isGithubTarget, focus, routingMode, onSubmit]);
 
   const handleTargetChange = useCallback((value: string) => {
     setTarget(value);
@@ -188,8 +182,6 @@ export function NewReviewForm({
 
               {/* Review configuration */}
               <ReviewConfig
-                depth={depth}
-                onDepthChange={setDepth}
                 routingMode={routingMode}
                 onRoutingModeChange={setRoutingMode}
                 focus={focus}

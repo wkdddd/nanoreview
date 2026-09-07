@@ -33,7 +33,6 @@ def _plan(routing_mode: str) -> ReviewPlan:
         target_name="repo",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode=routing_mode,
     )

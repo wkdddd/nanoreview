@@ -1,6 +1,7 @@
 """Fixed Markdown report renderer for code review results."""
 from __future__ import annotations
 
+from nanoreview.review.output.judge import ReviewJudgeStats
 from nanoreview.review.profiles import get_reviewer_profile
 from nanoreview.review.types import (
     SEVERITY_ORDER,
@@ -10,7 +11,6 @@ from nanoreview.review.types import (
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
-    ReviewModePolicy,
 )
 
 
@@ -52,11 +52,11 @@ def render_review_report(
     target_name: str,
     dimensions: list[ReviewDimensionResult],
     *,
-    policy: ReviewModePolicy | None = None,
     routing_mode: str = "explicit",
     selected_dimensions: tuple[str, ...] | list[str] = (),
     budget_skipped: tuple[ReviewBudgetSkip, ...] | list[ReviewBudgetSkip] = (),
     skipped_files: tuple[FileSkipSummary, ...] | list[FileSkipSummary] = (),
+    judge_stats: ReviewJudgeStats | None = None,
 ) -> str:
     """Render final Markdown report from validated dimension results."""
     all_accepted = _collect_accepted(dimensions)
@@ -65,14 +65,12 @@ def render_review_report(
 
     stats = _severity_stats(all_accepted)
     incomplete = bool(budget_skipped) or bool(skipped_files) or _has_incomplete_checks(dimensions)
-    quick_clean = _is_quick_scoped_clean(policy, dimensions, incomplete)
     summary = _build_summary(
         stats,
         dimensions,
         uncertain_count=len(all_uncertain),
         rejected_count=len(all_rejected),
         incomplete=incomplete,
-        quick_clean=quick_clean,
     )
 
     sections: list[str] = []
@@ -88,11 +86,10 @@ def render_review_report(
         uncertain_count=len(all_uncertain),
         rejected_count=len(all_rejected),
         incomplete=incomplete,
-        quick_clean=quick_clean,
     ))
     sections.append(_render_checks_performed(dimensions))
-    if policy is not None:
-        sections.append(_render_mode_notes(policy, dimensions))
+    if judge_stats is not None:
+        sections.append(_render_judge_stats(judge_stats))
     if all_uncertain:
         sections.append(_render_needs_confirmation(all_uncertain))
     if all_rejected:
@@ -125,7 +122,15 @@ def _collect_uncertain(
         if d.judged:
             for item in d.judged:
                 if item.final_verdict == FindingVerdict.UNCERTAIN:
-                    items.append((item.candidate, item.hard_verdict))
+                    reason = item.hard_verdict
+                    if item.judge_verdict is not None:
+                        # Surface why the judge (or judge outage) requires
+                        # manual confirmation, not the raw hard verdict.
+                        reason = ReviewFindingVerdict(
+                            verdict=FindingVerdict.UNCERTAIN,
+                            reason=item.judge_verdict.reason,
+                        )
+                    items.append((item.candidate, reason))
         else:
             items.extend(d.uncertain)
     return items
@@ -165,12 +170,9 @@ def _build_summary(
     uncertain_count: int = 0,
     rejected_count: int = 0,
     incomplete: bool = False,
-    quick_clean: bool = False,
 ) -> str:
     total = sum(stats.values())
     if total == 0:
-        if quick_clean:
-            return "No critical/high issues found in quick review."
         if incomplete:
             return "Review incomplete. Some checks could not access enough evidence to produce a reliable result."
         if uncertain_count:
@@ -196,33 +198,14 @@ def _has_incomplete_checks(dims: list[ReviewDimensionResult]) -> bool:
     return not dims or any(d.status in {"incomplete", "error"} or d.errors for d in dims)
 
 
-def _is_quick_scoped_clean(
-    policy: ReviewModePolicy | None,
-    dims: list[ReviewDimensionResult],
-    incomplete: bool,
-) -> bool:
-    if policy is None or policy.depth != "quick":
-        return False
-    if incomplete:
-        return False
-    if not dims:
-        return False
-    has_filtered = any(d.filtered_count > 0 for d in dims)
-    all_clean = all(d.status in ("no_findings", "validated") for d in dims)
-    return has_filtered and all_clean
-
-
 def _render_findings(
     findings: list[ReviewFindingCandidate],
     *,
     uncertain_count: int = 0,
     rejected_count: int = 0,
     incomplete: bool = False,
-    quick_clean: bool = False,
 ) -> str:
     if not findings:
-        if quick_clean:
-            return "### Findings\n\nNo critical/high actionable issues found.\n"
         if incomplete:
             return "### Findings\n\nReview incomplete; no reliable finding set was produced.\n"
         if uncertain_count:
@@ -328,29 +311,19 @@ def _render_checks_performed(dims: list[ReviewDimensionResult]) -> str:
     return "\n".join(lines)
 
 
-def _render_mode_notes(policy: ReviewModePolicy, dims: list[ReviewDimensionResult]) -> str:
-    lines = ["### Review Mode\n"]
-    lines.append(f"- Mode: {policy.depth}")
-    lines.append(f"- AI judge: {'enabled' if policy.judge_enabled else 'disabled'}")
-    lines.append(f"- Severity scope: {', '.join(policy.severities)}")
-    if policy.depth == "quick":
-        total_filtered = sum(d.filtered_count for d in dims)
-        if total_filtered > 0:
-            all_filtered_sevs: set[str] = set()
-            for d in dims:
-                all_filtered_sevs.update(d.filtered_severities)
-            skipped = ", ".join(sorted(all_filtered_sevs)) if all_filtered_sevs else "medium/low"
-            lines.append(
-                f"- Medium/low severity candidates were skipped by quick mode "
-                f"({total_filtered} candidate{'s' if total_filtered != 1 else ''}: {skipped})."
-            )
-        else:
-            lines.append(
-                "- Low-risk dimensions and medium/low severity candidates were intentionally skipped."
-            )
-    if policy.depth == "deep":
-        judged = sum(len(d.judged) for d in dims)
-        lines.append(f"- Deep cross-check candidates: {judged}")
+def _render_judge_stats(stats: ReviewJudgeStats) -> str:
+    """Render explicit AI judge statistics.
+
+    ``sent``/``verdicts`` come from the judge run itself (see
+    ReviewJudgeStats) — never from ``len(dimension.judged)``, which would
+    misreport unjudged candidates as actually sent to the judge.
+    """
+    lines = ["### AI Judge Statistics\n"]
+    lines.append(f"- Candidates: {stats.total_candidates}")
+    lines.append(f"- Sent to judge: {stats.sent_candidates}")
+    lines.append(f"- Verdicts returned: {stats.returned_verdicts}")
+    lines.append(f"- Needs confirmation: {stats.needs_confirmation}")
+    lines.append(f"- Batches: {stats.batches}")
     lines.append("")
     return "\n".join(lines)
 

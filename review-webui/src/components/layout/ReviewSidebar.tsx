@@ -90,7 +90,6 @@ function TaskItem({
   const reviewFocus = reviewListField(task.metadata, "review_focus");
   const reviewSource = [
     task.reviewAction,
-    task.reviewMode,
     task.reviewTargetType,
     reviewFocusLabel(reviewFocus),
   ].filter(Boolean).join(" · ");

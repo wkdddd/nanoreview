@@ -826,7 +826,6 @@ def review(
         "-f",
         help="Comma-separated reviewer dimensions (bug,security,performance,maintainability), or auto",
     ),
-    mode: str = typer.Option("full", "--mode", help="Review mode: quick, deep, or full"),
     target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto, github, or local"),
     action: str = typer.Option("repo", "--action", help="Review action: repo or diff"),
     max_concurrent_subagents: int | None = typer.Option(
@@ -849,9 +848,6 @@ def review(
         normalize_review_target_type,
     )
 
-    if mode not in ("quick", "deep", "full"):
-        console.print(f"[red]Invalid mode '{mode}'. Must be: quick, deep, or full[/red]")
-        raise typer.Exit(1)
     if target_type not in ("auto", "github", "local"):
         console.print(f"[red]Invalid --target-type '{target_type}'. Must be: auto, github, or local[/red]")
         raise typer.Exit(1)
@@ -892,14 +888,12 @@ def review(
 
             session_key = "cli:review"
             session = agent_loop.sessions.get_or_create(session_key)
-            session.metadata["review_mode"] = True
             session.metadata["review_target"] = target
             resolved_target_type = normalize_review_target_type(target_type, target)
             session.metadata["review_target_type"] = (
                 resolved_target_type if resolved_target_type != "auto" else infer_review_target_type(target)
             )
             session.metadata["review_focus"] = focus
-            session.metadata["review_mode_variant"] = mode
             session.metadata["review_action"] = normalized_action
             session.metadata["max_concurrent_subagents"] = effective_max_subagents
             agent_loop.sessions.save(session)

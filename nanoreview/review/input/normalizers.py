@@ -1,13 +1,10 @@
 """Normalize review inputs before building a review plan."""
 from __future__ import annotations
 
-from typing import Any
-
 from nanoreview.review.input.targets import infer_review_target_type
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     ReviewAction,
-    ReviewDepth,
     ReviewRole,
     review_action_values,
 )
@@ -55,11 +52,3 @@ def normalize_review_action(raw: str | None) -> ReviewAction:
         pass
     allowed = ", ".join(review_action_values())
     raise ValueError(f"Unknown review action '{value}'. Available action values: {allowed}")
-
-
-def normalize_mode(raw: Any) -> ReviewDepth:
-    value = str(raw or "full").strip().lower()
-    if value in {"quick", "full", "deep"}:
-        return value  # type: ignore[return-value]
-    return "full"
-

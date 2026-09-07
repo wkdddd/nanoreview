@@ -2,7 +2,6 @@ import type {
   ChatSummary,
   CodeContextPayload,
   ReviewAction,
-  ReviewDepth,
   ReviewTargetType,
   ReviewerProfile,
   SessionMessagesPayload,
@@ -88,10 +87,6 @@ function reviewActionField(value?: string): ReviewAction | undefined {
   return value === "repo" || value === "diff" ? value : undefined;
 }
 
-function reviewDepthField(value?: string): ReviewDepth | undefined {
-  return value === "quick" || value === "full" || value === "deep" ? value : undefined;
-}
-
 export async function listSessions(auth: ApiAuth): Promise<ChatSummary[]> {
   type Row = {
     key: string;
@@ -109,7 +104,6 @@ export async function listSessions(auth: ApiAuth): Promise<ChatSummary[]> {
       : undefined;
     const reviewTargetType = reviewTargetTypeField(stringField(metadata, "review_target_type"));
     const reviewAction = reviewActionField(stringField(metadata, "review_action"));
-    const reviewMode = reviewDepthField(stringField(metadata, "review_mode_variant"));
     return {
       key: session.key,
       ...splitKey(session.key),
@@ -121,7 +115,6 @@ export async function listSessions(auth: ApiAuth): Promise<ChatSummary[]> {
       reviewTarget: stringField(metadata, "review_target"),
       reviewTargetType,
       reviewAction,
-      reviewMode,
       pinned: metadata?.pinned === true,
       customTitle: stringField(metadata, "custom_title"),
     };

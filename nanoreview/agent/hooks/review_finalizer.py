@@ -9,10 +9,9 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
-from nanoreview.review.input import policy_for_depth
 from nanoreview.review.output.finalizer import ReviewFinalizer
 from nanoreview.review.output.judge import ReviewJudge
-from nanoreview.review.types import GitHubDiffEvidence, ReviewDepth
+from nanoreview.review.types import GitHubDiffEvidence
 
 
 class ReviewFinalizerHook(AgentHook):
@@ -28,7 +27,6 @@ class ReviewFinalizerHook(AgentHook):
         workspace: str,
         target_name: str,
         changed_files: list[str] | None = None,
-        depth: ReviewDepth = "full",
         judge: ReviewJudge | None = None,
         allowed_dimensions: list[str] | set[str] | None = None,
         can_finalize: Callable[[], bool] | None = None,
@@ -36,11 +34,9 @@ class ReviewFinalizerHook(AgentHook):
     ) -> None:
         super().__init__()
         self._target_name = target_name
-        self._policy = policy_for_depth(depth)
         self._finalizer = ReviewFinalizer(
             workspace,
             changed_files,
-            policy=self._policy,
             allowed_dimensions=allowed_dimensions,
             remote_diff=remote_diff,
         )

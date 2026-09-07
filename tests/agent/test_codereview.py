@@ -53,39 +53,15 @@ def test_review_role_sets() -> None:
     assert len(ALL_REVIEW_ROLES) == 4
 
 
-def test_build_code_review_context_keeps_subagent_limit_independent_of_mode() -> None:
-    prompt = build_code_review_context(
-        target="https://github.com/test/repo",
-        focus="security,bug",
-        max_subagents=6,
-        mode="quick",
-    )
-
-    assert "QUICK review" in prompt
-    assert "critical and high" in prompt
-    assert "Focus only on critical and high severity issues" in prompt
-
-
-def test_build_code_review_context_deep_mode_mentions_thorough() -> None:
+def test_build_code_review_context_mentions_all_severity_levels() -> None:
+    """Unified strategy: the prompt demands coverage of every severity."""
     prompt = build_code_review_context(
         target="https://github.com/test/repo",
         max_subagents=4,
-        mode="deep",
     )
 
-    assert "DEEP review" in prompt
-    assert "thorough" in prompt.lower()
-
-
-def test_build_code_review_context_full_mode_mentions_full() -> None:
-    prompt = build_code_review_context(
-        target="https://github.com/test/repo",
-        max_subagents=4,
-        mode="full",
-    )
-
-    assert "FULL review" in prompt
-    assert "- Action: repo" in prompt
+    assert "Cover all severity levels (critical, high, medium, low)" in prompt
+    assert "The AI judge is enabled" in prompt
 
 
 def test_build_code_review_context_includes_subagent_candidate_schema() -> None:
@@ -232,12 +208,11 @@ def test_dimension_contract_uses_forced_focus_dimensions() -> None:
     assert "Performance Reviewer" not in prompt
 
 
-def test_quick_forced_performance_focus_keeps_performance_dimension() -> None:
+def test_forced_performance_focus_keeps_performance_dimension() -> None:
     plan = build_review_plan(
         target="https://github.com/test/repo",
         target_type="github",
         focus="performance",
-        depth="quick",
     )
 
     assert plan is not None
@@ -247,7 +222,6 @@ def test_quick_forced_performance_focus_keeps_performance_dimension() -> None:
         target="https://github.com/test/repo",
         target_type="github",
         focus="performance",
-        mode="quick",
     )
 
     assert "Performance Reviewer" in prompt
@@ -280,7 +254,6 @@ def test_build_code_review_context_returns_fallback_without_target() -> None:
 def test_max_severity_and_order() -> None:
     report = ReviewReport(
         target="repo",
-        mode="full",
         dimensions=[],
         summary="",
         findings=[

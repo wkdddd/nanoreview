@@ -17,27 +17,19 @@ import {
   Moon,
   Monitor,
 } from "lucide-react";
-import type { ReviewerProfile, ReviewDepth, ReviewFocus } from "@/lib/types";
+import type { ReviewerProfile, ReviewFocus } from "@/lib/types";
 
 export type ThemeMode = "light" | "dark" | "system";
 
 export interface ReviewSettings {
-  defaultDepth: ReviewDepth;
   defaultFocus: ReviewFocus[];
   theme: ThemeMode;
 }
 
 const DEFAULT_SETTINGS: ReviewSettings = {
-  defaultDepth: "full",
   defaultFocus: [],
   theme: "light",
 };
-
-const DEPTH_OPTIONS: { value: ReviewDepth; label: string; description: string }[] = [
-  { value: "quick", label: "Quick", description: "Fast scan focused on obvious high-risk issues" },
-  { value: "full", label: "Full", description: "Balanced review across the selected dimensions" },
-  { value: "deep", label: "Deep", description: "More thorough analysis for subtle or systemic risks" },
-];
 
 const THEME_OPTIONS: {
   value: ThemeMode;
@@ -65,10 +57,6 @@ export function SettingsDialog({
   onSettingsChange,
   profiles,
 }: SettingsDialogProps) {
-  const handleDepthChange = (depth: ReviewDepth) => {
-    onSettingsChange({ ...settings, defaultDepth: depth });
-  };
-
   const handleThemeChange = (theme: ThemeMode) => {
     onSettingsChange({ ...settings, theme });
   };
@@ -156,45 +144,6 @@ export function SettingsDialog({
                   </label>
                 );
               })}
-            </div>
-          </section>
-
-          <Separator />
-
-          <section className="space-y-3">
-            <h3 className="text-sm font-medium text-foreground">
-              Default Review Depth
-            </h3>
-            <div className="space-y-2">
-              {DEPTH_OPTIONS.map((option) => (
-                <label
-                  key={option.value}
-                  className={cn(
-                    "flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors",
-                    settings.defaultDepth === option.value
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:bg-accent/50",
-                  )}
-                >
-                  <input
-                    type="radio"
-                    name="review-depth"
-                    value={option.value}
-                    checked={settings.defaultDepth === option.value}
-                    onChange={() => handleDepthChange(option.value)}
-                    className="mt-1 h-4 w-4 accent-primary"
-                  />
-                  <div className="flex-1">
-                    <div className="text-sm font-medium">{option.label}</div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">
-                      {option.description}
-                    </div>
-                  </div>
-                  {settings.defaultDepth === option.value && (
-                    <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                  )}
-                </label>
-              ))}
             </div>
           </section>
 

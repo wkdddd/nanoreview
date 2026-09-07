@@ -303,7 +303,6 @@ export class NanobotClient {
       content,
       ...(media && media.length > 0 ? { media } : {}),
       ...(options?.imageGeneration ? { image_generation: options.imageGeneration } : {}),
-      ...(options?.review?.mode ? { review_mode_variant: options.review.mode } : {}),
       ...(options?.review?.target ? { review_target: options.review.target } : {}),
       ...(options?.review?.target_type ? { review_target_type: options.review.target_type } : {}),
       ...(options?.review?.action ? { review_action: options.review.action } : {}),
@@ -327,14 +326,6 @@ export class NanobotClient {
       type: "set_session_permission",
       chat_id: chatId,
       approval_enabled: approvalEnabled,
-    });
-  }
-
-  sendSetReviewMode(chatId: string, enabled: boolean): void {
-    this.queueSend({
-      type: "set_review_mode",
-      chat_id: chatId,
-      enabled,
     });
   }
 

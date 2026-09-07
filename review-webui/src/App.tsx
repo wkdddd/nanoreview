@@ -30,7 +30,6 @@ import { NanobotClient } from "@/lib/nanobot-client";
 import type {
   ChatSummary,
   ConnectionStatus,
-  ReviewDepth,
   ReviewFocus,
   ReviewerProfile,
   ReviewTargetType,
@@ -77,7 +76,6 @@ function applyThemeClass(theme: ThemeMode): void {
 }
 
 const DEFAULT_SETTINGS: ReviewSettings = {
-  defaultDepth: "full",
   defaultFocus: [],
   theme: "light",
 };
@@ -105,7 +103,6 @@ function reviewTaskFromSubmit(submit: NewReviewSubmit): ReviewTask {
     target: submit.target,
     targetType: inferTargetType(submit.target),
     action: submit.action,
-    depth: submit.depth,
     focus: submit.focus,
   };
 }
@@ -117,7 +114,6 @@ function taskFromHistory(session: ChatSummary | null, messages: UIMessage[]): Re
       target: review.target,
       targetType: review.target_type,
       action: review.action,
-      depth: review.mode,
       focus: review.focus,
     };
   }
@@ -554,7 +550,6 @@ function ReviewAppShell({
       startReview(task);
       client.sendMessage(chatId, "", undefined, {
         review: {
-          mode: task.depth ?? "full",
           target: task.target,
           target_type: task.targetType,
           action: task.action ?? "repo",
@@ -590,7 +585,6 @@ function ReviewAppShell({
   const sessionInfo: SessionInfo | null = state.task
     ? {
         target: state.task.target,
-        depth: state.task.depth,
         dimensions: state.dimensions
           .filter((dimension) => dimension.status !== "skipped")
           .map((dimension) => dimension.dimension),
@@ -640,7 +634,6 @@ function ReviewAppShell({
           showReviewForm ? (
             <div className="flex h-full min-h-0 items-center justify-center overflow-hidden p-3">
               <NewReviewForm
-                defaultDepth={settings.defaultDepth}
                 defaultFocus={settings.defaultFocus}
                 profiles={reviewerProfiles}
                 onSubmit={handleSubmitReview}

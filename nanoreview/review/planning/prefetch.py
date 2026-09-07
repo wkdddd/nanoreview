@@ -9,7 +9,6 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
-from nanoreview.review.input import policy_for_depth
 from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceResult,
     preview_text,
@@ -36,6 +35,11 @@ _EXCERPT_CHAR_LIMIT = 16_000
 
 #: Maximum skipped-file descriptions embedded in one progress event.
 _EVENT_SKIPPED_LIMIT = 50
+
+#: Default cap on the number of evidence units requested from the evidence
+#: service. With the unified review strategy there is no depth-based tuning;
+#: this is a single balanced default (previously the "full" depth value).
+_DEFAULT_EVIDENCE_MAX_RESULTS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,7 +254,6 @@ async def maybe_prefetch_review_context(
 
     trace_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
-    policy = policy_for_depth(plan.depth)
     query = plan.user_requirements or "code review bug security performance maintainability entry points config"
     logger.info(
         "review.prefetch.start trace_id={} action={} target_type={} target={} target_repo={} scope_kind={} review_root={} target_subpath={} query_chars={} max_results={}",
@@ -263,7 +266,7 @@ async def maybe_prefetch_review_context(
         plan.local_scope.review_root if plan.local_scope else "",
         plan.target_subpath or "",
         len(query),
-        policy.evidence_max_results,
+        _DEFAULT_EVIDENCE_MAX_RESULTS,
     )
     await _emit_prefetch_progress(
         progress_callback,
@@ -290,7 +293,7 @@ async def maybe_prefetch_review_context(
             target_subpath=plan.target_subpath,
             target_subpath_kind=plan.target_subpath_kind,
             review_query=query,
-            max_results=policy.evidence_max_results,
+            max_results=_DEFAULT_EVIDENCE_MAX_RESULTS,
             include_tests=True,
             local_scope=plan.local_scope,
             trace_id=trace_id,

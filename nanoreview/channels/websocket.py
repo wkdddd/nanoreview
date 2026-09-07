@@ -78,41 +78,6 @@ def _normalize_config_path(path: str) -> str:
     return _strip_trailing_slash(path)
 
 
-def _review_mode_payload(meta: dict[str, Any]) -> dict[str, Any]:
-    target = str(meta.get("review_target") or "").strip()
-    target_type = normalize_review_target_type(
-        str(meta.get("review_target_type") or ""),
-        target or None,
-    )
-    payload: dict[str, Any] = {}
-    if target:
-        payload["target"] = target
-    if target_type:
-        payload["target_type"] = target_type
-    action = str(meta.get("review_action") or "").strip()
-    if action:
-        payload["action"] = action
-    focus = meta.get("review_focus")
-    if isinstance(focus, list):
-        payload["focus"] = focus
-    elif isinstance(focus, str) and focus.strip():
-        payload["focus"] = [item.strip() for item in focus.split(",") if item.strip()]
-    return payload
-
-
-def _clear_review_metadata(meta: dict[str, Any]) -> None:
-    for key in (
-        "review_target",
-        "review_target_type",
-        "review_focus",
-        "review_action",
-        "review_mode_variant",
-        "review_mode_name",
-        "max_concurrent_subagents",
-    ):
-        meta.pop(key, None)
-
-
 class WebSocketConfig(Base):
     """WebSocket server channel configuration.
 
@@ -617,31 +582,10 @@ class WebSocketChannel(BaseChannel):
                 approval_enabled=approval_enabled,
             )
 
-    async def _maybe_push_specialist_modes(self, chat_id: str) -> None:
-        """Replay mutually exclusive mode toggles after subscribe."""
-        if self._session_manager is None:
-            return
-        row = self._session_manager.read_session_file(f"websocket:{chat_id}")
-        meta = row.get("metadata", {}) if isinstance(row, dict) else {}
-        if not isinstance(meta, dict):
-            return
-        review_enabled = bool(meta.get("review_mode", False))
-        conns = list(self._subs.get(chat_id, ()))
-        for conn in conns:
-            if review_enabled:
-                await self._send_event(
-                    conn,
-                    "review_mode_updated",
-                    chat_id=chat_id,
-                    enabled=review_enabled,
-                    **_review_mode_payload(meta),
-                )
-
     async def _hydrate_after_subscribe(self, chat_id: str) -> None:
         """Replay goal/run strip state after subscribe (same-process refresh)."""
         await self._maybe_push_turn_run_wall_clock(chat_id)
         await self._maybe_push_session_approval_state(chat_id)
-        await self._maybe_push_specialist_modes(chat_id)
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
@@ -1411,17 +1355,14 @@ class WebSocketChannel(BaseChannel):
                 dup.setdefault("createdAt", int(time.time() * 1000))
                 review_target = str(dup.get("review_target") or "").strip()
                 review_target_type = str(dup.get("review_target_type") or "").strip()
-                review_mode_variant = str(dup.get("review_mode_variant") or "").strip()
                 review_action = str(dup.get("review_action") or "").strip()
                 review_focus = dup.get("review_focus")
-                if review_target or review_target_type or review_mode_variant or review_action or review_focus:
+                if review_target or review_target_type or review_action or review_focus:
                     review: dict[str, Any] = {}
                     if review_target:
                         review["target"] = review_target
                     if review_target_type:
                         review["target_type"] = review_target_type
-                    if review_mode_variant:
-                        review["mode"] = review_mode_variant
                     if review_action:
                         review["action"] = review_action
                     if isinstance(review_focus, list):
@@ -1466,14 +1407,11 @@ class WebSocketChannel(BaseChannel):
                 user_obj["media_paths"] = list(media)
             review_target = str(meta.get("review_target") or "").strip()
             review_target_type = str(meta.get("review_target_type") or "").strip()
-            review_mode_variant = str(meta.get("review_mode_variant") or "").strip()
             review_action = str(meta.get("review_action") or "").strip()
             if review_target:
                 user_obj["review_target"] = review_target
             if review_target_type:
                 user_obj["review_target_type"] = review_target_type
-            if review_mode_variant:
-                user_obj["review_mode_variant"] = review_mode_variant
             if review_action:
                 user_obj["review_action"] = review_action
             if isinstance(meta.get("review_focus"), list):
@@ -2261,13 +2199,11 @@ class WebSocketChannel(BaseChannel):
 
             raw_review_target = envelope.get("review_target")
             raw_review_target_type = envelope.get("review_target_type")
-            raw_review_mode_variant = envelope.get("review_mode_variant")
             raw_review_action = envelope.get("review_action")
             raw_review_focus = envelope.get("review_focus")
             has_review_payload = (
                 isinstance(raw_review_target, str)
                 or isinstance(raw_review_target_type, str)
-                or isinstance(raw_review_mode_variant, str)
                 or isinstance(raw_review_action, str)
                 or isinstance(raw_review_focus, list)
             )
@@ -2293,13 +2229,6 @@ class WebSocketChannel(BaseChannel):
             ):
                 session_key = f"websocket:{cid}"
                 session = self._session_manager.get_or_create(session_key)
-                session.metadata["review_mode"] = True
-                if isinstance(raw_review_mode_variant, str):
-                    mode = raw_review_mode_variant.strip().lower()
-                    if mode in {"quick", "full", "deep"}:
-                        session.metadata["review_mode_variant"] = mode
-                    else:
-                        session.metadata.pop("review_mode_variant", None)
                 if isinstance(raw_review_target, str):
                     target = raw_review_target.strip()
                     if target:
@@ -2330,19 +2259,16 @@ class WebSocketChannel(BaseChannel):
                 metadata["review_target"] = raw_review_target.strip()
             if isinstance(raw_review_target_type, str):
                 metadata["review_target_type"] = raw_review_target_type
-            if isinstance(raw_review_mode_variant, str):
-                metadata["review_mode_variant"] = raw_review_mode_variant
             if isinstance(raw_review_action, str):
                 metadata["review_action"] = normalized_review_action
             if isinstance(raw_review_focus, list):
                 metadata["review_focus"] = [str(item).strip() for item in raw_review_focus if str(item).strip()]
             if has_review_payload:
                 logger.info(
-                    "ws.review.request cid={} webui={} target_type={} mode={} action={} focus_count={} content_chars={} media_count={}",
+                    "ws.review.request cid={} webui={} target_type={} action={} focus_count={} content_chars={} media_count={}",
                     cid,
                     envelope.get("webui") is True,
                     raw_review_target_type if isinstance(raw_review_target_type, str) else "",
-                    raw_review_mode_variant if isinstance(raw_review_mode_variant, str) else "",
                     normalized_review_action or "",
                     len(metadata.get("review_focus", [])) if isinstance(metadata.get("review_focus"), list) else 0,
                     len(content),
@@ -2408,47 +2334,6 @@ class WebSocketChannel(BaseChannel):
                 "session_permission_updated",
                 chat_id=cid,
                 approval_enabled=approval_enabled,
-            )
-            return
-        if t == "set_review_mode":
-            cid = envelope.get("chat_id")
-            enabled = bool(envelope.get("enabled", False))
-            if not _is_valid_chat_id(cid):
-                await self._send_event(connection, "error", detail="invalid chat_id")
-                return
-            logger.info("session websocket:{} review mode: {}", cid, "enabled" if enabled else "disabled")
-            review_payload: dict[str, Any] = {}
-            if self._session_manager is not None:
-                session_key = f"websocket:{cid}"
-                session = self._session_manager.get_or_create(session_key)
-                session.metadata["review_mode"] = enabled
-                if enabled:
-                    raw_target = envelope.get("target")
-                    if isinstance(raw_target, str):
-                        target = raw_target.strip()
-                        if target:
-                            session.metadata["review_target"] = target
-                        else:
-                            session.metadata.pop("review_target", None)
-                    raw_target_type = envelope.get("target_type")
-                    target_type = normalize_review_target_type(
-                        raw_target_type if isinstance(raw_target_type, str) else None,
-                        session.metadata.get("review_target"),
-                    )
-                    if target_type:
-                        session.metadata["review_target_type"] = target_type
-                    else:
-                        session.metadata.pop("review_target_type", None)
-                    review_payload = _review_mode_payload(session.metadata)
-                else:
-                    _clear_review_metadata(session.metadata)
-                self._session_manager.save(session)
-            await self._send_event(
-                connection,
-                "review_mode_updated",
-                chat_id=cid,
-                enabled=enabled,
-                **review_payload,
             )
             return
         await self._send_event(connection, "error", detail=f"unknown type: {t!r}")

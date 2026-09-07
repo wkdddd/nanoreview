@@ -106,7 +106,6 @@ export interface ChatSummary {
   reviewTarget?: string;
   reviewTargetType?: ReviewTargetType;
   reviewAction?: ReviewAction;
-  reviewMode?: ReviewDepth;
   pinned?: boolean;
   customTitle?: string;
 }
@@ -300,11 +299,6 @@ export type InboundEvent =
       chat_id: string;
       approval_enabled: boolean;
     }
-  | {
-      event: "review_mode_updated";
-      chat_id: string;
-      enabled: boolean;
-    }
   | { event: "error"; chat_id?: string; detail?: string };
 
 /** Base64-encoded image attached to an outbound ``message`` envelope.
@@ -325,7 +319,6 @@ export interface OutboundImageGeneration {
   aspect_ratio?: string | null;
 }
 
-export type ReviewDepth = "quick" | "full" | "deep";
 export type ReviewTargetType = "auto" | "github" | "local";
 export type ReviewAction = "repo" | "diff";
 export type ReviewFocus = string;
@@ -337,7 +330,6 @@ export interface ReviewerProfile {
 }
 
 export interface OutboundReviewContext {
-  mode?: ReviewDepth;
   target_type?: ReviewTargetType;
   target?: string;
   action?: ReviewAction;
@@ -395,7 +387,6 @@ export type Outbound =
       content: string;
       media?: OutboundMedia[];
       image_generation?: OutboundImageGeneration;
-      review_mode_variant?: ReviewDepth;
       review_target?: string;
       review_target_type?: ReviewTargetType;
       review_action?: ReviewAction;
@@ -414,10 +405,5 @@ export type Outbound =
       type: "set_session_permission";
       chat_id: string;
       approval_enabled: boolean;
-    }
-  | {
-      type: "set_review_mode";
-      chat_id: string;
-      enabled: boolean;
     }
   ;

@@ -581,9 +581,9 @@ class AgentLoop:
                 )
         config = ReviewJudgeConfig(
             enabled=bool(getattr(judge_settings, "enabled", True)),
-            max_candidates=int(getattr(judge_settings, "max_candidates", 40)),
             timeout_seconds=int(getattr(judge_settings, "timeout_seconds", 60)),
             max_tokens=int(getattr(judge_settings, "max_tokens", 2048)),
+            context_window_tokens=int(self.context_window_tokens or 0) or None,
         )
         return ReviewJudge(provider=provider, model=model, config=config)
 

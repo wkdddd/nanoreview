@@ -2,13 +2,14 @@ import { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+
 import { Clock, AlertTriangle, AlertOctagon, Info } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Finding } from "@/hooks/useReviewSession";
 
 interface TaskOverviewProps {
-  task: { target: string; depth: string } | null;
+  task: { target: string } | null;
   findings: Finding[];
   summary: string;
 }
@@ -114,16 +115,11 @@ export function TaskOverview({ task, findings, summary }: TaskOverviewProps) {
 
   return (
     <div className="space-y-4">
-      {/* Top row: target name, depth badge, timestamp */}
+      {/* Top row: target name and timestamp */}
       <div className="flex items-center gap-3 flex-wrap">
         <h2 className="text-xl font-semibold text-foreground">
           {task?.target ?? "Review Target"}
         </h2>
-        {task?.depth && (
-          <Badge variant="secondary" className="capitalize">
-            {task.depth}
-          </Badge>
-        )}
         <span className="text-xs text-muted-foreground ml-auto">
           {new Date().toLocaleString()}
         </span>

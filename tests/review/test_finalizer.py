@@ -7,7 +7,6 @@ import pytest
 from loguru import logger
 
 from nanoreview.agent.hooks import AgentHookContext, ReviewFinalizerHook
-from nanoreview.review.input import policy_for_depth
 from nanoreview.review.output.finalizer import ReviewFinalizer
 from nanoreview.review.types import (
     ReviewJudgeDecision,
@@ -188,7 +187,7 @@ class TestSemanticVerdicts:
             "severity": "high", "file": "src/app.py", "line": 1,
             "title": "False positive", "evidence": "line1", "impact": "bad", "recommendation": "fix",
         }])
-        f = ReviewFinalizer(workspace, policy=policy_for_depth("full"))
+        f = ReviewFinalizer(workspace)
         f.ingest_subagent_output("security", raw)
         judge = FakeJudge({
             "security:src/app.py:1:false positive": ReviewJudgeVerdict(
@@ -203,21 +202,72 @@ class TestSemanticVerdicts:
         assert "No actionable issues found" not in result.report_markdown
         assert "AI judge rejected: not actionable" in result.report_markdown
 
-    def test_quick_policy_filters_medium_and_low_candidates(self, workspace):
+    def test_unified_strategy_keeps_medium_and_low_candidates(self, workspace):
         raw = _submit([
             {
                 "severity": "medium", "file": "src/app.py", "line": 1,
                 "title": "Medium issue", "evidence": "line1", "impact": "bad", "recommendation": "fix",
             },
             {
-                "severity": "high", "file": "src/app.py", "line": 2,
-                "title": "High issue", "evidence": "line2", "impact": "bad", "recommendation": "fix",
+                "severity": "low", "file": "src/app.py", "line": 2,
+                "title": "Low issue", "evidence": "line2", "impact": "bad", "recommendation": "fix",
             },
         ])
-        f = ReviewFinalizer(workspace, policy=policy_for_depth("quick"))
+        f = ReviewFinalizer(workspace)
         result = f.ingest_subagent_output("security", raw)
 
-        assert [candidate.title for candidate in result.accepted] == ["High issue"]
+        assert [candidate.title for candidate in result.accepted] == [
+            "Medium issue",
+            "Low issue",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_judge_unavailable_marks_candidates_needs_confirmation(self, workspace):
+        """No judge instance: candidates must not silently pass as accepted."""
+        raw = _submit([{
+            "severity": "high", "file": "src/app.py", "line": 1,
+            "title": "Unjudged issue", "evidence": "line1", "impact": "bad", "recommendation": "fix",
+        }])
+        f = ReviewFinalizer(workspace)
+        f.ingest_subagent_output("security", raw)
+
+        await f.apply_judge(None)
+        result = f.finalize("test")
+
+        assert "Unjudged issue" in result.report_markdown
+        assert "### Needs Confirmation" in result.report_markdown
+        assert "AI judge is unavailable" in result.report_markdown
+        assert "### AI Judge Statistics" in result.report_markdown
+        assert "- Sent to judge: 0" in result.report_markdown
+        # result.needs_confirmation must stay consistent with the report.
+        assert len(result.needs_confirmation) == 1
+        assert result.needs_confirmation[0][0].title == "Unjudged issue"
+        assert "AI judge is unavailable" in result.needs_confirmation[0][1].reason
+
+    @pytest.mark.asyncio
+    async def test_judge_total_failure_marks_candidates_needs_confirmation(self, workspace):
+        """A judge that raises outright must surface candidates, not accept them."""
+        raw = _submit([{
+            "severity": "high", "file": "src/app.py", "line": 1,
+            "title": "Failed judge issue", "evidence": "line1", "impact": "bad", "recommendation": "fix",
+        }])
+        f = ReviewFinalizer(workspace)
+        f.ingest_subagent_output("security", raw)
+
+        class ExplodingJudge:
+            async def judge_dimensions(self, dimensions):
+                raise RuntimeError("provider down")
+
+        await f.apply_judge(ExplodingJudge())
+        result = f.finalize("test")
+
+        assert "Failed judge issue" in result.report_markdown
+        assert "### Needs Confirmation" in result.report_markdown
+        assert "AI judge failed" in result.report_markdown
+        # result.needs_confirmation must stay consistent with the report.
+        assert len(result.needs_confirmation) == 1
+        assert result.needs_confirmation[0][0].title == "Failed judge issue"
+        assert "AI judge failed" in result.needs_confirmation[0][1].reason
 
 
 class TestFinalize:
@@ -561,7 +611,7 @@ class TestFinalize:
                 },
             }],
         )
-        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject", depth="quick")
+        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
 
         await hook.after_iteration(context)
         context.messages.append({

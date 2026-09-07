@@ -11,14 +11,11 @@ from loguru import logger
 
 from nanoreview.agent.context import ContextBuilder
 from nanoreview.review.input import (
-    apply_policy_to_roles,
     extract_review_target,
-    normalize_mode,
     normalize_requested_dimensions,
     normalize_review_action,
     normalize_review_target_type,
     parse_repo_target,
-    policy_for_depth,
 )
 from nanoreview.review.source.utils import (
     parse_github_scoped_target,
@@ -116,7 +113,6 @@ def build_review_plan(
     target: str | None = None,
     user_content: str = "",
     focus: str | list[str] | None = None,
-    depth: Any = "full",
     max_subagents: Any = 4,
     target_type: str | None = None,
     action: str | None = None,
@@ -170,20 +166,11 @@ def build_review_plan(
     if target_type_value == "local":
         local_scope, scope_reason = _resolve_local_scope(target)
 
-    depth_value = normalize_mode(depth)
-    policy = policy_for_depth(depth_value)
-    roles = apply_policy_to_roles(
-        roles=roles,
-        routing_mode=routing_mode,
-        policy=policy,
-    )
-
     plan = ReviewPlan(
         target=target,
         target_name=target_name or target,
         target_type=target_type_value,
         action=resolved_action,
-        depth=depth_value,
         roles=roles,
         routing_mode=routing_mode,
         user_requirements=user_content.strip(),
@@ -269,7 +256,6 @@ async def prepare_code_review_context(
         target=session_meta.get(ReviewMetaKey.TARGET) if isinstance(session_meta.get(ReviewMetaKey.TARGET), str) else None,
         user_content=user_content,
         focus=session_meta.get(ReviewMetaKey.REQUESTED_DIMENSIONS),
-        depth=session_meta.get(ReviewMetaKey.MODE_VARIANT) or session_meta.get("review_mode_name") or "full",
         max_subagents=session_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS) or 4,
         target_type=session_meta.get(ReviewMetaKey.TARGET_TYPE) if isinstance(session_meta.get(ReviewMetaKey.TARGET_TYPE), str) else None,
         action=session_meta.get(ReviewMetaKey.ACTION) if isinstance(session_meta.get(ReviewMetaKey.ACTION), str) else None,
@@ -330,7 +316,6 @@ def build_code_review_context(
     target: str | None = None,
     user_content: str = "",
     focus: str | None = None,
-    mode: str = "full",
     max_subagents: int = 4,
     target_type: str | None = None,
     action: str | None = None,
@@ -342,7 +327,6 @@ def build_code_review_context(
         target=target,
         user_content=user_content,
         focus=focus,
-        depth=mode,
         max_subagents=max_subagents,
         target_type=target_type,
         action=action,
@@ -357,13 +341,16 @@ def apply_review_metadata_from_message(
     session: Session,
     metadata: dict[str, Any] | None,
 ) -> bool:
-    """Apply structured Review metadata before this turn runs."""
+    """Apply structured Review metadata before this turn runs.
+
+    Review activation is decided solely by the presence of a valid
+    ``review_target``; the legacy toggle/depth variant has been removed.
+    """
     if not isinstance(metadata, dict):
         return False
     keys = (
         ReviewMetaKey.TARGET,
         ReviewMetaKey.TARGET_TYPE,
-        ReviewMetaKey.MODE_VARIANT,
         ReviewMetaKey.ACTION,
         ReviewMetaKey.REQUESTED_DIMENSIONS,
         ReviewMetaKey.TARGET_REF,
@@ -384,16 +371,6 @@ def apply_review_metadata_from_message(
         if key in session.metadata:
             session.metadata.pop(key, None)
             changed = True
-
-    _set_meta(ReviewMetaKey.MODE, True)
-
-    raw_mode = metadata.get(ReviewMetaKey.MODE_VARIANT)
-    if isinstance(raw_mode, str):
-        mode = raw_mode.strip().lower()
-        if mode in {"quick", "full", "deep"}:
-            _set_meta(ReviewMetaKey.MODE_VARIANT, mode)
-        else:
-            _pop_meta(ReviewMetaKey.MODE_VARIANT)
 
     raw_target = metadata.get(ReviewMetaKey.TARGET)
     if isinstance(raw_target, str):
