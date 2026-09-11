@@ -301,7 +301,6 @@ async def test_legacy_provider_migrates_risk_labels_to_risk_hints() -> None:
         target_name="workspace",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=[],
         routing_mode="auto",
     )

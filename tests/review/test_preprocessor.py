@@ -228,7 +228,7 @@ def test_supplement_related_attaches_supported_callers_only() -> None:
         InventoryEntry(path, len(text), *classify_path(path)) for path, text in files.items()
     ]
     budgets = EvidenceBudget.from_options(
-        token_budget=100_000,
+        evidence_token_budget=100_000,
         subagent_evidence_budget_chars=24_000,
         context_window_tokens=SMALL_WINDOW,
     )
@@ -405,7 +405,7 @@ def test_estimate_tokens_and_budget_derivation() -> None:
     assert estimate_tokens("abcde") == 2
 
     budget = EvidenceBudget.from_options(
-        token_budget=100_000,
+        evidence_token_budget=100_000,
         subagent_evidence_budget_chars=24_000,
         context_window_tokens=SMALL_WINDOW,
     )
@@ -425,7 +425,7 @@ def test_options_from_review_config_maps_budget_fields() -> None:
         "ReviewConfig",
         (),
         {
-            "token_budget": 50_000,
+            "evidence_token_budget": 50_000,
             "prefetch_budget_chars": 8_000,
             "subagent_evidence_budget_chars": 12_000,
             "prefetch_dense_backfill_limit": 64,
@@ -436,7 +436,7 @@ def test_options_from_review_config_maps_budget_fields() -> None:
 
     options = ProgrammaticEvidenceOptions.from_review_config(review_config)
 
-    assert options.token_budget == 50_000
+    assert options.evidence_token_budget == 50_000
     assert options.prefetch_budget_chars == 8_000
     assert options.subagent_evidence_budget_chars == 12_000
     assert options.prefetch_dense_backfill_limit == 64
@@ -446,7 +446,7 @@ def test_options_from_review_config_maps_budget_fields() -> None:
     assert options.context_window_tokens == ProgrammaticEvidenceOptions().context_window_tokens
 
     defaults = ProgrammaticEvidenceOptions.from_review_config(None)
-    assert defaults.token_budget == 100_000
+    assert defaults.evidence_token_budget == 100_000
     assert defaults.subagent_evidence_budget_chars == 24_000
     assert defaults.preview_target_chars == 600
     assert defaults.preview_hard_limit == 3_000
@@ -718,7 +718,7 @@ def test_risk_hints_stay_independent_from_relation_tags(tmp_path: Path) -> None:
     }
     inventory = [InventoryEntry(path, len(text), *classify_path(path)) for path, text in files.items()]
     budgets = EvidenceBudget.from_options(
-        token_budget=100_000,
+        evidence_token_budget=100_000,
         subagent_evidence_budget_chars=24_000,
         context_window_tokens=SMALL_WINDOW,
     )

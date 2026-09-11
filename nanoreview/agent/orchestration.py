@@ -20,7 +20,6 @@ from nanoreview.review.output.judge import ReviewJudge
 from nanoreview.review.types import (
     EvidenceReference,
     ReviewAssignment,
-    ReviewBudgetSkip,
     ReviewEvidenceBundle,
     ReviewPlan,
 )
@@ -80,7 +79,6 @@ class ReviewExecutionContext:
     metadata: dict[str, Any]
     max_concurrency: int
     result_callback: Callable[[Any], Awaitable[None]] | None = None
-    token_budget: int = 100_000
 
 
 class ReviewOrchestrator:
@@ -107,6 +105,9 @@ class ReviewOrchestrator:
         self._workspace = workspace
         self._max_tool_result_chars = max_tool_result_chars
         self._judge = judge
+        # One-shot guard for the tokenizer-unavailable warning so long runs
+        # with many dimensions do not spam the log.
+        self._tokenizer_fallback_warned = False
 
     async def execute(
         self,
@@ -141,13 +142,16 @@ class ReviewOrchestrator:
             plan=plan,
             evidence=evidence,
         )
-        admitted, skipped = await self._admit_assignments(
+        # Every validated assignment is dispatched: dimensions are either
+        # explicit user intent or planner decisions, and neither may be
+        # silently dropped by a token-count gate. Evidence-side over-budget
+        # units are already recorded by the preprocessor as SkippedReviewUnit.
+        limits_by_dimension = await self._derive_execution_limits(
             plan=plan,
             evidence=evidence,
             assignments=assignments,
             validation_workspace=validation_workspace,
             local_target=local_target,
-            token_budget=max(0, context.token_budget),
         )
         finalizer = ReviewFinalizer(
             validation_workspace,
@@ -157,21 +161,20 @@ class ReviewOrchestrator:
             selected_dimensions=[assignment.dimension for assignment in assignments],
             local_target=local_target,
             remote_diff=remote_diff,
-            budget_skipped=skipped,
             skipped_files=tuple(evidence.skipped_by_file().values()),
         )
         await self._dispatch_and_collect(
             plan=plan,
             evidence=evidence,
-            assignments=tuple(item[0] for item in admitted),
-            limits_by_dimension={item[0].dimension: item[1] for item in admitted},
+            assignments=tuple(assignments),
+            limits_by_dimension=limits_by_dimension,
             context=context,
             finalizer=finalizer,
         )
         await finalizer.apply_judge(self._judge)
         return finalizer.finalize(plan.target_name or plan.target or "target").report_markdown
 
-    async def _admit_assignments(
+    async def _derive_execution_limits(
         self,
         *,
         plan: ReviewPlan,
@@ -179,17 +182,16 @@ class ReviewOrchestrator:
         assignments: tuple[ReviewAssignment, ...],
         validation_workspace: str,
         local_target: str | None,
-        token_budget: int,
-    ) -> tuple[tuple[tuple[ReviewAssignment, SubagentExecutionLimits], ...], tuple[ReviewBudgetSkip, ...]]:
-        """Make one deterministic budget decision before spawning reviewers."""
-        reference_map = evidence.by_id()
-        ordered = list(assignments)
-        if plan.routing_mode == "auto":
-            priority = {"bug": 0, "security": 1, "performance": 2, "maintainability": 3}
-            ordered.sort(key=lambda item: priority.get(item.dimension, len(priority)))
+    ) -> dict[str, SubagentExecutionLimits]:
+        """Derive per-dimension execution limits from estimated input size.
 
-        budgeted: list[tuple[ReviewAssignment, int, int, int]] = []
-        for assignment in ordered:
+        Evidence volume only scales the iteration allowance (more evidence
+        needs more review rounds, bounded to 10-30). Output size and wall
+        clock limits stay fixed. No dimension is skipped here.
+        """
+        reference_map = evidence.by_id()
+        limits: dict[str, SubagentExecutionLimits] = {}
+        for assignment in assignments:
             references = _expand_assignment_references(reference_map, assignment.evidence_ids)
             input_tokens = await self._estimate_input_tokens(
                 plan=plan,
@@ -197,44 +199,20 @@ class ReviewOrchestrator:
                 validation_workspace=validation_workspace,
                 local_target=local_target,
             )
-            quota = max(12_000, min(30_000, 8_000 + 2 * input_tokens))
             max_rounds = max(10, min(30, 10 + math.ceil(input_tokens / 4_000)))
-            budgeted.append((assignment, input_tokens, quota, max_rounds))
-
-        admitted: list[tuple[ReviewAssignment, SubagentExecutionLimits]] = []
-        skipped: list[ReviewBudgetSkip] = []
-        used = 0
-        for assignment, input_tokens, quota, max_rounds in budgeted:
-            if token_budget > 0 and used + quota > token_budget:
-                skipped.append(
-                    ReviewBudgetSkip(
-                        dimension=assignment.dimension,
-                        input_tokens=input_tokens,
-                        quota_tokens=quota,
-                    )
-                )
-                continue
-            admitted.append(
-                (
-                    assignment,
-                    SubagentExecutionLimits(
-                        max_iterations=max_rounds,
-                        max_tokens=2_048,
-                        timeout_seconds=180,
-                        input_tokens=input_tokens,
-                        quota_tokens=quota,
-                    ),
-                )
+            limits[assignment.dimension] = SubagentExecutionLimits(
+                max_iterations=max_rounds,
+                max_tokens=2_048,
+                timeout_seconds=180,
             )
-            used += quota
+        rounds_values = [limit.max_iterations or 0 for limit in limits.values()]
         logger.info(
-            "review.subagent.budget.admitted total_budget={} admitted={} skipped={} reserved_tokens={}",
-            token_budget,
-            len(admitted),
-            len(skipped),
-            used,
+            "review.subagent.limits dimensions={} rounds_min={} rounds_max={}",
+            len(limits),
+            min(rounds_values) if rounds_values else 0,
+            max(rounds_values) if rounds_values else 0,
         )
-        return tuple(admitted), tuple(skipped)
+        return limits
 
     async def _estimate_input_tokens(
         self,
@@ -244,7 +222,12 @@ class ReviewOrchestrator:
         validation_workspace: str,
         local_target: str | None,
     ) -> int:
-        """Estimate target/evidence input without blocking the event loop."""
+        """Estimate target/evidence input without blocking the event loop.
+
+        tiktoken is optional; when unavailable the estimate falls back to a
+        chars/4 heuristic (with a one-time warning) so the derived round
+        count keeps scaling with evidence instead of silently collapsing.
+        """
         target_text = ""
         target_path = local_target
         if target_path is None and plan.local_scope is not None and plan.local_scope.kind == "file":
@@ -258,12 +241,20 @@ class ReviewOrchestrator:
             except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
                 target_text = ""
         evidence_text = "\n".join(reference.excerpt for reference in references)
+        combined = "\n".join((target_text, evidence_text))
         from nanoreview.utils.helpers import estimate_prompt_tokens
 
-        estimate = estimate_prompt_tokens([
-            {"role": "user", "content": "\n".join((target_text, evidence_text))}
-        ])
-        return max(1, int(estimate or 0))
+        estimate = estimate_prompt_tokens([{"role": "user", "content": combined}])
+        if estimate > 0:
+            return int(estimate)
+        if not self._tokenizer_fallback_warned:
+            logger.warning(
+                "review.orchestration.tokenizer_unavailable fallback=chars_per_token_4"
+            )
+            self._tokenizer_fallback_warned = True
+        # Conservative fallback mirroring review/output/judge.py: ~4 chars
+        # per token; max(1, ...) keeps an empty input estimateable.
+        return max(1, len(combined) // 4)
 
     async def _collect_plan(
         self,

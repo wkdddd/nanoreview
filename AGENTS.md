@@ -1,6 +1,6 @@
 # Agent Guidelines
 
-本文件是本仓库中 AI 编码代理的首要工作约束。
+本文件是本仓库中 AI 编码代理的首要工作约束。当程序事实和约束冲突时，优先考虑程序并更新约束。
 
 `.agents/` 包含按主题拆分的补充说明：开始工作时先阅读本文件；任务涉及架构、安全或运行时行为时，再阅读对应主题文件。根文件只保留入口级约束和仓库定位，专题文件负责展开具体规则；两者不得冲突。
 
@@ -47,7 +47,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 - 参数名应表达数据的职责和语义，不要仅因代码位于 review 模块就统一添加 `review_` 前缀。
 - review 模块内部的函数、方法和数据结构优先使用简洁语义名，例如：`target`、`target_type`、`action`、`query`、`root`、`path`、`scope`、`depth`、`dimensions`。只有同一作用域存在歧义或确实需要区分不同领域对象时，才使用领域前缀。
-- `review_` 前缀保留给跨模块或持久化的 review 命名空间键，例如会话 metadata、WebUI/API 事件和其他稳定 wire contract：`review_target`、`review_action`、`review_mode_variant`。私有的临时 metadata 可使用 `_review_` 前缀。
+- `review_` 前缀保留给跨模块或持久化的 review 命名空间键，例如会话 metadata、WebUI/API 事件和其他稳定 wire contract：`review_target`、`review_action`。私有的临时 metadata 可使用 `_review_` 前缀。
 - 工具和公共函数的新参数应按调用语义命名；review 专用工具中的“审查查询”使用 `query`，除非同一接口中同时存在多种查询而必须区分。已有外部参数名属于稳定契约，不能只为统一风格随意改名；如需修改，必须检查完整调用链、文档和测试。
 - 名称应体现类型和约束：布尔值使用 `is_`、`has_`、`include_` 或 `enable_`；数量使用 `*_count`、`*_limit`；路径使用 `*_path` 或 `*_root`；标识符使用 `*_id`；类型使用 `*_type`。避免使用无语义的 `data`、`info`、`value` 或缩写。
 
@@ -65,6 +65,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 - 验证与交付透明：优先运行最贴近改动的测试、静态检查或构建；交付时说明改动、验证结果、未执行项目及原因，并列出剩余风险。
 - 及时更新约束：若新增或修改了稳定接口、配置、工作流或项目规则，同步更新相关文档或 `.agents/` 专题说明。
 - 统一编码：输出、文件写入、命令和字符串均使用 UTF-8。
+- 需要commit时的日志信息需要完整但不啰嗦，不要使用"auto commits"等无价值信息
 
 ## 项目具体说明
 

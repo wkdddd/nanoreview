@@ -220,7 +220,7 @@ class EvidenceBudget:
     def from_options(
         cls,
         *,
-        token_budget: int,
+        evidence_token_budget: int,
         subagent_evidence_budget_chars: int,
         context_window_tokens: int | None,
     ) -> "EvidenceBudget":
@@ -229,7 +229,22 @@ class EvidenceBudget:
         margin = int(window * SAFETY_MARGIN_RATIO)
         usable = max(MIN_USABLE_TOKENS, window - overhead - margin)
         # Total accepted evidence also fits inside the review token budget.
-        evidence_budget = max(MIN_USABLE_TOKENS, min(token_budget, usable))
+        # A configured value above ``usable`` cannot widen the window, so
+        # record the clamp source instead of failing silently.
+        if evidence_token_budget <= MIN_USABLE_TOKENS:
+            clamp_source = "min_floor"
+        elif evidence_token_budget < usable:
+            clamp_source = "evidence_token_budget"
+        else:
+            clamp_source = "usable_window"
+        evidence_budget = max(MIN_USABLE_TOKENS, min(evidence_token_budget, usable))
+        logger.info(
+            "review.evidence.budget evidence_budget={} source={} configured={} usable_window={}",
+            evidence_budget,
+            clamp_source,
+            evidence_token_budget,
+            usable,
+        )
         # Per-subagent evidence task cap (chars -> tokens).
         task_cap = max(MIN_CHUNK_TOKENS // 2, subagent_evidence_budget_chars // 4)
         task_cap = min(task_cap, usable)
@@ -263,7 +278,7 @@ class ProgrammaticEvidenceOptions:
     ignore_dirs: set[str] = field(default_factory=lambda: set(DEFAULT_REVIEW_IGNORE_DIRS))
     ignore_globs: tuple[str, ...] = DEFAULT_REVIEW_IGNORE_GLOBS
     # Budget knobs mirrored from ReviewConfig so callers can inject config.
-    token_budget: int = 100_000
+    evidence_token_budget: int = 100_000
     prefetch_budget_chars: int = 16_000
     subagent_evidence_budget_chars: int = 24_000
     prefetch_dense_backfill_limit: int = 256
@@ -287,7 +302,7 @@ class ProgrammaticEvidenceOptions:
         if review_config is None:
             return options
         for name, attr in (
-            ("token_budget", "token_budget"),
+            ("evidence_token_budget", "evidence_token_budget"),
             ("prefetch_budget_chars", "prefetch_budget_chars"),
             ("subagent_evidence_budget_chars", "subagent_evidence_budget_chars"),
             ("prefetch_dense_backfill_limit", "prefetch_dense_backfill_limit"),
@@ -807,7 +822,7 @@ class ProgrammaticEvidenceService:
         trace_id = request.trace_id or "preproc"
         started = time.perf_counter()
         budgets = EvidenceBudget.from_options(
-            token_budget=self.options.token_budget,
+            evidence_token_budget=self.options.evidence_token_budget,
             subagent_evidence_budget_chars=self.options.subagent_evidence_budget_chars,
             context_window_tokens=request.context_window_tokens or self.options.context_window_tokens,
         )
@@ -909,7 +924,7 @@ class ProgrammaticEvidenceService:
     ) -> ProgrammaticEvidenceResult:
         """Convert diff patches into bounded diff units with budget filtering."""
         budgets = EvidenceBudget.from_options(
-            token_budget=self.options.token_budget,
+            evidence_token_budget=self.options.evidence_token_budget,
             subagent_evidence_budget_chars=self.options.subagent_evidence_budget_chars,
             context_window_tokens=context_window_tokens or self.options.context_window_tokens,
         )

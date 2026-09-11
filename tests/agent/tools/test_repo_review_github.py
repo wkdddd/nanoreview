@@ -54,7 +54,7 @@ def test_create_wires_review_config_into_preprocessor_options(tmp_path: Path) ->
     from nanoreview.config.schema import ReviewConfig
 
     review_config = ReviewConfig(
-        token_budget=50_000,
+        evidence_token_budget=50_000,
         subagent_evidence_budget_chars=12_000,
         prefetch_budget_chars=8_000,
         prefetch_dense_backfill_limit=64,
@@ -64,7 +64,7 @@ def test_create_wires_review_config_into_preprocessor_options(tmp_path: Path) ->
     tool = LocalReviewTool.create(ctx)
 
     options = tool.preprocessor.options
-    assert options.token_budget == 50_000
+    assert options.evidence_token_budget == 50_000
     assert options.subagent_evidence_budget_chars == 12_000
     assert options.prefetch_budget_chars == 8_000
     assert options.prefetch_dense_backfill_limit == 64
@@ -79,7 +79,7 @@ def test_create_without_review_config_keeps_default_options(tmp_path: Path) -> N
 
     tool = GitHubReviewTool.create(ctx)
 
-    assert tool.preprocessor.options.token_budget == 100_000
+    assert tool.preprocessor.options.evidence_token_budget == 100_000
     assert tool.preprocessor.options.subagent_evidence_budget_chars == 24_000
 
 

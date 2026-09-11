@@ -21,7 +21,6 @@ def _plan() -> ReviewPlan:
         target_name="workspace",
         target_type="local",
         action=ReviewAction.REPO,
-        depth="full",
         roles=list(ALL_REVIEW_ROLES.values()),
         routing_mode="auto",
         user_requirements="review auth",

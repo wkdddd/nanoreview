@@ -312,6 +312,10 @@ class AgentLoop:
             reasoning_effort=self._resolve_subagent_reasoning_effort(),
             llm_wall_timeout_for_session=lambda sk: None,
             execution_profiles=reviewer_execution_profiles(),
+            # Subagents share the loop's context window so the runner trims
+            # reviewer history the same way as the main agent's conversation.
+            context_window_tokens=self.context_window_tokens,
+            context_block_limit=self.context_block_limit,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -450,7 +454,7 @@ class AgentLoop:
         self.model = model
         self.context_window_tokens = context_window_tokens
         self.runner.provider = provider
-        self.subagents.set_provider(provider, model)
+        self.subagents.set_provider(provider, model, context_window_tokens)
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
@@ -1134,9 +1138,6 @@ class AgentLoop:
                                 review_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS)
                                 or getattr(self.review_config, "max_concurrent_subagents", 4)
                             ),
-                            token_budget=int(
-                                getattr(self.review_config, "token_budget", 100_000)
-                            ),
                             result_callback=_persist_automatic_subagent_result,
                         ),
                         validation_workspace=validation_workspace,
@@ -1717,7 +1718,7 @@ class AgentLoop:
         这个方法是一个「状态机引擎」，由以下状态组成：
         1. RESTORE：恢复上次中断的检查点
         2. COMPACT：根据需要进行会话池压缩
-        3. COMMAND：常疗判断是否是命令（如 /stop）
+        3. COMMAND：判断是否是命令（如 /stop）
         4. BUILD：构建 LLM 的初始提示词
         5. RUN：实际调用 LLM 并执行工具
         6. SAVE：保存轮下消息到 session

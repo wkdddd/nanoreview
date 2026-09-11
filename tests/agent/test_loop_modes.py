@@ -607,8 +607,6 @@ async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> No
         max_iterations=13,
         max_tokens=777,
         timeout_seconds=30,
-        input_tokens=120,
-        quota_tokens=12_240,
     )
     status = SubagentStatus(
         task_id="task-limits",
@@ -630,9 +628,6 @@ async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> No
     assert runner.specs[0].max_iterations == 13
     assert runner.specs[0].max_tokens == 777
     result = manager.drain_session_results("cli:direct", limit=1)[0]
-    assert result.metadata["subagent_input_tokens"] == 120
-    assert result.metadata["subagent_quota_tokens"] == 12_240
-    assert result.metadata["subagent_max_rounds"] == 13
     assert result.metadata["subagent_max_tokens"] == 777
     assert result.metadata["subagent_timeout_seconds"] == 30
 
@@ -663,8 +658,6 @@ async def test_subagent_timeout_announces_error_with_budget_metadata(tmp_path) -
             max_iterations=10,
             max_tokens=100,
             timeout_seconds=0.001,
-            input_tokens=10,
-            quota_tokens=12_000,
         ),
     )
 
@@ -673,7 +666,79 @@ async def test_subagent_timeout_announces_error_with_budget_metadata(tmp_path) -
     result = manager.drain_session_results("cli:direct", limit=1)[0]
     assert result.metadata["subagent_status"] == "error"
     assert "timed out" in result.metadata["subagent_result"]
-    assert result.metadata["subagent_quota_tokens"] == 12_000
+
+
+@pytest.mark.asyncio
+async def test_subagent_forwards_context_window_tokens_to_runner(tmp_path) -> None:
+    """Regression: subagent AgentRunSpec must carry the manager's window.
+
+    Before this wiring the subagent path left ``context_window_tokens``
+    unset, so ``runner._snip_history`` skipped trimming and long reviewer
+    runs grew unbounded.
+    """
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+        context_window_tokens=32_768,
+    )
+    runner = SpecCapturingRunner()
+    manager.runner = runner  # type: ignore[assignment]
+    status = SubagentStatus(
+        task_id="task-window",
+        label="generic",
+        task_description="windowed task",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task-window",
+        "windowed task",
+        "generic",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+    )
+
+    assert len(runner.specs) == 1
+    assert runner.specs[0].context_window_tokens == 32_768
+
+
+@pytest.mark.asyncio
+async def test_subagent_set_provider_updates_context_window_tokens(tmp_path) -> None:
+    """Regression: a runtime model switch must not leave a stale window.
+
+    ``set_provider`` mirrors ``Consolidator.set_provider`` and forwards the
+    snapshot's window so subagents spawned after the switch trim against
+    the new model's context window.
+    """
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+        context_window_tokens=32_768,
+    )
+    runner = SpecCapturingRunner()
+    manager.runner = runner  # type: ignore[assignment]
+    manager.set_provider(DummyProvider(), "switched-model", 131_072)
+
+    status = SubagentStatus(
+        task_id="task-switch",
+        label="generic",
+        task_description="post-switch task",
+        started_at=0.0,
+    )
+    await manager._run_subagent(
+        "task-switch",
+        "post-switch task",
+        "generic",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+    )
+
+    assert len(runner.specs) == 1
+    assert runner.specs[0].context_window_tokens == 131_072
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,6 @@ from nanoreview.review.types import (
     FileSkipSummary,
     FindingVerdict,
     GitHubDiffEvidence,
-    ReviewBudgetSkip,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
@@ -68,7 +67,6 @@ class ReviewFinalizer:
         remote_diff: GitHubDiffEvidence | None = None,
         routing_mode: str = "explicit",
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
-        budget_skipped: list[ReviewBudgetSkip] | tuple[ReviewBudgetSkip, ...] = (),
         skipped_files: list[FileSkipSummary] | tuple[FileSkipSummary, ...] = (),
     ) -> None:
         self._workspace = workspace
@@ -86,7 +84,6 @@ class ReviewFinalizer:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
         self._routing_mode = routing_mode
         self._selected_dimensions = tuple(selected_dimensions or ())
-        self._budget_skipped = tuple(budget_skipped)
         self._skipped_files = tuple(skipped_files)
         self._judge_stats: ReviewJudgeStats | None = None
 
@@ -383,7 +380,6 @@ class ReviewFinalizer:
                 self._dimensions,
                 routing_mode=self._routing_mode,
                 selected_dimensions=self._selected_dimensions,
-                budget_skipped=self._budget_skipped,
                 skipped_files=self._skipped_files,
                 judge_stats=self._judge_stats,
             )

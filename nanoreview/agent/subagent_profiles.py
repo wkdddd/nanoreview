@@ -22,8 +22,6 @@ class SubagentExecutionLimits:
     max_iterations: int | None = None
     max_tokens: int | None = None
     timeout_seconds: float | None = None
-    input_tokens: int | None = None
-    quota_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

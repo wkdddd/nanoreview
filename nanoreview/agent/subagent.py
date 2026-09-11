@@ -52,6 +52,8 @@ class SubagentManager:
         llm_wall_timeout_for_session: Callable[[str | None], float | None]
         | None = None,
         execution_profiles: dict[str, SubagentExecutionProfile] | None = None,
+        context_window_tokens: int | None = None,
+        context_block_limit: int | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -73,6 +75,16 @@ class SubagentManager:
             else defaults.max_concurrent_subagents
         )
         self.reasoning_effort = reasoning_effort
+        # Context window wiring mirrors AgentLoop: the runner trims history
+        # to this window, so subagents get the same protection as the main
+        # agent. None keeps the runner's no-trim behaviour for callers that
+        # manage context themselves.
+        self.context_window_tokens = (
+            context_window_tokens
+            if context_window_tokens is not None
+            else defaults.context_window_tokens
+        )
+        self.context_block_limit = context_block_limit
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._execution_profiles = {
@@ -234,10 +246,23 @@ class SubagentManager:
     def soft_tool_error_tools(profile: SubagentExecutionProfile) -> frozenset[str]:
         return profile.soft_tool_error_tools
 
-    def set_provider(self, provider: LLMProvider, model: str) -> None:
+    def set_provider(
+        self,
+        provider: LLMProvider,
+        model: str,
+        context_window_tokens: int | None = None,
+    ) -> None:
+        """Swap provider/model for future subagents.
+
+        ``context_window_tokens`` mirrors ``Consolidator.set_provider`` so a
+        runtime model switch also updates the window used for history
+        trimming; without it new subagents would keep the old window value.
+        """
         self.provider = provider
         self.model = model
         self.runner.provider = provider
+        if context_window_tokens is not None:
+            self.context_window_tokens = context_window_tokens
 
     async def spawn(
         self,
@@ -471,6 +496,20 @@ class SubagentManager:
             )
             effective_max_tokens = execution_limits.max_tokens if execution_limits else None
             timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
+            # One info record of the actually effective limits replaces the
+            # per-result metadata observability (quota/input estimates were
+            # removed with the budget admission gate).
+            logger.info(
+                "subagent.limits task_id={} label={} max_iterations={} max_tokens={} "
+                "timeout_seconds={} context_window_tokens={} context_block_limit={}",
+                task_id,
+                label,
+                effective_iterations,
+                effective_max_tokens,
+                timeout_seconds,
+                self.context_window_tokens,
+                self.context_block_limit,
+            )
             timeout_scope = (
                 asyncio.timeout(
                     max(0.0, timeout_seconds - (time.monotonic() - lifecycle_started_at))
@@ -497,6 +536,12 @@ class SubagentManager:
                         checkpoint_callback=_on_checkpoint,
                         session_key=sess_key,
                         llm_timeout_s=llm_timeout,
+                        # Route the subagent through the same context-window
+                        # trimming as the main agent (runner._snip_history);
+                        # without this value the runner skips trimming and
+                        # long reviewer runs grow unbounded.
+                        context_window_tokens=self.context_window_tokens,
+                        context_block_limit=self.context_block_limit,
                     )
                 )
                 status.stop_reason = result.stop_reason
@@ -703,12 +748,6 @@ class SubagentManager:
         if usage:
             metadata["subagent_usage"] = dict(usage)
         if execution_limits is not None:
-            if execution_limits.input_tokens is not None:
-                metadata["subagent_input_tokens"] = execution_limits.input_tokens
-            if execution_limits.quota_tokens is not None:
-                metadata["subagent_quota_tokens"] = execution_limits.quota_tokens
-            if execution_limits.max_iterations is not None:
-                metadata["subagent_max_rounds"] = execution_limits.max_iterations
             if execution_limits.max_tokens is not None:
                 metadata["subagent_max_tokens"] = execution_limits.max_tokens
             if execution_limits.timeout_seconds is not None:

@@ -60,6 +60,18 @@
 - Risks/tests: loop 对工具错误、空工具结果、取消、三段式上下文压缩、异步评论处理和后台任务 join 有专门测试（`internal/llmloop/*_test.go`）；迁移其设计时需保留停止原因、会话记录和压缩并发边界。
 - Last checked: 2026-09-03
 
+## open-code-review 的预算控制（已核查）
+- Root: `C:\Users\Administrator\Desktop\open-code-review`
+- Commit: `e95bdda`
+- Scope: `internal/agent`、`internal/llmloop` 的 token 预算与上下文压缩机制
+- Entry points: `internal/agent/estimate.go:estimateDiffFileTokens`、`internal/agent/agent.go:625`（滚动预算闸门）、`internal/llmloop/loop.go:345`（`resp.Usage` atomic 累加）、`internal/llmloop/compression.go:19-22`（60%/80% 三段压缩阈值）
+- Behavior: dispatch 循环在获取并发槽前做逐文件预算前瞻（已用 + 下一文件估算 > 预算即停止调度，在途 worker 不取消，超限有界）；实际用量由每个 LLM 响应的 `resp.Usage` atomic 累加，闸门基于实测值而非估算；上下文在 60% 窗口异步后台压缩、80% 同步立即压缩（LLM 摘要而非丢弃）。预算用尽是受控覆盖截断（recordWarning + failed(budget) 归因），不是 run 失败。
+- Contracts: `MaxTokensBudget` 为 opt-in 配置，默认 0 表示不限制；压缩阈值常量以 `PromptTokenLimit` 单点定义供 agent/scan 预检共享。
+- Current mapping: NanoReview 无等价总预算闸门（有意删除了 orchestration 的 `_admit_assignments` 越权准入）；证据侧总量由 `review.evidence_token_budget`（受 `EvidenceBudget.from_options` 的 usable 窗口钳制）控制，单请求尺寸由 `context_window_tokens`（主 agent 与 subagent 均接通 runner 裁剪）控制。
+- Differences: OCR 按文件并行（同质、可截断、N 个由数据驱动），预算用尽即 break 只损失覆盖面；NanoReview 按维度并行（异质、语义互补、4 个固定），静默丢维度会破坏用户显式选择或 planner 决策，故 OCR 的"预算用尽即 break"不可移植。若日后需要成本上限，应按 OCR 做法独立加 opt-in 的实测闸门（Usage 累加 + 默认 0 不限制），而非复用证据预算项。
+- Risks/tests: NanoReview 当前无压缩式上下文管理（OCR 的 60%/80% 三段压缩更成熟但需压缩模板与后台任务管理），reviewer 长会话仅靠 runner 硬裁剪兜底；压缩式上下文管理作为独立后续议题。
+- Last checked: 2026-09-11
+
 ## 摘要记录格式
 
 为每个参考项目或功能建立一条短记录，使用以下字段：

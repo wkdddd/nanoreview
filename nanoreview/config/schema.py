@@ -262,7 +262,10 @@ class ReviewConfig(Base):
     default_focus: list[str] = Field(default_factory=list)
     max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None
-    token_budget: int = Field(default=100_000, ge=10_000)
+    # Upper bound on accepted evidence tokens. The effective budget is also
+    # clamped by the provider context window (see EvidenceBudget.from_options);
+    # values above the usable window cannot widen it.
+    evidence_token_budget: int = Field(default=100_000, ge=10_000)
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
     prefetch_dense_backfill_limit: int = Field(default=256, ge=0)
     subagent_evidence_budget_chars: int = Field(default=24_000, ge=4_000)
