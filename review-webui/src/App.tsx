@@ -25,7 +25,7 @@ import {
   loadSavedSecret,
   saveSecret,
 } from "@/lib/bootstrap";
-import { fetchReviewerProfiles, fetchSessionMessages, fetchWebuiThread } from "@/lib/api";
+import { fetchReviewerProfiles, fetchReviewReport, fetchSessionMessages, fetchWebuiThread } from "@/lib/api";
 import { NanobotClient } from "@/lib/nanobot-client";
 import type {
   ChatSummary,
@@ -458,6 +458,43 @@ function ReviewAppShell({
             .map(sessionMessageToUIMessage)
             .filter((message): message is UIMessage => message !== null);
         }
+        // The persisted report artifact is the authoritative final report;
+        // sessions without one (e.g. legacy chats) keep the transcript report.
+        const reviewRunId = session?.reviewRunId;
+        const reviewStatus = session?.reviewStatus;
+        const reviewReportRef = session?.reviewReportRef;
+        let reportError: string | null = null;
+        let reviewInfo: Parameters<typeof loadHistory>[5];
+        try {
+          const report = await fetchReviewReport({ token, refreshAuth }, key);
+          if (report) {
+            reviewInfo = {
+              reportMarkdown: report.artifact.report_markdown,
+              runId: report.run_id,
+              reportRef: reviewReportRef ?? null,
+              status: report.status ?? reviewStatus ?? null,
+            };
+          } else if (reviewRunId) {
+            // The session metadata claims a review run, but no report artifact
+            // is available — surface the gap instead of silently falling back.
+            reviewInfo = {
+              runId: reviewRunId,
+              reportRef: reviewReportRef ?? null,
+              status: reviewStatus ?? null,
+            };
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Failed to load review report";
+          console.error("Failed to load review report", error);
+          reportError = message;
+          if (reviewRunId) {
+            reviewInfo = {
+              runId: reviewRunId,
+              reportRef: reviewReportRef ?? null,
+              status: reviewStatus ?? null,
+            };
+          }
+        }
         if (historyRequestRef.current !== requestId) return;
         const task = taskFromHistory(session, messages) ?? historyTaskFallback(session);
         const existing = historyCacheRef.current.get(key);
@@ -470,7 +507,15 @@ function ReviewAppShell({
           chatMessages: cachedChatMessages,
           subagentCards: persistedThread?.subagentCards ?? [],
         });
-        loadHistory(messages, task, undefined, cachedChatMessages, persistedThread?.subagentCards ?? []);
+        if (reportError) setSessionError(reportError);
+        loadHistory(
+          messages,
+          task,
+          reportError,
+          cachedChatMessages,
+          persistedThread?.subagentCards ?? [],
+          reviewInfo,
+        );
       } catch (error) {
         if (historyRequestRef.current !== requestId) return;
         const message = error instanceof Error ? error.message : "Failed to load review session";

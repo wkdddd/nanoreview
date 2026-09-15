@@ -30,6 +30,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
+from nanoreview.agent.review_state import ReviewArtifactError, ReviewArtifactStore
 from nanoreview.bus.events import OUTBOUND_META_AGENT_UI, InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.channels.base import BaseChannel
@@ -37,8 +38,9 @@ from nanoreview.command.builtin import builtin_command_palette
 from nanoreview.config.paths import get_media_dir
 from nanoreview.config.schema import Base, Config
 from nanoreview.review import normalize_review_action, normalize_review_target_type
-from nanoreview.review.profiles import public_reviewer_profiles
 from nanoreview.review.input import parse_repo_target
+from nanoreview.review.profiles import public_reviewer_profiles
+from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import safe_filename
 from nanoreview.utils.media_decode import (
     FileSizeExceeded,
@@ -715,6 +717,11 @@ class WebSocketChannel(BaseChannel):
         if m:
             return self._handle_webui_thread_get(request, m.group(1))
 
+        # Read-only review report artifact (one-shot ReviewAgent sessions).
+        m = re.match(r"^/api/sessions/([^/]+)/review-report$", got)
+        if m:
+            return self._handle_review_report_get(request, m.group(1))
+
         m = re.match(r"^/api/sessions/([^/]+)/code-context$", got)
         if m:
             return self._handle_code_context_get(request, m.group(1))
@@ -1074,6 +1081,23 @@ class WebSocketChannel(BaseChannel):
             return _http_error(404, "webui thread not found")
         return _http_json_response(data)
 
+    def _handle_review_report_get(self, request: WsRequest, key: str) -> Response:
+        """Serve the persisted review report artifact (read-only)."""
+        if not self._check_api_token(request):
+            return _http_error(401, "Unauthorized")
+        if self._session_manager is None:
+            return _http_error(503, "session manager unavailable")
+        decoded_key = _decode_api_key(key)
+        if decoded_key is None:
+            return _http_error(400, "invalid session key")
+        try:
+            payload = self._review_report_payload(decoded_key)
+        except ReviewArtifactError as exc:
+            return _http_error(exc.status, exc.reason)
+        if payload is None:
+            return _http_error(404, "session not found")
+        return _http_json_response(payload)
+
     def _handle_code_context_get(self, request: WsRequest, key: str) -> Response:
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
@@ -1127,6 +1151,44 @@ class WebSocketChannel(BaseChannel):
             scrub_subagent_messages_for_channel(messages)
         self._augment_media_urls(data)
         return data
+
+    def _review_report_payload(self, key: str) -> dict[str, Any] | None:
+        """Load the persisted review report artifact for a session.
+
+        Returns the verified artifact payload, ``None`` when the session does
+        not exist, or raises :class:`ReviewArtifactError` (404/409) when the
+        session has no report reference or the artifact fails verification.
+        """
+        if self._session_manager is None:
+            raise RuntimeError("session manager unavailable")
+        if not self._is_websocket_channel_session_key(key):
+            return None
+        data = self._session_manager.read_session_file(key)
+        if data is None:
+            return None
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ReviewArtifactError("session has no review report", status=404)
+        run_id = metadata.get(ReviewMetaKey.RUN_ID)
+        fingerprint = metadata.get(ReviewMetaKey.INPUT_FINGERPRINT)
+        report_ref = metadata.get(ReviewMetaKey.REPORT_REF)
+        if not isinstance(run_id, str) or not run_id:
+            raise ReviewArtifactError("session has no review report", status=404)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ReviewArtifactError("session has no review report", status=404)
+        # ``review_report_ref`` is the stable wire reference; it must agree
+        # with the run id that produced it before any artifact is served.
+        if not isinstance(report_ref, str) or not report_ref:
+            raise ReviewArtifactError("review report not generated", status=404)
+        store = ReviewArtifactStore(self._workspace_root())
+        if report_ref != store.reference_for(run_id):
+            raise ReviewArtifactError("review report reference mismatch", status=409)
+        artifact = store.read(run_id=run_id, session_key=key, input_fingerprint=fingerprint)
+        return {
+            "run_id": run_id,
+            "status": metadata.get(ReviewMetaKey.STATUS),
+            "artifact": artifact,
+        }
 
     def _webui_thread_payload(self, key: str) -> dict[str, Any] | None:
         if not self._is_websocket_channel_session_key(key):
@@ -1723,6 +1785,23 @@ class WebSocketChannel(BaseChannel):
             return web.json_response({"error": "webui thread not found"}, status=404)
         return web.json_response(payload)
 
+    async def _aiohttp_review_report(self, request: web.Request) -> web.Response:
+        """GET /api/sessions/{key}/review-report — read-only report artifact."""
+        if not self._check_aiohttp_api_token(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        key = _decode_api_key(request.match_info["key"])
+        if key is None:
+            return web.json_response({"error": "invalid session key"}, status=400)
+        try:
+            payload = self._review_report_payload(key)
+        except ReviewArtifactError as exc:
+            return web.json_response({"error": exc.reason}, status=exc.status)
+        except RuntimeError as exc:
+            return web.json_response({"error": str(exc)}, status=503)
+        if payload is None:
+            return web.json_response({"error": "session not found"}, status=404)
+        return web.json_response(payload)
+
     async def _aiohttp_code_context(self, request: web.Request) -> web.Response:
         if not self._check_aiohttp_api_token(request):
             return web.json_response({"error": "Unauthorized"}, status=401)
@@ -1928,6 +2007,7 @@ class WebSocketChannel(BaseChannel):
         app.router.add_get("/api/review/profiles", self._aiohttp_review_profiles)
         app.router.add_get("/api/sessions/{key}/messages", self._aiohttp_session_messages)
         app.router.add_get("/api/sessions/{key}/webui-thread", self._aiohttp_webui_thread)
+        app.router.add_get("/api/sessions/{key}/review-report", self._aiohttp_review_report)
         app.router.add_get("/api/sessions/{key}/code-context", self._aiohttp_code_context)
         app.router.add_post("/api/sessions/{key}/delete", self._aiohttp_session_delete)
         app.router.add_get("/api/sessions/{key}/delete", self._aiohttp_session_delete)

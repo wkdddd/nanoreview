@@ -1,4 +1,9 @@
-"""Program-controlled review planning, dispatch, and finalization."""
+"""Program-controlled review planning, dispatch, and finalization.
+
+Legacy implementation kept as a compatibility shell while the ReviewAgent
+supervisor (``agent/loop.py`` + ``agent/review_state.py``) takes ownership of
+run state and artifacts. New orchestration behavior must not grow here.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +15,13 @@ from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanoreview.agent.review_state import JudgeBatchState, ReviewPhase, ReviewRunState
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
-from nanoreview.review.output.finalizer import ReviewFinalizer
+from nanoreview.review.output.finalizer import ReviewFinalizer, ReviewFinalizerResult
 from nanoreview.review.output.judge import ReviewJudge
 from nanoreview.review.types import (
     EvidenceReference,
@@ -81,6 +87,15 @@ class ReviewExecutionContext:
     result_callback: Callable[[Any], Awaitable[None]] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewExecutionOutcome:
+    """Rich result of one review execution for the ReviewAgent supervisor."""
+
+    report_markdown: str
+    finalizer_result: ReviewFinalizerResult
+    assignments: tuple[ReviewAssignment, ...]
+
+
 class ReviewOrchestrator:
     """Execute a review without exposing subagent output to the coordinator."""
 
@@ -121,6 +136,39 @@ class ReviewOrchestrator:
         local_target: str | None = None,
         remote_diff: Any | None = None,
     ) -> str:
+        """Compatibility shell: run the review and return only report markdown."""
+        outcome = await self.execute_run(
+            coordinator_messages=coordinator_messages,
+            plan=plan,
+            evidence=evidence,
+            context=context,
+            validation_workspace=validation_workspace,
+            changed_files=changed_files,
+            local_target=local_target,
+            remote_diff=remote_diff,
+        )
+        return outcome.report_markdown
+
+    async def execute_run(
+        self,
+        *,
+        coordinator_messages: list[dict[str, Any]],
+        plan: ReviewPlan,
+        evidence: ReviewEvidenceBundle,
+        context: ReviewExecutionContext,
+        validation_workspace: str,
+        changed_files: list[str] | None = None,
+        local_target: str | None = None,
+        remote_diff: Any | None = None,
+        run_state: "ReviewRunState | None" = None,
+    ) -> ReviewExecutionOutcome:
+        """Execute the review and return the full outcome for the supervisor.
+
+        ``run_state`` is optional in-process observability: when provided, it is
+        updated only at business boundaries (validated assignments, reviewer
+        terminal results, judge application, finalization) — never with tasks,
+        clients, or callbacks.
+        """
         if not evidence.references:
             if plan.action.value == "diff" and plan.target_type == "local":
                 raise ReviewPlanningError(
@@ -142,6 +190,11 @@ class ReviewOrchestrator:
             plan=plan,
             evidence=evidence,
         )
+        if run_state is not None:
+            run_state.enter_phase(ReviewPhase.REVIEW)
+            run_state.assignments = tuple(assignments)
+            for assignment in assignments:
+                run_state.reviewer_state(assignment.dimension)
         # Every validated assignment is dispatched: dimensions are either
         # explicit user intent or planner decisions, and neither may be
         # silently dropped by a token-count gate. Evidence-side over-budget
@@ -170,9 +223,37 @@ class ReviewOrchestrator:
             limits_by_dimension=limits_by_dimension,
             context=context,
             finalizer=finalizer,
+            run_state=run_state,
         )
+        if run_state is not None:
+            run_state.enter_phase(ReviewPhase.FINALIZE)
         await finalizer.apply_judge(self._judge)
-        return finalizer.finalize(plan.target_name or plan.target or "target").report_markdown
+        if run_state is not None and self._judge is not None:
+            stats = getattr(self._judge, "last_stats", None)
+            if stats is not None:
+                batch = JudgeBatchState(
+                    batch_id="judge",
+                    status="completed",
+                    stats={
+                        "total_candidates": stats.total_candidates,
+                        "sent_candidates": stats.sent_candidates,
+                        "returned_verdicts": stats.returned_verdicts,
+                        "needs_confirmation": stats.needs_confirmation,
+                        "batches": stats.batches,
+                    },
+                )
+                run_state.judge_batches[batch.batch_id] = batch
+        finalizer_result = finalizer.finalize(
+            plan.target_name or plan.target or "target"
+        )
+        if run_state is not None:
+            for error in finalizer_result.errors:
+                run_state.add_warning(error)
+        return ReviewExecutionOutcome(
+            report_markdown=finalizer_result.report_markdown,
+            finalizer_result=finalizer_result,
+            assignments=tuple(assignments),
+        )
 
     async def _derive_execution_limits(
         self,
@@ -324,6 +405,7 @@ class ReviewOrchestrator:
         limits_by_dimension: dict[str, SubagentExecutionLimits],
         context: ReviewExecutionContext,
         finalizer: ReviewFinalizer,
+        run_state: ReviewRunState | None = None,
     ) -> None:
         pending = list(assignments)
         active = 0
@@ -343,10 +425,16 @@ class ReviewOrchestrator:
                         assignment.dimension,
                         f"Error: assignment {assignment.dimension!r} has no valid evidence references.",
                     )
+                    if run_state is not None:
+                        reviewer = run_state.reviewer_state(assignment.dimension)
+                        reviewer.status = "error"
+                        reviewer.error = "no valid evidence references"
                     logger.warning(
                         "review.dispatch.no_evidence dimension={}", assignment.dimension
                     )
                     continue
+                if run_state is not None:
+                    run_state.reviewer_state(assignment.dimension).status = "running"
                 task = self._build_subagent_task(
                     plan=plan,
                     assignment=assignment,
@@ -370,6 +458,10 @@ class ReviewOrchestrator:
                 )
                 if started.startswith("Error:"):
                     finalizer.ingest_subagent_output(assignment.dimension, started)
+                    if run_state is not None:
+                        reviewer = run_state.reviewer_state(assignment.dimension)
+                        reviewer.status = "error"
+                        reviewer.error = started
                     logger.warning("review.dispatch.failed dimension={} reason={}", assignment.dimension, started)
                 else:
                     active += 1
@@ -386,6 +478,8 @@ class ReviewOrchestrator:
             dimension = str(metadata.get("subagent_label") or "unknown")
             raw = str(metadata.get("subagent_result") or result.content)
             finalizer.ingest_subagent_output(dimension, raw)
+            if run_state is not None:
+                run_state.reviewer_state(dimension).status = "completed"
             if context.result_callback is not None:
                 await context.result_callback(result)
 

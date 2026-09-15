@@ -33,6 +33,10 @@ _SESSION_LIST_METADATA_KEYS = {
     "review_target",
     "review_target_type",
     "review_action",
+    "review_run_id",
+    "review_status",
+    "review_phase",
+    "review_report_ref",
     "pinned",
     "custom_title",
 }

@@ -2,6 +2,7 @@ import type {
   ChatSummary,
   CodeContextPayload,
   ReviewAction,
+  ReviewReportPayload,
   ReviewTargetType,
   ReviewerProfile,
   SessionMessagesPayload,
@@ -115,6 +116,10 @@ export async function listSessions(auth: ApiAuth): Promise<ChatSummary[]> {
       reviewTarget: stringField(metadata, "review_target"),
       reviewTargetType,
       reviewAction,
+      reviewRunId: stringField(metadata, "review_run_id"),
+      reviewStatus: stringField(metadata, "review_status"),
+      reviewPhase: stringField(metadata, "review_phase"),
+      reviewReportRef: stringField(metadata, "review_report_ref"),
       pinned: metadata?.pinned === true,
       customTitle: stringField(metadata, "custom_title"),
     };
@@ -174,6 +179,37 @@ export async function fetchSessionMessages(
     throw new ApiError(res.status, errorMessage(res.status, "Failed to load session messages", body));
   }
   return (await res.json()) as SessionMessagesPayload;
+}
+
+/** Fetch the persisted review report artifact for a session.
+ *
+ * Returns ``null`` when the session has no report (404) so callers can fall
+ * back to the transcript. Corruption or verification failures (409) and other
+ * HTTP errors propagate as :class:`ApiError`.
+ */
+export async function fetchReviewReport(
+  auth: ApiAuth,
+  key: string,
+): Promise<ReviewReportPayload | null> {
+  const url = `/api/sessions/${encodeURIComponent(key)}/review-report`;
+  let res = await fetchWithToken(url, auth.token);
+  if (res.status === 401) {
+    const refreshed = await auth.refreshAuth();
+    if (refreshed) {
+      res = await fetchWithToken(url, refreshed);
+    }
+  }
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {
+      // Ignore malformed error bodies; status still carries the failure.
+    }
+    throw new ApiError(res.status, errorMessage(res.status, "Failed to load review report", body));
+  }
+  return (await res.json()) as ReviewReportPayload;
 }
 
 export async function fetchCodeContext(

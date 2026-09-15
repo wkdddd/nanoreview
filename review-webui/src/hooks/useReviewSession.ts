@@ -85,6 +85,9 @@ export interface ReviewSessionState {
   error: string | null;
   messages: ChatMessage[];
   subagentCards: SubagentCard[];
+  /** One-shot ReviewAgent run identity restored from session metadata/report API. */
+  reviewRunId: string | null;
+  reviewReportRef: string | null;
 }
 
 const INITIAL_STATE: ReviewSessionState = {
@@ -101,7 +104,25 @@ const INITIAL_STATE: ReviewSessionState = {
   error: null,
   messages: [],
   subagentCards: [],
+  reviewRunId: null,
+  reviewReportRef: null,
 };
+
+/** Server review run status (``review_status``) mapped onto UI phases. */
+function phaseFromReviewStatus(status: string | undefined): ReviewPhase | null {
+  switch (status) {
+    case "running":
+      return "reviewing";
+    case "completed":
+      return "completed";
+    case "error":
+      return "error";
+    case "stopped":
+      return "stopped";
+    default:
+      return null;
+  }
+}
 
 function labelValue(value: string | undefined, fallback = "auto"): string {
   const trimmed = value?.trim();
@@ -661,6 +682,13 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
     error: string | null = null,
     preConverted?: ChatMessage[],
     subagentCards: SubagentCard[] = [],
+    review?: {
+      /** Report markdown from the persisted artifact; takes priority over the transcript. */
+      reportMarkdown?: string;
+      runId?: string | null;
+      reportRef?: string | null;
+      status?: string | null;
+    },
   ) => {
     let chatMessages = preConverted ?? messages
       .map(uiMessageToChatMessage)
@@ -688,9 +716,13 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       }
     }
 
-    const reportMarkdown = [...chatMessages].reverse().find((message) => message.type === "report")?.content ?? "";
-    const inferredPhase = error ? "error" : completedOrStoppedPhase(chatMessages);
-    const phase = reviewInProgressRef.current && !error ? "reviewing" : inferredPhase;
+    // The persisted report artifact is authoritative; fall back to the last
+    // report message in the transcript for sessions without one.
+    const transcriptMarkdown = [...chatMessages].reverse().find((message) => message.type === "report")?.content ?? "";
+    const reportMarkdown = review?.reportMarkdown?.trim() ? review.reportMarkdown : transcriptMarkdown;
+    const statusPhase = phaseFromReviewStatus(review?.status ?? undefined);
+    const inferredPhase = statusPhase ?? completedOrStoppedPhase(chatMessages);
+    const phase = error ? "error" : (reviewInProgressRef.current ? "reviewing" : inferredPhase);
     setState(stateWithReport({
       ...INITIAL_STATE,
       phase,
@@ -698,6 +730,8 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       error,
       messages: chatMessages,
       subagentCards,
+      reviewRunId: review?.runId ?? null,
+      reviewReportRef: review?.reportRef ?? null,
     }, reportMarkdown));
     reportBufferRef.current = "";
     assistantCarrierRef.current = placeholderId;
@@ -721,6 +755,8 @@ export function useReviewSession(client: NanobotClient, chatId: string | null) {
       rejectedCount: 0,
       reportMarkdown: "",
       subagentCards: [],
+      reviewRunId: null,
+      reviewReportRef: null,
       messages: [
         ...prev.messages,
         {

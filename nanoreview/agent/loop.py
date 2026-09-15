@@ -25,6 +25,17 @@ from nanoreview.agent.orchestration import (
     ReviewOrchestrator,
     ReviewPlanningError,
 )
+from nanoreview.agent.review_state import (
+    REVIEW_TERMINAL_STATUSES,
+    ReviewArtifactStore,
+    ReviewPhase,
+    ReviewRunState,
+    ReviewRunStatus,
+    build_report_artifact,
+    compute_review_input_fingerprint,
+    new_review_run_id,
+    serialize_finalizer_result,
+)
 from nanoreview.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
     AgentRunner,
@@ -137,6 +148,17 @@ class TurnContext:
 def _is_review_turn(metadata: dict[str, Any] | None) -> bool:
     meta = metadata or {}
     return bool(meta.get(ReviewMetaKey.TARGET) or meta.get("review_target"))
+
+
+def _is_internal_event(msg: InboundMessage) -> bool:
+    """Subagent results and system events bypass review session gating."""
+    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+    return (
+        msg.channel == "system"
+        or msg.sender_id == "subagent"
+        or meta.get("injected_event")
+        in ("subagent_result", "subagent_barrier")
+    )
 
 
 def _is_consumed_subagent_result(
@@ -327,6 +349,12 @@ class AgentLoop:
         # When a session has an active task, new messages for that session
         # are routed here instead of creating a new task.
         self._pending_queues: dict[str, asyncio.Queue] = {}
+        # One-shot ReviewAgent runs: session_key -> ReviewRunState. A session
+        # with an entry here (running or terminal) is gated against ordinary
+        # follow-up messages; only /status, /stop and internal subagent/system
+        # events stay available.
+        self._review_runs: dict[str, ReviewRunState] = {}
+        self._review_artifact_store: ReviewArtifactStore | None = None
         self._permission_futures: dict[str, asyncio.Future[bool]] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = self._parse_max_concurrent_requests()
@@ -760,6 +788,143 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    # -- One-shot review run supervision -------------------------------------
+
+    def _review_artifacts(self) -> ReviewArtifactStore:
+        if self._review_artifact_store is None:
+            self._review_artifact_store = ReviewArtifactStore(self.workspace)
+        return self._review_artifact_store
+
+    def _review_gate_response(
+        self, msg: InboundMessage, state: ReviewRunState
+    ) -> OutboundMessage:
+        """Short rejection shown when an ordinary message hits a gated session."""
+        if state.status is ReviewRunStatus.RUNNING:
+            content = (
+                "Review is already running. "
+                "Use /status to check progress or /stop to cancel."
+            )
+        elif state.status is ReviewRunStatus.COMPLETED:
+            content = (
+                "This review session is complete. "
+                "Start a new review session to run another review."
+            )
+        else:
+            content = (
+                f"This review session ended with status '{state.status.value}'. "
+                "Start a new review session to run another review."
+            )
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata=dict(msg.metadata or {}),
+        )
+
+    async def _publish_review_gate_response(
+        self, msg: InboundMessage, state: ReviewRunState
+    ) -> None:
+        """Publish a gate rejection plus a websocket turn-end marker."""
+        await self.bus.publish_outbound(self._review_gate_response(msg, state))
+        if msg.channel == "websocket":
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="",
+                    metadata={**dict(msg.metadata or {}), "_turn_end": True},
+                )
+            )
+
+    def reset_review_run(self, session_key: str) -> None:
+        """Drop the one-shot review gate for a session (used by /new)."""
+        self._review_runs.pop(session_key, None)
+        session = self.sessions.get_or_create(session_key)
+        changed = False
+        for key in (
+            ReviewMetaKey.RUN_ID,
+            ReviewMetaKey.STATUS,
+            ReviewMetaKey.PHASE,
+            ReviewMetaKey.REPORT_REF,
+            ReviewMetaKey.INPUT_FINGERPRINT,
+        ):
+            if key in session.metadata:
+                session.metadata.pop(key, None)
+                changed = True
+        if changed:
+            self.sessions.save(session)
+
+    def _review_metadata_gate(
+        self, session: Session, msg: InboundMessage
+    ) -> OutboundMessage | None:
+        """Gate ordinary messages on persisted review session metadata.
+
+        Covers sessions whose review run state is not in this process
+        (process restart, WebSocket retry against an old session): when the
+        session file carries a terminal review status — or a running status
+        with no live run — ordinary messages must not enter the review
+        history or context. Returns the rejection response, or None to let
+        the message through.
+        """
+        if _is_internal_event(msg):
+            return None
+        status_value = session.metadata.get(ReviewMetaKey.STATUS)
+        if not isinstance(status_value, str) or not status_value:
+            return None
+        if self._review_runs.get(session.key) is not None:
+            # A live in-process run handles gating at run()/_dispatch level.
+            return None
+        try:
+            status = ReviewRunStatus(status_value)
+        except ValueError:
+            return None
+        state = ReviewRunState(
+            run_id=str(session.metadata.get(ReviewMetaKey.RUN_ID) or "unknown"),
+            session_key=session.key,
+            input_fingerprint="",
+            status=status,
+        )
+        logger.info(
+            "review.gate.metadata_rejected session={} status={}",
+            session.key,
+            status.value,
+        )
+        return self._review_gate_response(msg, state)
+
+    def _finalize_review_run(
+        self,
+        session_key: str,
+        status: ReviewRunStatus,
+        *,
+        warning: str | None = None,
+    ) -> None:
+        """Move a running review run to a terminal status and persist metadata.
+
+        A run that never entered the review pipeline (phase still PREPARE)
+        simply releases the gate — the session stays usable instead of being
+        permanently closed by a turn that failed before planning.
+        """
+        state = self._review_runs.get(session_key)
+        if state is None or state.status is not ReviewRunStatus.RUNNING:
+            return
+        if state.phase is ReviewPhase.PREPARE:
+            self._review_runs.pop(session_key, None)
+            return
+        state.status = status
+        state.phase = ReviewPhase.DONE
+        if warning:
+            state.add_warning(warning)
+        session = self.sessions.get_or_create(session_key)
+        session.metadata.update(state.metadata_payload())
+        self.sessions.save(session)
+        logger.info(
+            "review.run.finalized session={} run_id={} status={} report_ref={}",
+            session_key,
+            state.run_id,
+            state.status.value,
+            state.report_ref,
+        )
+
     def _replay_token_budget(self) -> int:
         """Derive a token budget for session history replay from the context window."""
         if self.context_window_tokens <= 0:
@@ -1115,6 +1280,27 @@ class AgentLoop:
                     self.sessions.save(session)
 
             if review_preparation.plan is not None and review_preparation.evidence is not None:
+                # The review pipeline is confirmed for this run: record the
+                # plan identity, compute the input fingerprint shared by the
+                # run state / report artifact / session metadata, and persist
+                # the running status so restarts and /status can see it.
+                run_state = self._review_runs.get(active_session_key)
+                if run_state is not None:
+                    run_state.enter_phase(ReviewPhase.PLAN)
+                    run_state.plan = review_preparation.plan
+                    run_state.input_fingerprint = compute_review_input_fingerprint(
+                        review_preparation.plan,
+                        review_preparation.evidence,
+                    )
+                    if session is not None:
+                        session.metadata.update(run_state.metadata_payload())
+                        self.sessions.save(session)
+                        logger.info(
+                            "review.run.started session={} run_id={} fingerprint={}",
+                            active_session_key,
+                            run_state.run_id,
+                            run_state.input_fingerprint[:12],
+                        )
                 orchestrator = ReviewOrchestrator(
                     runner=self.runner,
                     subagentmanager=self.subagents,
@@ -1124,7 +1310,7 @@ class AgentLoop:
                     judge=self._build_review_judge(),
                 )
                 try:
-                    final_content = await orchestrator.execute(
+                    outcome = await orchestrator.execute_run(
                         coordinator_messages=initial_messages,
                         plan=review_preparation.plan,
                         evidence=review_preparation.evidence,
@@ -1144,7 +1330,35 @@ class AgentLoop:
                         changed_files=changed_files,
                         local_target=local_target if isinstance(local_target, str) else None,
                         remote_diff=remote_diff,
+                        run_state=run_state,
                     )
+                    final_content = outcome.report_markdown
+                    if run_state is not None:
+                        run_state.enter_phase(ReviewPhase.SAVE)
+                        findings, verdicts = serialize_finalizer_result(
+                            outcome.finalizer_result
+                        )
+                        run_state.findings = findings
+                        report_ref = self._review_artifacts().write(
+                            build_report_artifact(
+                                run_state,
+                                report_markdown=final_content,
+                                verdicts=verdicts,
+                            )
+                        )
+                        if report_ref is not None:
+                            run_state.report_ref = report_ref
+                            run_state.status = ReviewRunStatus.COMPLETED
+                        else:
+                            # Artifact write failed: no review_report_ref, the
+                            # session ends in error with a recorded warning.
+                            run_state.status = ReviewRunStatus.ERROR
+                            run_state.add_warning(
+                                "Failed to persist the review report artifact."
+                            )
+                        if session is not None:
+                            session.metadata.update(run_state.metadata_payload())
+                            self.sessions.save(session)
                     result = AgentRunResult(
                         final_content=final_content,
                         messages=list(initial_messages),
@@ -1152,6 +1366,12 @@ class AgentLoop:
                     )
                 except ReviewPlanningError as exc:
                     logger.warning("review.orchestration.failed reason={}", exc)
+                    if run_state is not None:
+                        run_state.status = ReviewRunStatus.ERROR
+                        run_state.add_warning(str(exc))
+                        if session is not None:
+                            session.metadata.update(run_state.metadata_payload())
+                            self.sessions.save(session)
                     result = AgentRunResult(
                         final_content=f"## Code Review Report\n\n### Error\n\n{exc}",
                         messages=list(initial_messages),
@@ -1284,6 +1504,25 @@ class AgentLoop:
                 )
                 continue
             effective_key = self._effective_session_key(msg)
+            # Review session gate: while a review run exists for this session
+            # (running or terminal), ordinary messages are rejected before they
+            # can reach the pending queue, the session history, or the model
+            # context. Commands (/status, /stop, …) and internal subagent/system
+            # events stay available.
+            review_state = self._review_runs.get(effective_key)
+            if (
+                review_state is not None
+                and not _is_internal_event(msg)
+                and not raw.startswith("/")
+            ):
+                await self._publish_review_gate_response(msg, review_state)
+                logger.info(
+                    "review.gate.rejected session={} status={} source={}",
+                    effective_key,
+                    review_state.status.value,
+                    msg.metadata.get("injected_event") or "user_message",
+                )
+                continue
             # If this session already has an active pending queue (i.e. a task
             # is processing this session), route the message there for mid-turn
             # injection instead of creating a competing task.
@@ -1348,6 +1587,22 @@ class AgentLoop:
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        # One-shot review registration. Runs before any await so duplicate
+        # review submissions for the same session cannot race past the gate:
+        # a session executes at most one review run.
+        if (
+            _is_review_turn(msg.metadata)
+            and not _is_internal_event(msg)
+            and not msg.content.strip().startswith("/")
+        ):
+            existing_run = self._review_runs.get(session_key)
+            if existing_run is not None:
+                await self._publish_review_gate_response(msg, existing_run)
+                return
+            self._review_runs[session_key] = ReviewRunState(
+                run_id=new_review_run_id(),
+                session_key=session_key,
+            )
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         pending = asyncio.Queue(maxsize=20)
@@ -1503,6 +1758,7 @@ class AgentLoop:
 
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
+                    self._finalize_review_run(session_key, ReviewRunStatus.STOPPED)
 
                     try:
                         key = self._effective_session_key(msg)
@@ -1527,6 +1783,11 @@ class AgentLoop:
                     logger.exception(
                         "Error processing message for session {}", session_key
                     )
+                    self._finalize_review_run(
+                        session_key,
+                        ReviewRunStatus.ERROR,
+                        warning="Review turn failed with an unexpected error.",
+                    )
                     await self.bus.publish_outbound(
                         OutboundMessage(
                             channel=msg.channel,
@@ -1538,6 +1799,16 @@ class AgentLoop:
                         await publish_forced_turn_end()
 
         finally:
+            # A registered review run that never entered the review pipeline
+            # (turn failed or was rerouted before planning) releases the gate
+            # so the session stays usable.
+            run_state = self._review_runs.get(session_key)
+            if (
+                run_state is not None
+                and run_state.status is ReviewRunStatus.RUNNING
+                and run_state.phase is ReviewPhase.PREPARE
+            ):
+                self._review_runs.pop(session_key, None)
             queue = self._pending_queues.pop(session_key, None)
             if queue is not None:
                 leftover = 0
@@ -1574,7 +1845,7 @@ class AgentLoop:
         if self._session_locks.get(session_key) is lock:
             self._session_locks.pop(session_key, None)
 
-    async def close_mcp(self) -> None:
+    async def close_background_tasks(self) -> None:
         """Drain pending background tasks."""
         if self._background_tasks:
             tasks = list(self._background_tasks)
@@ -1815,6 +2086,18 @@ class AgentLoop:
             ),
         )
         self._remember_turn_trace(ctx.session_key, ctx.trace)
+        # Review runs reach their final DONE phase once the turn finishes and
+        # the terminal status/report reference are persisted for the API.
+        finished_run = self._review_runs.get(key)
+        if (
+            finished_run is not None
+            and finished_run.status in REVIEW_TERMINAL_STATUSES
+            and finished_run.phase is not ReviewPhase.DONE
+        ):
+            finished_run.phase = ReviewPhase.DONE
+            if ctx.session is not None:
+                ctx.session.metadata.update(finished_run.metadata_payload())
+                self.sessions.save(ctx.session)
         return ctx.outbound
 
     @staticmethod
@@ -1928,6 +2211,16 @@ class AgentLoop:
 
     async def _state_command(self, ctx: TurnContext) -> str:
         raw = ctx.msg.content.strip()
+        # Review session gate (metadata side): a session whose persisted
+        # metadata carries a review status but has no in-process run state
+        # (e.g. the process restarted mid-run) rejects ordinary messages the
+        # same way live sessions do. Commands stay available so /status can
+        # read the final state and /stop stays idempotent.
+        if ctx.session is not None and not raw.startswith("/"):
+            gate_response = self._review_metadata_gate(ctx.session, ctx.msg)
+            if gate_response is not None:
+                ctx.outbound = gate_response
+                return "shortcut"
         cmd_ctx = CommandContext(
             msg=ctx.msg, session=ctx.session, key=ctx.session_key, raw=raw, loop=self
         )
@@ -2067,6 +2360,9 @@ class AgentLoop:
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
+        run_state = self._review_runs.get(ctx.session_key)
+        if run_state is not None:
+            run_state.phase = ReviewPhase.RESPOND
         ctx.outbound = self._assemble_outbound(
             ctx.msg,
             ctx.final_content,
@@ -2390,7 +2686,6 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a message directly and return the outbound payload."""
-        await self._connect_mcp()
         msg = InboundMessage(
             channel=channel,
             sender_id="user",

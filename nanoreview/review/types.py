@@ -31,6 +31,13 @@ class ReviewMetaKey:
     GITHUB_PREFETCH_READY = "_review_github_prefetch_ready"
     DIFF_CONTEXT_WINDOW_TOKENS = "_review_diff_context_window_tokens"
     GITHUB_PR_HEAD_REF = "_review_github_pr_head_ref"
+    # One-shot ReviewAgent run state (stable wire contract consumed by
+    # WebUI/API and the report artifact API).
+    RUN_ID = "review_run_id"
+    STATUS = "review_status"
+    PHASE = "review_phase"
+    REPORT_REF = "review_report_ref"
+    INPUT_FINGERPRINT = "review_input_fingerprint"
 
 ReviewTargetType = Literal["auto", "github", "local"]
 ReviewScopeKind = Literal["file", "directory", "repo"]

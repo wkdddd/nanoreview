@@ -106,6 +106,11 @@ export interface ChatSummary {
   reviewTarget?: string;
   reviewTargetType?: ReviewTargetType;
   reviewAction?: ReviewAction;
+  /** One-shot ReviewAgent run metadata (``review_run_id`` etc. from session metadata). */
+  reviewRunId?: string;
+  reviewStatus?: string;
+  reviewPhase?: string;
+  reviewReportRef?: string;
   pinned?: boolean;
   customTitle?: string;
 }
@@ -334,6 +339,27 @@ export interface OutboundReviewContext {
   target?: string;
   action?: ReviewAction;
   focus?: ReviewFocus[];
+}
+
+/** Review report artifact persisted server-side for one finished review run. */
+export interface ReviewReportArtifact {
+  run_id: string;
+  session_key?: string;
+  status: string;
+  input_fingerprint?: string;
+  report_markdown: string;
+  findings?: Array<Record<string, unknown>>;
+  verdicts?: Array<Record<string, unknown>>;
+  usage?: Record<string, number>;
+  warnings?: string[];
+  created_at?: string;
+}
+
+/** Response shape for ``GET .../review-report`` (read-only report artifact). */
+export interface ReviewReportPayload {
+  run_id: string;
+  status?: string;
+  artifact: ReviewReportArtifact;
 }
 
 /** Response shape for ``GET .../webui-thread`` (server-built transcript replay). */

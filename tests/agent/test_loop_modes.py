@@ -1412,14 +1412,27 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
 
 @pytest.mark.asyncio
 async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, monkeypatch) -> None:
+    from nanoreview.agent.orchestration import ReviewExecutionOutcome
     from nanoreview.bus.events import InboundMessage
+    from nanoreview.review.output.finalizer import ReviewFinalizerResult
+
+    report_markdown = "## Code Review Report: app.py\n\nNo actionable issues found."
 
     class FakeOrchestrator:
         def __init__(self, **_kwargs: Any) -> None:
             pass
 
         async def execute(self, **_kwargs: Any) -> str:
-            return "## Code Review Report: app.py\n\nNo actionable issues found."
+            return report_markdown
+
+        async def execute_run(self, **_kwargs: Any) -> ReviewExecutionOutcome:
+            return ReviewExecutionOutcome(
+                report_markdown=report_markdown,
+                finalizer_result=ReviewFinalizerResult(
+                    report_markdown=report_markdown
+                ),
+                assignments=(),
+            )
 
     plan = ReviewPlan(
         target="app.py",
