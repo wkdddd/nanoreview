@@ -549,15 +549,6 @@ def serve(
 
     api_app = create_app(agent_loop, model_name=model_name, request_timeout=timeout)
 
-    async def on_startup(_app):
-        await agent_loop._connect_mcp()
-
-    async def on_cleanup(_app):
-        await agent_loop.close_mcp()
-
-    api_app.on_startup.append(on_startup)
-    api_app.on_cleanup.append(on_cleanup)
-
     web.run_app(api_app, host=host, port=port, print=lambda msg: logger.info(msg))
 
 
@@ -798,7 +789,7 @@ def _run_gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            await agent.close_mcp()
+            await agent.close_background_tasks()
             agent.stop()
             await channels.stop_all()
             # Flush all cached sessions to durable storage before exit.
@@ -927,7 +918,7 @@ def review(
                     raise typer.Exit(exit_code)
 
         finally:
-            await agent_loop.close_mcp()
+            await agent_loop.close_background_tasks()
 
     asyncio.run(run_once())
 @app.command()
@@ -1021,7 +1012,7 @@ def agent(
                         **print_kwargs,
                     )
             finally:
-                await agent_loop.close_mcp()
+                await agent_loop.close_background_tasks()
 
         asyncio.run(run_once())
     else:
@@ -1167,7 +1158,7 @@ def agent(
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_mcp()
+                await agent_loop.close_background_tasks()
 
         asyncio.run(run_interactive())
 

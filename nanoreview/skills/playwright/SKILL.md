@@ -3,20 +3,18 @@ name: playwright
 slug: playwright
 version: 1.0.3
 homepage: https://clawic.com/skills/playwright
-description: "Browser automation via Playwright MCP. Navigate websites, click elements, fill forms, take screenshots, extract data, and debug real browser workflows. Use when (1) you need a real browser, not static fetch; (2) the task involves Playwright MCP, browser tools, Playwright tests, scripts, or JS-rendered pages; (3) the user wants navigation, forms, screenshots, PDFs, downloads, or browser-driven extraction turned into a reliable outcome."
-changelog: Clarified the MCP-first browser automation flow and improved quick-start guidance for forms, screenshots, and extraction.
-metadata: {"clawdbot":{"emoji":"P","requires":{"bins":["node","npx"]},"os":["linux","darwin","win32"],"install":[{"id":"npm-playwright","kind":"npm","package":"playwright","bins":["playwright"],"label":"Install Playwright"},{"id":"npm-playwright-mcp","kind":"npm","package":"@playwright/mcp","bins":["playwright-mcp"],"label":"Install Playwright MCP (optional)"}]}}
+description: "Browser automation via Playwright. Navigate websites, click elements, fill forms, take screenshots, extract data, and debug real browser workflows. Use when (1) you need a real browser, not static fetch; (2) the task involves browser tools, Playwright tests, scripts, or JS-rendered pages; (3) the user wants navigation, forms, screenshots, PDFs, downloads, or browser-driven extraction turned into a reliable outcome."
+changelog: Clarified the browser automation flow and improved quick-start guidance for forms, screenshots, and extraction.
+metadata: {"clawdbot":{"emoji":"P","requires":{"bins":["node","npx"]},"os":["linux","darwin","win32"],"install":[{"id":"npm-playwright","kind":"npm","package":"playwright","bins":["playwright"],"label":"Install Playwright"}]}}
 ---
 
 ## When to Use
 
-Use this skill for real browser tasks: JS-rendered pages, multi-step forms, screenshots or PDFs, UI debugging, Playwright test authoring, MCP-driven browser control, and structured extraction from rendered pages.
+Use this skill for real browser tasks: JS-rendered pages, multi-step forms, screenshots or PDFs, UI debugging, Playwright test authoring, and structured extraction from rendered pages.
 
 Prefer it when static fetch is insufficient or when the task depends on browser events, visible DOM state, authentication context, uploads or downloads, or user-facing rendering.
 
-If the user mainly wants the agent to drive a browser with simple actions like navigate, click, fill, screenshot, download, or extract, treat MCP as a first-class path.
-
-Use direct Playwright for scripts and tests. Use MCP when browser tools are already in the loop, the user explicitly wants MCP, or the fastest path is browser actions rather than writing new automation code.
+Use direct Playwright for scripts, tests, screenshots, downloads, and rendered extraction.
 
 Primary fit is repo-owned browser work: tests, debugging, repros, screenshots, and deterministic automation. Treat rendered-page extraction as a secondary use case, not the default identity.
 
@@ -28,26 +26,19 @@ Load only the smallest reference file needed for the task. Keep auth state tempo
 
 ## Quick Start
 
-### MCP browser path
-```bash
-npx @playwright/mcp --headless
-```
+### Common Playwright actions
 
-Use this path when the agent already has browser tools available or the user wants browser automation without writing new Playwright code.
-
-### Common MCP actions
-
-Typical Playwright MCP tool actions include:
-- `browser_navigate` for opening a page
-- `browser_click` and `browser_press` for interaction
-- `browser_type` and `browser_select_option` for forms
-- `browser_snapshot` and `browser_evaluate` for inspection and extraction
-- `browser_choose_file` for uploads
-- screenshot, PDF, trace, and download capture through the active browser workflow
+Typical Playwright actions include:
+- `page.goto` for opening a page
+- `locator.click` and `page.keyboard.press` for interaction
+- `locator.fill` and `locator.selectOption` for forms
+- `page.locator` and `page.evaluate` for inspection and extraction
+- `locator.setInputFiles` for uploads
+- `page.screenshot`, `page.pdf`, traces, and downloads through the active browser workflow
 
 ### Common browser outcomes
 
-| Goal | Typical MCP-style action |
+| Goal | Typical Playwright action |
 |------|--------------------------|
 | Open and inspect a site | navigate, wait, inspect, screenshot |
 | Complete a form | navigate, click, fill, select, submit |
@@ -98,7 +89,7 @@ const { chromium } = require('playwright');
 | You need a reliable first draft of selectors or flows | Start with `codegen` or a headed exploratory run | Faster than guessing selectors from source or stale DOM |
 | Local app, staging app, or repo-owned E2E suite | Use `@playwright/test` | Best fit for repeatable tests and assertions |
 | One-off browser automation, screenshots, downloads, or rendered extraction | Use direct Playwright API | Simple, explicit, and easy to debug in code |
-| Agent/browser-tool workflow already depends on `browser_*` tools or the user wants no-code browser control | Use Playwright MCP | Fastest path for navigate-click-fill-screenshot workflows |
+| Agent/browser-tool workflow needs browser control | Use direct Playwright | Explicit and easy to test and debug |
 | CI failures, flake, or environment drift | Start with `debugging.md` and `ci-cd.md` | Traces and artifacts matter more than new code |
 
 ## Core Rules
@@ -152,7 +143,7 @@ const { chromium } = require('playwright');
 | Endpoint | Data Sent | Purpose |
 |----------|-----------|---------|
 | User-requested web origins | Browser requests, form input, cookies, uploads, and page interactions required by the task | Automation, testing, screenshots, PDFs, and rendered extraction |
-| `https://registry.npmjs.org` | Package metadata and tarballs during optional installation | Install Playwright or Playwright MCP |
+| `https://registry.npmjs.org` | Package metadata and tarballs during optional installation | Install Playwright |
 
 No other data is sent externally.
 

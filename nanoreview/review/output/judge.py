@@ -27,7 +27,7 @@ from nanoreview.review.types import (
     ReviewJudgeDecision,
     ReviewJudgeVerdict,
 )
-from nanoreview.utils.helpers import estimate_prompt_tokens
+from nanoreview.utils.helpers import estimate_prompt_tokens, merge_token_usage
 
 _VERDICT_TOOL: dict = {
     "type": "function",
@@ -131,6 +131,10 @@ class ReviewJudge:
         #: Statistics of the most recent judge_dimensions call (None when the
         #: call judged nothing, e.g. there were no candidates).
         self.last_stats: ReviewJudgeStats | None = None
+        #: Aggregated token usage of the most recent judge_dimensions call.
+        #: The judge still calls the provider directly, so the supervisor can
+        #: only read usage back from here until the JudgeAgent migration lands.
+        self.last_usage: dict[str, int] = {}
         #: Emits the tokenizer-fallback warning at most once per judge.
         self._tokenizer_fallback_warned = False
 
@@ -143,8 +147,12 @@ class ReviewJudge:
         Returns a mapping of candidate-id -> verdict. Candidates that could
         not be judged (e.g. too large to fit a single batch, or batch failure)
         receive an explicit ``needs_confirmation`` verdict so they are never
-        silently treated as accepted.
+        silently treated as accepted. Token usage is accumulated per batch
+        into ``self.last_usage``.
         """
+        # Reset before any early return so callers never read a previous
+        # run's usage as this run's.
+        self.last_usage = {}
         candidates = self._collect_candidates(dimensions)
         total_candidates = len(candidates)
         if total_candidates == 0:
@@ -464,6 +472,9 @@ class ReviewJudge:
             ),
             timeout=self._config.timeout_seconds,
         )
+        # Fold this batch's usage into the judge total; the response counter
+        # is the only place judge tokens are observable today.
+        merge_token_usage(self.last_usage, getattr(response, "usage", None))
         return self._parse_verdicts(response.tool_calls)
 
     @staticmethod

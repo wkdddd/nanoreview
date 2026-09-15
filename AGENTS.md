@@ -56,7 +56,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 - Python 使用 `pathlib.Path`，异步路径使用 `async`/`await`，不得在事件循环中执行长时间阻塞操作。
 - 在实现新模块或功能时，项目的日志打印需要完整（错误信息和关键节点的成功info）,但不要泛滥，方便调试
 - 调整代码时不需要兼容旧配置或旧参数，除非用户明确要求。
-- 先取证，后判断：开始前阅读相关代码、测试、配置和专题约束；结论应引用具体文件、行号或命令结果，不凭猜测补全信息。
+- 先取证，后判断：开始前阅读相关代码、测试、配置和专题约束；结论应引用具体文件、行号或命令结果，不凭猜测补全信息,证据或需求不清楚时询问用户，不得自行猜测。
 - 保持范围清晰：只修改完成任务所必需的文件和行为；保留用户已有改动，不回滚、覆盖或顺手重构无关内容。
 - 检查完整链路：涉及 API、消息、配置、提示词、工具权限或 WebUI 时，检查生产者、消费者、状态流转、测试和文档。
 - 优先复用现有设计：遵循项目已有模式，采用最小但可维护的方案；如存在取舍，说明影响和选择理由。
@@ -74,6 +74,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 - Common gotchas：`.agents/gotchas.md`
 - Debug constraints：`.agents/debug.md`
 - Design principle:`.agents/design.md`
+- Budget and token controls：`.agents/budget.md`
 
 ## 参考项目open-code-review
 

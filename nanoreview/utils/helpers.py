@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -542,6 +543,29 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
         return max(4, len(enc.encode(payload)) + 4)
     except Exception:
         return max(4, len(payload) // 4 + 4)
+
+
+def merge_token_usage(
+    target: dict[str, int], usage: Mapping[str, Any] | None
+) -> dict[str, int]:
+    """Add positive numeric token counters from *usage* into *target*.
+
+    Every agent run (coordinator planner, reviewer subagent, judge batch)
+    reports its own usage dict; callers fold each one into the owning review
+    run so a multi-agent run reports one aggregated total. Unknown keys are
+    merged as-is so provider-specific counters are never dropped.
+    """
+    if not usage:
+        return target
+    for key, raw in usage.items():
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        target[key] = target.get(key, 0) + value
+    return target
 
 
 def estimate_prompt_tokens_chain(

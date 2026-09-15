@@ -189,6 +189,8 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
     """Stop active task and start a fresh session."""
     loop = ctx.loop
     await loop._cancel_active_tasks(ctx.key)
+    # /new releases the one-shot review gate so the chat becomes reusable.
+    loop.reset_review_run(ctx.key)
     session = ctx.session or loop.sessions.get_or_create(ctx.key)
     session.clear()
     loop.sessions.save(session)

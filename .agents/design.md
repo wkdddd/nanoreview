@@ -2,7 +2,7 @@
 
 ## Core Stays Small
 
-New capabilities belong at extension points: channels, tools, skills, Providers or MCP servers. `AgentLoop` and `AgentRunner` are critical-path code; changes there must be minimal and justified. Runtime events may be generic, but channel and WebUI wire behavior must stay in their adapters or coordinators.
+New capabilities belong at extension points: channels, tools, skills, or Providers. `AgentLoop` and `AgentRunner` are critical-path code; changes there must be minimal and justified. Runtime events may be generic, but channel and WebUI wire behavior must stay in their adapters or coordinators.
 
 ## Prefer Explicit, Local Solutions
 

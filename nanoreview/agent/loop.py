@@ -1339,11 +1339,16 @@ class AgentLoop:
                             outcome.finalizer_result
                         )
                         run_state.findings = findings
+                        # Decide the terminal status before serialization: the
+                        # artifact must not freeze a run that is still marked
+                        # running. A failed write leaves no artifact behind,
+                        # so the run itself degrades to error instead.
                         report_ref = self._review_artifacts().write(
                             build_report_artifact(
                                 run_state,
                                 report_markdown=final_content,
                                 verdicts=verdicts,
+                                status=ReviewRunStatus.COMPLETED,
                             )
                         )
                         if report_ref is not None:

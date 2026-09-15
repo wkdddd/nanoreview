@@ -35,10 +35,12 @@ class FakeJudgeProvider:
         self,
         verdicts_by_call: list[list[dict[str, str]]] | None = None,
         error: Exception | None = None,
+        usage: dict[str, int] | None = None,
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self._verdicts_by_call = verdicts_by_call or []
         self._error = error
+        self._usage = usage
 
     async def chat_with_retry(self, **kwargs: Any) -> LLMResponse:
         self.calls.append(kwargs)
@@ -55,7 +57,11 @@ class FakeJudgeProvider:
             name="submit_verdicts",
             arguments={"verdicts": verdicts},
         )
-        return LLMResponse(content=None, tool_calls=[tool_call])
+        return LLMResponse(
+            content=None,
+            tool_calls=[tool_call],
+            usage=dict(self._usage) if self._usage else {},
+        )
 
 
 def _candidate(
@@ -407,3 +413,45 @@ async def test_judge_no_candidates_leaves_stats_none() -> None:
     assert verdicts == {}
     assert provider.calls == []
     assert judge.last_stats is None
+    assert judge.last_usage == {}
+
+
+async def test_judge_usage_aggregates_every_batch() -> None:
+    """Judge tokens are summed across batches so the run can report them."""
+    provider = FakeJudgeProvider(
+        verdicts_by_call=[[], [], []],
+        usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+    )
+    big_evidence = "lorem ipsum dolor sit amet " * 80  # ~700 tokens
+    dimensions = [_dimension("security", ["S1", "S2", "S3"], evidence=big_evidence)]
+    judge = ReviewJudge(
+        provider=provider,
+        model="test-model",
+        config=ReviewJudgeConfig(
+            context_window_tokens=1_200,
+            max_tokens=128,
+            timeout_seconds=5,
+        ),
+    )
+
+    await judge.judge_dimensions(dimensions)
+
+    calls = len(provider.calls)
+    assert calls >= 2, "expected the fixtures to split into batches"
+    # One batch would return 150 here; multi-batch runs multiply it.
+    assert judge.last_usage == {
+        "prompt_tokens": 120 * calls,
+        "completion_tokens": 30 * calls,
+        "total_tokens": 150 * calls,
+    }
+
+
+async def test_judge_usage_resets_between_runs() -> None:
+    """A second run must not inherit the previous run's usage."""
+    provider = FakeJudgeProvider(usage={"total_tokens": 10})
+    judge = _judge(provider)
+    await judge.judge_dimensions([_dimension("security", ["S1"])])
+    assert judge.last_usage == {"total_tokens": 10}
+
+    await judge.judge_dimensions([_dimension("security", [])])
+    assert judge.last_usage == {}

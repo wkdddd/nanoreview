@@ -233,22 +233,12 @@ class LLMProvider(ABC):
 
     @classmethod
     def _tool_cache_marker_indices(cls, tools: list[dict[str, Any]]) -> list[int]:
-        """Return cache marker indices: builtin/MCP boundary and tail index."""
+        """Return cache marker indices for the final tool definitions."""
         if not tools:
             return []
 
         tail_idx = len(tools) - 1
-        last_builtin_idx: int | None = None
-        for i in range(tail_idx, -1, -1):
-            if not cls._tool_name(tools[i]).startswith("mcp_"):
-                last_builtin_idx = i
-                break
-
-        ordered_unique: list[int] = []
-        for idx in (last_builtin_idx, tail_idx):
-            if idx is not None and idx not in ordered_unique:
-                ordered_unique.append(idx)
-        return ordered_unique
+        return [tail_idx]
 
     @staticmethod
     def _sanitize_request_messages(

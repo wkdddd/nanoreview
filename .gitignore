@@ -95,15 +95,9 @@ temp/
 
 学习/
 
-requirement.md
-
 trae大赛html/
 
-webui/
-
 .trae
-
-bug.md
 
 review-webui/node_modules/
 
@@ -113,3 +107,7 @@ nanobot-competition-post/
 .nanoreview/
 
 .trae-html-share-packages/
+
+.workbuddy/
+
+ROADMAP.md

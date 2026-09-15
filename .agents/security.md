@@ -10,7 +10,7 @@ Tool paths must be resolved through the established filesystem/path utilities an
 
 Every outbound HTTP request created by an agent tool must use `nanoreview.security.network.validate_url_target`. Revalidate redirect destinations with `validate_resolved_url`. The default policy blocks loopback, private, link-local, CGNAT and cloud metadata ranges.
 
-HTTP/SSE MCP URLs belong to the same rule. Private endpoints require an explicit `tools.ssrf_whitelist` entry; stdio MCP servers are not HTTP requests. Do not introduce direct HTTP calls that bypass these checks.
+Any HTTP/SSE endpoint belongs to the same SSRF rule. Private endpoints require an explicit `tools.ssrf_whitelist` entry. Do not introduce direct HTTP calls that bypass these checks.
 
 ## Persistent Prompt Data
 

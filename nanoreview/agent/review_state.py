@@ -16,6 +16,7 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanoreview.utils.helpers import safe_filename
+from nanoreview.utils.helpers import merge_token_usage, safe_filename
 
 if TYPE_CHECKING:
     from nanoreview.review.output.finalizer import ReviewFinalizerResult
@@ -77,6 +78,11 @@ class ReviewerRunState:
     dimension: str
     status: str = "pending"  # pending | running | completed | error
     error: str = ""
+    usage: dict[str, int] = field(default_factory=dict)
+
+    def add_usage(self, usage: Mapping[str, Any] | None) -> None:
+        """Accumulate this reviewer's token usage for the run audit trail."""
+        merge_token_usage(self.usage, usage)
 
 
 @dataclass(slots=True)
@@ -86,6 +92,11 @@ class JudgeBatchState:
     batch_id: str
     status: str = "pending"  # pending | completed | error
     stats: dict[str, int] = field(default_factory=dict)
+    usage: dict[str, int] = field(default_factory=dict)
+
+    def add_usage(self, usage: Mapping[str, Any] | None) -> None:
+        """Accumulate this judge batch's token usage."""
+        merge_token_usage(self.usage, usage)
 
 
 @dataclass(slots=True)
@@ -115,6 +126,10 @@ class ReviewRunState:
         text = str(message).strip()
         if text and text not in self.warnings:
             self.warnings.append(text)
+
+    def add_usage(self, usage: Mapping[str, Any] | None) -> None:
+        """Accumulate one agent run's token usage into this review run."""
+        merge_token_usage(self.usage, usage)
 
     def reviewer_state(self, dimension: str) -> ReviewerRunState:
         state = self.reviewers.get(dimension)
@@ -297,12 +312,20 @@ def build_report_artifact(
     *,
     report_markdown: str,
     verdicts: list[dict[str, Any]] | None = None,
+    status: ReviewRunStatus | None = None,
 ) -> dict[str, Any]:
-    """Assemble the JSON artifact payload for a finished review run."""
+    """Assemble the JSON artifact payload for a finished review run.
+
+    An artifact describes a finished run, so the caller must decide the
+    terminal status *before* serialization: ``ReviewRunState.status`` can
+    still be ``running`` while the artifact is being written, and baking
+    that in would leave a permanently "running" report on disk. Pass
+    ``status`` explicitly; the state's own value is only a fallback.
+    """
     return {
         "run_id": state.run_id,
         "session_key": state.session_key,
-        "status": state.status.value,
+        "status": (status or state.status).value,
         "input_fingerprint": state.input_fingerprint,
         "report_markdown": report_markdown,
         "findings": state.findings,

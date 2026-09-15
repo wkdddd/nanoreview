@@ -189,6 +189,7 @@ class ReviewOrchestrator:
             coordinator_messages=coordinator_messages,
             plan=plan,
             evidence=evidence,
+            run_state=run_state,
         )
         if run_state is not None:
             run_state.enter_phase(ReviewPhase.REVIEW)
@@ -229,20 +230,27 @@ class ReviewOrchestrator:
             run_state.enter_phase(ReviewPhase.FINALIZE)
         await finalizer.apply_judge(self._judge)
         if run_state is not None and self._judge is not None:
+            # One aggregate entry covers every judge batch: batches are a
+            # context-window split inside one business step, not separate
+            # resume units.
+            batch = run_state.judge_batches.setdefault(
+                "judge", JudgeBatchState(batch_id="judge")
+            )
+            # Only this invocation's judge usage is folded in, so a re-entered
+            # run cannot double count a batch it already reported.
+            judge_usage = getattr(self._judge, "last_usage", None)
+            batch.add_usage(judge_usage)
+            run_state.add_usage(judge_usage)
             stats = getattr(self._judge, "last_stats", None)
             if stats is not None:
-                batch = JudgeBatchState(
-                    batch_id="judge",
-                    status="completed",
-                    stats={
-                        "total_candidates": stats.total_candidates,
-                        "sent_candidates": stats.sent_candidates,
-                        "returned_verdicts": stats.returned_verdicts,
-                        "needs_confirmation": stats.needs_confirmation,
-                        "batches": stats.batches,
-                    },
-                )
-                run_state.judge_batches[batch.batch_id] = batch
+                batch.status = "completed"
+                batch.stats = {
+                    "total_candidates": stats.total_candidates,
+                    "sent_candidates": stats.sent_candidates,
+                    "returned_verdicts": stats.returned_verdicts,
+                    "needs_confirmation": stats.needs_confirmation,
+                    "batches": stats.batches,
+                }
         finalizer_result = finalizer.finalize(
             plan.target_name or plan.target or "target"
         )
@@ -343,6 +351,7 @@ class ReviewOrchestrator:
         coordinator_messages: list[dict[str, Any]],
         plan: ReviewPlan,
         evidence: ReviewEvidenceBundle,
+        run_state: "ReviewRunState | None" = None,
     ) -> tuple[ReviewAssignment, ...]:
         """Collect a validated plan inside a single AgentRun.
 
@@ -382,6 +391,8 @@ class ReviewOrchestrator:
                 "review.coordinator.plan.accepted assignments={}",
                 len(receiver.submission),
             )
+            if run_state is not None:
+                run_state.add_usage(result.usage)
             return receiver.submission
         failure = (
             result.terminal_error
@@ -477,9 +488,16 @@ class ReviewOrchestrator:
             metadata = result.metadata if isinstance(result.metadata, dict) else {}
             dimension = str(metadata.get("subagent_label") or "unknown")
             raw = str(metadata.get("subagent_result") or result.content)
+            reviewer_usage = metadata.get("subagent_usage")
             finalizer.ingest_subagent_output(dimension, raw)
             if run_state is not None:
-                run_state.reviewer_state(dimension).status = "completed"
+                reviewer = run_state.reviewer_state(dimension)
+                reviewer.status = "completed"
+                # Reviewer token usage is only carried by the result metadata;
+                # fold it into the run total so a multi-reviewer run reports
+                # one aggregated usage instead of losing every unit.
+                reviewer.add_usage(reviewer_usage)
+                run_state.add_usage(reviewer_usage)
             if context.result_callback is not None:
                 await context.result_callback(result)
 

@@ -150,6 +150,60 @@ def test_build_report_artifact_uses_run_state_fields() -> None:
     assert artifact["created_at"]
 
 
+def test_build_report_artifact_status_overrides_running_state() -> None:
+    """The artifact is persisted before the run status flips to terminal.
+
+    ``AgentLoop`` must therefore pass the decided terminal status, otherwise
+    a completed report would be written with ``status: running`` and later
+    consumers would treat a finished report as still in flight.
+    """
+    state = _run_state(status=ReviewRunStatus.RUNNING)
+    artifact = build_report_artifact(
+        state,
+        report_markdown="# report",
+        status=ReviewRunStatus.COMPLETED,
+    )
+    assert artifact["status"] == "completed"
+    # Writing the artifact never mutates the in-process run state.
+    assert state.status is ReviewRunStatus.RUNNING
+
+
+def test_build_report_artifact_can_record_a_failed_run() -> None:
+    state = _run_state(status=ReviewRunStatus.RUNNING)
+    artifact = build_report_artifact(
+        state, report_markdown="", status=ReviewRunStatus.ERROR
+    )
+    assert artifact["status"] == "error"
+
+
+def test_review_run_state_add_usage_accumulates_counters() -> None:
+    state = _run_state()
+    state.add_usage({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})
+    state.add_usage({"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60})
+    assert state.usage == {
+        "prompt_tokens": 150,
+        "completion_tokens": 30,
+        "total_tokens": 180,
+    }
+    # Empty, non-numeric, negative and None payloads are ignored.
+    state.add_usage(None)
+    state.add_usage({})
+    state.add_usage({"total_tokens": "not-a-number"})
+    state.add_usage({"total_tokens": -5})
+    assert state.usage["total_tokens"] == 180
+
+
+def test_reviewer_and_judge_state_accumulate_usage() -> None:
+    reviewer = ReviewerRunState(dimension="security")
+    reviewer.add_usage({"total_tokens": 11})
+    reviewer.add_usage({"prompt_tokens": 4, "total_tokens": 9})
+    assert reviewer.usage == {"prompt_tokens": 4, "total_tokens": 20}
+
+    batch = JudgeBatchState(batch_id="judge")
+    batch.add_usage({"total_tokens": 7})
+    assert batch.usage == {"total_tokens": 7}
+
+
 class TestReviewArtifactStore:
     def _store(self, tmp_path: Path) -> ReviewArtifactStore:
         return ReviewArtifactStore(tmp_path / "workspace")

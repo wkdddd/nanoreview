@@ -9,6 +9,7 @@ from nanoreview.agent.orchestration import (
     ReviewOrchestrator,
     ReviewPlanningError,
 )
+from nanoreview.agent.review_state import ReviewRunState
 from nanoreview.agent.runner import AgentRunResult
 from nanoreview.bus.events import InboundMessage
 from nanoreview.review.types import (
@@ -60,6 +61,8 @@ class _NoPlanRunner:
 
 
 class _PlanRunner:
+    usage: dict[str, int] = {}
+
     async def run(self, spec):
         tool = spec.tools.get("submit_review_plan")
         assert tool is not None
@@ -78,11 +81,16 @@ class _PlanRunner:
             ]
         )
         assert result == "review plan accepted"
-        return AgentRunResult(final_content="", messages=[])
+        return AgentRunResult(
+            final_content="", messages=[], usage=dict(self.usage)
+        )
 
 
 class _Subagents:
     max_concurrent_subagents = 2
+
+    #: Usage reported by every reviewer result metadata.
+    usage: dict[str, int] = {}
 
     def __init__(self) -> None:
         self.results: asyncio.Queue[InboundMessage] = asyncio.Queue()
@@ -93,16 +101,19 @@ class _Subagents:
 
     async def spawn(self, **kwargs):
         self.calls.append(kwargs)
+        metadata = {
+            "subagent_label": kwargs["label"],
+            "subagent_result": '{"submitted":true,"findings":[],"errors":[]}',
+        }
+        if self.usage:
+            metadata["subagent_usage"] = dict(self.usage)
         await self.results.put(
             InboundMessage(
                 channel="system",
                 sender_id="subagent",
                 chat_id="cli:review",
                 content="completed",
-                metadata={
-                    "subagent_label": kwargs["label"],
-                    "subagent_result": '{"submitted":true,"findings":[],"errors":[]}',
-                },
+                metadata=metadata,
             )
         )
         return "Review subagent started"
@@ -161,6 +172,57 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(tmp_p
     assert [call["label"] for call in subagents.calls] == ["security", "bug"]
     assert all(call["deliver_to_bus"] is False for call in subagents.calls)
     assert "No actionable issues found" in report
+
+
+@pytest.mark.asyncio
+async def test_execute_run_aggregates_agent_usage_into_run_state(tmp_path) -> None:
+    """Coordinator and reviewer tokens must roll up into one run total.
+
+    Judge usage is exercised in tests/review/test_judge.py; the orchestrator
+    simply reads ``ReviewJudge.last_usage`` at the same boundary.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+
+    plan_runner = _PlanRunner()
+    plan_runner.usage = {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+    }
+    subagents = _Subagents()
+    subagents.usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "total_tokens": 120,
+    }
+    orchestrator = ReviewOrchestrator(
+        runner=plan_runner,
+        subagents=subagents,
+        model="test",
+        workspace=tmp_path,
+        max_tool_result_chars=1000,
+        judge=None,
+    )
+    run_state = ReviewRunState(
+        run_id="run-usage-1", session_key="cli:review", input_fingerprint="fp"
+    )
+
+    await orchestrator.execute_run(
+        coordinator_messages=[{"role": "system", "content": "plan"}],
+        plan=_plan("security", "bug"),
+        evidence=_evidence(),
+        context=ReviewExecutionContext("cli", "review", "cli:review", None, {}, 1),
+        validation_workspace=str(tmp_path),
+        run_state=run_state,
+    )
+
+    assert run_state.usage == {
+        "prompt_tokens": 210,  # 10 (coordinator) + 2 x 100 (reviewers)
+        "completion_tokens": 42,
+        "total_tokens": 252,
+    }
+    assert run_state.reviewers["security"].usage == dict(subagents.usage)
+    assert run_state.reviewers["bug"].status == "completed"
 
 
 @pytest.mark.asyncio
