@@ -8,6 +8,7 @@ from loguru import logger
 
 from nanoreview.agent.hooks import AgentHookContext, ReviewFinalizerHook
 from nanoreview.review.output.finalizer import ReviewFinalizer
+from nanoreview.review.output.judge import JudgeExecutionResult
 from nanoreview.review.types import (
     ReviewJudgeDecision,
     ReviewJudgeVerdict,
@@ -16,13 +17,23 @@ from nanoreview.review.types import (
 
 
 class FakeJudge:
-    def __init__(self, verdicts):
+    """Judge stub returning a ``JudgeExecutionResult`` for the given verdicts."""
+
+    def __init__(self, verdicts, *, stats=None, usage=None, error=None):
         self.verdicts = verdicts
+        self.stats = stats
+        self.usage = dict(usage or {})
+        self.error = error
         self.calls = 0
 
     async def judge_dimensions(self, dimensions):
         self.calls += 1
-        return self.verdicts
+        return JudgeExecutionResult(
+            verdicts=self.verdicts,
+            stats=self.stats,
+            usage=dict(self.usage),
+            error=self.error,
+        )
 
 
 @pytest.fixture
@@ -269,6 +280,69 @@ class TestSemanticVerdicts:
         assert result.needs_confirmation[0][0].title == "Failed judge issue"
         assert "AI judge failed" in result.needs_confirmation[0][1].reason
 
+    @pytest.mark.asyncio
+    async def test_apply_judge_returns_stats_usage_and_bounded_error(self, workspace):
+        """The finalizer consumes and returns the judge's immutable result."""
+        from nanoreview.review.output.judge import ReviewJudgeStats
+
+        raw = _submit([{
+            "severity": "high", "file": "src/app.py", "line": 1,
+            "title": "Partial judge issue", "evidence": "line1", "impact": "bad",
+            "recommendation": "fix",
+        }])
+        f = ReviewFinalizer(workspace)
+        f.ingest_subagent_output("security", raw)
+        stats = ReviewJudgeStats(
+            total_candidates=1, sent_candidates=1, returned_verdicts=0,
+            needs_confirmation=1, batches=1,
+        )
+        judge = FakeJudge(
+            {
+                "security:src/app.py:1:partial judge issue": ReviewJudgeVerdict(
+                    decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+                    reason="AI judge batch failed; manual verification required",
+                )
+            },
+            stats=stats,
+            usage={"total_tokens": 42},
+            error="AI judge batch failed (terminal_tool_failed): boom",
+        )
+
+        returned = await f.apply_judge(judge)
+        result = f.finalize("test")
+
+        assert returned.stats is stats
+        assert returned.usage == {"total_tokens": 42}
+        assert returned.error == "AI judge batch failed (terminal_tool_failed): boom"
+        # A judge error never silently accepts: the candidate is surfaced.
+        assert len(result.needs_confirmation) == 1
+        assert result.needs_confirmation[0][0].title == "Partial judge issue"
+        assert "batch failed" in result.needs_confirmation[0][1].reason
+        assert "### AI Judge Statistics" in result.report_markdown
+        assert "- Sent to judge: 1" in result.report_markdown
+
+    @pytest.mark.asyncio
+    async def test_apply_judge_escalated_failure_reports_bounded_error(self, workspace):
+        """An escaping judge failure returns a bounded error for the supervisor."""
+        raw = _submit([{
+            "severity": "high", "file": "src/app.py", "line": 1,
+            "title": "Escaped judge issue", "evidence": "line1", "impact": "bad",
+            "recommendation": "fix",
+        }])
+        f = ReviewFinalizer(workspace)
+        f.ingest_subagent_output("security", raw)
+
+        class ExplodingJudge:
+            async def judge_dimensions(self, dimensions):
+                raise RuntimeError("provider down\nwith a long trace")
+
+        returned = await f.apply_judge(ExplodingJudge())
+
+        assert returned.error is not None
+        assert "provider down" in returned.error
+        assert "\n" not in returned.error
+        assert len(returned.error) <= 300
+
 
 class TestFinalize:
     def test_finalize_without_dimensions_is_incomplete_not_clean(self, workspace):
@@ -403,6 +477,29 @@ class TestFinalize:
         assert accepted.dimension == "performance"
         assert "Blocking external stylesheet" in result.report_markdown
         assert not result.errors
+
+    def test_ingest_runner_message_with_failed_status_is_incomplete(self, workspace):
+        """An explicit non-ok subagent status must not be parsed as a clean
+        result, even when the raw payload is valid empty-findings JSON."""
+        raw_result = _submit([])
+        message = {
+            "role": "user",
+            "content": "[Subagent 'security' failed]",
+            "_metadata": {
+                "injected_event": "subagent_result",
+                "subagent_label": "security",
+                "subagent_status": "error",
+                "subagent_result": raw_result,
+            },
+        }
+        f = ReviewFinalizer(workspace)
+        assert f.ingest_messages([message]) == 1
+        result = f.finalize("myproject")
+        assert "Review incomplete" in result.report_markdown
+        assert "No actionable issues found" not in result.report_markdown
+        security = next(d for d in result.dimensions if d.dimension == "security")
+        assert security.status == "incomplete"
+        assert "reviewer status=error" in security.errors[0]
 
     def test_ingest_runner_message_metadata_prefers_raw_result(self, workspace):
         raw_result = _submit([{

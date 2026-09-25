@@ -7,7 +7,12 @@ from typing import Any
 
 from loguru import logger
 
-from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeStats
+from nanoreview.agent.review_state import bound_child_error
+from nanoreview.review.output.judge import (
+    JudgeExecutionResult,
+    ReviewJudge,
+    ReviewJudgeStats,
+)
 from nanoreview.review.output.report import render_review_report
 from nanoreview.review.output.validator import ReviewValidator, ValidationContext
 from nanoreview.review.types import (
@@ -22,6 +27,24 @@ from nanoreview.review.types import (
     ReviewJudgeVerdict,
     normalize_review_dimension,
 )
+
+# Reviewer error text stored on dimension results is bounded so a huge
+# subagent transcript cannot bloat the in-memory report state.
+_REVIEWER_ERROR_MAX_CHARS = 300
+
+
+def reviewer_failure_reason(status: str, raw: str) -> str:
+    """Bounded, human-readable reason for a failed reviewer result.
+
+    ``status`` is the terminal subagent status from result metadata; an empty
+    status means the producer did not report one, which is treated as a failure
+    rather than silently as success.
+    """
+    label = status or "unknown"
+    detail = " ".join(raw.split())
+    if detail:
+        return f"reviewer status={label}: {detail}"[:_REVIEWER_ERROR_MAX_CHARS]
+    return f"reviewer status={label}: no result output"
 
 
 @dataclass
@@ -128,13 +151,33 @@ class ReviewFinalizer:
             if not raw_output.strip():
                 logger.warning("review.finalizer.skip_empty dimension={}", dimension)
                 continue
-            self.ingest_subagent_output(dimension, raw_output)
+            # An explicitly reported non-ok terminal status marks the output as
+            # failed regardless of its shape: a failed reviewer's raw payload
+            # (even valid findings JSON) must never be parsed into a clean
+            # no_findings result. A missing status keeps the lenient legacy
+            # behaviour for persisted messages produced before the status
+            # contract existed.
+            status = str(meta.get("subagent_status") or "").strip().lower()
+            failure_reason = None if status in ("", "ok") else reviewer_failure_reason(status, raw_output)
+            self.ingest_subagent_output(dimension, raw_output, failure_reason=failure_reason)
             count += 1
         logger.info("review.finalizer.ingest messages={} dimensions={}", len(messages), count)
         return count
 
-    def ingest_subagent_output(self, dimension: str, raw_output: str) -> ReviewDimensionResult:
-        """Parse one subagent's raw text output and validate its candidates."""
+    def ingest_subagent_output(
+        self,
+        dimension: str,
+        raw_output: str,
+        *,
+        failure_reason: str | None = None,
+    ) -> ReviewDimensionResult:
+        """Parse one subagent's raw text output and validate its candidates.
+
+        ``failure_reason`` marks the output as a known reviewer failure: the
+        dimension is recorded as ``incomplete`` with that reason and the raw
+        payload is not parsed, so a failed reviewer can never be presented as
+        a clean no_findings dimension.
+        """
         normalized_dimension = normalize_review_dimension(dimension) or dimension.strip().lower()
         if self._allowed_dimensions is not None and normalized_dimension not in self._allowed_dimensions:
             logger.warning(
@@ -148,6 +191,14 @@ class ReviewFinalizer:
                 status="skipped_disallowed",
             )
         dimension = normalized_dimension
+        if failure_reason:
+            result = ReviewDimensionResult(
+                dimension=dimension,
+                status="incomplete",
+                errors=[failure_reason],
+            )
+            self._upsert_dimension(result)
+            return result
         incomplete_reason = self._incomplete_reason(raw_output)
         if incomplete_reason:
             result = ReviewDimensionResult(
@@ -209,29 +260,45 @@ class ReviewFinalizer:
                 items.extend(d.uncertain)
         return items
 
-    async def apply_judge(self, judge: ReviewJudge | None) -> None:
+    async def apply_judge(self, judge: ReviewJudge | None) -> JudgeExecutionResult:
         """Apply AI judge verdicts to every accepted/uncertain candidate.
 
-        When the judge is unavailable (not created, disabled, or failing
-        outright), candidates are explicitly marked ``needs_confirmation``
-        instead of silently inheriting their hard verdicts — a candidate must
-        never be presented as having passed the judge without a verdict.
+        Consumes and returns the judge's :class:`JudgeExecutionResult`: the
+        verdict map is applied to the judged findings, ``stats`` becomes the
+        report's judge statistics, and ``error`` (a bounded batch/provider/
+        terminal failure reason) is handed back to the supervisor so the run's
+        judge batch is recorded as ``error`` without failing the whole run.
+        Candidates without a verdict — including every candidate of a failed
+        batch — are explicitly marked ``needs_confirmation`` instead of
+        silently inheriting their hard verdicts, so a candidate is never
+        presented as having passed the judge.
         """
         if judge is None:
             logger.info("review.finalizer.judge.unavailable reason=not_created")
-            self._judge_stats = self._mark_unjudged_needs_confirmation(
+            stats = self._mark_unjudged_needs_confirmation(
                 "AI judge is unavailable; manual verification required"
             )
-            return
+            self._judge_stats = stats
+            return JudgeExecutionResult(verdicts={}, stats=stats, usage={}, error=None)
         try:
-            verdicts = await judge.judge_dimensions(self._dimensions)
+            result = await judge.judge_dimensions(self._dimensions)
         except Exception as exc:
+            # Cancellation is a BaseException and propagates untouched; any
+            # other escaping judge failure degrades to needs_confirmation.
             logger.warning("review.finalizer.judge.failed reason={}", exc)
-            self._judge_stats = self._mark_unjudged_needs_confirmation(
+            stats = self._mark_unjudged_needs_confirmation(
                 "AI judge failed; manual verification required"
             )
-            return
-        self._judge_stats = getattr(judge, "last_stats", None)
+            self._judge_stats = stats
+            return JudgeExecutionResult(
+                verdicts={}, stats=stats, usage={}, error=bound_child_error(exc)
+            )
+        self._judge_stats = result.stats
+        verdicts = result.verdicts
+        if result.error:
+            logger.warning(
+                "review.finalizer.judge.partial_failure reason={}", result.error
+            )
         if not verdicts:
             total = self._candidate_total()
             if total > 0:
@@ -240,12 +307,15 @@ class ReviewFinalizer:
                 logger.warning(
                     "review.finalizer.judge.no_verdicts candidates={}", total
                 )
-                self._judge_stats = self._mark_unjudged_needs_confirmation(
+                stats = self._mark_unjudged_needs_confirmation(
                     "AI judge returned no verdicts; manual verification required"
                 )
-            else:
-                self._apply_judged_defaults()
-            return
+                self._judge_stats = stats
+                return JudgeExecutionResult(
+                    verdicts={}, stats=stats, usage=result.usage, error=result.error
+                )
+            self._apply_judged_defaults()
+            return result
         for dimension in self._dimensions:
             judged: list[ReviewJudgedFinding] = []
             for candidate in dimension.accepted:
@@ -272,6 +342,7 @@ class ReviewFinalizer:
                 ))
             dimension.judged = judged
         logger.info("review.finalizer.judge.applied dimensions={}", len(self._dimensions))
+        return result
 
     @staticmethod
     def _verdict_or_needs_confirmation(

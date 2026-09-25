@@ -88,7 +88,7 @@ Provider 返回的 usage 会在 `AgentRunner` 中按每次模型响应累计到 
 
 WebSocket `/usage` 暴露 process 级 `usage` 和 `last_usage`。Subagent 的 usage 会放在结果 metadata 的 `subagent_usage` 中，但不会额外合并进全局总量。
 
-当前 Judge 调用和会话压缩调用直接访问 Provider，也没有合并到 `AgentLoop._total_usage`。因此这些字段适合做运行观测，不等同于完整账单。
+Judge 自 2026-09-20 起不再直接访问 Provider：每个 judge batch 通过共享 `AgentRunner.run()` 执行，usage 由 `AgentRunResult.usage` 经 `JudgeExecutionResult.usage` 折进 `JudgeBatchState` 和 `ReviewRunState`。失败的 batch 也必须计入已消耗的 usage（run 结束的失败取 `AgentRunResult.usage`，超时取批内逐轮快照），不得因为失败而丢弃；失败时写入的 `error` 必须非空，否则调用方会把 batch 读成 `completed`。会话压缩调用仍直接访问 Provider，且 review（含 judge）用量未合并到 `AgentLoop._total_usage`。因此这些字段适合做运行观测，不等同于完整账单。
 
 ## Change Rules
 

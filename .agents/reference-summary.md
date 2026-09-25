@@ -46,7 +46,7 @@
 
 `WebSocket/API -> review input normalization -> review orchestration -> planning -> subagents -> validation/finalizer -> WebUI report`
 
-审查专用的协调、分派、收集和最终化由 `review/orchestration.py` 负责，不要把这些逻辑下沉到通用 `AgentLoop`。
+审查专用的协调、分派、收集和最终化当前由 `review/orchestration.py` 承担，但它已被标记为迁移中的 legacy compatibility shell；目标 owner 是 `agent/loop.py` 的 supervisor 生命周期（见 `.agents/architecture.md`）。迁移完成前不要在 legacy orchestrator 中新增能力，也不要复制它的黑盒入口。
 
 ## open-code-review 的 LLM loop（已核查）
 - Root: `C:\Users\Administrator\Desktop\open-code-review`
@@ -55,7 +55,7 @@
 - Entry points: `internal/llmloop/loop.go:RunPerFile`、`internal/llmloop/loop.go:Runner`、`internal/agent/agent.go:Agent.Run`、`internal/agent/agent.go:Agent.executeSubtask`、`internal/scan/agent.go:Agent.executeSubtask`
 - Behavior: `llmloop.Runner.RunPerFile` 为每个文件维护一段增长中的对话，在有界轮数内请求 LLM、顺序执行返回的工具调用、追加 assistant/tool 消息；`task_done` 成功即完成，否则可因最大轮数、连续空结果或上下文压缩失败停止。最大轮数耗尽后会进行一次只允许 `code_comment`/`task_done` 的 grace round。
 - Contracts: `llmloop.Deps` 注入 LLM client、工具注册表、模板、会话、diff 定位器和评论收集器；Runner 聚合 token/warning/tool-call 统计并等待后台压缩。上下层通过 `(completed, MainLoopStop, error)` 判断完成和停止原因。
-- Current mapping: NanoReview 的 `nanoreview/agent/runner.py:AgentRunner.run` 是最接近的单会话工具循环；`nanoreview/agent/loop.py:AgentLoop` 还额外承担 bus、会话恢复、状态机、并发入站消息和出站响应；审查专用协调在 `nanoreview/review/orchestration.py`。
+- Current mapping: NanoReview 的 `nanoreview/agent/runner.py:AgentRunner.run` 是最接近的单会话工具循环；`nanoreview/agent/loop.py:AgentLoop` 还额外承担 bus、会话恢复、状态机、并发入站消息和出站响应；审查专用协调在 `nanoreview/agent/orchestration.py`（迁移中的 legacy shell，目标 owner 为 `agent/loop.py`）。
 - Differences: 参考项目没有与 NanoReview 等价的全局消息 `AgentLoop`；`internal/agent.Agent` 是 diff-review 的产品层编排器，按文件并发 dispatch，先可选 PLAN_TASK，再调用共享 `llmloop.Runner`，最后做 review filter。`internal/gitcmd/runner.go` 仅是 Git 子进程 runner，不是 agent loop。
 - Risks/tests: loop 对工具错误、空工具结果、取消、三段式上下文压缩、异步评论处理和后台任务 join 有专门测试（`internal/llmloop/*_test.go`）；迁移其设计时需保留停止原因、会话记录和压缩并发边界。
 - Last checked: 2026-09-03
@@ -71,6 +71,18 @@
 - Differences: OCR 按文件并行（同质、可截断、N 个由数据驱动），预算用尽即 break 只损失覆盖面；NanoReview 按维度并行（异质、语义互补、4 个固定），静默丢维度会破坏用户显式选择或 planner 决策，故 OCR 的"预算用尽即 break"不可移植。若日后需要成本上限，应按 OCR 做法独立加 opt-in 的实测闸门（Usage 累加 + 默认 0 不限制），而非复用证据预算项。
 - Risks/tests: NanoReview 当前无压缩式上下文管理（OCR 的 60%/80% 三段压缩更成熟但需压缩模板与后台任务管理），reviewer 长会话仅靠 runner 硬裁剪兜底；压缩式上下文管理作为独立后续议题。
 - Last checked: 2026-09-11
+
+## open-code-review 的跨运行 resume（已核查）
+- Root: `C:\Users\Administrator\Desktop\open-code-review`
+- Commit: `e95bdda`
+- Scope: `internal/session/resume.go`、`internal/session/resume_identity.go`、`internal/session/persist.go`、`cmd/opencodereview/review_cmd.go`、`cmd/opencodereview/scan_cmd.go`
+- Entry points: `cmd/opencodereview/shared_flags.go:201/237`（`--resume` flag）、`cmd/opencodereview/review_cmd.go:165`（`validateResumeIdentity`）、`internal/session/resume.go:107`（`LoadReviewResumeState`）、`internal/session/resume_identity.go:50`（`ResumeState.ValidateResume`）
+- Behavior: resume 是**显式 CLI 入口**而非自动重入——`ocr review --resume <session-id>` / `ocr scan --resume <session-id>`。会话以 JSONL 持久化在 `$HOME/.opencodereview/sessions/<encoded-repo-path>/<session-id>.jsonl`；resume 时重放该文件构建只读 checkpoint 索引（`ResumeState`，item 按 diff fingerprint 记录已完成文件及其评论），并从中复用已完成的 file-level 工作单元。`--preview` 与 `--resume` 互斥；review 的 resume 还要求 `--from/--to` 或 `--commit`，不支持 workspace resume。
+- Contracts: `session_end` 记录携带冻结的 `RunManifest`（父 run 的 coverage 快照）。`Manifest` 为 nil 表示父 run 的输入身份不可校验，而不是“没做工作”；`Closed` 区分被中断的父 run 与正常关闭。`ValidateResume(ResumeRequest)` 会在 `agent.New` 之前校验 repo/branch/model/review mode/diff 范围等输入身份，身份不符直接拒绝且不落任何持久化；新 session 记录 `ResumedFrom`/`ResumeLineage` 血缘。
+- Current mapping: NanoReview **当前不采用**该机制。没有任何 resume 入口：`ReviewRunState` 只是进程内运行期可观测性（status/phase/usage/cancel/artifact ref），不是恢复协议；进程异常或重启后不恢复 reviewer/judge 工作，session metadata 的 review 状态只用于 gate 和状态展示。
+- Differences: OCR 的 resume 是面向“中断后继续”的产品能力，依赖显式用户入口、持久化 manifest、逐文件 fingerprint 和输入身份校验；这类能力必须作为独立设计落地（显式入口 + 身份校验 + manifest），不能与进程内状态对象混为一谈。
+- Risks/tests: 若日后 NanoReview 需要 resume，必须一次性补齐用户入口、输入身份校验、持久化 manifest 和跨运行一致性测试；不要复用任何“进程内恢复”式的半成品，也不要把 `result_ref` 之类字段提前预埋进现有 wire contract。
+- Last checked: 2026-09-19
 
 ## 摘要记录格式
 

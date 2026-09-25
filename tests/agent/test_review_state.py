@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from nanoreview.agent.review_state import (
+    CHILD_ERROR_MAX_CHARS,
     REVIEW_ARTIFACTS_DIR_NAME,
     JudgeBatchState,
     ReviewArtifactError,
@@ -16,6 +17,7 @@ from nanoreview.agent.review_state import (
     ReviewPhase,
     ReviewRunState,
     ReviewRunStatus,
+    bound_child_error,
     build_report_artifact,
     compute_input_fingerprint,
     compute_review_input_fingerprint,
@@ -202,6 +204,61 @@ def test_reviewer_and_judge_state_accumulate_usage() -> None:
     batch = JudgeBatchState(batch_id="judge")
     batch.add_usage({"total_tokens": 7})
     assert batch.usage == {"total_tokens": 7}
+
+
+def test_judge_batch_state_transition_and_bounded_error() -> None:
+    """A judge batch moves pending -> running -> completed/error with a bounded reason."""
+    batch = JudgeBatchState(batch_id="judge")
+    assert batch.status == "pending"
+    assert batch.error == ""
+    assert batch.stats == {}
+
+    batch.status = "running"
+    batch.status = "completed"
+    batch.stats = {"total_candidates": 3}
+    assert batch.status == "completed"
+
+    failing = JudgeBatchState(batch_id="judge")
+    failing.status = "running"
+    failing.status = "error"
+    # The error reason is stored bounded so a huge provider trace (even if the
+    # caller passes a raw exception) cannot bloat the run state.
+    failing.error = bound_child_error("x" * 500)
+    assert len(failing.error) == CHILD_ERROR_MAX_CHARS
+
+
+def test_bound_child_error_collapses_and_bounds_reason() -> None:
+    assert bound_child_error(None) == ""
+    assert bound_child_error("  two   spaces  ") == "two spaces"
+    long_reason = "x" * (CHILD_ERROR_MAX_CHARS + 50)
+    assert len(bound_child_error(long_reason)) == CHILD_ERROR_MAX_CHARS
+
+
+def test_reviewer_stopped_status_distinct_from_completed() -> None:
+    """``stopped`` records a cancelled reviewer, never a successful completion."""
+    stopped = ReviewerRunState(dimension="security", status="stopped")
+    stopped.error = "review stopped before the run finished"
+    assert stopped.status == "stopped"
+    assert stopped.status != "completed"
+    assert stopped.error
+
+
+def test_run_state_terminal_locks_phase_and_metadata() -> None:
+    """After a terminal status the phase stops changing and metadata matches."""
+    state = _run_state()
+    state.enter_phase(ReviewPhase.REVIEW)
+    state.status = ReviewRunStatus.COMPLETED
+    state.enter_phase(ReviewPhase.DONE)
+    assert state.phase is ReviewPhase.REVIEW
+    assert state.metadata_payload()["review_status"] == "completed"
+    assert state.metadata_payload()["review_phase"] == "review"
+    # Terminal run keeps a stable metadata payload: only status/phase/fp/ref.
+    assert set(state.metadata_payload()) == {
+        "review_run_id",
+        "review_status",
+        "review_phase",
+        "review_input_fingerprint",
+    }
 
 
 class TestReviewArtifactStore:

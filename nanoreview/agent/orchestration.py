@@ -21,7 +21,11 @@ from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
-from nanoreview.review.output.finalizer import ReviewFinalizer, ReviewFinalizerResult
+from nanoreview.review.output.finalizer import (
+    ReviewFinalizer,
+    ReviewFinalizerResult,
+    reviewer_failure_reason,
+)
 from nanoreview.review.output.judge import ReviewJudge
 from nanoreview.review.types import (
     EvidenceReference,
@@ -70,6 +74,10 @@ def validation_repository_root(plan: ReviewPlan, fallback: Path) -> str:
     if plan.local_scope is not None:
         return plan.local_scope.review_root
     return str(fallback.resolve())
+
+
+# Reviewer error text stored on run state and dimension results is built by
+# the finalizer's reviewer_failure_reason() so both share one bounded format.
 
 
 class ReviewPlanningError(RuntimeError):
@@ -228,29 +236,42 @@ class ReviewOrchestrator:
         )
         if run_state is not None:
             run_state.enter_phase(ReviewPhase.FINALIZE)
-        await finalizer.apply_judge(self._judge)
+        # The aggregated judge batch goes running before the pass starts so a
+        # failure cannot leave it stuck in ``pending``/``running``.
+        judge_batch: JudgeBatchState | None = None
         if run_state is not None and self._judge is not None:
-            # One aggregate entry covers every judge batch: batches are a
-            # context-window split inside one business step, not separate
-            # resume units.
-            batch = run_state.judge_batches.setdefault(
+            judge_batch = run_state.judge_batches.setdefault(
                 "judge", JudgeBatchState(batch_id="judge")
             )
-            # Only this invocation's judge usage is folded in, so a re-entered
-            # run cannot double count a batch it already reported.
-            judge_usage = getattr(self._judge, "last_usage", None)
-            batch.add_usage(judge_usage)
-            run_state.add_usage(judge_usage)
-            stats = getattr(self._judge, "last_stats", None)
-            if stats is not None:
-                batch.status = "completed"
-                batch.stats = {
-                    "total_candidates": stats.total_candidates,
-                    "sent_candidates": stats.sent_candidates,
-                    "returned_verdicts": stats.returned_verdicts,
-                    "needs_confirmation": stats.needs_confirmation,
-                    "batches": stats.batches,
-                }
+            judge_batch.status = "running"
+            judge_batch.error = ""
+        judge_result = await finalizer.apply_judge(self._judge)
+        if judge_batch is not None and judge_result is not None:
+            # Only this invocation's judge usage is folded in, so the run total
+            # reflects exactly one judge pass. Batches are a context-window
+            # split inside one business step, not independent units.
+            judge_batch.add_usage(judge_result.usage)
+            run_state.add_usage(judge_result.usage)
+            if judge_result.error:
+                # Judge failure/timeout stays a judge-level problem: record it
+                # locally, keep the run eligible to complete, and let the
+                # finalizer's needs_confirmation surface the candidates.
+                judge_batch.status = "error"
+                judge_batch.error = judge_result.error
+            else:
+                # Normal return — including every candidate needs_confirmation
+                # and the empty (no-candidates) case. No candidates yields a
+                # completed batch with default stats rather than a false error.
+                judge_batch.status = "completed"
+                stats = judge_result.stats
+                if stats is not None:
+                    judge_batch.stats = {
+                        "total_candidates": stats.total_candidates,
+                        "sent_candidates": stats.sent_candidates,
+                        "returned_verdicts": stats.returned_verdicts,
+                        "needs_confirmation": stats.needs_confirmation,
+                        "batches": stats.batches,
+                    }
         finalizer_result = finalizer.finalize(
             plan.target_name or plan.target or "target"
         )
@@ -489,15 +510,42 @@ class ReviewOrchestrator:
             dimension = str(metadata.get("subagent_label") or "unknown")
             raw = str(metadata.get("subagent_result") or result.content)
             reviewer_usage = metadata.get("subagent_usage")
-            finalizer.ingest_subagent_output(dimension, raw)
+            # Failure of one reviewer must not be silently reported as success:
+            # the terminal status carried by the subagent result decides the
+            # reviewer state, while the raw output (including the error text)
+            # always goes through the finalizer so the report stays explicit
+            # about the incomplete dimension. No outer retry is attempted here;
+            # provider retries and terminal retries already happened inside
+            # AgentRunner.
+            status = str(metadata.get("subagent_status") or "").strip().lower()
+            succeeded = status == "ok"
+            # A failed reviewer's raw output must never be parsed into a clean
+            # result (e.g. valid empty-findings JSON -> no_findings): the
+            # terminal failure is passed explicitly so the finalizer records
+            # the dimension as incomplete with the bounded failure reason.
+            failure_reason = None if succeeded else reviewer_failure_reason(status, raw)
+            finalizer.ingest_subagent_output(dimension, raw, failure_reason=failure_reason)
             if run_state is not None:
                 reviewer = run_state.reviewer_state(dimension)
-                reviewer.status = "completed"
+                if succeeded:
+                    reviewer.status = "completed"
+                    reviewer.error = ""
+                else:
+                    reviewer.status = "error"
+                    reviewer.error = failure_reason
                 # Reviewer token usage is only carried by the result metadata;
-                # fold it into the run total so a multi-reviewer run reports
-                # one aggregated usage instead of losing every unit.
+                # fold it into the run total on success and failure alike so a
+                # multi-reviewer run reports one aggregated usage instead of
+                # losing every unit.
                 reviewer.add_usage(reviewer_usage)
                 run_state.add_usage(reviewer_usage)
+            if not succeeded:
+                logger.warning(
+                    "review.dispatch.reviewer_failed dimension={} status={} error={}",
+                    dimension,
+                    status or "unknown",
+                    failure_reason,
+                )
             if context.result_callback is not None:
                 await context.result_callback(result)
 

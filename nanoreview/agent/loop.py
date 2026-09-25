@@ -587,37 +587,24 @@ class AgentLoop:
         )
 
     def _build_review_judge(self) -> ReviewJudge | None:
+        """Build the judge on the coordinator/plan runner and model.
+
+        The judge never resolves its own model or provider: it reuses
+        ``self.runner`` and ``self.model`` so a review batch runs on exactly the
+        same execution path as the plan batch. ``review.judge.model_preset`` is
+        deliberately ignored here (kept only as a legacy config field), so the
+        judge can never silently fork onto a different model than the plan.
+        """
         judge_settings = getattr(self.review_config, "judge", None)
         if judge_settings is not None and not getattr(judge_settings, "enabled", True):
             return None
-        provider = self.provider
-        model = self.model
-        preset_name = (
-            getattr(judge_settings, "model_preset", None)
-            if judge_settings is not None
-            else None
-        )
-        if preset_name:
-            try:
-                snapshot = self._build_model_preset_snapshot(preset_name)
-                provider = snapshot.provider
-                model = snapshot.model
-                logger.info(
-                    "review.judge.preset.loaded preset={} model={}", preset_name, model
-                )
-            except Exception as exc:
-                logger.warning(
-                    "review.judge.preset_unavailable preset={} reason={}",
-                    preset_name,
-                    exc,
-                )
         config = ReviewJudgeConfig(
             enabled=bool(getattr(judge_settings, "enabled", True)),
             timeout_seconds=int(getattr(judge_settings, "timeout_seconds", 60)),
             max_tokens=int(getattr(judge_settings, "max_tokens", 2048)),
             context_window_tokens=int(self.context_window_tokens or 0) or None,
         )
-        return ReviewJudge(provider=provider, model=model, config=config)
+        return ReviewJudge(runner=self.runner, model=self.model, config=config)
 
     def _set_tool_context(
         self,
@@ -914,6 +901,24 @@ class AgentLoop:
         state.phase = ReviewPhase.DONE
         if warning:
             state.add_warning(warning)
+        # Child work still in flight must not read as ``completed``: unfinished
+        # reviewers/judge are recorded with the target terminal status and a
+        # bounded reason (e.g. a cancelled reviewer is ``stopped``, never the
+        # run being marked complete). Finished work keeps its own terminal state.
+        child_status = "stopped" if status is ReviewRunStatus.STOPPED else "error"
+        child_reason = (
+            "review stopped before the run finished"
+            if status is ReviewRunStatus.STOPPED
+            else "review failed before the run finished"
+        )
+        for reviewer in state.reviewers.values():
+            if reviewer.status in ("pending", "running"):
+                reviewer.status = child_status
+                reviewer.error = child_reason
+        for batch in state.judge_batches.values():
+            if batch.status in ("pending", "running"):
+                batch.status = child_status
+                batch.error = child_reason
         session = self.sessions.get_or_create(session_key)
         session.metadata.update(state.metadata_payload())
         self.sessions.save(session)

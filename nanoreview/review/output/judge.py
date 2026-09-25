@@ -7,6 +7,11 @@ batches that fit within the model's available context window. Batches are
 executed sequentially and their verdicts are merged; each candidate is judged
 at most once. Candidates that cannot fit into a single batch even on their own
 are explicitly marked as ``needs_confirmation`` rather than silently accepted.
+
+Each batch runs through the shared :class:`~nanoreview.agent.runner.AgentRunner`
+with the same provider/model as the coordinator/plan run, so the judge inherits
+provider retry, terminal retry, cancellation and usage accounting instead of
+calling the provider directly.
 """
 from __future__ import annotations
 
@@ -19,6 +24,16 @@ from typing import Any
 
 from loguru import logger
 
+from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.agent.review_state import bound_child_error
+from nanoreview.agent.runner import AgentRunner, AgentRunSpec
+from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.agent.tools.review_judge import (
+    VERDICT_TOOL_NAME,
+    VERDICT_TOOL_SCHEMA,
+    JudgeVerdictReceiver,
+    SubmitJudgeVerdictsTool,
+)
 from nanoreview.review.types import (
     FindingVerdict,
     ReviewDimensionResult,
@@ -28,36 +43,6 @@ from nanoreview.review.types import (
     ReviewJudgeVerdict,
 )
 from nanoreview.utils.helpers import estimate_prompt_tokens, merge_token_usage
-
-_VERDICT_TOOL: dict = {
-    "type": "function",
-    "function": {
-        "name": "submit_verdicts",
-        "description": "Submit judge verdicts for all candidates.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "verdicts": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "decision": {
-                                "type": "string",
-                                "enum": ["accept", "reject", "needs_confirmation"],
-                            },
-                            "reason": {"type": "string"},
-                            "confidence": {"type": "string"},
-                        },
-                        "required": ["id", "decision", "reason", "confidence"],
-                    },
-                }
-            },
-            "required": ["verdicts"],
-        },
-    },
-}
 
 #: Conservative fallback context window (tokens) when the runtime cannot
 #: supply a usable value. Logged when used so operators can correct the
@@ -85,6 +70,17 @@ _PROMPT_INSTRUCTION = (
     "evidence, or needs_confirmation when it is plausible but still requires "
     "manual verification."
 )
+
+#: Terminal submission attempts allowed for one judge batch inside one AgentRun.
+_JUDGE_TERMINAL_RETRY_LIMIT = 5
+#: Tool choice forces ``submit_verdicts`` each turn, so every iteration is one
+#: terminal attempt; a few spare iterations absorb empty/length recovery turns.
+_JUDGE_MAX_ITERATIONS = _JUDGE_TERMINAL_RETRY_LIMIT + 2
+
+#: Tool-result budget for the judge run. The judge registers a single terminal
+#: tool whose result is a short acknowledgement, so a small bound is enough and
+#: keeps a pathological payload from inflating the batch conversation.
+_JUDGE_MAX_TOOL_RESULT_CHARS = 4_096
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,56 +111,112 @@ class ReviewJudgeConfig:
     context_window_tokens: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class JudgeExecutionResult:
+    """Immutable outcome of one ``judge_dimensions`` call.
+
+    Replaces the previous mutable ``last_usage`` / ``last_stats`` /
+    ``last_error`` cross-call interface: the caller (finalizer, supervisor)
+    reads everything it needs from the returned value, so concurrent or
+    repeated judge runs can never inherit another run's state.
+
+    ``verdicts`` always covers every collected candidate (explicit
+    ``needs_confirmation`` for anything unjudged); ``error`` is a bounded reason
+    for a batch/provider/terminal failure, and is non-empty only when at least
+    one batch failed. ``usage`` aggregates every batch that reached the model,
+    including failed and timed-out ones: a failure never hides tokens that were
+    already consumed.
+    """
+
+    verdicts: dict[str, ReviewJudgeVerdict]
+    stats: ReviewJudgeStats | None
+    usage: dict[str, int]
+    error: str | None = None
+
+
+class _JudgeUsageObserver(AgentHook):
+    """Snapshot per-iteration usage so a timed-out batch keeps its spend.
+
+    ``AgentRunner`` reports usage only through ``AgentRunResult``, which a run
+    cancelled by its own ``asyncio.wait_for`` timeout never produces. This hook
+    records each iteration's usage as it completes, so tokens already consumed
+    before the timeout stay visible to the caller instead of being dropped.
+    """
+
+    __slots__ = ("usage",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.usage: dict[str, int] = {}
+
+    async def after_iteration(self, context: AgentHookContext) -> None:
+        # ``context.usage`` carries exactly one iteration's usage (including a
+        # finalization retry merged into it), and the runner calls this once
+        # per iteration, so accumulating here mirrors ``AgentRunResult.usage``.
+        merge_token_usage(self.usage, context.usage)
+
+
+class _JudgeBatchError(RuntimeError):
+    """A failed judge batch that may still have consumed tokens.
+
+    ``usage`` carries whatever the batch managed to spend — the run's reported
+    usage, or the observer snapshot when the run was cancelled by the batch
+    timeout — so the caller folds it into the judge total instead of dropping
+    already-billed tokens.
+    """
+
+    __slots__ = ("usage",)
+
+    def __init__(self, message: str, *, usage: dict[str, int] | None = None) -> None:
+        super().__init__(message)
+        self.usage = dict(usage or {})
+
+
 class ReviewJudge:
-    """Use an LLM to judge whether subagent candidates are review-worthy."""
+    """Use an LLM to judge whether subagent candidates are review-worthy.
+
+    The judge shares the coordinator/plan ``AgentRunner`` and model. It never
+    creates its own provider, runner or model preset: batch execution differs
+    from the plan run only in the prompt, tool set and terminal tool.
+    """
 
     def __init__(
         self,
         *,
-        provider: Any,
+        runner: AgentRunner,
         model: str,
         config: ReviewJudgeConfig | None = None,
     ) -> None:
-        self._provider = provider
+        self._runner = runner
         self._model = model
         self._config = config or ReviewJudgeConfig()
-        #: Statistics of the most recent judge_dimensions call (None when the
-        #: call judged nothing, e.g. there were no candidates).
-        self.last_stats: ReviewJudgeStats | None = None
-        #: Aggregated token usage of the most recent judge_dimensions call.
-        #: The judge still calls the provider directly, so the supervisor can
-        #: only read usage back from here until the JudgeAgent migration lands.
-        self.last_usage: dict[str, int] = {}
         #: Emits the tokenizer-fallback warning at most once per judge.
         self._tokenizer_fallback_warned = False
 
     async def judge_dimensions(
         self,
         dimensions: list[ReviewDimensionResult],
-    ) -> dict[str, ReviewJudgeVerdict]:
+    ) -> JudgeExecutionResult:
         """Judge all accepted/uncertain candidates, batching by context window.
 
-        Returns a mapping of candidate-id -> verdict. Candidates that could
-        not be judged (e.g. too large to fit a single batch, or batch failure)
-        receive an explicit ``needs_confirmation`` verdict so they are never
-        silently treated as accepted. Token usage is accumulated per batch
-        into ``self.last_usage``.
+        Returns a :class:`JudgeExecutionResult` covering every candidate.
+        Candidates that could not be judged (too large to fit a single batch,
+        batch failure, timeout) receive an explicit ``needs_confirmation``
+        verdict so they are never silently treated as accepted. Cancellation
+        propagates; ordinary provider/terminal/timeout errors become a bounded
+        ``error`` plus ``needs_confirmation`` candidates.
         """
-        # Reset before any early return so callers never read a previous
-        # run's usage as this run's.
-        self.last_usage = {}
         candidates = self._collect_candidates(dimensions)
         total_candidates = len(candidates)
         if total_candidates == 0:
-            self.last_stats = None
             logger.info("review.judge.skip reason=no_candidates")
-            return {}
+            return JudgeExecutionResult(verdicts={}, stats=None, usage={}, error=None)
 
         if not self._config.enabled:
             # Disabled judge is an ops switch, not a pass-through: candidates
             # get an explicit needs_confirmation verdict so the report never
             # presents them as judge-accepted.
-            self.last_stats = ReviewJudgeStats(
+            stats = ReviewJudgeStats(
                 total_candidates=total_candidates,
                 sent_candidates=0,
                 returned_verdicts=0,
@@ -176,15 +228,15 @@ class ReviewJudge:
                 total_candidates,
                 total_candidates,
             )
-            return {
-                candidate_id: ReviewJudgeVerdict(
-                    decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                    reason="AI judge is disabled; manual verification required",
-                    confidence="low",
-                    severity=candidate.severity,
-                )
-                for candidate_id, candidate, _hard in candidates
-            }
+            return JudgeExecutionResult(
+                verdicts=self._needs_confirmation_verdicts(
+                    candidates,
+                    "AI judge is disabled; manual verification required",
+                ),
+                stats=stats,
+                usage={},
+                error=None,
+            )
 
         context_window = self._resolve_context_window()
         reserved_output = max(1, int(self._config.max_tokens or _DEFAULT_RESERVED_OUTPUT_TOKENS))
@@ -198,7 +250,7 @@ class ReviewJudge:
                     {"role": "system", "content": self._system_prompt()},
                     {"role": "user", "content": _PROMPT_INSTRUCTION},
                 ],
-                [_VERDICT_TOOL],
+                [VERDICT_TOOL_SCHEMA],
             )
             + reserved_output
         )
@@ -214,18 +266,6 @@ class ReviewJudge:
                 context_window,
                 total_candidates,
             )
-            verdicts = {
-                candidate_id: ReviewJudgeVerdict(
-                    decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                    reason=(
-                        "Judge context window is smaller than the fixed request overhead; "
-                        "manual verification required"
-                    ),
-                    confidence="low",
-                    severity=candidate.severity,
-                )
-                for candidate_id, candidate, _hard in candidates
-            }
             stats = ReviewJudgeStats(
                 total_candidates=total_candidates,
                 sent_candidates=0,
@@ -233,13 +273,21 @@ class ReviewJudge:
                 needs_confirmation=total_candidates,
                 batches=0,
             )
-            self.last_stats = stats
             logger.info(
                 "review.judge.done trace_id=window status=exhausted total={} sent=0 verdicts=0 needs_confirmation={} batches=0",
                 total_candidates,
                 total_candidates,
             )
-            return verdicts
+            return JudgeExecutionResult(
+                verdicts=self._needs_confirmation_verdicts(
+                    candidates,
+                    "Judge context window is smaller than the fixed request overhead; "
+                    "manual verification required",
+                ),
+                stats=stats,
+                usage={},
+                error=None,
+            )
 
         batches, unbatchable = self._split_batches(candidates, available_per_batch)
         trace_id = uuid.uuid4().hex[:8]
@@ -254,25 +302,128 @@ class ReviewJudge:
             context_window,
         )
 
+        try:
+            verdicts, stats, usage, error = await self._run_batches(
+                batches,
+                unbatchable,
+                total_candidates,
+                trace_id,
+            )
+        except Exception as exc:
+            # An escaping failure (unlikely beyond provider/timeout, which the
+            # batch loop already pins) is surfaced as a bounded judge error so
+            # the run's judge batch is never left as ``pending``/``running``.
+            error = bound_child_error(exc)
+            logger.warning(
+                "review.judge.failed reason={} total={}",
+                error,
+                total_candidates,
+            )
+            return JudgeExecutionResult(
+                verdicts=self._needs_confirmation_verdicts(
+                    candidates,
+                    "AI judge failed; manual verification required",
+                ),
+                stats=ReviewJudgeStats(
+                    total_candidates=total_candidates,
+                    sent_candidates=0,
+                    returned_verdicts=0,
+                    needs_confirmation=total_candidates,
+                    batches=0,
+                ),
+                usage={},
+                error=error,
+            )
+
+        logger.info(
+            "review.judge.done trace_id={} status={} total={} sent={} verdicts={} needs_confirmation={} batches={} elapsed_ms={:.1f}",
+            trace_id,
+            "partial_error" if error else "ok",
+            stats.total_candidates,
+            stats.sent_candidates,
+            stats.returned_verdicts,
+            stats.needs_confirmation,
+            stats.batches,
+            (time.perf_counter() - started) * 1000,
+        )
+        return JudgeExecutionResult(
+            verdicts=verdicts, stats=stats, usage=usage, error=error
+        )
+
+    @staticmethod
+    def candidate_id(candidate: ReviewFindingCandidate) -> str:
+        return f"{candidate.dimension}:{candidate.file}:{candidate.line or 0}:{candidate.title}".lower()
+
+    @staticmethod
+    def _needs_confirmation_verdicts(
+        candidates: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
+        reason: str,
+    ) -> dict[str, ReviewJudgeVerdict]:
+        return {
+            candidate_id: ReviewJudgeVerdict(
+                decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+                reason=reason,
+                confidence="low",
+                severity=candidate.severity,
+            )
+            for candidate_id, candidate, _hard in candidates
+        }
+
+    async def _run_batches(
+        self,
+        batches: list[list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]]],
+        unbatchable: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
+        total_candidates: int,
+        trace_id: str,
+    ) -> tuple[dict[str, ReviewJudgeVerdict], ReviewJudgeStats, dict[str, int], str | None]:
+        """Execute every batch and fold in per-candidate needs_confirmation.
+
+        A provider error, terminal failure or timeout on one batch marks the
+        affected candidates ``needs_confirmation`` and records a bounded reason
+        in the returned error (so the caller records an ``error`` batch) but
+        does not abort the remaining batches. Whatever the failed batch already
+        consumed is folded into ``usage`` — a failure must not make the run's
+        token total understate real spend.
+        """
         verdicts: dict[str, ReviewJudgeVerdict] = {}
+        usage: dict[str, int] = {}
         sent_count = 0
         returned_count = 0
+        error: str | None = None
         for index, batch in enumerate(batches):
             batch_trace = f"{trace_id}:b{index + 1}"
             batch_started = time.perf_counter()
             batch_failed = False
             try:
-                batch_verdicts = await self._judge_batch(batch, batch_trace)
+                batch_verdicts, batch_usage = await self._judge_batch(batch, batch_trace)
             except Exception as exc:
+                batch_verdicts = {}
+                # A failed batch is still billed: recover the usage the batch
+                # reported (or the observer snapshotted before its timeout)
+                # instead of dropping it from the run total.
+                batch_usage = dict(getattr(exc, "usage", None) or {})
+                batch_failed = True
                 logger.warning(
-                    "review.judge.batch.done trace_id={} status=error reason={} batch_size={} elapsed_ms={:.1f}",
+                    "review.judge.batch.done trace_id={} status=error reason={} batch_size={} usage={} elapsed_ms={:.1f}",
                     batch_trace,
                     exc,
                     len(batch),
+                    batch_usage,
                     (time.perf_counter() - batch_started) * 1000,
                 )
-                batch_verdicts = {}
-                batch_failed = True
+                # A failed/timeout batch is a judge-level failure, not a clean
+                # completion: record a bounded reason so the run's judge batch
+                # is surfaced as ``error`` while the finalizer still marks the
+                # affected candidates as needs_confirmation. The first failure
+                # wins so the reported reason stays the root cause. The
+                # fallback guarantees a non-empty signal even for exceptions
+                # whose ``str()`` is empty (e.g. a bare timeout), because the
+                # caller treats an empty error as "completed".
+                if error is None:
+                    error = bound_child_error(exc) or (
+                        f"AI judge batch failed ({type(exc).__name__})"
+                    )
+            merge_token_usage(usage, batch_usage)
             sent_count += len(batch)
             # Count only verdicts that actually match a candidate in this
             # batch; unknown or duplicated model IDs must not inflate stats.
@@ -305,11 +456,12 @@ class ReviewJudge:
                     )
             if not batch_failed:
                 logger.info(
-                    "review.judge.batch.done trace_id={} status=ok batch_size={} verdicts={} covered={} elapsed_ms={:.1f}",
+                    "review.judge.batch.done trace_id={} status=ok batch_size={} verdicts={} covered={} usage={} elapsed_ms={:.1f}",
                     batch_trace,
                     len(batch),
                     len(matched),
                     covered,
+                    batch_usage,
                     (time.perf_counter() - batch_started) * 1000,
                 )
 
@@ -334,22 +486,7 @@ class ReviewJudge:
             needs_confirmation=needs_confirmation_count,
             batches=len(batches),
         )
-        self.last_stats = stats
-        logger.info(
-            "review.judge.done trace_id={} status=ok total={} sent={} verdicts={} needs_confirmation={} batches={} elapsed_ms={:.1f}",
-            trace_id,
-            stats.total_candidates,
-            stats.sent_candidates,
-            stats.returned_verdicts,
-            stats.needs_confirmation,
-            stats.batches,
-            (time.perf_counter() - started) * 1000,
-        )
-        return verdicts
-
-    @staticmethod
-    def candidate_id(candidate: ReviewFindingCandidate) -> str:
-        return f"{candidate.dimension}:{candidate.file}:{candidate.line or 0}:{candidate.title}".lower()
+        return verdicts, stats, usage, error
 
     def _resolve_context_window(self) -> int:
         value = self._config.context_window_tokens
@@ -453,29 +590,94 @@ class ReviewJudge:
         self,
         batch: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
         trace_id: str,
-    ) -> dict[str, ReviewJudgeVerdict]:
-        prompt = self._build_prompt(batch)
-        response = await asyncio.wait_for(
-            self._provider.chat_with_retry(
-                messages=[
-                    {"role": "system", "content": self._system_prompt()},
-                    {"role": "user", "content": prompt},
-                ],
-                tools=[_VERDICT_TOOL],
-                model=self._model,
-                max_tokens=self._config.max_tokens,
-                temperature=0,
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": "submit_verdicts"},
-                },
-            ),
-            timeout=self._config.timeout_seconds,
+    ) -> tuple[dict[str, ReviewJudgeVerdict], dict[str, int]]:
+        """Run one batch through the shared ``AgentRunner``.
+
+        Returns ``(verdicts, usage)``. The batch is only successful when the run
+        completed *and* the receiver captured a legal ``submit_verdicts``
+        submission; every other outcome raises a :class:`_JudgeBatchError`
+        carrying the usage the batch already consumed, so ``_run_batches`` marks
+        the candidates ``needs_confirmation``, records a bounded error and still
+        accounts for the spend.
+        """
+        receiver = JudgeVerdictReceiver()
+        tools = ToolRegistry()
+        tools.register(SubmitJudgeVerdictsTool(receiver))
+        # Observes per-iteration usage so a batch cancelled by the timeout below
+        # still reports the tokens it burned; harmless on the success path,
+        # where ``AgentRunResult.usage`` is authoritative.
+        usage_observer = _JudgeUsageObserver()
+        spec = AgentRunSpec(
+            initial_messages=[
+                {"role": "system", "content": self._system_prompt()},
+                {"role": "user", "content": self._build_prompt(batch)},
+            ],
+            tools=tools,
+            model=self._model,
+            max_iterations=_JUDGE_MAX_ITERATIONS,
+            max_tool_result_chars=_JUDGE_MAX_TOOL_RESULT_CHARS,
+            temperature=0,
+            max_tokens=self._config.max_tokens,
+            tool_choice={
+                "type": "function",
+                "function": {"name": VERDICT_TOOL_NAME},
+            },
+            terminal_tools=frozenset({VERDICT_TOOL_NAME}),
+            terminal_retry_limit=_JUDGE_TERMINAL_RETRY_LIMIT,
+            context_window_tokens=self._config.context_window_tokens,
+            error_message=None,
+            concurrent_tools=False,
+            # The judge batch is a self-contained execution: no persisted
+            # session, checkpoint, injection or workspace is shared with the
+            # coordinator run.
+            workspace=None,
+            session_key=None,
+            hook=usage_observer,
         )
-        # Fold this batch's usage into the judge total; the response counter
-        # is the only place judge tokens are observable today.
-        merge_token_usage(self.last_usage, getattr(response, "usage", None))
-        return self._parse_verdicts(response.tool_calls)
+        try:
+            result = await asyncio.wait_for(
+                self._runner.run(spec),
+                timeout=self._config.timeout_seconds,
+            )
+        except TimeoutError as exc:
+            # ``wait_for`` cancels the run mid-flight, so there is no
+            # ``AgentRunResult``: the observer snapshot is the only record of
+            # what this batch already spent. Cancellation of the judge itself
+            # (``/stop``) stays a ``CancelledError`` and still propagates.
+            detail = str(exc) or f"exceeded {self._config.timeout_seconds}s"
+            logger.warning(
+                "review.judge.batch.rejected trace_id={} stop_reason=timeout reason={} observed_usage={}",
+                trace_id,
+                detail,
+                usage_observer.usage,
+            )
+            raise _JudgeBatchError(
+                f"AI judge batch failed (timeout): {detail}",
+                usage=usage_observer.usage,
+            ) from exc
+        if result.stop_reason != "completed":
+            reason = (
+                result.terminal_error
+                or result.error
+                or result.final_content
+                or f"judge batch stopped with {result.stop_reason}"
+            )
+            logger.warning(
+                "review.judge.batch.rejected trace_id={} stop_reason={} reason={}",
+                trace_id,
+                result.stop_reason,
+                str(reason)[:200],
+            )
+            raise _JudgeBatchError(
+                f"AI judge batch failed ({result.stop_reason}): {reason}",
+                usage=dict(result.usage),
+            )
+        if receiver.submission is None:
+            raise _JudgeBatchError(
+                "AI judge batch failed: submit_verdicts was not called",
+                usage=dict(result.usage),
+            )
+        return receiver.submission, dict(result.usage)
 
     @staticmethod
     def _system_prompt() -> str:
@@ -515,31 +717,30 @@ class ReviewJudge:
         ]
         return _PROMPT_INSTRUCTION + "\n\n" + json.dumps(payload, ensure_ascii=False)
 
-    @staticmethod
-    def _parse_verdicts(tool_calls: list) -> dict[str, ReviewJudgeVerdict]:
-        if not tool_calls:
-            logger.warning("review.judge.parse_failed reason=no_tool_calls")
-            return {}
-        data = tool_calls[0].arguments.get("verdicts", [])
-        if not isinstance(data, list):
-            return {}
-        verdicts: dict[str, ReviewJudgeVerdict] = {}
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            candidate_id = str(item.get("id", "")).strip().lower()
-            if not candidate_id:
-                continue
-            decision_raw = str(item.get("decision", "needs_confirmation")).strip().lower()
-            try:
-                decision = ReviewJudgeDecision(decision_raw)
-            except ValueError:
-                decision = ReviewJudgeDecision.NEEDS_CONFIRMATION
-            severity = item.get("severity")
-            verdicts[candidate_id] = ReviewJudgeVerdict(
-                decision=decision,
-                reason=str(item.get("reason", "")),
-                confidence=str(item.get("confidence", "medium")),
-                severity=str(severity).lower() if severity else None,
-            )
-        return verdicts
+
+#: Conservative fallback context window (tokens) when the runtime cannot
+#: supply a usable value. Logged when used so operators can correct the
+#: configuration. Chosen to be small enough to fit most judge models while
+#: still allowing a meaningful single batch.
+_FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000
+
+#: Rough chars-per-token estimate used ONLY when tiktoken is unavailable
+#: (estimate_prompt_tokens returns 0). 4 chars/token is a conservative upper
+#: bound for mixed ASCII/CJK content that avoids underestimating cost.
+_CHARS_PER_TOKEN = 4
+
+#: Reserved tokens for the model's response (matches ReviewJudgeConfig.max_tokens
+#: by default). Keeps room for the tool-call verdict payload.
+_DEFAULT_RESERVED_OUTPUT_TOKENS = 2048
+
+#: Fixed instruction text prepended to the candidate JSON in each user prompt.
+_PROMPT_INSTRUCTION = (
+    "Judge these code review candidates. Use decision accept, reject, or "
+    "needs_confirmation. Reject unsupported, vague, duplicate, or non-actionable "
+    "items. Keep true high-risk issues. A hard_reason such as evidence not "
+    "found in file can be caused by evidence formatting; if the candidate has "
+    "a concrete file, line, and code-like evidence, do not reject solely for "
+    "that hard_reason. Use accept when the claim is supported by the supplied "
+    "evidence, or needs_confirmation when it is plausible but still requires "
+    "manual verification."
+)

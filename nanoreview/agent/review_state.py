@@ -70,13 +70,31 @@ REVIEW_TERMINAL_STATUSES = frozenset(
     {ReviewRunStatus.COMPLETED, ReviewRunStatus.ERROR, ReviewRunStatus.STOPPED}
 )
 
+#: Child (reviewer/judge) error/failure reason length cap. Error text stored on
+#: run state must be bounded so a huge subagent transcript or provider trace
+#: cannot bloat the in-process audit trail.
+CHILD_ERROR_MAX_CHARS = 300
+
+
+def bound_child_error(reason: Any) -> str:
+    """Bound an error/failure reason to ``CHILD_ERROR_MAX_CHARS`` characters."""
+    if reason is None:
+        return ""
+    text = " ".join(str(reason).split())
+    return text[:CHILD_ERROR_MAX_CHARS]
+
 
 @dataclass(slots=True)
 class ReviewerRunState:
-    """Per-reviewer (dimension) execution state."""
+    """Per-reviewer (dimension) execution state.
+
+    ``status`` is one of ``pending | running | completed | error | stopped``.
+    ``stopped`` records a reviewer cancelled before it finished (e.g. a
+    ``/stop``), never a successful completion.
+    """
 
     dimension: str
-    status: str = "pending"  # pending | running | completed | error
+    status: str = "pending"
     error: str = ""
     usage: dict[str, int] = field(default_factory=dict)
 
@@ -87,10 +105,16 @@ class ReviewerRunState:
 
 @dataclass(slots=True)
 class JudgeBatchState:
-    """Per-batch judge execution state."""
+    """Per-batch judge execution state.
+
+    A batch moves through ``pending -> running -> completed`` on success, or to
+    ``error``/``stopped`` on failure or cancellation. ``error`` carries a
+    bounded ``reason`` so a provider trace never inflates the audit trail.
+    """
 
     batch_id: str
-    status: str = "pending"  # pending | completed | error
+    status: str = "pending"
+    error: str = ""
     stats: dict[str, int] = field(default_factory=dict)
     usage: dict[str, int] = field(default_factory=dict)
 
