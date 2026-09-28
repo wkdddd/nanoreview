@@ -117,6 +117,7 @@ class ReviewOrchestrator:
         workspace: Path,
         max_tool_result_chars: int,
         judge: ReviewJudge | None,
+        context_window_tokens: int | None = None,
     ) -> None:
         self._runner = runner
         self._subagentmanager = (
@@ -128,9 +129,14 @@ class ReviewOrchestrator:
         self._workspace = workspace
         self._max_tool_result_chars = max_tool_result_chars
         self._judge = judge
+        # The coordinator run uses the same resolved context window as the
+        # judge so run-level compression and batch splitting agree on the
+        # budget.
+        self._context_window_tokens = context_window_tokens
         # One-shot guard for the tokenizer-unavailable warning so long runs
         # with many dimensions do not spam the log.
         self._tokenizer_fallback_warned = False
+
 
     async def execute(
         self,
@@ -390,7 +396,10 @@ class ReviewOrchestrator:
         tools.register(SubmitReviewPlanTool(receiver))
         result = await self._runner.run(
             AgentRunSpec(
-                initial_messages=list(coordinator_messages),
+                # The coordinator task + evidence manifest are a frozen
+                # envelope; the run has no inherited history.
+                frozen_messages=list(coordinator_messages),
+                working_messages=[],
                 tools=tools,
                 model=self._model,
                 max_iterations=_PLANNER_MAX_ITERATIONS,
@@ -405,8 +414,10 @@ class ReviewOrchestrator:
                 concurrent_tools=False,
                 workspace=self._workspace,
                 session_key=None,
+                context_window_tokens=self._context_window_tokens,
             )
         )
+
         if receiver.submission is not None:
             logger.info(
                 "review.coordinator.plan.accepted assignments={}",

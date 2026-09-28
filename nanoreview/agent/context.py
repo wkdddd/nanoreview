@@ -127,6 +127,45 @@ class ContextBuilder:
         session_metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
+        frozen, working = self.build_partitioned_messages(
+            history,
+            current_message,
+            media=media,
+            channel=channel,
+            chat_id=chat_id,
+            current_role=current_role,
+            sender_id=sender_id,
+            session_summary=session_summary,
+            session_metadata=session_metadata,
+        )
+        return [*frozen, *working]
+
+    def build_partitioned_messages(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str,
+        media: list[str] | None = None,
+        channel: str | None = None,
+        chat_id: str | None = None,
+        current_role: str = "user",
+        sender_id: str | None = None,
+        session_summary: str | None = None,
+        session_metadata: Mapping[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Build the frozen/working partition of the context for one turn.
+
+        Ownership is explicit and never inferred from the history's last role:
+
+        - Frozen is the system prompt plus the current user (or subagent) turn,
+          including the runtime-context block. It is copied verbatim into every
+          request and run-level compression must never summarize or trim it.
+        - Working is the replayable session history. It is the only zone
+          run-level compression may summarize; everything the run appends later
+          lands at its tail.
+
+        The current turn is never merged back into the last history message, so
+        a caller always knows which zone holds the live task.
+        """
         runtime_ctx = self._build_runtime_context(
             channel,
             chat_id,
@@ -143,17 +182,17 @@ class ContextBuilder:
             merged = f"{user_content}\n\n{runtime_ctx}"
         else:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
-        messages = [
-            {"role": "system", "content": self.build_system_prompt(channel=channel, session_summary=session_summary)},
-            *history,
-        ]
-        if messages[-1].get("role") == current_role:
-            last = dict(messages[-1])
-            last["content"] = self._merge_message_content(last.get("content"), merged)
-            messages[-1] = last
-            return messages
-        messages.append({"role": current_role, "content": merged})
-        return messages
+        system_prompt = self.build_system_prompt(
+            channel=channel, session_summary=session_summary
+        )
+        return (
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": current_role, "content": merged},
+            ],
+            [dict(message) for message in history],
+        )
+
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""

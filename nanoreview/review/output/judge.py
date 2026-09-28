@@ -155,6 +155,16 @@ class _JudgeUsageObserver(AgentHook):
         # per iteration, so accumulating here mirrors ``AgentRunResult.usage``.
         merge_token_usage(self.usage, context.usage)
 
+    def record_compression_usage(self, usage: dict[str, int]) -> None:
+        """Fold a completed run-compression request's usage into the snapshot.
+
+        Run-level compression calls the provider outside the iteration loop, so
+        ``after_iteration`` never sees that spend. The runner invokes this
+        callback the moment each compression request's usage is billed, which
+        keeps it visible even when the batch is cancelled by the outer timeout.
+        """
+        merge_token_usage(self.usage, usage)
+
 
 class _JudgeBatchError(RuntimeError):
     """A failed judge batch that may still have consumed tokens.
@@ -608,10 +618,11 @@ class ReviewJudge:
         # where ``AgentRunResult.usage`` is authoritative.
         usage_observer = _JudgeUsageObserver()
         spec = AgentRunSpec(
-            initial_messages=[
+            frozen_messages=[
                 {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": self._build_prompt(batch)},
             ],
+            working_messages=[],
             tools=tools,
             model=self._model,
             max_iterations=_JUDGE_MAX_ITERATIONS,
@@ -633,7 +644,11 @@ class ReviewJudge:
             workspace=None,
             session_key=None,
             hook=usage_observer,
+            # Bank compression usage the instant it is billed, so a batch that
+            # is cancelled by the timeout below still reports that spend.
+            compression_usage_callback=usage_observer.record_compression_usage,
         )
+
         try:
             result = await asyncio.wait_for(
                 self._runner.run(spec),

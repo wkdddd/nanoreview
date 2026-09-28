@@ -365,7 +365,10 @@ class LLMProvider(ABC):
     @staticmethod
     def _is_response_format_unsupported_error(content: str | None) -> bool:
         text = (content or "").lower()
-        if "response_format" not in text and "response format" not in text:
+        if not any(
+            marker in text
+            for marker in ("response_format", "response format", "output_config", "structured output")
+        ):
             return False
         markers = (
             "unexpected keyword argument",

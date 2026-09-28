@@ -413,6 +413,27 @@ class AnthropicProvider(LLMProvider):
     # Build API kwargs
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _convert_response_format(
+        response_format: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Translate the provider-neutral response format to Anthropic's shape."""
+        if response_format is None:
+            return None
+
+        format_type = response_format.get("type")
+        if format_type == "json_object":
+            schema: dict[str, Any] = {"type": "object"}
+        elif format_type == "json_schema":
+            json_schema = response_format.get("json_schema")
+            if not isinstance(json_schema, dict) or not isinstance(json_schema.get("schema"), dict):
+                raise ValueError("response_format.json_schema.schema must be a JSON Schema object")
+            schema = json_schema["schema"]
+        else:
+            raise ValueError(f"Unsupported Anthropic response format: {format_type!r}")
+
+        return {"format": {"type": "json_schema", "schema": schema}}
+
     def _build_kwargs(
         self,
         messages: list[dict[str, Any]],
@@ -423,6 +444,7 @@ class AnthropicProvider(LLMProvider):
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
         supports_caching: bool = True,
+        response_format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         model_name = self._strip_prefix(model or self.default_model)
         system, anthropic_msgs = self._convert_messages(self._sanitize_empty_content(messages))
@@ -471,6 +493,12 @@ class AnthropicProvider(LLMProvider):
             tc = self._convert_tool_choice(tool_choice, thinking_enabled)
             if tc:
                 kwargs["tool_choice"] = tc
+
+        output_config = self._convert_response_format(response_format)
+        if output_config is not None:
+            # Use extra_body so the feature also works with older Anthropic SDKs
+            # covered by the dependency range but unaware of output_config.
+            kwargs["extra_body"] = {"output_config": output_config}
 
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
@@ -555,10 +583,9 @@ class AnthropicProvider(LLMProvider):
         tool_choice: str | dict[str, Any] | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
-        _ = response_format
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
-            reasoning_effort, tool_choice,
+            reasoning_effort, tool_choice, response_format=response_format,
         )
         try:
             response = await self._client.messages.create(**kwargs)
@@ -578,6 +605,7 @@ class AnthropicProvider(LLMProvider):
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
                     tool_choice=tool_choice,
+                    response_format=response_format,
                 )
             return self._handle_error(e)
 
@@ -594,10 +622,9 @@ class AnthropicProvider(LLMProvider):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        _ = response_format
         kwargs = self._build_kwargs(
             messages, tools, model, max_tokens, temperature,
-            reasoning_effort, tool_choice,
+            reasoning_effort, tool_choice, response_format=response_format,
         )
         idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "45"))
         try:

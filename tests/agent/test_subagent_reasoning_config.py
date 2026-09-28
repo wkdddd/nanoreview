@@ -121,7 +121,8 @@ async def test_reasoning_effort_high_reaches_provider() -> None:
     runner = AgentRunner(provider)
     hook = SubagentHook("task-1")
     spec = AgentRunSpec(
-        initial_messages=[{"role": "user", "content": "review this"}],
+        frozen_messages=[{"role": "user", "content": "review this"}],
+        working_messages=[],
         tools=ToolRegistry(),
         model="dummy",
         max_iterations=1,
@@ -129,8 +130,8 @@ async def test_reasoning_effort_high_reaches_provider() -> None:
         reasoning_effort="high",
         hook=hook,
     )
-    context = AgentHookContext(iteration=0, messages=list(spec.initial_messages))
-    await runner._request_model(spec, spec.initial_messages, hook, context)
+    context = AgentHookContext(iteration=0, messages=list([*spec.frozen_messages, *spec.working_messages]))
+    await runner._request_model(spec, [*spec.frozen_messages, *spec.working_messages], hook, context)
     assert provider.recorded_effort == "high"
 
 
@@ -146,7 +147,8 @@ async def test_reasoning_effort_none_reaches_provider() -> None:
     runner = AgentRunner(provider)
     hook = SubagentHook("task-1")
     spec = AgentRunSpec(
-        initial_messages=[{"role": "user", "content": "review this"}],
+        frozen_messages=[{"role": "user", "content": "review this"}],
+        working_messages=[],
         tools=ToolRegistry(),
         model="dummy",
         max_iterations=1,
@@ -154,6 +156,6 @@ async def test_reasoning_effort_none_reaches_provider() -> None:
         reasoning_effort="none",
         hook=hook,
     )
-    context = AgentHookContext(iteration=0, messages=list(spec.initial_messages))
-    await runner._request_model(spec, spec.initial_messages, hook, context)
+    context = AgentHookContext(iteration=0, messages=list([*spec.frozen_messages, *spec.working_messages]))
+    await runner._request_model(spec, [*spec.frozen_messages, *spec.working_messages], hook, context)
     assert provider.recorded_effort == "none"

@@ -118,7 +118,8 @@ class ResponseFormatRejectingProvider(LLMProvider):
 
 def make_spec(tools: ToolRegistry | None = None, **overrides: Any) -> AgentRunSpec:
     values: dict[str, Any] = {
-        "initial_messages": [],
+        "frozen_messages": [],
+        "working_messages": [],
         "tools": tools or ToolRegistry(),
         "model": "dummy",
         "max_iterations": 1,

@@ -1,12 +1,12 @@
 # Agent Guidelines
 
-本文件是本仓库中 AI 编码代理的首要工作约束。当程序事实和约束冲突时，优先考虑程序并更新约束。此文件应保持精简，避免包含冗余或与其他约束文件重复的信息。
+本文件是本仓库中 AI 编码代理的首要工作约束。当程序事实和约束冲突时，优先考虑程序并更新约束，且优先考虑由用户手动做调整除非提出明确要求。此文件应保持精简，避免包含冗余或与其他约束文件重复的信息。
 
 `.agents/` 包含按主题拆分的补充说明：开始工作时先阅读本文件；任务涉及架构、安全或运行时行为时，再阅读对应主题文件。根文件只保留入口级约束和仓库定位，专题文件负责展开具体规则；两者不得冲突。
 
 ## 项目定位
 
-NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主体为 Python，配套 React/TypeScript WebUI。涉及消息链路、模块归属和跨边界改动时，阅读 `.agents/architecture.md`；涉及扩展点、抽象与最小改动时，阅读 `.agents/design.md`。
+NanoReview 是基于 nanobot（a personal AI agent framework）演进的个人多智能体代码审查系统，主体为 Python，配套 React/TypeScript WebUI。
 
 ## 常用命令
 
@@ -72,7 +72,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
   - 编辑任何约束或参考文件前，必须确认：事实是什么、唯一权威文件是哪一个、现有文字是否已经失真、是否有明确的跨文件同步理由。现有文字仍准确时停止扩散；确需同步时逐文件说明不同消费者需要的内容，禁止整段镜像。
 - 统一编码：输出、文件写入、命令和字符串均使用 UTF-8。
 - 需要commit时的日志信息需要完整但不啰嗦，不要使用"auto commits"等无价值信息
-
+- 此项目是多agent架构的代码审查agent，不需要考虑普通agent能力（如用户后续追问等），项目原本是一个通用agent可能会有功能上的残留，执行代码调整时不要考虑适配或增加“普通agent能力”
 ## 项目具体说明
 
 - Architecture constraints：`.agents/architecture.md`

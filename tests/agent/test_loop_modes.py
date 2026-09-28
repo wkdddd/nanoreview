@@ -15,6 +15,7 @@ from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.context import current_request_context
 from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -54,8 +55,8 @@ class CapturingRunner:
         self.initial_messages: list[dict[str, Any]] | None = None
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        self.initial_messages = list(spec.initial_messages)
-        return AgentRunResult(final_content="ok", messages=spec.initial_messages)
+        self.initial_messages = [*spec.frozen_messages, *spec.working_messages]
+        return AgentRunResult(final_content="ok", messages=[*spec.frozen_messages, *spec.working_messages])
 
 
 class SpecCapturingRunner:
@@ -64,13 +65,13 @@ class SpecCapturingRunner:
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         self.specs.append(spec)
-        return AgentRunResult(final_content="ok", messages=list(spec.initial_messages))
+        return AgentRunResult(final_content="ok", messages=[*spec.frozen_messages, *spec.working_messages])
 
 
 class SlowRunner:
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         await asyncio.sleep(0.05)
-        return AgentRunResult(final_content="late", messages=list(spec.initial_messages))
+        return AgentRunResult(final_content="late", messages=[*spec.frozen_messages, *spec.working_messages])
 
 
 class SpawnExecutingRunner:
@@ -87,7 +88,7 @@ class SpawnExecutingRunner:
         )
         context = AgentHookContext(
             iteration=0,
-            messages=list(spec.initial_messages),
+            messages=[*spec.frozen_messages, *spec.working_messages],
             response=LLMResponse(content="spawning reviewer", tool_calls=[call]),
             tool_calls=[call],
         )
@@ -97,7 +98,7 @@ class SpawnExecutingRunner:
         assert tool is not None
         self.result = await tool.execute(**call.arguments)
         return AgentRunResult(
-            final_content="ok", messages=spec.initial_messages, tools_used=["spawn"]
+            final_content="ok", messages=[*spec.frozen_messages, *spec.working_messages], tools_used=["spawn"]
         )
 
 
@@ -110,7 +111,7 @@ class InjectionRunner:
         self.injected = await spec.injection_callback(limit=3)
         return AgentRunResult(
             final_content="ok",
-            messages=list(spec.initial_messages) + list(self.injected),
+            messages=[*spec.frozen_messages, *spec.working_messages] + list(self.injected),
             had_injections=bool(self.injected),
         )
 
@@ -130,7 +131,7 @@ class ReviewSubmitRunner:
         self.specs.append(spec)
         return AgentRunResult(
             final_content=None,
-            messages=list(spec.initial_messages),
+            messages=[*spec.frozen_messages, *spec.working_messages],
             tool_events=[
                 {"name": "read_file", "status": "ok", "detail": "file content"},
                 {
@@ -153,7 +154,7 @@ class BlockingSubmitRunner:
         await self.release.wait()
         return AgentRunResult(
             final_content=None,
-            messages=list(spec.initial_messages),
+            messages=[*spec.frozen_messages, *spec.working_messages],
             tool_events=[
                 {"name": "read_file", "status": "ok", "detail": "file content"},
                 {
@@ -245,7 +246,7 @@ class MultiDrainRunner:
             item.get("_metadata", {}).get("injected_event") == "subagent_barrier" for item in second
         )
 
-        messages = list(spec.initial_messages)
+        messages = [*spec.frozen_messages, *spec.working_messages]
         for batch in self.injected_batches:
             messages.extend(batch)
         return AgentRunResult(final_content="ok", messages=messages, had_injections=True)
@@ -267,7 +268,7 @@ class ManagerQueueDrainRunner:
         self.injected = await asyncio.wait_for(wait, timeout=0.5)
         return AgentRunResult(
             final_content="ok",
-            messages=list(spec.initial_messages) + list(self.injected),
+            messages=[*spec.frozen_messages, *spec.working_messages] + list(self.injected),
             had_injections=bool(self.injected),
         )
 
@@ -378,6 +379,7 @@ async def test_agent_loop_always_injects_review_context(
 
     await loop._run_agent_loop(
         [{"role": "user", "content": "hello"}],
+        [],
         session=session,
         session_key=session.key,
     )
@@ -403,6 +405,7 @@ async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_p
 
     await loop._run_agent_loop(
         [{"role": "user", "content": "hello"}],
+        [],
         session=session,
         session_key=session.key,
         pending_queue=pending,
@@ -432,6 +435,7 @@ async def test_agent_loop_drain_waits_on_subagent_manager_result_queue(tmp_path,
 
     await loop._run_agent_loop(
         [{"role": "user", "content": "hello"}],
+        [],
         session=session,
         session_key=session.key,
         pending_queue=pending,
@@ -668,6 +672,94 @@ async def test_subagent_timeout_announces_error_with_budget_metadata(tmp_path) -
     assert "timed out" in result.metadata["subagent_result"]
 
 
+class CompressionStopRunner:
+    """Runner stub whose reviewer run is stopped by run-level compression."""
+
+    def __init__(self, stop_reason: str, error: str) -> None:
+        self.stop_reason = stop_reason
+        self.error = error
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        return AgentRunResult(
+            final_content=None,
+            messages=list([*spec.frozen_messages, *spec.working_messages]),
+            stop_reason=self.stop_reason,
+            error=self.error,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["compression_failed", "compression_limit"])
+async def test_subagent_compression_stop_marks_reviewer_error(
+    tmp_path, stop_reason: str
+) -> None:
+    """A compression-stopped reviewer run is an error, so its dimension is incomplete."""
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+    )
+    manager.runner = CompressionStopRunner(  # type: ignore[assignment]
+        stop_reason, "sync compression failed after 2 attempts: no content"
+    )
+    status = SubagentStatus(
+        task_id="task-compress",
+        label="generic",
+        task_description="review task",
+        started_at=0.0,
+    )
+
+    await manager._run_subagent(
+        "task-compress",
+        "review task",
+        "generic",
+        {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
+        status,
+    )
+
+    assert status.phase == "error"
+    result = manager.drain_session_results("cli:direct", limit=1)[0]
+    assert result.metadata["subagent_status"] == "error"
+    assert "compression" in result.metadata["subagent_result"]
+
+
+@pytest.mark.asyncio
+async def test_compression_stop_outbound_is_not_marked_streamed(tmp_path) -> None:
+    """compression_failed/limit stops must be delivered by the outbound message."""
+    loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
+    msg = InboundMessage(channel="cli", sender_id="user", chat_id="chat", content="hi")
+
+    async def on_stream(_chunk: str) -> None:
+        return None
+
+    for stop_reason in ("compression_failed", "compression_limit"):
+        outbound = loop._assemble_outbound(
+            msg,
+            "compression failed: run stopped",
+            [{"role": "user", "content": "hi"}],
+            stop_reason,
+            False,
+            [],
+            on_stream,
+        )
+        assert outbound is not None
+        # Not marked as streamed: the channel must actually send the error.
+        assert "_streamed" not in outbound.metadata
+
+    normal = loop._assemble_outbound(
+        msg,
+        "the answer",
+        [{"role": "user", "content": "hi"}],
+        "completed",
+        False,
+        [],
+        on_stream,
+    )
+    assert normal is not None
+    assert normal.metadata.get("_streamed") is True
+
+
 @pytest.mark.asyncio
 async def test_subagent_forwards_context_window_tokens_to_runner(tmp_path) -> None:
     """Regression: subagent AgentRunSpec must carry the manager's window.
@@ -747,16 +839,17 @@ async def test_subagent_hook_uses_streaming_request_path() -> None:
     runner = AgentRunner(provider)
     hook = SubagentHook("task-1")
     spec = AgentRunSpec(
-        initial_messages=[{"role": "user", "content": "review this"}],
+        frozen_messages=[{"role": "user", "content": "review this"}],
+        working_messages=[],
         tools=ToolRegistry(),
         model="dummy",
         max_iterations=1,
         max_tool_result_chars=1000,
         hook=hook,
     )
-    context = AgentHookContext(iteration=0, messages=list(spec.initial_messages))
+    context = AgentHookContext(iteration=0, messages=[*spec.frozen_messages, *spec.working_messages])
 
-    response = await runner._request_model(spec, spec.initial_messages, hook, context)
+    response = await runner._request_model(spec, [*spec.frozen_messages, *spec.working_messages], hook, context)
 
     assert provider.calls == ["stream"]
     assert response.content == "streamed final"
@@ -933,7 +1026,7 @@ class AlwaysNoSubmitRunner:
         self.specs.append(spec)
         return AgentRunResult(
             final_content="review prose without tool call",
-            messages=list(spec.initial_messages),
+            messages=[*spec.frozen_messages, *spec.working_messages],
             stop_reason="max_iterations",
         )
 
@@ -1058,7 +1151,7 @@ async def test_subagent_workspace_uses_local_root(tmp_path) -> None:
             captured.append(spec.tools)
             return AgentRunResult(
                 final_content=None,
-                messages=list(spec.initial_messages),
+                messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
                     {"name": "read_file", "status": "ok", "detail": "content"},
                     {
@@ -1197,7 +1290,7 @@ async def test_empty_findings_without_evidence_is_incomplete(tmp_path) -> None:
         async def run(self, spec: AgentRunSpec) -> AgentRunResult:
             return AgentRunResult(
                 final_content=None,
-                messages=list(spec.initial_messages),
+                messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
                     {
                         "name": "review_submit",
@@ -1247,7 +1340,7 @@ async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -
         async def run(self, spec: AgentRunSpec) -> AgentRunResult:
             return AgentRunResult(
                 final_content=None,
-                messages=list(spec.initial_messages),
+                messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
                     {"name": "read_file", "status": "ok", "detail": "content"},
                     {
@@ -1296,7 +1389,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
         async def run(self, spec: AgentRunSpec) -> AgentRunResult:
             return AgentRunResult(
                 final_content=None,
-                messages=list(spec.initial_messages),
+                messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
                     {"name": "github_review", "status": "ok", "detail": "repo content"},
                     {
@@ -1345,6 +1438,7 @@ async def test_agent_loop_review_target_injects_code_review_context(tmp_path, mo
 
     await loop._run_agent_loop(
         [{"role": "user", "content": "please review https://github.com/test/repo"}],
+        [],
         session=session,
         session_key=session.key,
     )
@@ -1482,7 +1576,7 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, mon
         turn_id="turn-report",
         session=session,
     )
-    ctx.initial_messages = [{"role": "user", "content": "审查"}]
+    ctx.frozen_messages = [{"role": "user", "content": "审查"}]
 
     await loop._state_run(ctx)
 

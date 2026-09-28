@@ -479,10 +479,13 @@ class SubagentManager:
                     session_key, task_id, events
                 ),
             )
-            messages: list[dict[str, Any]] = [
+            # Reviewer system prompt + task/evidence envelope are a frozen
+            # envelope; the reviewer run starts with no inherited history.
+            frozen_messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
+
             sess_key = origin.get("session_key")
             llm_timeout = (
                 self._llm_wall_timeout_for_session(sess_key)
@@ -520,8 +523,10 @@ class SubagentManager:
             async with timeout_scope:
                 result = await self.runner.run(
                     AgentRunSpec(
-                        initial_messages=messages,
+                        frozen_messages=frozen_messages,
+                        working_messages=[],
                         tools=tools,
+
                         model=self.model,
                         max_iterations=effective_iterations,
                         max_tokens=effective_max_tokens,
@@ -562,13 +567,19 @@ class SubagentManager:
                         execution_limits=execution_limits,
                     )
                     return
-                if result.stop_reason == "error":
+                if result.stop_reason in ("error", "compression_failed", "compression_limit"):
+                    # Run-level compression stopped the run: it is an execution
+                    # failure, not a completion. The reviewer is marked error so
+                    # the finalizer treats its dimension as incomplete.
                     status.phase = "error"
+                    reason = result.error or (
+                        f"Error: reviewer run stopped with {result.stop_reason}."
+                    )
                     await self._announce_result(
                         task_id,
                         label,
                         task,
-                        result.error or "Error: subagent execution failed.",
+                        reason,
                         origin,
                         "error",
                         origin_message_id,

@@ -6,12 +6,25 @@ import asyncio
 import inspect
 import os
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
+from nanoreview.agent.compression import (
+    AsyncSnapshot,
+    CompressionError,
+    RunCompressionState,
+    build_summary_message,
+    canonical_json,
+    is_compression_summary,
+    parse_and_validate,
+    partition_working,
+    serialize_transcript,
+    split_units,
+)
 from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.safety_boundary import classify_violation
@@ -24,6 +37,7 @@ from nanoreview.utils.helpers import (
     extract_reasoning,
     find_legal_message_start,
     maybe_persist_tool_result,
+    merge_token_usage,
     strip_think,
     truncate_text,
 )
@@ -59,11 +73,29 @@ _COMPACTABLE_TOOLS = frozenset(
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 _STREAM_OUTER_TIMEOUT_MULTIPLIER = 3.0
 _TOOL_ERROR_PREFIXES = ("Error:", "Error executing ")
+# Run-level compression stop reasons. Both carry a non-empty ``error`` and end
+# the run before the next business model request.
+_STOP_COMPRESSION_FAILED = "compression_failed"
+_STOP_COMPRESSION_LIMIT = "compression_limit"
+# Each compression task runs at most this many runner-level logical requests
+# (first attempt + one retry). Provider-internal retries are not counted here.
+_COMPRESSION_ATTEMPTS = 2
+# Max characters of a failure reason recorded/logged (never the full context).
+_COMPRESSION_RETRY_REASON_CHARS = 200
+_COMPRESSION_TEMPLATE_PATH = "agent/memory_compression.md"
 # Reason recorded when the model answers with prose instead of submitting
 # through its required terminal tool.
 _TERMINAL_PROSE_MISS_REASON = (
     "model returned a prose response without calling the required terminal tool"
 )
+
+
+def _bounded(reason: Any) -> str:
+    """Truncate a compression failure reason so logs never carry full context."""
+    text = str(reason or "").strip().replace("\n", " ")
+    if len(text) > _COMPRESSION_RETRY_REASON_CHARS:
+        return text[: _COMPRESSION_RETRY_REASON_CHARS - 3] + "..."
+    return text
 
 
 def _is_tool_error_result(result: Any) -> bool:
@@ -81,9 +113,20 @@ def _build_terminal_submission_prompt(terminal_tools: frozenset[str]) -> str:
 
 @dataclass(slots=True)
 class AgentRunSpec:
-    """Configuration for a single agent execution."""
+    """Configuration for a single agent execution.
 
-    initial_messages: list[dict[str, Any]]
+    ``frozen_messages`` and ``working_messages`` are an explicit partition of
+    the run's starting context, chosen by the caller (the runner never guesses
+    a boundary by role or position):
+
+    - ``frozen_messages`` is a fixed task/evidence envelope copied verbatim into
+      every request. Context governance never repairs, compacts, or trims it.
+    - ``working_messages`` is the mutable history. It may be summarized by
+      run-level compression; the original messages stay in the run result.
+    """
+
+    frozen_messages: list[dict[str, Any]]
+    working_messages: list[dict[str, Any]]
     tools: ToolRegistry
     model: str
     max_iterations: int
@@ -116,6 +159,14 @@ class AgentRunSpec:
     # Max terminal-tool submission attempts (failed submissions and prose
     # answers both count) before the run fails with terminal_tool_failed.
     terminal_retry_limit: int = 5
+    #: Overrides the default ``agent/memory_compression.md`` prompt template.
+    compression_prompt: str | None = None
+    #: Wall-clock timeout applied to each compression-layer logical request.
+    compression_timeout_s: float = 180.0
+    #: Receives each completed compression request's usage for outer-timeout
+    #: snapshots (judge). Exceptions are logged, never fatal.
+    compression_usage_callback: Callable[[dict[str, int]], None] | None = None
+
 
 
 @dataclass(slots=True)
@@ -135,6 +186,25 @@ class AgentRunResult:
     # the last concrete failure reason when the run ended terminal_tool_failed.
     terminal_attempts: int = 0
     terminal_error: str | None = None
+
+
+@dataclass(slots=True)
+class _IterationOutcome:
+    """Counters and terminal state produced by one business-model iteration.
+
+    A non-``None`` ``stop_reason`` ends the run; otherwise the caller loops and
+    carries the mutated counters forward.
+    """
+
+    injection_cycles: int
+    empty_content_retries: int
+    length_recovery_count: int
+    terminal_attempts: int
+    terminal_error: str | None
+    had_injections: bool
+    stop_reason: str | None = None
+    final_content: str | None = None
+    error: str | None = None
 
 
 class AgentRunner:
@@ -182,6 +252,7 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
+        state: RunCompressionState | None,
         assistant_message: dict[str, Any] | None,
         injection_cycles: int,
         *,
@@ -191,9 +262,10 @@ class AgentRunner:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
         If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
-        append them to *messages* (and emit a checkpoint if *assistant_message*
-        and *iteration* are both provided) and return (True, cycles+1) so the
-        caller continues the iteration loop.  Otherwise return (False, cycles).
+        append them to *messages* (and to the model working context when *state*
+        is given, plus a checkpoint if *assistant_message* and *iteration* are
+        both provided) and return (True, cycles+1) so the caller continues the
+        iteration loop. Otherwise return (False, cycles).
         """
         if injection_cycles >= _MAX_INJECTION_CYCLES:
             return False, injection_cycles
@@ -202,7 +274,10 @@ class AgentRunner:
             return False, injection_cycles
         injection_cycles += 1
         if assistant_message is not None:
-            messages.append(assistant_message)
+            if state is not None:
+                self._append_raw(messages, state, assistant_message)
+            else:
+                messages.append(assistant_message)
             if iteration is not None:
                 await self._emit_checkpoint(
                     spec,
@@ -215,7 +290,14 @@ class AgentRunner:
                         "pending_tool_calls": [],
                     },
                 )
-        self._append_injected_messages(messages, injections)
+        # Injections are written separately (independent copies) into the raw
+        # history and the model working context; they also count as new
+        # interactive content for the working revision, which re-enables a
+        # previously failed async compression retry.
+        self._append_injected_messages(messages, deepcopy(injections))
+        if state is not None:
+            self._append_injected_messages(state.working, deepcopy(injections))
+            state.working_revision += 1
         logger.info(
             "Injected {} follow-up message(s) {} ({}/{})",
             len(injections),
@@ -224,6 +306,7 @@ class AgentRunner:
             _MAX_INJECTION_CYCLES,
         )
         return True, injection_cycles
+
 
     async def _drain_injections(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
         """Drain pending user messages via the injection callback.
@@ -281,7 +364,19 @@ class AgentRunner:
     ##核心方法
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
-        messages = list(spec.initial_messages)
+        # ``messages`` is the raw run history: it is append-only and is what the
+        # caller persists. Run-level compression only ever rewrites the separate
+        # model working context, never this list. Raw history, model state and
+        # provider requests all hold independent deep copies, so a provider
+        # that mutates its request in place can never corrupt either.
+        messages = deepcopy([*spec.frozen_messages, *spec.working_messages])
+        # Run-local compression state: never stored on the runner, so concurrent
+        # reviewer/judge runs cannot apply or cancel each other's jobs.
+        state = RunCompressionState(
+            frozen=deepcopy(spec.frozen_messages),
+            working=deepcopy(spec.working_messages),
+            context_window_tokens=spec.context_window_tokens,
+        )
         final_content: str | None = None
         tools_used: list[str] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -300,450 +395,112 @@ class AgentRunner:
         # tool is still pending); terminal_error keeps the last concrete error.
         terminal_attempts = 0
         terminal_error: str | None = None
+        content_replaced = False
 
-        for iteration in range(spec.max_iterations):
-            try:
-                # Keep the persisted conversation untouched. Context governance
-                # may repair or compact historical messages for the model, but
-                # those synthetic edits must not shift the append boundary used
-                # later when the caller saves only the new turn.
-                messages_for_model = self._prepare_messages(spec, messages)
-            except Exception:
-                logger.exception(
-                    "Context governance failed on turn {} for {}; applying minimal repair",
-                    iteration,
-                    spec.session_key or "default",
-                )
-                try:
-                    messages_for_model = self._drop_orphan_tool_results(messages)
-                    messages_for_model = self._backfill_missing_tool_results(messages_for_model)
-                except Exception:
-                    messages_for_model = messages
-            context = AgentHookContext(iteration=iteration, messages=messages)
-            await hook.before_iteration(context)
-            ##请求模型
-            response = await self._request_model(spec, messages_for_model, hook, context)
-            raw_usage = self._usage_dict(response.usage)
-            context.response = response
-            context.usage = dict(raw_usage)
-            context.tool_calls = list(response.tool_calls)
-            self._accumulate_usage(usage, raw_usage)
-
-            reasoning_text, cleaned_content = extract_reasoning(
-                response.reasoning_content,
-                response.thinking_blocks,
-                response.content,
-            )
-            response.content = cleaned_content
-            if reasoning_text and not context.streamed_reasoning:
-                await hook.emit_reasoning(reasoning_text)
-                await hook.emit_reasoning_end()
-                context.streamed_reasoning = True
-
-            if response.should_execute_tools:
-                context.tool_calls = list(response.tool_calls)
-                if hook.wants_streaming():
-                    await hook.on_stream_end(context, resuming=True)
-
-                assistant_message = build_assistant_message(
-                    response.content or "",
-                    tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-                messages.append(assistant_message)
-                tools_used.extend(tc.name for tc in response.tool_calls)
-                await self._emit_checkpoint(
-                    spec,
-                    {
-                        "phase": "awaiting_tools",
-                        "iteration": iteration,
-                        "model": spec.model,
-                        "assistant_message": assistant_message,
-                        "completed_tool_results": [],
-                        "pending_tool_calls": [
-                            tc.to_openai_tool_call() for tc in response.tool_calls
-                        ],
-                    },
-                )
-
-                await hook.before_execute_tools(context)
-
-                if spec.terminal_tools:
-                    for tool_call in response.tool_calls:
-                        if tool_call.name in spec.terminal_tools:
-                            logger.info(
-                                "terminal_tool.start tool={} attempt={}/{}",
-                                tool_call.name,
-                                terminal_attempts + 1,
-                                spec.terminal_retry_limit,
-                            )
-
-                results, new_events, fatal_error = await self._execute_tools(
-                    spec,
-                    response.tool_calls,
-                    external_lookup_counts,
-                    workspace_violation_counts,
-                )
-                tool_events.extend(new_events)
-                context.tool_results = list(results)
-                context.tool_events = list(new_events)
-                completed_tool_results: list[dict[str, Any]] = []
-                for tool_call, result in zip(response.tool_calls, results):
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.name,
-                        "content": self._normalize_tool_result(
-                            spec,
-                            tool_call.id,
-                            tool_call.name,
-                            result,
-                        ),
-                    }
-                    messages.append(tool_message)
-                    completed_tool_results.append(tool_message)
-                if fatal_error is not None:
-                    error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
-                    final_content = error
-                    stop_reason = "tool_error"
-                    self._append_final_message(messages, final_content)
-                    context.final_content = final_content
-                    context.error = error
-                    context.stop_reason = stop_reason
-                    await hook.after_iteration(context)
-                    should_continue, injection_cycles = await self._try_drain_injections(
-                        spec,
-                        messages,
-                        None,
-                        injection_cycles,
-                        phase="after tool error",
-                    )
-                    if should_continue:
-                        had_injections = True
-                        continue
-                    break
-                await self._emit_checkpoint(
-                    spec,
-                    {
-                        "phase": "tools_completed",
-                        "iteration": iteration,
-                        "model": spec.model,
-                        "assistant_message": assistant_message,
-                        "completed_tool_results": completed_tool_results,
-                        "pending_tool_calls": [],
-                    },
-                )
-                # Terminal tools (e.g. review_submit) signal completion: once
-                # executed successfully, break immediately instead of giving the
-                # LLM another turn that could re-invoke them in a loop. A failed
-                # terminal submission stays inside this AgentRun: the assistant
-                # and tool messages (including the error) are kept so the model
-                # can correct its submission with full context, up to
-                # spec.terminal_retry_limit attempts.
-                if spec.terminal_tools:
-                    terminal_success: str | None = None
-                    terminal_failure: tuple[str, str] | None = None
-                    for tool_call, result in zip(response.tool_calls, results):
-                        if tool_call.name not in spec.terminal_tools:
-                            continue
-                        if _is_tool_error_result(result):
-                            terminal_failure = (tool_call.name, str(result))
-                        else:
-                            terminal_success = tool_call.name
-                            break
-                    if terminal_success is not None:
-                        terminal_attempts += 1
-                        logger.info(
-                            "terminal_tool.completed tool={} attempts={}",
-                            terminal_success,
-                            terminal_attempts,
+        try:
+            for iteration in range(spec.max_iterations):
+                # The first business request skips run-level 60%/80%
+                # compression, but its context is already built as
+                # ``frozen + governed working``: governance (orphan repair,
+                # backfill, microcompact, tool budget, hard trim) only ever
+                # touches the working zone and never crosses the frozen
+                # boundary. From the second request on, the compression state
+                # machine additionally runs before every request.
+                if iteration > 0:
+                    outcome = await self._apply_run_compression(spec, state)
+                    if outcome == "stop":
+                        stop_reason = state.stopped_reason or _STOP_COMPRESSION_FAILED
+                        error = state.stopped_error or stop_reason
+                        # Normal agents surface the caller's user-facing error
+                        # message; the bounded diagnostic stays in ``error``.
+                        # Callers that pass ``error_message=None`` (coordinator,
+                        # reviewer, judge) fall back to the diagnostic itself.
+                        final_content = (
+                            spec.error_message if spec.error_message is not None else error
                         )
-                        stop_reason = "completed"
-                        final_content = ""
-                        context.stop_reason = stop_reason
-                        await hook.after_iteration(context)
                         break
-                    if terminal_failure is not None:
-                        failure_name, failure_text = terminal_failure
-                        terminal_attempts += 1
-                        terminal_error = failure_text
-                        if terminal_attempts >= spec.terminal_retry_limit:
-                            error = terminal_error
-                            final_content = error
-                            stop_reason = "terminal_tool_failed"
-                            self._append_final_message(messages, final_content)
-                            context.final_content = final_content
-                            context.error = error
-                            context.stop_reason = stop_reason
-                            logger.info(
-                                "terminal_tool.failed tool={} attempts={} reason={}",
-                                failure_name,
-                                terminal_attempts,
-                                failure_text[:200],
-                            )
-                            await hook.after_iteration(context)
-                            break
-                        logger.info(
-                            "terminal_tool.retry tool={} attempt={} reason={}",
-                            failure_name,
-                            terminal_attempts,
-                            failure_text[:200],
-                        )
-                        # Continue the current AgentRun so the same context,
-                        # plan, and tool definitions remain available.
-                empty_content_retries = 0
-                length_recovery_count = 0
-                # Checkpoint 1: drain injections after tools, before next LLM call
-                _drained, injection_cycles = await self._try_drain_injections(
-                    spec,
-                    messages,
-                    None,
-                    injection_cycles,
-                    phase="after tool execution",
-                )
-                if _drained:
-                    had_injections = True
-                await hook.after_iteration(context)
-                continue
-
-            if response.has_tool_calls:
-                logger.warning(
-                    "Ignoring tool calls under finish_reason='{}' for {}",
-                    response.finish_reason,
-                    spec.session_key or "default",
-                )
-
-            clean = hook.finalize_content(context, response.content)
-            if response.finish_reason != "error" and is_blank_text(clean):
-                empty_content_retries += 1
-                if empty_content_retries < _MAX_EMPTY_RETRIES:
-                    logger.warning(
-                        "Empty response on turn {} for {} ({}/{}); retrying",
-                        iteration,
-                        spec.session_key or "default",
-                        empty_content_retries,
-                        _MAX_EMPTY_RETRIES,
-                    )
-                    if hook.wants_streaming():
-                        await hook.on_stream_end(context, resuming=False)
-                    await hook.after_iteration(context)
-                    continue
-                logger.warning(
-                    "Empty response on turn {} for {} after {} retries; attempting finalization",
-                    iteration,
-                    spec.session_key or "default",
-                    empty_content_retries,
-                )
-                if hook.wants_streaming():
-                    await hook.on_stream_end(context, resuming=False)
-                response = await self._request_finalization_retry(spec, messages_for_model)
-                retry_usage = self._usage_dict(response.usage)
-                self._accumulate_usage(usage, retry_usage)
-                raw_usage = self._merge_usage(raw_usage, retry_usage)
+                # The provider gets its own deep copy: in-place cleanup by the
+                # provider chain must never reach the raw history or the state.
+                messages_for_model = deepcopy(self._model_context(spec, state))
+                context = AgentHookContext(iteration=iteration, messages=messages)
+                await hook.before_iteration(context)
+                ##请求模型
+                response = await self._request_model(spec, messages_for_model, hook, context)
+                raw_usage = self._usage_dict(response.usage)
                 context.response = response
                 context.usage = dict(raw_usage)
                 context.tool_calls = list(response.tool_calls)
-                clean = hook.finalize_content(context, response.content)
+                self._accumulate_usage(usage, raw_usage)
 
-            if response.finish_reason == "length" and not is_blank_text(clean):
-                length_recovery_count += 1
-                if length_recovery_count <= _MAX_LENGTH_RECOVERIES:
-                    logger.info(
-                        "Output truncated on turn {} for {} ({}/{}); continuing",
-                        iteration,
-                        spec.session_key or "default",
-                        length_recovery_count,
-                        _MAX_LENGTH_RECOVERIES,
-                    )
-                    if hook.wants_streaming():
-                        await hook.on_stream_end(context, resuming=True)
-                    messages.append(
-                        build_assistant_message(
-                            clean,
-                            reasoning_content=response.reasoning_content,
-                            thinking_blocks=response.thinking_blocks,
-                        )
-                    )
-                    messages.append(build_length_recovery_message())
-                    await hook.after_iteration(context)
-                    continue
-
-            assistant_message: dict[str, Any] | None = None
-            if response.finish_reason != "error" and not is_blank_text(clean):
-                assistant_message = build_assistant_message(
-                    clean,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-
-            # Check for mid-turn injections BEFORE signaling stream end.
-            # If a hook replaced the content with a terminal system report,
-            # that report is authoritative for the turn and must not be
-            # overwritten by follow-up coordinator prose.
-            if context.content_replaced:
-                should_continue = False
-            else:
-                should_continue, injection_cycles = await self._try_drain_injections(
+                iteration_outcome = await self._run_iteration(
                     spec,
+                    state,
                     messages,
-                    assistant_message,
+                    messages_for_model,
+                    response,
+                    raw_usage,
+                    context,
+                    hook,
+                    iteration,
+                    tools_used,
+                    tool_events,
+                    external_lookup_counts,
+                    workspace_violation_counts,
+                    usage,
                     injection_cycles,
-                    phase="after final response",
-                    iteration=iteration,
-                )
-                if should_continue:
-                    had_injections = True
-
-            if hook.wants_streaming():
-                await hook.on_stream_end(context, resuming=should_continue)
-
-            if should_continue:
-                await hook.after_iteration(context)
-                continue
-
-            if response.finish_reason == "error":
-                final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
-                stop_reason = "error"
-                error = final_content
-                self._append_model_error_placeholder(messages)
-                context.final_content = final_content
-                context.error = error
-                context.stop_reason = stop_reason
-                await hook.after_iteration(context)
-                should_continue, injection_cycles = await self._try_drain_injections(
-                    spec,
-                    messages,
-                    None,
-                    injection_cycles,
-                    phase="after LLM error",
-                )
-                if should_continue:
-                    had_injections = True
-                    continue
-                break
-            if is_blank_text(clean):
-                final_content = EMPTY_FINAL_RESPONSE_MESSAGE
-                stop_reason = "empty_final_response"
-                error = final_content
-                self._append_final_message(messages, final_content)
-                context.final_content = final_content
-                context.error = error
-                context.stop_reason = stop_reason
-                await hook.after_iteration(context)
-                should_continue, injection_cycles = await self._try_drain_injections(
-                    spec,
-                    messages,
-                    None,
-                    injection_cycles,
-                    phase="after empty response",
-                )
-                if should_continue:
-                    had_injections = True
-                    continue
-                break
-
-            # A terminal-tool run that answers with prose instead of submitting
-            # keeps the same AgentRun: inject one fixed prompt asking for the
-            # terminal tool and count this as a terminal submission attempt.
-            if spec.terminal_tools and not context.content_replaced:
-                messages.append(
-                    assistant_message
-                    or build_assistant_message(
-                        clean,
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    )
-                )
-                terminal_attempts += 1
-                terminal_error = _TERMINAL_PROSE_MISS_REASON
-                terminal_names = ",".join(sorted(spec.terminal_tools))
-                if terminal_attempts >= spec.terminal_retry_limit:
-                    error = terminal_error
-                    final_content = error
-                    stop_reason = "terminal_tool_failed"
-                    context.final_content = final_content
-                    context.error = error
-                    context.stop_reason = stop_reason
-                    logger.info(
-                        "terminal_tool.failed tool={} attempts={} reason={}",
-                        terminal_names,
-                        terminal_attempts,
-                        terminal_error,
-                    )
-                    await hook.after_iteration(context)
-                    break
-                logger.info(
-                    "terminal_tool.retry tool={} attempt={} reason={}",
-                    terminal_names,
+                    empty_content_retries,
+                    length_recovery_count,
                     terminal_attempts,
-                    _TERMINAL_PROSE_MISS_REASON,
+                    terminal_error,
+                    had_injections,
                 )
-                self._append_injected_messages(
-                    messages,
-                    [
-                        {
-                            "role": "user",
-                            "content": _build_terminal_submission_prompt(
-                                spec.terminal_tools
-                            ),
-                        }
-                    ],
-                )
-                await hook.after_iteration(context)
-                continue
-
-            messages.append(
-                assistant_message
-                or build_assistant_message(
-                    clean,
-                    reasoning_content=response.reasoning_content,
-                    thinking_blocks=response.thinking_blocks,
-                )
-            )
-            await self._emit_checkpoint(
-                spec,
-                {
-                    "phase": "final_response",
-                    "iteration": iteration,
-                    "model": spec.model,
-                    "assistant_message": messages[-1],
-                    "completed_tool_results": [],
-                    "pending_tool_calls": [],
-                },
-            )
-            final_content = clean
-            context.final_content = final_content
-            context.stop_reason = stop_reason
-            await hook.after_iteration(context)
-            break
-        else:
-            stop_reason = "max_iterations"
-            if spec.max_iterations_message:
-                final_content = spec.max_iterations_message.format(
-                    max_iterations=spec.max_iterations,
-                )
+                injection_cycles = iteration_outcome.injection_cycles
+                empty_content_retries = iteration_outcome.empty_content_retries
+                length_recovery_count = iteration_outcome.length_recovery_count
+                terminal_attempts = iteration_outcome.terminal_attempts
+                terminal_error = iteration_outcome.terminal_error
+                had_injections = had_injections or iteration_outcome.had_injections
+                content_replaced = content_replaced or context.content_replaced
+                if iteration_outcome.stop_reason is not None:
+                    stop_reason = iteration_outcome.stop_reason
+                    error = iteration_outcome.error
+                    final_content = iteration_outcome.final_content
+                    break
             else:
-                final_content = render_template(
-                    "agent/max_iterations_message.md",
-                    strip=True,
-                    max_iterations=spec.max_iterations,
+                stop_reason = "max_iterations"
+                if spec.max_iterations_message:
+                    final_content = spec.max_iterations_message.format(
+                        max_iterations=spec.max_iterations,
+                    )
+                else:
+                    final_content = render_template(
+                        "agent/max_iterations_message.md",
+                        strip=True,
+                        max_iterations=spec.max_iterations,
+                    )
+                self._append_raw(messages, state, build_assistant_message(final_content))
+                # Drain any remaining injections so they are appended to the
+                # conversation history instead of being re-published as
+                # independent inbound messages by _dispatch's finally block.
+                # We ignore should_continue here because the for-loop has already
+                # exhausted all iterations.
+                drained_after_max_iterations, injection_cycles = await self._try_drain_injections(
+                    spec,
+                    messages,
+                    state,
+                    None,
+                    injection_cycles,
+                    phase="after max_iterations",
                 )
-            self._append_final_message(messages, final_content)
-            # Drain any remaining injections so they are appended to the
-            # conversation history instead of being re-published as
-            # independent inbound messages by _dispatch's finally block.
-            # We ignore should_continue here because the for-loop has already
-            # exhausted all iterations.
-            drained_after_max_iterations, injection_cycles = await self._try_drain_injections(
-                spec,
-                messages,
-                None,
-                injection_cycles,
-                phase="after max_iterations",
-            )
-            if drained_after_max_iterations:
-                had_injections = True
+                if drained_after_max_iterations:
+                    had_injections = True
+        finally:
+            # Always settle the in-flight compression task: normal completion,
+            # terminal tool success, business error, max iterations and external
+            # cancellation all go through here. Usage recorded by compression is
+            # part of the run and must survive every exit path.
+            await self._close_compression(spec, state, usage)
+            merge_token_usage(usage, state.usage)
 
         return AgentRunResult(
             final_content=final_content,
@@ -754,10 +511,1096 @@ class AgentRunner:
             error=error,
             tool_events=tool_events,
             had_injections=had_injections,
-            content_replaced=context.content_replaced,
+            content_replaced=content_replaced,
             terminal_attempts=terminal_attempts,
             terminal_error=terminal_error,
         )
+
+
+    async def _run_iteration(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        messages: list[dict[str, Any]],
+        messages_for_model: list[dict[str, Any]],
+        response: LLMResponse,
+        raw_usage: dict[str, int],
+        context: AgentHookContext,
+        hook: AgentHook,
+        iteration: int,
+        tools_used: list[str],
+        tool_events: list[dict[str, Any]],
+        external_lookup_counts: dict[str, int],
+        workspace_violation_counts: dict[str, int],
+        usage: dict[str, int],
+        injection_cycles: int,
+        empty_content_retries: int,
+        length_recovery_count: int,
+        terminal_attempts: int,
+        terminal_error: str | None,
+        had_injections: bool,
+    ) -> "_IterationOutcome":
+        """Handle one business model response and advance the run.
+
+        Returns an :class:`_IterationOutcome`. A non-``None`` ``stop_reason``
+        means the run must end with that reason; otherwise the caller loops.
+        """
+        reasoning_text, cleaned_content = extract_reasoning(
+            response.reasoning_content,
+            response.thinking_blocks,
+            response.content,
+        )
+        response.content = cleaned_content
+        if reasoning_text and not context.streamed_reasoning:
+            await hook.emit_reasoning(reasoning_text)
+            await hook.emit_reasoning_end()
+            context.streamed_reasoning = True
+
+        outcome = _IterationOutcome(
+            injection_cycles=injection_cycles,
+            empty_content_retries=empty_content_retries,
+            length_recovery_count=length_recovery_count,
+            terminal_attempts=terminal_attempts,
+            terminal_error=terminal_error,
+            had_injections=had_injections,
+        )
+
+        if response.should_execute_tools:
+            context.tool_calls = list(response.tool_calls)
+            if hook.wants_streaming():
+                await hook.on_stream_end(context, resuming=True)
+
+            assistant_message = build_assistant_message(
+                response.content or "",
+                tool_calls=[tc.to_openai_tool_call() for tc in response.tool_calls],
+                reasoning_content=response.reasoning_content,
+                thinking_blocks=response.thinking_blocks,
+            )
+            self._append_raw(messages, state, assistant_message)
+            tools_used.extend(tc.name for tc in response.tool_calls)
+            await self._emit_checkpoint(
+                spec,
+                {
+                    "phase": "awaiting_tools",
+                    "iteration": iteration,
+                    "model": spec.model,
+                    "assistant_message": assistant_message,
+                    "completed_tool_results": [],
+                    "pending_tool_calls": [
+                        tc.to_openai_tool_call() for tc in response.tool_calls
+                    ],
+                },
+            )
+
+            await hook.before_execute_tools(context)
+
+            if spec.terminal_tools:
+                for tool_call in response.tool_calls:
+                    if tool_call.name in spec.terminal_tools:
+                        logger.info(
+                            "terminal_tool.start tool={} attempt={}/{}",
+                            tool_call.name,
+                            outcome.terminal_attempts + 1,
+                            spec.terminal_retry_limit,
+                        )
+
+            results, new_events, fatal_error = await self._execute_tools(
+                spec,
+                response.tool_calls,
+                external_lookup_counts,
+                workspace_violation_counts,
+            )
+            tool_events.extend(new_events)
+            context.tool_results = list(results)
+            context.tool_events = list(new_events)
+            completed_tool_results: list[dict[str, Any]] = []
+            for tool_call, result in zip(response.tool_calls, results):
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.name,
+                    "content": self._normalize_tool_result(
+                        spec,
+                        tool_call.id,
+                        tool_call.name,
+                        result,
+                    ),
+                }
+                self._append_raw(messages, state, tool_message)
+                completed_tool_results.append(tool_message)
+            if fatal_error is not None:
+                error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
+                final_content = error
+                stop_reason = "tool_error"
+                self._append_final_message(messages, final_content)
+                context.final_content = final_content
+                context.error = error
+                context.stop_reason = stop_reason
+                await hook.after_iteration(context)
+                should_continue, injection_cycles = await self._try_drain_injections(
+                    spec,
+                    messages,
+                    state,
+                    None,
+                    outcome.injection_cycles,
+                    phase="after tool error",
+                )
+                outcome.injection_cycles = injection_cycles
+                if should_continue:
+                    outcome.had_injections = True
+                    return outcome
+                outcome.stop_reason = stop_reason
+                outcome.error = error
+                outcome.final_content = final_content
+                return outcome
+            await self._emit_checkpoint(
+                spec,
+                {
+                    "phase": "tools_completed",
+                    "iteration": iteration,
+                    "model": spec.model,
+                    "assistant_message": assistant_message,
+                    "completed_tool_results": completed_tool_results,
+                    "pending_tool_calls": [],
+                },
+            )
+            # Terminal tools (e.g. review_submit) signal completion: once
+            # executed successfully, break immediately instead of giving the
+            # LLM another turn that could re-invoke them in a loop. A failed
+            # terminal submission stays inside this AgentRun: the assistant
+            # and tool messages (including the error) are kept so the model
+            # can correct its submission with full context, up to
+            # spec.terminal_retry_limit attempts.
+            if spec.terminal_tools:
+                terminal_success: str | None = None
+                terminal_failure: tuple[str, str] | None = None
+                for tool_call, result in zip(response.tool_calls, results):
+                    if tool_call.name not in spec.terminal_tools:
+                        continue
+                    if _is_tool_error_result(result):
+                        terminal_failure = (tool_call.name, str(result))
+                    else:
+                        terminal_success = tool_call.name
+                        break
+                if terminal_success is not None:
+                    outcome.terminal_attempts += 1
+                    logger.info(
+                        "terminal_tool.completed tool={} attempts={}",
+                        terminal_success,
+                        outcome.terminal_attempts,
+                    )
+                    stop_reason = "completed"
+                    final_content = ""
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    outcome.stop_reason = stop_reason
+                    outcome.final_content = final_content
+                    return outcome
+                if terminal_failure is not None:
+                    failure_name, failure_text = terminal_failure
+                    outcome.terminal_attempts += 1
+                    outcome.terminal_error = failure_text
+                    if outcome.terminal_attempts >= spec.terminal_retry_limit:
+                        error = outcome.terminal_error
+                        final_content = error
+                        stop_reason = "terminal_tool_failed"
+                        self._append_final_message(messages, final_content)
+                        context.final_content = final_content
+                        context.error = error
+                        context.stop_reason = stop_reason
+                        logger.info(
+                            "terminal_tool.failed tool={} attempts={} reason={}",
+                            failure_name,
+                            outcome.terminal_attempts,
+                            _bounded(failure_text),
+                        )
+                        await hook.after_iteration(context)
+                        outcome.stop_reason = stop_reason
+                        outcome.error = error
+                        outcome.final_content = final_content
+                        return outcome
+                    logger.info(
+                        "terminal_tool.retry tool={} attempt={} reason={}",
+                        failure_name,
+                        outcome.terminal_attempts,
+                        _bounded(failure_text),
+                    )
+                    # Continue the current AgentRun so the same context,
+                    # plan, and tool definitions remain available.
+            outcome.empty_content_retries = 0
+            outcome.length_recovery_count = 0
+            # Checkpoint 1: drain injections after tools, before next LLM call
+            _drained, injection_cycles = await self._try_drain_injections(
+                spec,
+                messages,
+                state,
+                None,
+                outcome.injection_cycles,
+                phase="after tool execution",
+            )
+            outcome.injection_cycles = injection_cycles
+            if _drained:
+                outcome.had_injections = True
+            await hook.after_iteration(context)
+            return outcome
+
+        if response.has_tool_calls:
+            logger.warning(
+                "Ignoring tool calls under finish_reason='{}' for {}",
+                response.finish_reason,
+                spec.session_key or "default",
+            )
+
+        clean = hook.finalize_content(context, response.content)
+        if response.finish_reason != "error" and is_blank_text(clean):
+            outcome.empty_content_retries += 1
+            if outcome.empty_content_retries < _MAX_EMPTY_RETRIES:
+                logger.warning(
+                    "Empty response on turn {} for {} ({}/{}); retrying",
+                    iteration,
+                    spec.session_key or "default",
+                    outcome.empty_content_retries,
+                    _MAX_EMPTY_RETRIES,
+                )
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=False)
+                await hook.after_iteration(context)
+                return outcome
+            logger.warning(
+                "Empty response on turn {} for {} after {} retries; attempting finalization",
+                iteration,
+                spec.session_key or "default",
+                outcome.empty_content_retries,
+            )
+            if hook.wants_streaming():
+                await hook.on_stream_end(context, resuming=False)
+            response = await self._request_finalization_retry(spec, messages_for_model)
+            retry_usage = self._usage_dict(response.usage)
+            self._accumulate_usage(usage, retry_usage)
+            raw_usage = self._merge_usage(raw_usage, retry_usage)
+            context.response = response
+            context.usage = dict(raw_usage)
+            context.tool_calls = list(response.tool_calls)
+            clean = hook.finalize_content(context, response.content)
+        _ = raw_usage
+
+        if response.finish_reason == "length" and not is_blank_text(clean):
+            outcome.length_recovery_count += 1
+            if outcome.length_recovery_count <= _MAX_LENGTH_RECOVERIES:
+                logger.info(
+                    "Output truncated on turn {} for {} ({}/{}); continuing",
+                    iteration,
+                    spec.session_key or "default",
+                    outcome.length_recovery_count,
+                    _MAX_LENGTH_RECOVERIES,
+                )
+                if hook.wants_streaming():
+                    await hook.on_stream_end(context, resuming=True)
+                self._append_raw(
+                    messages,
+                    state,
+                    build_assistant_message(
+                        clean,
+                        reasoning_content=response.reasoning_content,
+                        thinking_blocks=response.thinking_blocks,
+                    ),
+                )
+                self._append_raw(messages, state, build_length_recovery_message())
+                await hook.after_iteration(context)
+                return outcome
+
+        assistant_message: dict[str, Any] | None = None
+        if response.finish_reason != "error" and not is_blank_text(clean):
+            assistant_message = build_assistant_message(
+                clean,
+                reasoning_content=response.reasoning_content,
+                thinking_blocks=response.thinking_blocks,
+            )
+
+        # Check for mid-turn injections BEFORE signaling stream end.
+        # If a hook replaced the content with a terminal system report,
+        # that report is authoritative for the turn and must not be
+        # overwritten by follow-up coordinator prose.
+        if context.content_replaced:
+            should_continue = False
+        else:
+            should_continue, injection_cycles = await self._try_drain_injections(
+                spec,
+                messages,
+                state,
+                assistant_message,
+                outcome.injection_cycles,
+                phase="after final response",
+                iteration=iteration,
+            )
+            outcome.injection_cycles = injection_cycles
+            if should_continue:
+                outcome.had_injections = True
+
+        if hook.wants_streaming():
+            await hook.on_stream_end(context, resuming=should_continue)
+
+        if should_continue:
+            await hook.after_iteration(context)
+            return outcome
+
+        if response.finish_reason == "error":
+            final_content = clean or spec.error_message or _DEFAULT_ERROR_MESSAGE
+            stop_reason = "error"
+            error = final_content
+            self._append_model_error_placeholder(messages)
+            context.final_content = final_content
+            context.error = error
+            context.stop_reason = stop_reason
+            await hook.after_iteration(context)
+            should_continue, injection_cycles = await self._try_drain_injections(
+                spec,
+                messages,
+                state,
+                None,
+                outcome.injection_cycles,
+                phase="after LLM error",
+            )
+            outcome.injection_cycles = injection_cycles
+            if should_continue:
+                outcome.had_injections = True
+                return outcome
+            outcome.stop_reason = stop_reason
+            outcome.error = error
+            outcome.final_content = final_content
+            return outcome
+        if is_blank_text(clean):
+            final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+            stop_reason = "empty_final_response"
+            error = final_content
+            self._append_final_message(messages, final_content)
+            context.final_content = final_content
+            context.error = error
+            context.stop_reason = stop_reason
+            await hook.after_iteration(context)
+            should_continue, injection_cycles = await self._try_drain_injections(
+                spec,
+                messages,
+                state,
+                None,
+                outcome.injection_cycles,
+                phase="after empty response",
+            )
+            outcome.injection_cycles = injection_cycles
+            if should_continue:
+                outcome.had_injections = True
+                return outcome
+            outcome.stop_reason = stop_reason
+            outcome.error = error
+            outcome.final_content = final_content
+            return outcome
+
+        # A terminal-tool run that answers with prose instead of submitting
+        # keeps the same AgentRun: inject one fixed prompt asking for the
+        # terminal tool and count this as a terminal submission attempt.
+        if spec.terminal_tools and not context.content_replaced:
+            self._append_raw(
+                messages,
+                state,
+                assistant_message
+                or build_assistant_message(
+                    clean,
+                    reasoning_content=response.reasoning_content,
+                    thinking_blocks=response.thinking_blocks,
+                ),
+            )
+            outcome.terminal_attempts += 1
+            outcome.terminal_error = _TERMINAL_PROSE_MISS_REASON
+            terminal_names = ",".join(sorted(spec.terminal_tools))
+            if outcome.terminal_attempts >= spec.terminal_retry_limit:
+                error = outcome.terminal_error
+                final_content = error
+                stop_reason = "terminal_tool_failed"
+                context.final_content = final_content
+                context.error = error
+                context.stop_reason = stop_reason
+                logger.info(
+                    "terminal_tool.failed tool={} attempts={} reason={}",
+                    terminal_names,
+                    outcome.terminal_attempts,
+                    _TERMINAL_PROSE_MISS_REASON,
+                )
+                await hook.after_iteration(context)
+                outcome.stop_reason = stop_reason
+                outcome.error = error
+                outcome.final_content = final_content
+                return outcome
+            logger.info(
+                "terminal_tool.retry tool={} attempt={} reason={}",
+                terminal_names,
+                outcome.terminal_attempts,
+                _TERMINAL_PROSE_MISS_REASON,
+            )
+            self._append_injected_messages(
+                messages,
+                [
+                    {
+                        "role": "user",
+                        "content": _build_terminal_submission_prompt(
+                            spec.terminal_tools
+                        ),
+                    }
+                ],
+            )
+            # The synthetic prompt must enter the model working context too.
+            self._append_injected_messages(
+                state.working,
+                [
+                    {
+                        "role": "user",
+                        "content": _build_terminal_submission_prompt(
+                            spec.terminal_tools
+                        ),
+                    }
+                ],
+            )
+            # New interactive content: counts for the compression retry gate.
+            state.working_revision += 1
+            await hook.after_iteration(context)
+            return outcome
+
+        final_message = (
+            assistant_message
+            or build_assistant_message(
+                clean,
+                reasoning_content=response.reasoning_content,
+                thinking_blocks=response.thinking_blocks,
+            )
+        )
+        self._append_raw(messages, state, final_message)
+        await self._emit_checkpoint(
+            spec,
+            {
+                "phase": "final_response",
+                "iteration": iteration,
+                "model": spec.model,
+                "assistant_message": messages[-1],
+                "completed_tool_results": [],
+                "pending_tool_calls": [],
+            },
+        )
+        final_content = clean
+        context.final_content = final_content
+        context.stop_reason = "completed"
+        await hook.after_iteration(context)
+        outcome.stop_reason = "completed"
+        outcome.final_content = final_content
+        return outcome
+
+    # ------------------------------------------------------------------
+    # Run-level compression
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _append_raw(
+        messages: list[dict[str, Any]],
+        state: RunCompressionState,
+        message: dict[str, Any],
+    ) -> None:
+        """Append a message to the raw history and the model working context.
+
+        Each list receives its own deep copy, so no nested content, tool call
+        or metadata is ever shared between the persisted history and the
+        model-visible context. Bumping ``working_revision`` records that new
+        interactive content exists, which is what re-enables a previously
+        failed async compression retry.
+        """
+        messages.append(deepcopy(message))
+        state.working.append(deepcopy(message))
+        state.working_revision += 1
+
+    def _model_context(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+    ) -> list[dict[str, Any]]:
+        """Build the message list for the next business model request.
+
+        From the very first request on, the context is ``frozen verbatim +
+        governed working``: orphan repair, backfill, microcompact, tool-result
+        budget and hard trim only ever see the working zone, never the frozen
+        envelope, and never pair a tool round across the boundary. If the
+        frozen zone alone exceeds the window it is still sent whole and the
+        Provider is the one that reports the context-length error.
+        """
+        try:
+            return self._prepare_messages(spec, state.frozen, list(state.working))
+        except Exception:
+            logger.exception(
+                "Context governance failed for {}; applying minimal repair",
+                spec.session_key or "default",
+            )
+            try:
+                repaired = self._drop_orphan_tool_results(list(state.working))
+                repaired = self._backfill_missing_tool_results(repaired)
+                return [*[dict(m) for m in state.frozen], *repaired]
+            except Exception:
+                return [*[dict(m) for m in state.frozen], *state.working]
+
+    async def _apply_run_compression(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+    ) -> str:
+        """Run the pre-request compression state machine.
+
+        Returns ``"stop"`` when the run must end (``compression_failed`` /
+        ``compression_limit``), otherwise ``"continue"``.
+        """
+        sync_limit = state.sync_limit
+        soft_limit = state.soft_limit
+        if sync_limit is None:
+            # No usable window: nothing to protect, leave the run untouched.
+            return "continue"
+
+        # 1. Collect a completed async task. Its usage is always recorded, even
+        #    when the result is discarded because the context moved on. When the
+        #    summary is applied, the next business request is sent as rebuilt:
+        #    sync compression is deliberately not re-entered in the same step,
+        #    the recount happens before the following request.
+        if await self._collect_async_result(spec, state):
+            return "continue"
+
+        # 2. Recount the full request that would be sent next.
+        before_tokens, source = self._count_request_tokens(spec, state)
+        if before_tokens <= 0:
+            return "continue"
+
+        if before_tokens >= sync_limit:
+            # 3. Sync compression takes priority over any background job.
+            await self._cancel_pending_compression(state, reason="sync_takeover")
+            await self._compress_sync(
+                spec, state, before_tokens=before_tokens, source=source
+            )
+            if state.stopped:
+                return "stop"
+            after_tokens, _ = self._count_request_tokens(spec, state)
+            if after_tokens >= sync_limit:
+                state.stopped = True
+                state.stopped_reason = _STOP_COMPRESSION_LIMIT
+                state.stopped_error = (
+                    "compression succeeded but the request still reaches "
+                    f"{after_tokens} tokens (>= {sync_limit} sync limit)"
+                )
+                logger.warning(
+                    "compression.stopped trace={} reason={} tokens={} limit={}",
+                    state.trace_id,
+                    _STOP_COMPRESSION_LIMIT,
+                    after_tokens,
+                    sync_limit,
+                )
+            return "stop" if state.stopped else "continue"
+
+        # 4. Below the hard limit: start async compression if we are in the
+        #    soft zone, there is no pending job, and a retry is permitted.
+        if before_tokens >= soft_limit:
+            await self._maybe_start_async_compression(
+                spec, state, before_tokens=before_tokens, source=source
+            )
+        return "continue"
+
+    def _tool_definitions_for_estimate(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
+        try:
+            return spec.tools.get_definitions()
+        except Exception:
+            logger.exception("Failed to build tool definitions for token estimate")
+            return []
+
+    def _count_request_tokens(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+    ) -> tuple[int, str]:
+        """Estimate the full next request: frozen + working + tools."""
+        messages = self._model_context(spec, state)
+        try:
+            tokens, source = estimate_prompt_tokens_chain(
+                self.provider,
+                spec.model,
+                messages,
+                self._tool_definitions_for_estimate(spec),
+            )
+        except Exception:
+            logger.exception("Token estimate failed; treating request as under limit")
+            return 0, "none"
+        return int(tokens), source
+
+    def _compression_template(self, spec: AgentRunSpec) -> str:
+        if spec.compression_prompt:
+            return spec.compression_prompt
+        return render_template(_COMPRESSION_TEMPLATE_PATH, strip=True)
+
+    async def _collect_async_result(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+    ) -> bool:
+        """Apply a finished async compression job if its snapshot still matches.
+
+        Returns ``True`` only when a summary was actually written back, so the
+        caller can skip further compression decisions for this request. The
+        job's usage was already banked when the compression request returned
+        (see ``_compress_working``), so nothing is recorded here.
+        """
+        pending = state.pending
+        if pending is None or not pending.done():
+            return False
+        state.pending = None
+        snapshot = state.snapshot
+        state.snapshot = None
+        try:
+            result = pending.result()
+        except asyncio.CancelledError:
+            return False
+        except Exception as exc:
+            state.async_failed = True
+            # Retry is keyed on the working revision the failed attempt
+            # started from: messages appended while the job was in flight
+            # (even before this failure was collected) move the revision and
+            # therefore count as a retryable condition; a failure with no new
+            # content does not.
+            state.async_failed_revision = (
+                snapshot.working_revision if snapshot is not None else state.working_revision
+            )
+            logger.warning(
+                "compression.failed mode=async trace={} attempts={} reason={}",
+                state.trace_id,
+                _COMPRESSION_ATTEMPTS,
+                _bounded(exc),
+            )
+            return False
+        if result is None or snapshot is None:
+            return False
+        if not self._snapshot_matches(state, snapshot):
+            logger.info(
+                "compression.discarded mode=async trace={} reason=snapshot_mismatch snapshot={}",
+                state.trace_id,
+                state.snapshot_context(),
+            )
+            return False
+        summary_message = build_summary_message(canonical_json(result))
+        # Rebuild: new summary + the snapshot's active zone + everything appended
+        # since the snapshot. The compress zone (which held the previous summary,
+        # if any) is dropped from the model context, so summaries are replaced,
+        # never accumulated, and the active zone is never lost.
+        suffix = state.working[len(snapshot.working_prefix) :]
+        state.working = self._rebuild_working(
+            summary_message, snapshot.active_prefix, suffix
+        )
+        state.working_revision += 1
+        state.async_failed = False
+        state.async_failed_revision = None
+        after_tokens, _ = self._count_request_tokens(spec, state)
+        logger.info(
+            "compression.applied mode=async trace={} before_tokens={} after_tokens={} "
+            "active={} suffix={} working_len={}",
+            state.trace_id,
+            snapshot.before_tokens,
+            after_tokens,
+            len(snapshot.active_prefix),
+            len(suffix),
+            len(state.working),
+        )
+        return True
+
+    @staticmethod
+    def _rebuild_working(
+        summary_message: dict[str, Any],
+        active_prefix: list[dict[str, Any]],
+        suffix: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Rebuild the model working context after a successful compression.
+
+        Shared by the async apply path and the sync path: ``frozen + summary +
+        active + suffix``. The compress zone is replaced by the synthetic
+        summary, the active zone is replayed verbatim, and anything appended
+        after the compression boundary keeps its position at the tail.
+        """
+        return [
+            summary_message,
+            *[dict(message) for message in active_prefix],
+            *[dict(message) for message in suffix],
+        ]
+
+    def _snapshot_matches(
+        self,
+        state: RunCompressionState,
+        snapshot: AsyncSnapshot,
+    ) -> bool:
+        """Whether the snapshot's frozen/working prefixes are still intact.
+
+        Comparison is by value, not object identity: the async job and the
+        governance pipeline both deep-copy messages, so the live entries are
+        never the same objects the snapshot captured. While a snapshot is live,
+        ``state.working`` only ever grows at the tail (``_append_raw``); every
+        path that rewrites it (sync compression, applying an async summary)
+        clears ``state.snapshot`` first. A value-equal prefix therefore means the
+        region the summary was built from has not been rewritten.
+        """
+        if len(state.frozen) < snapshot.frozen_len:
+            return False
+        if len(state.working) < snapshot.working_len:
+            return False
+        return all(
+            state.frozen[index] == snapshot.frozen_prefix[index]
+            for index in range(snapshot.frozen_len)
+        ) and all(
+            state.working[index] == snapshot.working_prefix[index]
+            for index in range(snapshot.working_len)
+        )
+
+    async def _maybe_start_async_compression(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        *,
+        before_tokens: int,
+        source: str,
+    ) -> None:
+        if state.pending is not None:
+            return
+        # Retry gate after a failed attempt: the working revision must have
+        # moved on since that attempt started (a complete round or an
+        # injection was appended). Without new content the failure is never
+        # retried, so no request loop forms.
+        if state.async_failed and state.working_revision == state.async_failed_revision:
+            return
+        working_prefix = deepcopy(state.working)
+        frozen_prefix = deepcopy(state.frozen)
+        # Only snapshot the compress zone: keep the newest complete units active.
+        keep_budget = state.soft_limit or before_tokens
+        partition = partition_working(
+            working_prefix,
+            keep_budget_tokens=keep_budget,
+            estimate=estimate_message_tokens,
+        )
+        if not partition.compress:
+            return
+        if not self._compression_request_room_available(partition.compress_prefix):
+            return
+        # The snapshot records the compress zone, the active zone that must be
+        # replayed verbatim on apply, the full working prefix used to locate
+        # the suffix appended while the job was in flight, and the working
+        # revision that governs any later retry decision.
+        snapshot = AsyncSnapshot(
+            frozen_prefix=frozen_prefix,
+            working_prefix=working_prefix,
+            compress_prefix=partition.compress_prefix,
+            active_prefix=partition.active_prefix,
+            working_revision=state.working_revision,
+            before_tokens=before_tokens,
+        )
+        state.snapshot = snapshot
+        logger.info(
+            "compression.started mode=async trace={} session={} before_tokens={} "
+            "soft_limit={} source={}",
+            state.trace_id,
+            spec.session_key or "default",
+            before_tokens,
+            state.soft_limit,
+            source,
+        )
+        state.pending = asyncio.create_task(
+            self._async_compress(spec, state, partition.compress_prefix)
+        )
+
+    @staticmethod
+    def _compression_request_room_available(messages: list[dict[str, Any]]) -> bool:
+        """Whether the compress zone carries anything worth summarizing.
+
+        A zone made only of synthetic summaries has no new content to fold in;
+        re-summarizing a summary would loop without shrinking the request, so
+        such a zone is treated as not compressible (the caller then reports
+        ``compression_limit`` on its recount).
+        """
+        return any(not is_compression_summary(message) for message in messages)
+
+    async def _async_compress(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        prefix: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Deep-copy the compress zone, summarize it, and return the payload.
+
+        Nothing is written back here: the runner applies the summary only after
+        re-validating the snapshot, so a cancelled or stale job can never
+        rewrite the working context. Per-attempt logging (including retry and
+        failure reasons) happens inside ``_compress_working``; this coroutine
+        stays silent so a failure is logged exactly once when collected.
+        """
+        working_copy = deepcopy(prefix)
+        return await self._compress_working(spec, state, working_copy, mode="async")
+
+    async def _cancel_pending_compression(
+        self,
+        state: RunCompressionState,
+        *,
+        reason: str,
+    ) -> None:
+        pending = state.pending
+        if pending is None:
+            return
+        state.pending = None
+        state.snapshot = None
+        if not pending.done():
+            pending.cancel()
+            logger.info(
+                "compression.discarded mode=async trace={} reason={}",
+                state.trace_id,
+                reason,
+            )
+        with suppress(asyncio.CancelledError, Exception):
+            await pending
+
+    async def _close_compression(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        usage: dict[str, int],
+    ) -> None:
+        """Settle the in-flight compression task when the run ends."""
+        if state.closed:
+            return
+        state.closed = True
+        pending = state.pending
+        if pending is None:
+            return
+        state.pending = None
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await pending
+            # A cancelled summary must never be applied.
+            state.snapshot = None
+            return
+        # Already finished but not yet consumed: still bank its usage.
+        try:
+            pending.result()
+        except (asyncio.CancelledError, Exception):
+            # A failed async job contributed only its own (already recorded)
+            # usage; nothing to apply.
+            state.snapshot = None
+            return
+        state.snapshot = None
+
+    async def _compress_sync(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        *,
+        before_tokens: int,
+        source: str,
+    ) -> None:
+        """Synchronously compress the compress zone; stop the run on failure."""
+        keep_budget = state.soft_limit or before_tokens
+        partition = partition_working(
+            [dict(message) for message in state.working],
+            keep_budget_tokens=keep_budget,
+            estimate=estimate_message_tokens,
+        )
+        if not partition.compress or not self._compression_request_room_available(
+            partition.compress_prefix
+        ):
+            # No legal complete prefix (or only synthetic summaries, which
+            # carry nothing new): nothing to summarize. The caller then
+            # reports compression_limit because the request is still too big.
+            return
+        logger.info(
+            "compression.started mode=sync trace={} session={} before_tokens={} "
+            "sync_limit={} source={}",
+            state.trace_id,
+            spec.session_key or "default",
+            before_tokens,
+            state.sync_limit,
+            source,
+        )
+        try:
+            payload = await self._compress_working(
+                spec, state, partition.compress_prefix, mode="sync"
+            )
+        except CompressionError as exc:
+            state.stopped = True
+            state.stopped_reason = _STOP_COMPRESSION_FAILED
+            state.stopped_error = (
+                f"sync compression failed after {_COMPRESSION_ATTEMPTS} attempts: "
+                f"{_bounded(exc)}"
+            )
+            logger.warning(
+                "compression.failed mode=sync trace={} attempts={} reason={}",
+                state.trace_id,
+                _COMPRESSION_ATTEMPTS,
+                _bounded(exc),
+            )
+            logger.warning(
+                "compression.stopped trace={} reason={} detail={}",
+                state.trace_id,
+                _STOP_COMPRESSION_FAILED,
+                state.stopped_error,
+            )
+            return
+        summary_message = build_summary_message(canonical_json(payload))
+        # Same rebuild as the async path: summary + active zone, no suffix
+        # because sync compression is applied at the compression boundary.
+        state.working = self._rebuild_working(
+            summary_message, partition.active_prefix, ()
+        )
+        state.working_revision += 1
+        state.async_failed = False
+        state.async_failed_revision = None
+        after_tokens, _ = self._count_request_tokens(spec, state)
+        logger.info(
+            "compression.applied mode=sync trace={} before_tokens={} after_tokens={} "
+            "active={} working_len={}",
+            state.trace_id,
+            before_tokens,
+            after_tokens,
+            len(partition.active_prefix),
+            len(state.working),
+        )
+
+    async def _compress_working(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        messages: list[dict[str, Any]],
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Run the bounded compression requests for *messages*.
+
+        At most ``_COMPRESSION_ATTEMPTS`` runner-level logical requests are made
+        (first attempt + one retry). The Provider's visible usage is recorded
+        for *every* attempt — error responses, empty responses and first-fail/
+        second-success alike — before ``finish_reason``, content and JSON are
+        validated, and each recording triggers ``compression_usage_callback``.
+        Usage that the Provider never exposed (timeouts, raised exceptions) is
+        never fabricated.
+        """
+        last_error: CompressionError | None = None
+        for attempt in range(1, _COMPRESSION_ATTEMPTS + 1):
+            try:
+                content, attempt_usage = await self._run_compression_request(
+                    spec, messages
+                )
+            except CompressionError as exc:
+                last_error = exc
+                if exc.visible_usage:
+                    # The Provider returned (and billed) a response whose
+                    # content was unusable; its usage still counts.
+                    self._record_compression_usage(spec, state, exc.visible_usage)
+                logger.warning(
+                    "compression.retry mode={} trace={} attempt={}/{} reason={}",
+                    mode,
+                    state.trace_id,
+                    attempt,
+                    _COMPRESSION_ATTEMPTS,
+                    _bounded(exc),
+                )
+                continue
+            self._record_compression_usage(spec, state, attempt_usage)
+            try:
+                payload = parse_and_validate(content)
+            except CompressionError as exc:
+                last_error = exc
+                logger.warning(
+                    "compression.retry mode={} trace={} attempt={}/{} reason={}",
+                    mode,
+                    state.trace_id,
+                    attempt,
+                    _COMPRESSION_ATTEMPTS,
+                    _bounded(exc),
+                )
+                continue
+            return payload
+        raise last_error or CompressionError("compression produced no usable summary")
+
+    async def _run_compression_request(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, int]]:
+        """One compression-layer logical request. Raises on failure/timeout."""
+        template = self._compression_template(spec)
+        transcript = serialize_transcript(messages)
+        request_messages = [
+            {"role": "system", "content": template},
+            {"role": "user", "content": transcript},
+        ]
+        kwargs = self._build_compression_kwargs(spec, request_messages)
+        timeout_s = spec.compression_timeout_s
+        try:
+            coro = self.provider.chat_with_retry(**kwargs)
+            if timeout_s is not None and timeout_s > 0:
+                response = await asyncio.wait_for(coro, timeout=timeout_s)
+            else:
+                response = await coro
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise CompressionError(
+                f"compression request timed out after {timeout_s:g}s"
+            ) from exc
+        except Exception as exc:
+            raise CompressionError(f"compression request failed: {exc}") from exc
+        usage = self._usage_dict(response.usage)
+        if response.finish_reason == "error" or not (response.content or "").strip():
+            # The Provider answered (and billed usage for) a response whose
+            # content is unusable: carry the visible usage on the error so the
+            # retry loop can still account for it before validating anything.
+            raise CompressionError(
+                f"compression request returned no content ({response.finish_reason})",
+                visible_usage=usage,
+            )
+        return response.content, usage
+
+    def _build_compression_kwargs(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compression request kwargs: same provider chain, no business tools.
+
+        ``max_tokens`` is only forwarded when the spec sets it; otherwise the
+        parameter is omitted so ``Provider.chat_with_retry()`` falls back to the
+        provider's own generation default instead of a hard-coded cap.
+        """
+        kwargs: dict[str, Any] = {
+            "messages": messages,
+            "tools": None,
+            "model": spec.model,
+            "retry_mode": spec.provider_retry_mode,
+            "on_retry_wait": spec.retry_wait_callback,
+            "response_format": {"type": "json_object"},
+        }
+        if spec.temperature is not None:
+            kwargs["temperature"] = spec.temperature
+        if isinstance(spec.max_tokens, int):
+            kwargs["max_tokens"] = spec.max_tokens
+        if spec.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = spec.reasoning_effort
+        return kwargs
+
+    def _record_compression_usage(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        attempt_usage: dict[str, int],
+    ) -> None:
+        if not attempt_usage:
+            return
+        merge_token_usage(state.usage, attempt_usage)
+        callback = spec.compression_usage_callback
+        if callback is None:
+            return
+        try:
+            callback(dict(attempt_usage))
+        except Exception:
+            logger.exception("compression_usage_callback failed")
 
     def _build_request_kwargs(
         self,
@@ -766,6 +1609,7 @@ class AgentRunner:
         *,
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
+
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tools,
@@ -1199,9 +2043,25 @@ class AgentRunner:
     def _prepare_messages(
         self,
         spec: AgentRunSpec,
+        frozen: list[dict[str, Any]],
+        working: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Prepare message history for the model in a fixed-order pipeline.
+
+        ``frozen`` is copied verbatim and prepended; governance (orphan repair,
+        backfill, microcompact, tool-result budget, hard trim) only ever touches
+        the ``working`` zone and never pairs a tool round across the boundary.
+        """
+        governed = self._govern(spec, list(working))
+        frozen_copy = [dict(message) for message in frozen]
+        return [*frozen_copy, *governed]
+
+    def _govern(
+        self,
+        spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Prepare message history for the model in a fixed-order pipeline."""
+        """Run the repair/compact/budget/trim pipeline over *messages*."""
         result = self._drop_orphan_tool_results(messages)
         result = self._backfill_missing_tool_results(result)
         result = self._microcompact(result)
@@ -1211,6 +2071,7 @@ class AgentRunner:
         result = self._drop_orphan_tool_results(result)
         result = self._backfill_missing_tool_results(result)
         return result
+
 
     @staticmethod
     def _drop_orphan_tool_results(
@@ -1367,15 +2228,20 @@ class AgentRunner:
 
         system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
         remaining_budget = max(128, budget - system_tokens)
-        kept: list[dict[str, Any]] = []
+        # Drop the oldest whole interactive units so a user/assistant/tool round
+        # is never cut in half (which would orphan tool results or split a
+        # tool-call from its results).
+        units = split_units(non_system)
+        kept_units: list[list[dict[str, Any]]] = []
         kept_tokens = 0
-        for message in reversed(non_system):
-            msg_tokens = estimate_message_tokens(message)
-            if kept and kept_tokens + msg_tokens > remaining_budget:
+        for unit in reversed(units):
+            unit_tokens = sum(estimate_message_tokens(message) for message in unit)
+            if kept_units and kept_tokens + unit_tokens > remaining_budget:
                 break
-            kept.append(message)
-            kept_tokens += msg_tokens
-        kept.reverse()
+            kept_units.append(unit)
+            kept_tokens += unit_tokens
+        kept_units.reverse()
+        kept: list[dict[str, Any]] = [message for unit in kept_units for message in unit]
 
         if kept:
             for i, message in enumerate(kept):

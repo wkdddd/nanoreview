@@ -115,7 +115,8 @@ class TurnContext:
     session: Session | None = None
 
     history: list[dict[str, Any]] = field(default_factory=list)
-    initial_messages: list[dict[str, Any]] = field(default_factory=list)
+    frozen_messages: list[dict[str, Any]] = field(default_factory=list)
+    working_messages: list[dict[str, Any]] = field(default_factory=list)
 
     final_content: str | None = None
     tools_used: list[str] = field(default_factory=list)
@@ -727,9 +728,13 @@ class AgentLoop:
         session: Session,
         history: list[dict[str, Any]],
         pending_summary: str | None,
-    ) -> list[dict[str, Any]]:
-        """Build the initial message list for the LLM turn."""
-        messages = self.context.build_messages(
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Build the frozen/working partition for the LLM turn.
+
+        Frozen is the system prompt plus the current user turn; working is the
+        replayed session history that run-level compression may summarize.
+        """
+        return self.context.build_partitioned_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -739,7 +744,7 @@ class AgentLoop:
             session_summary=pending_summary,
             session_metadata=session.metadata,
         )
-        return messages
+
 
     async def _dispatch_command_inline(
         self,
@@ -946,7 +951,8 @@ class AgentLoop:
 
     async def _run_agent_loop(
         self,
-        initial_messages: list[dict],
+        frozen_messages: list[dict],
+        working_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1175,7 +1181,7 @@ class AgentLoop:
                 if evidence_provider := getattr(review_tool, "evidence_provider", None):
                     review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = evidence_provider
             review_preparation = await prepare_code_review_context(
-                initial_messages,
+                [*frozen_messages, *working_messages],
                 review_meta,
                 progress_callback=on_progress,
             )
@@ -1251,7 +1257,9 @@ class AgentLoop:
                     session_key=session_key,
                 )
             if specialist_prompt:
-                initial_messages.insert(
+                # The reviewer system prompt belongs to the frozen envelope: it
+                # is part of the task definition and must never be summarized.
+                frozen_messages.insert(
                     0, {"role": "system", "content": specialist_prompt}
                 )
 
@@ -1313,10 +1321,12 @@ class AgentLoop:
                     workspace=self.workspace,
                     max_tool_result_chars=self.max_tool_result_chars,
                     judge=self._build_review_judge(),
+                    context_window_tokens=self.context_window_tokens,
                 )
                 try:
                     outcome = await orchestrator.execute_run(
-                        coordinator_messages=initial_messages,
+                        coordinator_messages=[*frozen_messages, *working_messages],
+
                         plan=review_preparation.plan,
                         evidence=review_preparation.evidence,
                         context=ReviewExecutionContext(
@@ -1371,7 +1381,7 @@ class AgentLoop:
                             self.sessions.save(session)
                     result = AgentRunResult(
                         final_content=final_content,
-                        messages=list(initial_messages),
+                        messages=[*frozen_messages, *working_messages],
                         content_replaced=True,
                     )
                 except ReviewPlanningError as exc:
@@ -1384,15 +1394,17 @@ class AgentLoop:
                             self.sessions.save(session)
                     result = AgentRunResult(
                         final_content=f"## Code Review Report\n\n### Error\n\n{exc}",
-                        messages=list(initial_messages),
+                        messages=[*frozen_messages, *working_messages],
                         stop_reason="error",
                         error=str(exc),
                     )
             else:
                 result = await self.runner.run(
                     AgentRunSpec(
-                    initial_messages=initial_messages,
+                    frozen_messages=frozen_messages,
+                    working_messages=working_messages,
                     tools=self.tools,
+
                     model=self.model,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
@@ -1938,7 +1950,7 @@ class AgentLoop:
         history = session.get_history(**_hist_kwargs)
         current_role = "assistant" if is_subagent else "user"
 
-        messages = self.context.build_messages(
+        frozen_messages, working_messages = self.context.build_partitioned_messages(
             history=history,
             current_message="" if is_subagent else msg.content,
             channel=channel,
@@ -1950,8 +1962,10 @@ class AgentLoop:
         )
         t_wall = time.time()
         final_content, _, all_msgs, stop_reason, _, _ = await self._run_agent_loop(
-            messages,
+            frozen_messages,
+            working_messages,
             session=session,
+
             channel=channel,
             chat_id=chat_id,
             message_id=msg.metadata.get("message_id"),
@@ -2159,7 +2173,18 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
         meta = dict(msg.metadata or {})
-        if on_stream is not None and stop_reason not in {"error", "tool_error"}:
+        # Error-like stop reasons must not be marked as already streamed: the
+        # final error message was never streamed to the channel, so it has to
+        # be delivered by the outbound message itself. This includes the
+        # run-level compression stops, which end the run before the business
+        # request that would have streamed any content.
+        unstreamed_stop_reasons = {
+            "error",
+            "tool_error",
+            "compression_failed",
+            "compression_limit",
+        }
+        if on_stream is not None and stop_reason not in unstreamed_stop_reasons:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
@@ -2284,7 +2309,7 @@ class AgentLoop:
             if m.get("_metadata", {}).get("injected_event") != "subagent_result"
         ]
 
-        ctx.initial_messages = self._build_initial_messages(
+        ctx.frozen_messages, ctx.working_messages = self._build_initial_messages(
             ctx.msg, ctx.session, ctx.history, ctx.pending_summary
         )
         ctx.user_persisted_early = self._persist_user_message_early(
@@ -2302,7 +2327,8 @@ class AgentLoop:
         """Run the model/tool loop and collect the final turn state."""
         await publish_turn_run_status(self.bus, ctx.msg, "running")
         result = await self._run_agent_loop(
-            ctx.initial_messages,
+            ctx.frozen_messages,
+            ctx.working_messages,
             on_progress=ctx.on_progress,
             on_stream=ctx.on_stream,
             on_stream_end=ctx.on_stream_end,

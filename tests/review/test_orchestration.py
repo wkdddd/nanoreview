@@ -241,6 +241,49 @@ async def test_coordinator_plan_failure_raises_planning_error(tmp_path) -> None:
     assert runner.calls == 1
 
 
+class _CompressionStopRunner:
+    """Coordinator runner stub stopped by run-level compression."""
+
+    def __init__(self, stop_reason: str, error: str) -> None:
+        self.stop_reason = stop_reason
+        self.error = error
+
+    async def run(self, spec):
+        return AgentRunResult(
+            final_content=None,
+            messages=list([*spec.frozen_messages, *spec.working_messages]),
+            stop_reason=self.stop_reason,
+            error=self.error,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["compression_failed", "compression_limit"])
+async def test_coordinator_compression_stop_raises_planning_error(
+    tmp_path, stop_reason: str
+) -> None:
+    """A compression-stopped coordinator run surfaces as ReviewPlanningError."""
+    orchestrator = ReviewOrchestrator(
+        runner=_CompressionStopRunner(
+            stop_reason, "sync compression failed after 2 attempts: no content"
+        ),
+        subagents=_Subagents(),
+        model="test",
+        workspace=tmp_path,
+        max_tool_result_chars=1000,
+        judge=None,
+    )
+
+    with pytest.raises(ReviewPlanningError, match="compression"):
+        await orchestrator.execute(
+            coordinator_messages=[{"role": "system", "content": "plan"}],
+            plan=_plan("security"),
+            evidence=_evidence(),
+            context=ReviewExecutionContext("cli", "review", "cli:review", None, {}, 1),
+            validation_workspace=str(tmp_path),
+        )
+
+
 @pytest.mark.asyncio
 async def test_program_dispatches_planned_dimensions_without_bus_injection(tmp_path) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")

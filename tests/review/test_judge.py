@@ -504,6 +504,52 @@ async def test_judge_failed_batch_keeps_consumed_usage() -> None:
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
 
 
+class _CompressionStopRunner:
+    """Judge runner stub whose batch is stopped by run-level compression."""
+
+    def __init__(self, stop_reason: str, usage: dict[str, int]) -> None:
+        self.stop_reason = stop_reason
+        self._usage = usage
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        return AgentRunResult(
+            final_content=None,
+            messages=list([*spec.frozen_messages, *spec.working_messages]),
+            stop_reason=self.stop_reason,
+            error="sync compression failed after 2 attempts: no content",
+            usage=dict(self._usage),
+        )
+
+
+async def test_judge_compression_stop_is_a_failed_batch_with_usage() -> None:
+    """A compression-stopped batch fails but still reports the tokens it spent."""
+    usage = {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50}
+    judge = ReviewJudge(
+        runner=_CompressionStopRunner("compression_failed", usage),  # type: ignore[arg-type]
+        model="test-model",
+        config=ReviewJudgeConfig(context_window_tokens=_LARGE_WINDOW, timeout_seconds=5),
+    )
+
+    result = await judge.judge_dimensions([_dimension("security", ["S1"])])
+
+    assert result.error is not None and "compression" in result.error
+    # The spend is never hidden behind the failure.
+    assert result.usage == usage
+    verdict = next(iter(result.verdicts.values()))
+    assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
+
+
+def test_judge_usage_observer_folds_compression_usage() -> None:
+    """The observer accumulates compression usage so it survives a timeout."""
+    from nanoreview.review.output.judge import _JudgeUsageObserver
+
+    observer = _JudgeUsageObserver()
+    observer.record_compression_usage({"prompt_tokens": 7, "completion_tokens": 3})
+    observer.record_compression_usage({"prompt_tokens": 5, "completion_tokens": 2})
+
+    assert observer.usage == {"prompt_tokens": 12, "completion_tokens": 5}
+
+
 async def test_judge_cancellation_propagates() -> None:
     """``/stop`` must cancel a judge batch instead of being swallowed."""
     judge = ReviewJudge(
@@ -734,8 +780,8 @@ async def test_judge_batch_runs_through_shared_runner_with_terminal_spec() -> No
     assert spec.checkpoint_callback is None
     assert spec.injection_callback is None
     assert spec.permission_policy is None
-    assert [message["role"] for message in spec.initial_messages] == ["system", "user"]
-    assert "S1" in spec.initial_messages[1]["content"]
+    assert [message["role"] for message in [*spec.frozen_messages, *spec.working_messages]] == ["system", "user"]
+    assert "S1" in [*spec.frozen_messages, *spec.working_messages][1]["content"]
 
 
 async def test_judge_prose_response_marks_candidates_needs_confirmation() -> None:
