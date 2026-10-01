@@ -1,13 +1,44 @@
-# Agent Reference Index
+# 文档索引
 
-根目录 `AGENTS.md` 是本仓库 AI 编码代理的首要约束。本目录将高风险或高上下文主题拆分，避免根文件膨胀：
+根 `AGENTS.md` 规定协作方式；本目录按信息用途分层，按任务读取，不默认全量加载。
 
-- `architecture.md`：模块职责、消息链路和变更影响范围。
-- `design.md`：架构边界、最小改动和抽象原则。
-- `security.md`：文件系统、网络、执行和持久上下文安全边界。
-- `debug.md`：运行日志类型、路径、关联方式和调试排查约束。
-- `gotchas.md`：Windows、配置变量、模板、格式化与上下文回放陷阱。
-- `budget.md`：预算配置、证据裁剪、执行限制、上下文压缩和 usage 统计口径。
-- `reference-summary.md`：本地参考项目的入口索引、摘要格式、增量刷新和低 Token 筛查流程。
+## 约束
 
-任务涉及对应主题时，先阅读相关文件再修改。若本目录与根 `AGENTS.md` 冲突，以根文件为准，并在同一次改动中消除冲突。
+`constraints/` 记录稳定模块边界与排查入口：
+
+- [architecture.md](constraints/architecture.md)：当前链路与职责。
+- [security.md](constraints/security.md)：工具、网络与持久上下文。
+- [design.md](constraints/design.md)：复用、抽象与变更边界。
+- [budget.md](constraints/budget.md)：预算、上下文治理与 usage。
+- [debug.md](constraints/debug.md)：日志路径与关联方式。
+- [gotchas.md](constraints/gotchas.md)：平台、配置与迁移陷阱。
+
+## 规划
+
+- [project-roadmap.md](plans/project-roadmap.md)：长期产品目标、架构原则、待评估方向和明确不做；确定产品方向时先读。
+- [code-adjustment-plan.md](plans/code-adjustment-plan.md)：当前已选定的具体代码调整节点；没有确认节点时保持为空。
+
+
+新目标不等于当前实现。进展须核对 HEAD/工作区，候选分支单独记录；历史测试结果不得冒充本次验证。需求冲突先按已确认的新目标解释，未确认处询问用户。
+
+### 历史规划参考
+
+以下文档从旧 `.claude/plans/` 恢复，专门用于 review workflow 调整时回顾既有设计、实施顺序和已验证的取舍：
+
+- [reviewagent-multi-agent-handoff.md](reviewagent-multi-agent-handoff.md)：ReviewLoop、review 生命周期、Reviewer/Judge 编排和终态边界的历史目标。
+- [reviewagent-multi-agent-handoff-implementation-addendum.md](reviewagent-multi-agent-handoff-implementation-addendum.md)：上述目标的历史实施进展、验证结果和缺口记录。
+- [agent-runner-run-level-compression.md](agent-runner-run-level-compression.md)：`AgentRunner` run-level compression 的历史设计与验收细节。
+
+这些文档是调整 review workflow 的参考资料，不是当前产品目标、代码事实或待执行任务的权威来源。当前方向以 [project-roadmap.md](plans/project-roadmap.md) 为准，当前实施任务以 [code-adjustment-plan.md](plans/code-adjustment-plan.md) 为准；实现状态仍须以代码、测试和当前约束文件核对。
+
+## 参考
+
+| 项目摘要 | 参考用途 | 已核查 commit |
+|---|---|---|
+| [nanobot](references/nanobot.md) | 对话、session、上下文与 Runner | `4de728a5` |
+| [open-code-review](references/open-code-review.md) | 审查流程、LLM loop、预算与显式 resume | `e95bdda` |
+| [kodus-ai](references/kodus-ai.md) | 审查与对话分流、共享执行内核 | `1df08e5` |
+
+按问题选择项目摘要，再定位相关源码；不默认加载全部摘要或仓库。路径、核查范围与日期见各文件。参考文件只记录外部事实和必要差异，不定义产品目标；本项目职责见约束，候选分支取舍见计划。
+
+参考更新时比较已核查 commit，仅重读变化文件及直接消费者；无 Git 时使用内容 hash。摘要保留路径、版本、范围、入口、行为/契约、差异和验证局限，不复制密钥、会话或无关源码。
