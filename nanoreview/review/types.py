@@ -40,6 +40,13 @@ class ReviewMetaKey:
     INPUT_FINGERPRINT = "review_input_fingerprint"
     #: Wire-safe reference to the immutable input snapshot captured at admission.
     SNAPSHOT_REF = "review_snapshot_ref"
+    #: Bounded digest of the produced report, or the failure reason when no
+    #: report exists. Persisted with the terminal state so a restart (or a
+    #: transport that never owned the run) can explain the outcome without
+    #: loading the report artifact.
+    SUMMARY = "review_summary"
+    #: Bounded failure reason persisted for a non-completed terminal run.
+    ERROR = "review_error"
     #: Run whose report has already been injected into the first conversation
     #: turn. Its presence marks the handoff as consumed so a later turn does
     #: not inject the same report twice.

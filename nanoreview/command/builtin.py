@@ -109,11 +109,19 @@ def builtin_command_palette() -> list[dict[str, str]]:
 
 
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
-    """Cancel all active tasks and subagents for the session."""
+    """Cancel all active tasks and subagents, then settle a leftover review run."""
     loop = ctx.loop
     msg = ctx.msg
     total = await loop._cancel_active_tasks(ctx.key)
-    content = f"Stopped {total} task(s)." if total else "No active task to stop."
+    review_note = await loop._settle_review_run_after_stop(ctx.key)
+    if total:
+        content = f"Stopped {total} task(s)."
+    elif review_note:
+        content = review_note
+    else:
+        content = "No active task to stop."
+    if review_note and total:
+        content = f"{content} {review_note}"
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content=content,
         metadata=dict(msg.metadata or {})

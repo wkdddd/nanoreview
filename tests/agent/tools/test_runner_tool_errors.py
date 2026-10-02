@@ -87,6 +87,83 @@ class ErrorTextTool(Tool):
         return "Error handling best practices: keep the real result intact."
 
 
+class LongResultTool(Tool):
+    @property
+    def name(self) -> str:
+        return "long_result_tool"
+
+    @property
+    def description(self) -> str:
+        return "Returns a result longer than the event detail cap."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> Any:
+        return "X" * 300
+
+
+class TerminalTool(Tool):
+    def __init__(self, *, fail: bool = False) -> None:
+        self._fail = fail
+
+    @property
+    def name(self) -> str:
+        return "terminal_tool"
+
+    @property
+    def description(self) -> str:
+        return "Terminal submission tool."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> Any:
+        if self._fail:
+            raise ValueError("bad submission")
+        return '{"submitted": true}'
+
+
+class ScriptedProvider(LLMProvider):
+    """Returns scripted responses; the last reply repeats once exhausted."""
+
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        super().__init__()
+        self.responses = list(responses)
+        self.calls = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        index = self.calls
+        self.calls += 1
+        return self.responses[min(index, len(self.responses) - 1)]
+
+    def get_default_model(self) -> str:
+        return "dummy"
+
+
+def _terminal_call_response(name: str = "terminal_tool") -> LLMResponse:
+    return LLMResponse(
+        content=None,
+        tool_calls=[ToolCallRequest(id="call_1", name=name, arguments={})],
+    )
+
+
+def _prose_response(text: str = "all done") -> LLMResponse:
+    return LLMResponse(content=text)
+
+
 class ResponseFormatRejectingProvider(LLMProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -316,3 +393,141 @@ async def test_drain_injections_falls_back_when_signature_is_unavailable(monkeyp
     )
 
     assert injected == [{"role": "user", "content": "limit=5"}]
+
+
+@pytest.mark.asyncio
+async def test_run_tool_omits_raw_result_unless_declared() -> None:
+    """An ordinary tool result is never kept untruncated by default."""
+    tools = ToolRegistry()
+    tools.register(LongResultTool())
+    runner = AgentRunner(DummyProvider())
+
+    result, event, error = await runner._run_tool(
+        make_spec(tools),
+        ToolCallRequest(id="call_1", name="long_result_tool", arguments={}),
+        external_lookup_counts={},
+        workspace_violation_counts={},
+    )
+
+    assert result == "X" * 300
+    assert event["status"] == "ok"
+    assert "raw_result" not in event
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_run_tool_preserves_declared_tool_result_untruncated() -> None:
+    """A declared tool keeps the full result alongside the bounded detail."""
+    tools = ToolRegistry()
+    tools.register(LongResultTool())
+    runner = AgentRunner(DummyProvider())
+
+    result, event, error = await runner._run_tool(
+        make_spec(tools, preserve_tool_result_tools=frozenset({"long_result_tool"})),
+        ToolCallRequest(id="call_1", name="long_result_tool", arguments={}),
+        external_lookup_counts={},
+        workspace_violation_counts={},
+    )
+
+    assert event["status"] == "ok"
+    assert event["raw_result"] == "X" * 300
+    assert event["detail"].endswith("...")
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_success_ends_the_run() -> None:
+    tools = ToolRegistry()
+    tools.register(TerminalTool())
+    provider = ScriptedProvider([_terminal_call_response()])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            max_iterations=3,
+        )
+    )
+
+    assert result.stop_reason == "completed"
+    assert result.terminal_attempts == 1
+    # Success breaks immediately instead of giving the model another turn.
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_failure_retries_then_fails_at_limit() -> None:
+    tools = ToolRegistry()
+    tools.register(TerminalTool(fail=True))
+    provider = ScriptedProvider([_terminal_call_response()])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            terminal_retry_limit=2,
+            max_iterations=5,
+        )
+    )
+
+    assert result.stop_reason == "terminal_tool_failed"
+    assert result.terminal_attempts == 2
+    assert result.terminal_error is not None
+    assert "bad submission" in result.terminal_error
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_failure_then_success_completes_the_run() -> None:
+    """A failed submission is retried inside the same run and can succeed."""
+
+    class FlakyTerminalTool(TerminalTool):
+        def __init__(self) -> None:
+            super().__init__(fail=False)
+            self.calls = 0
+
+        async def execute(self, **kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("bad submission")
+            return '{"submitted": true}'
+
+    tools = ToolRegistry()
+    tools.register(FlakyTerminalTool())
+    provider = ScriptedProvider([_terminal_call_response()])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            terminal_retry_limit=3,
+            max_iterations=5,
+        )
+    )
+
+    assert result.stop_reason == "completed"
+    assert result.terminal_attempts == 2
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_tool_prose_answer_counts_as_attempt_and_fails_at_limit() -> None:
+    tools = ToolRegistry()
+    tools.register(TerminalTool())
+    provider = ScriptedProvider([_prose_response()])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            terminal_retry_limit=2,
+            max_iterations=5,
+        )
+    )
+
+    assert result.stop_reason == "terminal_tool_failed"
+    assert result.terminal_attempts == 2
+    assert provider.calls == 2

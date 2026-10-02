@@ -538,6 +538,7 @@ class SubagentManager:
                         fail_on_tool_error=True,
                         soft_tool_error_tools=self.soft_tool_error_tools(profile),
                         terminal_tools=self.terminal_tools(profile),
+                        preserve_tool_result_tools=profile.preserve_tool_result_tools,
                         checkpoint_callback=_on_checkpoint,
                         session_key=sess_key,
                         llm_timeout_s=llm_timeout,
@@ -681,32 +682,6 @@ class SubagentManager:
                 stop_reason=result.stop_reason,
             )
         return await profile.result_handler(result=result, target_type=target_type)
-
-    @staticmethod
-    def _extract_review_submit_result(
-        messages: list[dict[str, Any]],
-        tool_events: list[dict[str, Any]] | None = None,
-    ) -> str | None:
-        """Extract a successfully processed structured review submission."""
-        candidates: list[Any] = []
-        for event in reversed(tool_events or []):
-            if event.get("name") == "review_submit" and event.get("status") == "ok":
-                candidates.append(event.get("raw_result"))
-        for message in reversed(messages):
-            if message.get("role") == "tool" and message.get("name") == "review_submit":
-                candidates.append(message.get("content"))
-        import json
-
-        for raw in candidates:
-            if not isinstance(raw, str):
-                continue
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if payload.get("submitted") is True and isinstance(payload.get("findings"), list):
-                return json.dumps(payload, ensure_ascii=False)
-        return None
 
     async def _announce_result(
         self,

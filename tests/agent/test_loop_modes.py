@@ -10,6 +10,7 @@ import pytest
 from nanoreview.agent.hooks import AgentHookContext
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanoreview.agent.loop import AgentLoop, TurnContext, TurnState, _is_consumed_subagent_result
+from nanoreview.agent.review_loop import ReviewLoopOutcome, ReviewTurnRequest
 from nanoreview.agent.review_state import ReviewPhase, ReviewRunState, ReviewRunStatus
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent import SubagentManager
@@ -20,14 +21,9 @@ from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanoreview.review.planning.planner import ReviewPreparation
 from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.types import (
-    EvidenceReference,
-    ReviewAction,
-    ReviewEvidenceBundle,
     ReviewMetaKey,
-    ReviewPlan,
 )
 from nanoreview.session.manager import Session
 
@@ -243,8 +239,9 @@ class MultiDrainRunner:
         task_ids = [item.get("_metadata", {}).get("subagent_task_id") for item in second]
         assert "second" in task_ids
         assert any(item.get("content") == "user interjection" for item in second)
-        assert any(
-            item.get("_metadata", {}).get("injected_event") == "subagent_barrier" for item in second
+        assert all(
+            item.get("_metadata", {}).get("injected_event") != "subagent_barrier"
+            for item in second
         )
 
         messages = [*spec.frozen_messages, *spec.working_messages]
@@ -272,10 +269,6 @@ class ManagerQueueDrainRunner:
             messages=[*spec.frozen_messages, *spec.working_messages] + list(self.injected),
             had_injections=bool(self.injected),
         )
-
-
-async def _review_fallback_preparation() -> ReviewPreparation:
-    return ReviewPreparation(None, "review system prompt")
 
 
 REVIEW_TURN_RUN_ID = "run-test-review"
@@ -308,12 +301,33 @@ def _admit_review_run(
     return {"_review_admitted": run_id}
 
 
-async def _review_coordinator_preparation() -> ReviewPreparation:
-    return ReviewPreparation(
-        None,
-        "You are the planning coordinator for a read-only code review.\n"
-        "- Name: test/repo\nsubmit_review_plan",
-    )
+def _stub_review_execution(
+    loop: AgentLoop,
+    *,
+    report_markdown: str = "## Code Review Report\n\nNo actionable issues found.",
+    produces_report: bool = True,
+    stop_reason: str = "",
+    error: str | None = None,
+) -> list[ReviewTurnRequest]:
+    """Replace ``ReviewLoop.execute`` and record the delegated requests.
+
+    These cases pin the *loop* half of the boundary — which turns are delegated
+    and how the produced report is delivered. The review lifecycle itself is
+    covered by ``tests/agent/test_review_loop.py``.
+    """
+    requests: list[ReviewTurnRequest] = []
+
+    async def _fake_execute(request: ReviewTurnRequest) -> ReviewLoopOutcome:
+        requests.append(request)
+        return ReviewLoopOutcome(
+            report_markdown=report_markdown,
+            stop_reason=stop_reason,
+            error=error,
+            produces_report=produces_report,
+        )
+
+    loop.review_loop.execute = _fake_execute  # type: ignore[method-assign]
+    return requests
 
 
 def _inbound(
@@ -392,61 +406,57 @@ def test_agent_loop_state_machine_has_no_review_finalize_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_admitted_review_turn_injects_review_context(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    """The admitted review turn resolves and injects the review prompt."""
+async def test_admitted_review_turn_is_delegated_to_review_loop(tmp_path) -> None:
+    """An admitted review turn is handed to ``ReviewLoop`` as a whole turn.
 
-    async def mock_review(*args: Any, **kwargs: Any) -> ReviewPreparation:
-        return ReviewPreparation(None, "review system prompt")
-
-    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", mock_review)
+    The loop keeps turn semantics (bus, queues, cancel, history); the review
+    lifecycle — preparation, planning, dispatch, report, cleanup — lives in
+    ``ReviewLoop``. So the loop must not run the plain agent for this turn.
+    """
 
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     loop.runner = runner
+    requests = _stub_review_execution(
+        loop, report_markdown="## Code Review Report\n\nNo actionable issues found."
+    )
     session = Session(key="test:review")
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "prior reply"},
+    ]
     admitted = _admit_review_run(loop, session.key)
 
-    await loop._run_agent_loop(
-        [{"role": "user", "content": "hello"}],
-        [],
-        session=session,
-        session_key=session.key,
-        metadata=admitted,
+    content, _tools, _messages, _stop_reason, _had_injections, content_replaced = (
+        await loop._run_agent_loop(
+            messages,
+            [],
+            session=session,
+            session_key=session.key,
+            metadata=admitted,
+        )
     )
 
-    assert runner.initial_messages[0] == {"role": "system", "content": "review system prompt"}
-    assert runner.initial_messages[1] == {"role": "user", "content": "hello"}
+    assert runner.initial_messages is None
+    assert len(requests) == 1
+    assert requests[0].session_key == session.key
+    assert requests[0].messages == messages
+    assert content_replaced is True
+    assert content == "## Code Review Report\n\nNo actionable issues found."
 
 
 @pytest.mark.asyncio
-async def test_conversation_turn_never_resolves_review_context(
-    tmp_path,
-    monkeypatch,
-) -> None:
+async def test_conversation_turn_never_delegates_to_review_loop(tmp_path) -> None:
     """A session that owns a review run must not re-enter review from metadata.
 
     The review target stays on the session after the review ends, so a
-    conversation turn in the same session must skip review preparation
-    entirely — otherwise it would silently re-run the review.
+    conversation turn in the same session must run as a plain agent turn —
+    otherwise it would silently re-run the review it is meant to discuss.
     """
-    calls: list[dict[str, Any]] = []
-
-    async def mock_review(
-        _messages: list[dict[str, Any]],
-        session_meta: dict[str, Any],
-        **_kwargs: Any,
-    ) -> ReviewPreparation:
-        calls.append(dict(session_meta))
-        return ReviewPreparation(None, "review system prompt")
-
-    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", mock_review)
-
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     loop.runner = runner
+    requests = _stub_review_execution(loop)
     session = Session(key="test:conversation")
     session.metadata[ReviewMetaKey.TARGET] = "https://github.com/test/repo"
 
@@ -457,21 +467,16 @@ async def test_conversation_turn_never_resolves_review_context(
         session_key=session.key,
     )
 
-    assert calls == []
+    assert requests == []
     assert runner.initial_messages == [{"role": "user", "content": "one more question"}]
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_path, monkeypatch) -> None:
+async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_path) -> None:
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     subagents = RunningSubagents(running=1)
     loop.subagents = subagents
     session = Session(key="test:pending")
-    session.metadata["review_target"] = "target"
-    monkeypatch.setattr(
-        "nanoreview.agent.loop.prepare_code_review_context",
-        lambda *_args, **_kwargs: _review_fallback_preparation(),
-    )
     pending: asyncio.Queue = asyncio.Queue()
     runner = MultiDrainRunner(pending, subagents)
     loop.runner = runner
@@ -481,7 +486,6 @@ async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_p
         [],
         session=session,
         session_key=session.key,
-        metadata=_admit_review_run(loop, session.key),
         pending_queue=pending,
     )
 
@@ -489,20 +493,14 @@ async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_p
         "first",
         "second",
     ]
-    assert runner.injected_batches[1][-1]["_metadata"]["injected_event"] == "subagent_barrier"
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_drain_waits_on_subagent_manager_result_queue(tmp_path, monkeypatch) -> None:
+async def test_agent_loop_drain_waits_on_subagent_manager_result_queue(tmp_path) -> None:
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     subagents = RunningSubagents(running=1)
     loop.subagents = subagents
     session = Session(key="test:pending")
-    session.metadata["review_target"] = "target"
-    monkeypatch.setattr(
-        "nanoreview.agent.loop.prepare_code_review_context",
-        lambda *_args, **_kwargs: _review_fallback_preparation(),
-    )
     pending: asyncio.Queue = asyncio.Queue()
     runner = ManagerQueueDrainRunner(subagents)
     loop.runner = runner
@@ -512,13 +510,11 @@ async def test_agent_loop_drain_waits_on_subagent_manager_result_queue(tmp_path,
         [],
         session=session,
         session_key=session.key,
-        metadata=_admit_review_run(loop, session.key),
         pending_queue=pending,
     )
 
-    assert len(runner.injected) == 2
+    assert len(runner.injected) == 1
     assert runner.injected[0]["_metadata"]["subagent_task_id"] == "direct"
-    assert runner.injected[1]["_metadata"]["injected_event"] == "subagent_barrier"
 
 
 def test_invalid_max_concurrent_requests_falls_back_to_default(monkeypatch) -> None:
@@ -931,84 +927,6 @@ async def test_subagent_hook_uses_streaming_request_path() -> None:
     assert context.streamed_content is True
 
 
-def test_review_subagent_extracts_review_submit_tool_result() -> None:
-    messages = [
-        {
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "name": "review_submit",
-            "content": (
-                '{"submitted":true,"findings":[{"severity":"high","file":"src/app.py",'
-                '"line":1,"title":"Issue","evidence":"line1",'
-                '"impact":"bad","recommendation":"fix"}],"errors":[]}'
-            ),
-        }
-    ]
-
-    result = SubagentManager._extract_review_submit_result(messages)
-
-    assert result is not None
-    assert '"Issue"' in result
-    assert result.startswith("{")
-    assert '"submitted": true' in result
-
-
-def test_review_subagent_extracts_untruncated_review_submit_event() -> None:
-    raw_result = (
-        '{"submitted":true,"findings":[{"severity":"high","file":"src/app.py",'
-        '"line":1,"title":"Issue","evidence":"line1",'
-        '"impact":"bad","recommendation":"fix"}],"errors":[]}'
-    )
-    messages = [
-        {
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "name": "review_submit",
-            "content": raw_result[:60] + "\n... (truncated)",
-        }
-    ]
-    tool_events = [
-        {
-            "name": "review_submit",
-            "status": "ok",
-            "detail": raw_result[:120] + "...",
-            "raw_result": raw_result,
-        }
-    ]
-
-    result = SubagentManager._extract_review_submit_result(messages, tool_events)
-
-    assert result is not None
-    assert '"Issue"' in result
-    assert result.startswith("{")
-    assert '"submitted": true' in result
-
-
-def test_review_subagent_ignores_unprocessed_review_submit_arguments() -> None:
-    messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "review_submit",
-                        "arguments": (
-                            '{"findings":[{"severity":"high","file":"src/app.py",'
-                            '"line":1,"title":"Issue","evidence":"line1",'
-                            '"impact":"bad","recommendation":"fix"}]}'
-                        ),
-                    },
-                }
-            ],
-        }
-    ]
-
-    assert SubagentManager._extract_review_submit_result(messages) is None
-
-
 @pytest.mark.asyncio
 async def test_review_subagent_run_uses_terminal_submit_contract(tmp_path) -> None:
     """Single reviewer run: forcing review_submit is the runner's terminal-tool
@@ -1043,6 +961,7 @@ async def test_review_subagent_run_uses_terminal_submit_contract(tmp_path) -> No
     assert "read_file" in runner.specs[0].soft_tool_error_tools
     assert "review_submit" not in runner.specs[0].soft_tool_error_tools
     assert runner.specs[0].terminal_tools == frozenset({"review_submit"})
+    assert runner.specs[0].preserve_tool_result_tools == frozenset({"review_submit"})
     assert runner.specs[0].terminal_retry_limit >= 1
     assert status.phase == "done"
     assert status.stop_reason == "completed"
@@ -1500,52 +1419,19 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_admitted_review_turn_injects_code_review_context(tmp_path, monkeypatch) -> None:
-    loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
-    runner = CapturingRunner()
-    loop.runner = runner
-    monkeypatch.setattr(
-        "nanoreview.agent.loop.prepare_code_review_context",
-        lambda *_args, **_kwargs: _review_coordinator_preparation(),
-    )
-    session = Session(key="test:review")
-    session.metadata["review_target"] = "https://github.com/test/repo"
+async def test_review_turn_delegates_review_metadata_same_turn(tmp_path) -> None:
+    """The turn's review metadata reaches ``ReviewLoop`` within the same turn.
 
-    await loop._run_agent_loop(
-        [{"role": "user", "content": "please review https://github.com/test/repo"}],
-        [],
-        session=session,
-        session_key=session.key,
-        metadata=_admit_review_run(loop, session.key),
-    )
-
-    assert runner.initial_messages is not None
-    assert runner.initial_messages[0]["role"] == "system"
-    assert "planning coordinator" in runner.initial_messages[0]["content"]
-    assert "submit_review_plan" in runner.initial_messages[0]["content"]
-
-
-@pytest.mark.asyncio
-async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path, monkeypatch) -> None:
+    Preparation (which resolves the target and injects the reviewer prompt) now
+    lives in ``ReviewLoop``; the loop's job is to hand over the turn metadata
+    unchanged so preparation sees the target/focus carried by the message.
+    """
     from nanoreview.bus.events import InboundMessage
 
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     loop.runner = runner
-    async def mock_review(
-        _messages: list[dict[str, Any]],
-        session_meta: dict[str, Any],
-        **_kwargs: Any,
-    ) -> ReviewPreparation:
-        assert session_meta["review_target"] == "https://github.com/test/repo"
-        assert session_meta["review_focus"] == ["dependency"]
-        session_meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = ["dependency"]
-        return ReviewPreparation(
-            None,
-            "- Name: https://github.com/test/repo\n- Type: github\nDependency Reviewer",
-        )
-
-    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", mock_review)
+    requests = _stub_review_execution(loop)
     session = Session(key="websocket:review")
     msg = InboundMessage(
         channel="websocket",
@@ -1553,11 +1439,9 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
         chat_id="review",
         content="请审查登录逻辑",
         metadata={
-            **{
-                "review_target": "https://github.com/test/repo",
-                "review_target_type": "github",
-                "review_focus": ["dependency"],
-            },
+            "review_target": "https://github.com/test/repo",
+            "review_target_type": "github",
+            "review_focus": ["dependency"],
             **_admit_review_run(loop, session.key),
         },
     )
@@ -1574,67 +1458,23 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
     await loop._state_build(ctx)
     await loop._state_run(ctx)
 
-    assert runner.initial_messages is not None
-    assert runner.initial_messages[0]["role"] == "system"
-    assert "- Name: https://github.com/test/repo" in runner.initial_messages[0]["content"]
-    assert "- Type: github" in runner.initial_messages[0]["content"]
-    assert session.metadata["allowed_review_dimensions"] == ["dependency"]
-    assert "Dependency Reviewer" in runner.initial_messages[0]["content"]
-    assert "Security Reviewer" not in runner.initial_messages[0]["content"]
+    assert runner.initial_messages is None
+    assert len(requests) == 1
+    assert requests[0].metadata["review_target"] == "https://github.com/test/repo"
+    assert requests[0].metadata["review_target_type"] == "github"
+    assert requests[0].metadata["review_focus"] == ["dependency"]
+    assert requests[0].messages[-1]["content"].startswith("请审查登录逻辑")
 
 
 @pytest.mark.asyncio
-async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, monkeypatch) -> None:
-    from nanoreview.agent.orchestration import ReviewExecutionOutcome
+async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path) -> None:
     from nanoreview.bus.events import InboundMessage
-    from nanoreview.review.output.finalizer import ReviewFinalizerResult
 
     report_markdown = "## Code Review Report: app.py\n\nNo actionable issues found."
 
-    class FakeOrchestrator:
-        def __init__(self, **_kwargs: Any) -> None:
-            pass
-
-        async def execute(self, **_kwargs: Any) -> str:
-            return report_markdown
-
-        async def execute_run(self, **_kwargs: Any) -> ReviewExecutionOutcome:
-            return ReviewExecutionOutcome(
-                report_markdown=report_markdown,
-                finalizer_result=ReviewFinalizerResult(
-                    report_markdown=report_markdown
-                ),
-                assignments=(),
-            )
-
-    plan = ReviewPlan(
-        target="app.py",
-        target_name="app.py",
-        target_type="local",
-        action=ReviewAction.REPO,
-        roles=[],
-        routing_mode="auto",
-    )
-    evidence = ReviewEvidenceBundle(
-        references=(
-            EvidenceReference(
-                id="ev-1",
-                path="app.py",
-                start_line=1,
-                end_line=1,
-                excerpt="value = 1",
-            ),
-        ),
-    )
-
-    async def fake_prepare(*_args: Any, **_kwargs: Any) -> ReviewPreparation:
-        return ReviewPreparation(plan, "review prompt", evidence)
-
-    monkeypatch.setattr("nanoreview.agent.review_loop.ReviewOrchestrator", FakeOrchestrator)
-    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", fake_prepare)
-
     bus = MessageBus()
     loop = AgentLoop(bus, DummyProvider(), tmp_path)
+    requests = _stub_review_execution(loop, report_markdown=report_markdown)
     session = Session(key="websocket:review-report")
     session.metadata[ReviewMetaKey.TARGET] = "app.py"
     msg = InboundMessage(
@@ -1660,6 +1500,7 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, mon
 
     await loop._state_run(ctx)
 
+    assert len(requests) == 1
     assert ctx.content_replaced is True
     while bus.outbound_size:
         await bus.consume_outbound()
@@ -1701,3 +1542,53 @@ async def test_process_system_message_accepts_agent_loop_return_shape(tmp_path) 
 
     assert response is not None
     assert response.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_unsettled_review_report_appends_the_settlement_failure(
+    tmp_path,
+) -> None:
+    """A produced report whose run could not settle names the failure.
+
+    The loop must not deliver the bare report as if nothing went wrong: when
+    ``ReviewLoop`` produced a report but reported a settle failure, the bounded
+    reason is appended so the user learns the session is still gated.
+    """
+    from nanoreview.bus.events import InboundMessage
+
+    loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
+    _stub_review_execution(
+        loop,
+        report_markdown="## Code Review Report\n\nNo actionable issues found.",
+        produces_report=True,
+        stop_reason="error",
+        error="the terminal review state could not be persisted (OSError)",
+    )
+    session = Session(key="websocket:review")
+    msg = InboundMessage(
+        channel="websocket",
+        sender_id="user",
+        chat_id="review",
+        content="审查",
+        metadata={
+            ReviewMetaKey.TARGET: "app.py",
+            ReviewMetaKey.TARGET_TYPE: "local",
+            **_admit_review_run(loop, session.key),
+        },
+    )
+    ctx = TurnContext(
+        msg=msg,
+        session_key=session.key,
+        state=TurnState.RUN,
+        turn_id="turn-report",
+        session=session,
+    )
+    ctx.frozen_messages = [{"role": "user", "content": "审查"}]
+    ctx.working_messages = []
+
+    await loop._state_run(ctx)
+
+    assert ctx.content_replaced is True
+    assert ctx.stop_reason == "error"
+    assert "Review settlement failed" in ctx.final_content
+    assert "OSError" in ctx.final_content

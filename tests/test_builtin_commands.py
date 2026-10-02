@@ -17,6 +17,9 @@ async def test_stop_uses_effective_context_key() -> None:
         cancelled.append(key)
         return 1
 
+    async def settle_review_after_stop(key: str) -> str | None:
+        return None
+
     msg = InboundMessage(
         channel="websocket",
         sender_id="client",
@@ -30,12 +33,49 @@ async def test_stop_uses_effective_context_key() -> None:
             session=None,
             key="__unified__",
             raw="/stop",
-            loop=SimpleNamespace(_cancel_active_tasks=cancel),
+            loop=SimpleNamespace(
+                _cancel_active_tasks=cancel,
+                _settle_review_run_after_stop=settle_review_after_stop,
+            ),
         )
     )
 
     assert cancelled == ["__unified__"]
     assert result.content == "Stopped 1 task(s)."
+
+
+@pytest.mark.asyncio
+async def test_stop_with_no_task_settles_a_leftover_review_run() -> None:
+    """A cancelled turn with no active task still reports the settled run."""
+    settle_key: list[str] = []
+
+    async def cancel(key: str) -> int:
+        return 0
+
+    async def settle_review_after_stop(key: str) -> str | None:
+        settle_key.append(key)
+        return "Settled review run run-x as stopped."
+
+    result = await cmd_stop(
+        CommandContext(
+            msg=InboundMessage(
+                channel="cli",
+                sender_id="client",
+                chat_id="chat",
+                content="/stop",
+            ),
+            session=None,
+            key="cli:review",
+            raw="/stop",
+            loop=SimpleNamespace(
+                _cancel_active_tasks=cancel,
+                _settle_review_run_after_stop=settle_review_after_stop,
+            ),
+        )
+    )
+
+    assert settle_key == ["cli:review"]
+    assert result.content == "Settled review run run-x as stopped."
 
 
 def test_removed_math_commands_are_not_advertised_or_routable() -> None:

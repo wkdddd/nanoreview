@@ -113,28 +113,6 @@ class ReviewFinalizer:
     def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
 
-    def set_validation_context(
-        self,
-        *,
-        workspace: str,
-        changed_files: list[str] | None = None,
-        local_target: str | None = None,
-        remote_diff: GitHubDiffEvidence | None = None,
-    ) -> None:
-        if self._dimensions:
-            logger.warning("review.finalizer.validation_context_ignored reason=already_ingested")
-            return
-        self._workspace = workspace
-        self._changed_files = list(changed_files or [])
-        self._local_target = local_target
-        self._ctx = ValidationContext(
-            workspace=workspace,
-            changed_files=self._changed_files,
-            local_target=local_target,
-            remote_diff=remote_diff,
-        )
-        self._validator = ReviewValidator(self._ctx)
-
     @property
     def dimensions(self) -> list[ReviewDimensionResult]:
         return list(self._dimensions)

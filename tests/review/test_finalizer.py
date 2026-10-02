@@ -6,7 +6,6 @@ import json
 import pytest
 from loguru import logger
 
-from nanoreview.agent.hooks import AgentHookContext, ReviewFinalizerHook
 from nanoreview.review.output.finalizer import ReviewFinalizer
 from nanoreview.review.output.judge import JudgeExecutionResult
 from nanoreview.review.types import (
@@ -582,69 +581,8 @@ class TestFinalize:
         assert "Announced finding" not in result.report_markdown
         assert "Review incomplete" in result.report_markdown
 
-    def test_hook_finalizes_content_from_subagent_messages(self, workspace):
-        raw_result = _submit([{
-            "severity": "critical",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Hook finding",
-            "evidence": "line1",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        context = AgentHookContext(
-            iteration=1,
-            messages=[{
-                "role": "user",
-                "content": "wrapper",
-                "_metadata": {
-                    "injected_event": "subagent_result",
-                    "subagent_label": "security",
-                    "subagent_result": raw_result,
-                },
-            }],
-        )
-        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
-
-        content = hook.finalize_content(context, "raw assistant prose")
-
-        assert "## Code Review Report: myproject" in content
-        assert "Hook finding" in content
-
-    def test_hook_replaces_prose_when_no_subagent_results(self, workspace):
-        context = AgentHookContext(
-            iteration=1,
-            messages=[{"role": "user", "content": "review this repo"}],
-        )
-        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
-
-        content = hook.finalize_content(context, "Looks fine from an architecture perspective.")
-
-        assert "## Code Review Report: myproject" in (content or "")
-        assert "Review incomplete" in (content or "")
-        assert "Looks fine from an architecture perspective" not in (content or "")
-        assert context.content_replaced is True
-
-    def test_hook_keeps_rendered_report_authoritative(self, workspace):
-        context = AgentHookContext(
-            iteration=1,
-            messages=[{"role": "user", "content": "review this repo"}],
-        )
-        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
-
-        first = hook.finalize_content(context, "raw assistant prose")
-        second_context = AgentHookContext(
-            iteration=2,
-            messages=context.messages,
-        )
-        second = hook.finalize_content(second_context, "later coordinator summary")
-
-        assert first == second
-        assert "## Code Review Report: myproject" in (second or "")
-        assert "later coordinator summary" not in (second or "")
-        assert second_context.content_replaced is True
-
-    def test_hook_allowed_dimensions_can_be_set_after_construction(self, workspace):
+    def test_allowed_dimensions_set_after_construction_filters_late_results(self, workspace):
+        """A dimension outside the (late) allow-list is skipped, not reported."""
         raw_result = _submit([{
             "severity": "critical",
             "file": "src/app.py",
@@ -654,29 +592,19 @@ class TestFinalize:
             "impact": "bad",
             "recommendation": "fix",
         }])
-        context = AgentHookContext(
-            iteration=1,
-            messages=[{
-                "role": "user",
-                "content": "wrapper",
-                "_metadata": {
-                    "injected_event": "subagent_result",
-                    "subagent_label": "security",
-                    "subagent_result": raw_result,
-                },
-            }],
-        )
-        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
-        hook.set_allowed_dimensions(["maintainability"])
+        f = ReviewFinalizer(workspace)
+        f.set_allowed_dimensions(["maintainability"])
 
-        content = hook.finalize_content(context, "raw assistant prose")
+        accepted = f.ingest_subagent_output("security", raw_result)
+        result = f.finalize("myproject")
 
-        assert "Disallowed finding" not in (content or "")
-        assert "Review incomplete" in (content or "")
-        assert "No actionable issues found" not in (content or "")
+        assert accepted.status == "skipped_disallowed"
+        assert "Disallowed finding" not in result.report_markdown
+        assert "Review incomplete" in result.report_markdown
+        assert "No actionable issues found" not in result.report_markdown
 
-    @pytest.mark.asyncio
-    async def test_hook_ingests_incremental_subagent_results(self, workspace):
+    def test_incremental_subagent_outputs_accumulate(self, workspace):
+        """Ingesting per dimension accumulates findings across ingest calls."""
         first = _submit([{
             "severity": "high",
             "file": "src/app.py",
@@ -695,34 +623,11 @@ class TestFinalize:
             "impact": "bad",
             "recommendation": "fix",
         }], details=_BUG_DETAILS)
-        context = AgentHookContext(
-            iteration=1,
-            messages=[{
-                "role": "user",
-                "content": "wrapper",
-                "_metadata": {
-                    "injected_event": "subagent_result",
-                    "subagent_task_id": "first",
-                    "subagent_label": "security",
-                    "subagent_result": first,
-                },
-            }],
-        )
-        hook = ReviewFinalizerHook(workspace=workspace, target_name="myproject")
+        f = ReviewFinalizer(workspace)
 
-        await hook.after_iteration(context)
-        context.messages.append({
-            "role": "user",
-            "content": "wrapper",
-            "_metadata": {
-                "injected_event": "subagent_result",
-                "subagent_task_id": "second",
-                "subagent_label": "bug",
-                "subagent_result": second,
-            },
-        })
-        await hook.after_iteration(context)
-        content = hook.finalize_content(context, "raw assistant prose")
+        f.ingest_subagent_output("security", first)
+        f.ingest_subagent_output("bug", second)
+        result = f.finalize("myproject")
 
-        assert "First finding" in content
-        assert "Second finding" in content
+        assert "First finding" in result.report_markdown
+        assert "Second finding" in result.report_markdown

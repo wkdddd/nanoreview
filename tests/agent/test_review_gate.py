@@ -10,6 +10,7 @@ gated forever.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -587,3 +588,88 @@ def test_commands_are_untouched_outside_review_sessions(tmp_path) -> None:
     session = loop.sessions.get_or_create("cli:plain")
 
     assert loop._review_command_gate(session, _ordinary_message(), "/new") is None
+
+
+@pytest.mark.asyncio
+async def test_stop_settles_a_leftover_run_without_an_active_turn(tmp_path) -> None:
+    """A running run with no active task is settled as stopped by /stop.
+
+    After a run's turn already returned while cleanup/persistence failed, the
+    session gate would stay closed forever because ``/stop`` had nothing to
+    cancel. The fallback settles the run so the gate opens.
+    """
+    loop, target = _admission_loop(tmp_path)
+    admission = _admit(loop, target)
+    # Simulate the unsettled outcome: the turn ended, the run stayed running.
+    state = loop.review_loop.get(REVIEW_SESSION_KEY)
+    state.phase = ReviewPhase.CLEANUP
+    loop.sessions.save(loop.sessions.get_or_create(REVIEW_SESSION_KEY))
+
+    note = await loop._settle_review_run_after_stop(REVIEW_SESSION_KEY)
+
+    assert note == f"Settled review run {admission.run_id} as stopped."
+    assert loop.review_loop.running(REVIEW_SESSION_KEY) is None
+    persisted = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
+    assert persisted.metadata[ReviewMetaKey.STATUS] == "stopped"
+    assert persisted.metadata[ReviewMetaKey.PHASE] == "done"
+
+
+@pytest.mark.asyncio
+async def test_stop_settle_is_a_noop_without_a_live_run(tmp_path) -> None:
+    """A plain session (no live run) settles nothing and returns None."""
+    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+
+    assert await loop._settle_review_run_after_stop("cli:plain") is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_queued_on_the_lock_settles_instead_of_discarding(
+    tmp_path,
+) -> None:
+    """Cancelling a turn queued on the session lock settles the admitted run.
+
+    Before the fix, a cancel during ``async with lock, gate`` skipped the inner
+    cancellation handler and the ``finally`` dropped the admitted ``PREPARE``
+    run while its persisted metadata still claimed ``running``. The run must
+    settle as ``stopped`` instead of being discarded.
+    """
+    loop, target = _admission_loop(tmp_path)
+    admission = _admit(loop, target)
+    assert loop.review_loop.running(REVIEW_SESSION_KEY) is not None
+
+    # Hold the session lock so the dispatched turn parks on acquisition.
+    lock = loop._session_locks.setdefault(REVIEW_SESSION_KEY, asyncio.Lock())
+    await lock.acquire()
+    try:
+        msg = InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="gate-session",
+            content=f"Review {target}",
+            session_key_override=REVIEW_SESSION_KEY,
+            metadata={
+                "_review_admitted": admission.run_id,
+                "review_target": str(target),
+                "review_target_type": "local",
+                "review_action": "repo",
+            },
+        )
+        task = asyncio.create_task(loop._dispatch(msg))
+        loop._active_tasks.setdefault(REVIEW_SESSION_KEY, []).append(task)
+        task.add_done_callback(
+            lambda t, k=REVIEW_SESSION_KEY: loop._remove_active_task(k, t)
+        )
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        await loop._cancel_active_tasks(REVIEW_SESSION_KEY)
+        await asyncio.gather(task, return_exceptions=True)
+    finally:
+        lock.release()
+
+    # The admitted run survived as a settled (stopped) run, not discarded.
+    state = loop.review_loop.get(REVIEW_SESSION_KEY)
+    assert state is not None
+    assert state.status is ReviewRunStatus.STOPPED
+    persisted = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
+    assert persisted.metadata[ReviewMetaKey.STATUS] == "stopped"

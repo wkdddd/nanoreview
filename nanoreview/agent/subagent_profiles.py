@@ -51,6 +51,10 @@ class SubagentExecutionProfile:
     required_tools: frozenset[str] = frozenset()
     terminal_tools: frozenset[str] = frozenset()
     soft_tool_error_tools: frozenset[str] = frozenset()
+    #: Tools whose untruncated result must be preserved in the run's
+    #: ``tool_events``. Declared per profile; the generic profile keeps none so
+    #: ordinary tool results stay bounded by default.
+    preserve_tool_result_tools: frozenset[str] = frozenset()
     prompt_builder: Callable[[dict[str, Any], Path], str] | None = None
     workspace_resolver: Callable[[dict[str, Any], Path], Path] | None = None
     result_handler: SubagentResultHandler | None = None

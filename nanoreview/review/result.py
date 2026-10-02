@@ -18,6 +18,7 @@ from enum import StrEnum
 from typing import Any
 
 from nanoreview.agent.review_state import (
+    REVIEW_SUMMARY_MAX_CHARS,
     REVIEW_TERMINAL_STATUSES,
     ReviewRunState,
     ReviewRunStatus,
@@ -229,12 +230,26 @@ def result_from_session_metadata(
     report_ref = report_ref if isinstance(report_ref, str) and report_ref else None
     snapshot_ref = values.get(ReviewMetaKey.SNAPSHOT_REF)
     fingerprint = values.get(ReviewMetaKey.INPUT_FINGERPRINT)
+    persisted_error = values.get(ReviewMetaKey.ERROR)
+    persisted_error = (
+        _bounded(persisted_error) if isinstance(persisted_error, str) else ""
+    )
+    persisted_summary = values.get(ReviewMetaKey.SUMMARY)
+    persisted_summary = (
+        _bounded(persisted_summary, REVIEW_SUMMARY_MAX_CHARS)
+        if isinstance(persisted_summary, str)
+        else ""
+    )
     if status is ReviewRunStatus.RUNNING:
         error = "review was interrupted before it produced a result"
-    elif report_ref:
-        error = ""
+    elif status is ReviewRunStatus.COMPLETED:
+        error = "" if report_ref else (
+            "the review report artifact is missing"
+        )
     else:
-        error = f"review ended with status '{status.value}' without a report artifact"
+        error = persisted_error or (
+            f"review ended with status '{status.value}' without a report artifact"
+        )
     gaps: tuple[str, ...] = ()
     handoff = _classify_handoff(status, report_ref, gaps)
     if not error and status is not ReviewRunStatus.COMPLETED:
@@ -247,7 +262,7 @@ def result_from_session_metadata(
         report_ref=report_ref,
         snapshot_ref=str(snapshot_ref) if isinstance(snapshot_ref, str) and snapshot_ref else None,
         input_fingerprint=str(fingerprint) if isinstance(fingerprint, str) else "",
-        summary=error,
+        summary=persisted_summary or error,
         error=error,
     )
 

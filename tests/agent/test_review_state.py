@@ -53,7 +53,7 @@ def test_review_run_state_tracks_phase_and_warnings() -> None:
 
 def test_review_run_state_enter_phase_ignored_after_terminal_status() -> None:
     state = _run_state(status=ReviewRunStatus.STOPPED)
-    state.enter_phase(ReviewPhase.RESPOND)
+    state.enter_phase(ReviewPhase.CLEANUP)
     assert state.phase is ReviewPhase.PREPARE
 
 
@@ -71,6 +71,58 @@ def test_review_run_state_metadata_payload_shape() -> None:
     state.report_ref = f"{REVIEW_ARTIFACTS_DIR_NAME}/run-000111222333.json"
     payload = state.metadata_payload()
     assert payload[ReviewMetaKey.REPORT_REF] == state.report_ref
+
+
+def test_metadata_payload_persists_bounded_summary_and_failure_reason() -> None:
+    """A restart must be able to read *why* a run ended, not just that it did."""
+    state = _run_state()
+    state.set_summary("report digest")
+    state.add_warning("plan failed: no reviewer profile for 'security'")
+
+    payload = state.metadata_payload(
+        status=ReviewRunStatus.ERROR, phase=ReviewPhase.DONE
+    )
+
+    assert payload[ReviewMetaKey.STATUS] == "error"
+    assert payload[ReviewMetaKey.PHASE] == "done"
+    assert payload[ReviewMetaKey.SUMMARY] == "report digest"
+    assert payload[ReviewMetaKey.ERROR] == "plan failed: no reviewer profile for 'security'"
+
+
+def test_metadata_payload_bounds_the_persisted_reason() -> None:
+    state = _run_state()
+    state.add_warning("x" * (CHILD_ERROR_MAX_CHARS + 50))
+
+    payload = state.metadata_payload(
+        status=ReviewRunStatus.STOPPED, phase=ReviewPhase.DONE
+    )
+
+    assert len(payload[ReviewMetaKey.ERROR]) == CHILD_ERROR_MAX_CHARS
+
+
+def test_running_payload_never_persists_a_failure_reason() -> None:
+    """Warnings during a live run stay in-process; only a terminal run has a reason."""
+    state = _run_state()
+    state.set_summary("partial digest")
+    state.add_warning("reviewer warning")
+
+    payload = state.metadata_payload()
+
+    assert payload[ReviewMetaKey.STATUS] == "running"
+    assert payload[ReviewMetaKey.SUMMARY] == "partial digest"
+    assert ReviewMetaKey.ERROR not in payload
+
+
+def test_completed_payload_carries_no_failure_reason() -> None:
+    state = _run_state()
+    state.add_warning("reviewer warning")
+
+    payload = state.metadata_payload(
+        status=ReviewRunStatus.COMPLETED, phase=ReviewPhase.DONE
+    )
+
+    assert payload[ReviewMetaKey.STATUS] == "completed"
+    assert ReviewMetaKey.ERROR not in payload
 
 
 def test_review_run_state_child_states() -> None:

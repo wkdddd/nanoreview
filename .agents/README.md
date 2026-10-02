@@ -25,8 +25,6 @@
 
 以下文档从旧 `.claude/plans/` 恢复，专门用于 review workflow 调整时回顾既有设计、实施顺序和已验证的取舍：
 
-- [reviewagent-multi-agent-handoff.md](reviewagent-multi-agent-handoff.md)：ReviewLoop、review 生命周期、Reviewer/Judge 编排和终态边界的历史目标。
-- [reviewagent-multi-agent-handoff-implementation-addendum.md](reviewagent-multi-agent-handoff-implementation-addendum.md)：上述目标的历史实施进展、验证结果和缺口记录。
 - [agent-runner-run-level-compression.md](agent-runner-run-level-compression.md)：`AgentRunner` run-level compression 的历史设计与验收细节。
 
 这些文档是调整 review workflow 的参考资料，不是当前产品目标、代码事实或待执行任务的权威来源。当前方向以 [project-roadmap.md](plans/project-roadmap.md) 为准，当前实施任务以 [code-adjustment-plan.md](plans/code-adjustment-plan.md) 为准；实现状态仍须以代码、测试和当前约束文件核对。

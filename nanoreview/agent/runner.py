@@ -156,6 +156,11 @@ class AgentRunSpec:
     permission_request_callback: Any | None = None
     soft_tool_error_tools: frozenset[str] = field(default_factory=frozenset)
     terminal_tools: frozenset[str] = field(default_factory=frozenset)
+    #: Tools whose untruncated result is kept in ``tool_events[*].raw_result``.
+    #: The runner only preserves what the caller explicitly declares, so an
+    #: ordinary tool result is never persisted or propagated untruncated by
+    #: default.
+    preserve_tool_result_tools: frozenset[str] = field(default_factory=frozenset)
     # Max terminal-tool submission attempts (failed submissions and prose
     # answers both count) before the run fails with terminal_tool_failed.
     terminal_retry_limit: int = 5
@@ -664,13 +669,12 @@ class AgentRunner:
                     "pending_tool_calls": [],
                 },
             )
-            # Terminal tools (e.g. review_submit) signal completion: once
-            # executed successfully, break immediately instead of giving the
-            # LLM another turn that could re-invoke them in a loop. A failed
-            # terminal submission stays inside this AgentRun: the assistant
-            # and tool messages (including the error) are kept so the model
-            # can correct its submission with full context, up to
-            # spec.terminal_retry_limit attempts.
+            # A terminal tool signals completion: once executed successfully,
+            # break immediately instead of giving the LLM another turn that
+            # could re-invoke it in a loop. A failed terminal submission stays
+            # inside this AgentRun: the assistant and tool messages (including
+            # the error) are kept so the model can correct its submission with
+            # full context, up to spec.terminal_retry_limit attempts.
             if spec.terminal_tools:
                 terminal_success: str | None = None
                 terminal_failure: tuple[str, str] | None = None
@@ -818,9 +822,9 @@ class AgentRunner:
             )
 
         # Check for mid-turn injections BEFORE signaling stream end.
-        # If a hook replaced the content with a terminal system report,
-        # that report is authoritative for the turn and must not be
-        # overwritten by follow-up coordinator prose.
+        # If a hook replaced the content, that replacement is authoritative
+        # for the turn and must not be overwritten by follow-up prose from
+        # injected messages.
         if context.content_replaced:
             should_continue = False
         else:
@@ -1968,7 +1972,9 @@ class AgentRunner:
             return result + hint, event, None
 
         detail = "" if result is None else str(result)
-        raw_result = detail if tool_call.name == "review_submit" else None
+        raw_result = (
+            detail if tool_call.name in spec.preserve_tool_result_tools else None
+        )
         detail = detail.replace("\n", " ").strip()
         if not detail:
             detail = "(empty)"

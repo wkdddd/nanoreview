@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
+from nanoreview.agent.runner import AgentRunResult
 from nanoreview.agent.subagent_profiles import (
     BUG_REVIEWER_SCOPE,
     GENERIC_SUBAGENT_PROFILE,
@@ -74,6 +79,134 @@ def test_plan_allows_evidence_reuse_across_reviewers() -> None:
         {"dimension": "bug", "focus": "exception path", "evidence_ids": ["ev-1"]},
     ])
     assert accepted
+
+
+def test_reviewer_profiles_preserve_review_submit_result() -> None:
+    """Reviewer profiles declare the accepted submission as a preserved result."""
+    profiles = reviewer_execution_profiles()
+    assert all(
+        profile.preserve_tool_result_tools == frozenset({"review_submit"})
+        for profile in profiles.values()
+    )
+
+
+def test_generic_profile_preserves_no_tool_result() -> None:
+    """The generic profile keeps no review tool and no preserved result."""
+    assert GENERIC_SUBAGENT_PROFILE.terminal_tools == frozenset()
+    assert GENERIC_SUBAGENT_PROFILE.preserve_tool_result_tools == frozenset()
+
+
+def _submit_payload(*, marker: str) -> str:
+    return json.dumps(
+        {
+            "submitted": True,
+            "findings": [
+                {
+                    "severity": "high",
+                    "file": "src/app.py",
+                    "line": 1,
+                    "title": marker,
+                    "evidence": "x" * 400,
+                    "impact": "bad",
+                    "recommendation": "fix",
+                }
+            ],
+            "errors": [],
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_handler_parses_full_submission() -> None:
+    handler = reviewer_execution_profiles()["bug"].result_handler
+    assert handler is not None
+    raw_result = _submit_payload(marker="Issue")
+    result = AgentRunResult(
+        final_content=None,
+        messages=[
+            {"role": "tool", "name": "read_file", "content": "evidence"},
+            {"role": "tool", "name": "review_submit", "content": raw_result},
+        ],
+        tool_events=[
+            {"name": "read_file", "status": "ok", "detail": "evidence"},
+            {
+                "name": "review_submit",
+                "status": "ok",
+                "detail": raw_result[:120] + "...",
+                "raw_result": raw_result,
+            },
+        ],
+    )
+
+    completion = await handler(result=result, target_type="local")
+
+    assert completion.status == "ok"
+    assert json.loads(completion.content)["findings"][0]["title"] == "Issue"
+    assert completion.stop_reason == "completed"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_handler_truncated_tool_message_uses_raw_result() -> None:
+    """The bounded tool message must not shadow the untruncated raw result."""
+    handler = reviewer_execution_profiles()["bug"].result_handler
+    assert handler is not None
+    raw_result = _submit_payload(marker="FullFinding")
+    truncated = raw_result[:60] + "\n... (truncated)"
+    result = AgentRunResult(
+        final_content=None,
+        messages=[
+            {"role": "tool", "name": "review_submit", "content": truncated},
+        ],
+        tool_events=[
+            {
+                "name": "review_submit",
+                "status": "ok",
+                "detail": raw_result[:120] + "...",
+                "raw_result": raw_result,
+            },
+        ],
+    )
+
+    completion = await handler(result=result, target_type="local")
+
+    assert completion.status == "ok"
+    parsed = json.loads(completion.content)
+    assert parsed["findings"][0]["title"] == "FullFinding"
+    assert parsed["findings"][0]["evidence"] == "x" * 400
+
+
+@pytest.mark.asyncio
+async def test_reviewer_handler_rejects_unprocessed_submission() -> None:
+    """A review_submit call without a processed result is not a valid submission."""
+    handler = reviewer_execution_profiles()["bug"].result_handler
+    assert handler is not None
+    result = AgentRunResult(
+        final_content=None,
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "review_submit",
+                            "arguments": _submit_payload(marker="Issue"),
+                        },
+                    }
+                ],
+            }
+        ],
+        tool_events=[
+            {"name": "review_submit", "status": "error", "detail": "failed"},
+        ],
+    )
+
+    completion = await handler(result=result, target_type="local")
+
+    assert completion.status == "error"
+    assert "No structured findings submitted" in completion.content
 
 
 def test_review_submit_preserves_details() -> None:

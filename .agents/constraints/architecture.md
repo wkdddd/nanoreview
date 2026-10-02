@@ -2,23 +2,22 @@
 
 ## 当前链路
 
-本节基于主工作区 `1675aeb5`；候选分支与目标方案不等于已落地实现。
+本节基于主工作区 `850aeb6b` 之上的当前实现（含 ReviewLoop 收敛改动）；候选分支与目标方案不等于已落地实现。
 
 `channels -> MessageBus -> AgentLoop(SessionCoordinator) -> AgentRunner / ReviewLoop -> MessageBus -> channels`
 
-- `agent/loop.py`：消息与 turn 编排、session/context、取消和结果交付；review 与 conversation 的准入、路由和门禁已委托给 `session/coordinator.py`。
-- `agent/review_loop.py`：一次 review run 的生命周期、状态迁移、终态持久化和结构化结果；执行委托 `agent/orchestration.py`。
+- `agent/loop.py`：消息与 turn 编排、session/context、取消和结果交付；review 与 conversation 的准入、路由和门禁已委托给 `session/coordinator.py`。对已准入的 review turn 只构造 `ReviewTurnRequest` 并交给 `ReviewLoop`，不写 review 状态。
+- `agent/review_loop.py`：一次 review run 的唯一 supervisor——准备、计划、reviewer/Judge 执行、报告持久化、资源清理与终态写入，内部按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序执行；同时拥有状态迁移和结构化结果。
 - `session/coordinator.py`：进程级路由与门禁（准入调用、session 路由、命令门禁、review→conversation 交接与索引）；不调用模型、不执行工具、不建立独立持久化状态机。
 - `agent/conversation_loop.py`：conversation 阶段的输入/输出契约占位，无执行。
-- `agent/orchestration.py`：当前实际执行计划、reviewer 调度/收集与 finalizer/Judge，并非空壳；其迁移设计见计划。
-- `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage。
+- `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
 - `agent/subagent.py`：子代理任务生命周期；`agent/review_state.py`：run 状态、fingerprint 与报告 artifact。
 - `review/`：`admission.py` 准入边界，`result.py` 终态结果与交接渲染，`input/`、`planning/`、`source/`、`output/` 输入、证据、源码、finding 校验、Judge 与报告领域逻辑。
 - `session/`：历史持久化与回放；`agent/context.py`、`memory.py`、`autocompact.py`：提示上下文与会话整理。
 - `channels/`：协议、交付和重试；`providers/`：模型调用适配；`agent/tools/`：能力与权限。
 - `review-webui/`：展示与交互；`templates/`、`skills/`：模型行为契约。
 
-仅有 review 处于 `running` 时门禁普通消息；review 进入终态且资源清理、结果持久化完成后，同 session 立即开放对话。长期目标见 `.agents/plans/project-roadmap.md`，当前代码调整计划见 `.agents/plans/code-adjustment-plan.md`。
+当前代码在 review `running` 时拒绝普通消息和非控制命令；只有清理完成且终态 metadata 已成功落盘（phase `done`）才发布 live `DONE` 并路由到 conversation。清理失败、再次取消或终态保存失败时 run 保持 `running`、门禁不开放，并向 turn 返回有界错误；已准入且停在 `PREPARE` 的 run 同样收尾为 `stopped`/`error` 及原因。失败原因与结果摘要随终态持久化，供重启后读取；无 live executor 的持久化 `running` 仍一次性规范化为 `error`。长期目标见 `.agents/plans/project-roadmap.md`。
 
 ## 本地 review 准入
 
@@ -32,12 +31,16 @@
 ## Review / Conversation 运行时边界
 
 - 一个 session 首版最多一个 review run；review 只能由用户经准入入口触发，Conversation Agent 不得自主发起 review，也不允许创建纯 conversation session。
-- 转入门禁：普通消息与非控制命令仅在 review `running` 时被拒，且不写入历史或 pending queue；`/status`、`/stop`、权限响应可用；review session 内 `/new` 被拒绝且不清空 session。
+- 当前转入行为（待按计划调整）：普通消息与非控制命令在 review `running` 时被拒，且不写入历史或 pending queue；`/status`、`/stop`、权限响应可用；review session 内 `/new` 被拒绝且不清空 session。
 - 只有携带 `_review_admitted` 且匹配 live `running` run 的 turn 进入 review 管线。session 在 review 结束后仍保留 `review_target` metadata，因此持久化 target 本身不足以重入 review。
+- `/stop` 先取消活动 turn task 与 subagent，再兜底收尾：取消后若 session 仍有 live `running` review run（典型是 turn 已结束但清理/终态保存失败留下的残留），补一次 `finalize(STOPPED)` 并如实报告结果；无残留 run 时 `finalize` 是 no-op，不影响纯 conversation session。取消发生在 turn 尚未进入 review 管线（还在等 session lock 或并发 gate）时，已准入的 `PREPARE` run 也被收尾为 `stopped`，不被静默丢弃。
 - `ReviewLoop` 是 run 状态、report artifact 与终态 metadata 的唯一写入者；`SessionCoordinator` 只读结果、写 `review_context` 索引、切换路由；`AgentRunner` 不写 review 状态。
-- 阶段判断从 live `ReviewRunState`、session metadata、report artifact 和交接索引推导，不新增 session phase 字段。无 live executor 的持久化 `running` 会被一次性规范化为终态 `error`，不 resume、不重跑。
+- review 固定按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序推进，每步只更新 `ReviewRunState.phase`，不引入状态转移表或通用 `BaseLoop`。成功、错误和 `/stop` 三种出口都先经过 `CLEANUP` 再在 `DONE` 写终态：正常为 `completed`、致命失败为 `error`、取消为 `stopped`。清理未确认完成或终态保存失败时不发布 `DONE`：run 保持 `running`、门禁保持关闭，并把有界错误交给 turn（`finalize()` 此时返回 `None`）。report stream 等 transport 事件由上层交付，不属于 review phase。
+- `REVIEW` 阶段内部固定为「并发 dispatch reviewer → 全部收齐 → 校验 finding → 按 context window 切候选批 → 逐批判定」：reviewer 受并发上限约束并行执行；Judge 只在所有 reviewer 终态、候选集完整后才运行。Judge 的“批”是对已收齐候选池按 token 预算的切分，不是 reviewer 到达流；各批串行执行，批间 verdicts 合并与顺序无关。
+- 阶段判断从 live `ReviewRunState`、session metadata、report artifact 和交接索引推导，不新增 session phase 字段。终态 metadata 先落盘、后发布 live `DONE`，因此“可路由”等价于“已持久化”。无 live executor 的持久化 `running` 会被一次性规范化为终态 `error`，并持久化有界中断原因，不 resume、不重跑。规范化在 `pending_handoff()` 里先于 `_review_settled()` 执行（`result()` 提前调用），保证重启后第一条普通消息就修复 orphan，而非永远卡在 `running`。规范化的 `save()` 失败必须回滚 metadata（缓存不提前发布 `error/done`），保持磁盘与缓存一致，留待下次读重试。
+- 终态 metadata 除 run id/status/phase/fingerprint/report ref 外，还持久化有界 `review_summary`（report 摘要或失败原因）与 `review_error`（非 `completed` 终态的原因），供重启后读取；不持久化 child transcript 或其他中间状态。
 - 交接三态：`complete`（artifact 已落盘且无缺口）、`partial`（artifact 已落盘但存在缺口）、`failed`（无可用 artifact，绝不渲染为完整成功）。交接不重试、不自动补齐、不重跑；已落盘 report 仍可查看。
-- 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。交接失败时仍进入对话，但必须说明失败、可用结果与覆盖缺口。
+- 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。review 完成 `DONE` 后，交接失败仍可进入对话，但必须说明失败、可用结果与覆盖缺口。
 - report artifact 与 `ReviewRunState` 是权威来源，Conversation Agent 不得改写；`review_context` 只是索引。
 - conversation 按 session 串行、最多 20 条待处理消息；`/stop` 取消当前与排队 turn 且保留已发生的修改不自动回滚；重启后不执行未完成队列。
 - 不新增第三个 Agent、通用 `BaseLoop` 或完整独立的 session 状态机。

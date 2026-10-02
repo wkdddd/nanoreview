@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import merge_token_usage, safe_filename
 
 if TYPE_CHECKING:
@@ -51,14 +52,22 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ReviewPhase(StrEnum):
-    """Supervisor phases of one review run."""
+    """Supervisor phases of one review run.
+
+    The phases are strictly ordered:
+
+    ``PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE``
+
+    ``CLEANUP`` runs after the report artifact is persisted and before the run
+    turns terminal, so resource cleanup is never skipped on a success, error or
+    stop exit. The wire values of the pre-existing phases are unchanged.
+    """
 
     PREPARE = "prepare"
     PLAN = "plan"
     REVIEW = "review"
     FINALIZE = "finalize"
-    SAVE = "save"
-    RESPOND = "respond"
+    CLEANUP = "cleanup"
     DONE = "done"
 
 
@@ -130,7 +139,7 @@ class JudgeBatchState:
 
 @dataclass(slots=True)
 class ReviewRunState:
-    """In-process state of one review run owned by ``AgentLoop``."""
+    """In-process state of one review run owned by ``ReviewLoop``."""
 
     run_id: str
     session_key: str
@@ -176,20 +185,40 @@ class ReviewRunState:
             self.reviewers[dimension] = state
         return state
 
-    def metadata_payload(self) -> dict[str, Any]:
+    def metadata_payload(
+        self,
+        *,
+        status: ReviewRunStatus | None = None,
+        phase: ReviewPhase | None = None,
+    ) -> dict[str, Any]:
         """Stable session metadata fields describing this run.
 
         Only the artifact reference, run id, status and phase cross the wire —
-        never the full report or any absolute server path.
+        never the full report or any absolute server path. ``status``/``phase``
+        override the in-memory values so the terminal payload can be persisted
+        *before* the run itself turns terminal: a successful save is what
+        publishes the live ``DONE``.
+
+        The bounded summary (report digest or failure reason) and, for a
+        non-completed run, the bounded failure reason are persisted too, so a
+        restart can explain the outcome without the in-process state.
         """
+        effective_status = status or self.status
         payload: dict[str, Any] = {
-            "review_run_id": self.run_id,
-            "review_status": self.status.value,
-            "review_phase": self.phase.value,
-            "review_input_fingerprint": self.input_fingerprint,
+            ReviewMetaKey.RUN_ID: self.run_id,
+            ReviewMetaKey.STATUS: effective_status.value,
+            ReviewMetaKey.PHASE: (phase or self.phase).value,
+            ReviewMetaKey.INPUT_FINGERPRINT: self.input_fingerprint,
         }
         if self.report_ref is not None:
-            payload["review_report_ref"] = self.report_ref
+            payload[ReviewMetaKey.REPORT_REF] = self.report_ref
+        if self.summary:
+            payload[ReviewMetaKey.SUMMARY] = self.summary[:REVIEW_SUMMARY_MAX_CHARS]
+        if (
+            effective_status in (ReviewRunStatus.ERROR, ReviewRunStatus.STOPPED)
+            and self.warnings
+        ):
+            payload[ReviewMetaKey.ERROR] = bound_child_error(self.warnings[-1])
         return payload
 
 

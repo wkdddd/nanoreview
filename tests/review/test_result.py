@@ -299,6 +299,55 @@ def test_unknown_persisted_status_without_a_report_is_failed() -> None:
     assert result.error
 
 
+def test_restored_error_run_keeps_the_persisted_reason() -> None:
+    """The bounded failure reason survives a restart instead of degrading."""
+    reason = "planning failed: no reviewer profile for 'security'"
+    result = result_from_session_metadata(
+        "cli:review",
+        _metadata(
+            **{
+                ReviewMetaKey.STATUS: "error",
+                ReviewMetaKey.REPORT_REF: None,
+                ReviewMetaKey.ERROR: reason,
+                ReviewMetaKey.SUMMARY: reason,
+            }
+        ),
+    )
+
+    assert result is not None
+    assert result.status is ReviewRunStatus.ERROR
+    assert result.handoff is ReviewHandoffState.FAILED
+    assert result.error == reason
+    assert result.summary == reason
+
+
+def test_restored_stopped_run_prefers_the_persisted_reason() -> None:
+    """A stopped run with an artifact still explains itself after a restart."""
+    reason = "review cleanup was interrupted by another cancellation"
+    result = result_from_session_metadata(
+        "cli:review",
+        _metadata(**{ReviewMetaKey.STATUS: "stopped", ReviewMetaKey.ERROR: reason}),
+    )
+
+    assert result is not None
+    assert result.status is ReviewRunStatus.STOPPED
+    assert result.handoff is ReviewHandoffState.PARTIAL
+    assert result.error == reason
+    assert result.summary == reason
+
+
+def test_restored_terminal_run_without_a_reason_stays_generic() -> None:
+    """Older metadata without the reason keys still degrades to a bounded error."""
+    result = result_from_session_metadata(
+        "cli:review",
+        _metadata(**{ReviewMetaKey.STATUS: "error", ReviewMetaKey.REPORT_REF: None}),
+    )
+
+    assert result is not None
+    assert result.error
+    assert result.summary == result.error
+
+
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------

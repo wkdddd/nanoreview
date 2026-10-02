@@ -171,17 +171,85 @@ def test_an_orphaned_running_run_is_repaired_once_and_reopens_the_session(
     assert result.error == INTERRUPTED_RUN_REASON
     assert session.metadata[ReviewMetaKey.STATUS] == "error"
     assert session.metadata[ReviewMetaKey.PHASE] == "done"
+    # ...and the reason is persisted with the repair, not only in memory.
+    assert session.metadata[ReviewMetaKey.SUMMARY] == INTERRUPTED_RUN_REASON
+    assert session.metadata[ReviewMetaKey.ERROR] == INTERRUPTED_RUN_REASON
 
     assert env.coordinator.route(session) is SessionRoute.CONVERSATION
 
-    # ...and the repair is persisted, so a fresh process reads a terminal run.
+    # ...and the repair is persisted, so a fresh process reads a terminal run
+    # that still explains why it failed.
     reloaded = SessionManager(env.workspace).get_or_create(SESSION_KEY)
     assert reloaded.metadata[ReviewMetaKey.STATUS] == "error"
     settled = env.coordinator.result(reloaded)
     assert settled is not None
     assert settled.is_terminal is True
     assert settled.handoff is ReviewHandoffState.FAILED
-    assert settled.error
+    assert settled.error == INTERRUPTED_RUN_REASON
+
+
+def test_pending_handoff_repairs_an_orphan_without_a_manual_result_call(
+    env: _Env,
+) -> None:
+    """The real handoff entry repairs an orphan, not just ``result()``.
+
+    After a restart the persisted run is still ``running`` with no live
+    executor. ``pending_handoff`` must normalize that orphan itself (it calls
+    ``result()`` before the settlement check), so the first conversation turn
+    injects the failure context instead of silently dropping the handoff while
+    the metadata stays ``running`` forever.
+    """
+    session = env.sessions.get_or_create(SESSION_KEY)
+    session.metadata[ReviewMetaKey.RUN_ID] = "run-a"
+    session.metadata[ReviewMetaKey.STATUS] = "running"
+    session.metadata[ReviewMetaKey.PHASE] = "cleanup"
+    env.sessions.save(session)
+    assert env.review_loop.get(SESSION_KEY) is None
+
+    handoff = env.coordinator.pending_handoff(session)
+
+    assert handoff is not None
+    assert handoff.result.handoff is ReviewHandoffState.FAILED
+    assert handoff.result.error == INTERRUPTED_RUN_REASON
+    # The orphan is normalized to a terminal error in memory and on disk.
+    assert session.metadata[ReviewMetaKey.STATUS] == "error"
+    assert session.metadata[ReviewMetaKey.PHASE] == "done"
+
+
+def test_a_failed_orphan_repair_does_not_publish_done_in_cache(env: _Env) -> None:
+    """A failed repair save restores the metadata instead of running ahead.
+
+    ``_normalize_interrupted_run`` must not leave the cache claiming
+    ``error/done`` while disk still says ``running``: on a failed save the
+    previous metadata is restored so the run stays ``running`` and a later
+    read retries the repair.
+    """
+    session = env.sessions.get_or_create(SESSION_KEY)
+    session.metadata[ReviewMetaKey.RUN_ID] = "run-a"
+    session.metadata[ReviewMetaKey.STATUS] = "running"
+    session.metadata[ReviewMetaKey.PHASE] = "review"
+    env.sessions.save(session)
+    assert env.review_loop.get(SESSION_KEY) is None
+
+    original_save = env.sessions.save
+
+    def _flaky_save(sess: Any) -> None:
+        raise OSError("disk full (injected)")
+
+    env.sessions.save = _flaky_save  # type: ignore[method-assign]
+    try:
+        result = env.coordinator.result(session)
+    finally:
+        env.sessions.save = original_save  # type: ignore[method-assign]
+
+    # The repair failed: the cache must still reflect the persisted ``running``
+    # state, not a premature ``error/done``.
+    assert result is not None
+    assert result.status is ReviewRunStatus.RUNNING
+    assert session.metadata[ReviewMetaKey.STATUS] == "running"
+    assert session.metadata[ReviewMetaKey.PHASE] == "review"
+    # Once persistence works again, a later read repairs the orphan.
+    assert env.coordinator.result(session).status is ReviewRunStatus.ERROR
 
 
 def test_a_live_run_is_never_mistaken_for_an_orphan(env: _Env) -> None:
@@ -390,12 +458,33 @@ async def test_finalize_settles_the_run_and_indexes_the_result(env: _Env) -> Non
 
 
 @pytest.mark.asyncio
-async def test_finalize_releases_a_run_that_never_started(env: _Env) -> None:
-    """A turn that failed before planning must not brick its session."""
+async def test_finalize_settles_a_run_that_never_started(env: _Env) -> None:
+    """A run cancelled in PREPARE is settled with a reason, never dropped.
+
+    Admission already persisted ``running`` for this turn, so dropping the live
+    run would leave a claim no process can explain: the run is closed as the
+    requested terminal status with a bounded reason and the index is written.
+    """
     _live_run(env, phase=ReviewPhase.PREPARE)
 
-    assert await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.ERROR) is None
+    result = await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.ERROR)
 
+    assert result is not None
+    assert result.status is ReviewRunStatus.ERROR
+    assert result.error
     session = env.sessions.get_or_create(SESSION_KEY)
-    assert env.review_loop.get(SESSION_KEY) is None
+    assert env.review_loop.running(SESSION_KEY) is None
+    assert env.review_loop.get(SESSION_KEY) is not None
+    assert session.metadata[ReviewMetaKey.STATUS] == "error"
+    assert session.metadata[ReviewMetaKey.PHASE] == "done"
+    assert session.metadata[ReviewMetaKey.SUMMARY] == result.error
+    assert session.metadata[ReviewMetaKey.ERROR] == result.error
     assert env.coordinator.route(session) is SessionRoute.CONVERSATION
+    assert any(
+        message.get("injected_event") == REVIEW_CONTEXT_EVENT
+        for message in session.messages
+    )
+
+    # A fresh process reads the settled run and its reason from disk.
+    reloaded = SessionManager(env.workspace).get_or_create(SESSION_KEY)
+    assert reloaded.metadata[ReviewMetaKey.ERROR] == result.error

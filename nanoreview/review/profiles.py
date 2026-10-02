@@ -51,6 +51,9 @@ class ReviewerProfile:
             required_tools=_REVIEWER_REQUIRED_TOOLS,
             terminal_tools=frozenset({"review_submit"}),
             soft_tool_error_tools=_SOFT_TOOLS,
+            # The reviewer protocol interprets the full structured submission,
+            # so its untruncated result must survive into tool_events.
+            preserve_tool_result_tools=frozenset({"review_submit"}),
             prompt_builder=lambda metadata, workspace: _build_reviewer_prompt(
                 self, metadata, workspace
             ),

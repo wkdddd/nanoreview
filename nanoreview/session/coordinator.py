@@ -84,6 +84,10 @@ INTERRUPTED_RUN_REASON = (
     "the review was interrupted before it produced a result and cannot be resumed"
 )
 
+#: Placeholder for "key absent" when snapshotting session metadata before a
+#: repair write, so a failed save can restore the exact previous state.
+_ABSENT = object()
+
 
 def _is_review_turn(metadata: dict[str, Any] | None) -> bool:
     meta = metadata or {}
@@ -227,10 +231,43 @@ class SessionCoordinator:
         a review, so the persisted status is corrected to ``error`` with a
         bounded reason. The repair is idempotent: it runs once and later reads
         see the terminal status.
+
+        The repair mutates the session metadata in place but must not publish
+        a terminal state it cannot persist: on a failed save the previous
+        values are restored so the cache never runs ahead of disk (the run
+        stays ``running`` and a later read retries the repair).
         """
+        keys = (
+            ReviewMetaKey.STATUS,
+            ReviewMetaKey.PHASE,
+            ReviewMetaKey.SUMMARY,
+            ReviewMetaKey.ERROR,
+        )
+        previous = {
+            key: session.metadata.get(key, _ABSENT) for key in keys
+        }
         session.metadata[ReviewMetaKey.STATUS] = ReviewRunStatus.ERROR.value
         session.metadata[ReviewMetaKey.PHASE] = ReviewPhase.DONE.value
-        self._sessions.save(session)
+        # Persist the bounded reason alongside the repaired status so every
+        # later reader (other transports, a restart) sees why the run failed,
+        # not just that it failed.
+        session.metadata[ReviewMetaKey.SUMMARY] = INTERRUPTED_RUN_REASON
+        session.metadata[ReviewMetaKey.ERROR] = INTERRUPTED_RUN_REASON
+        try:
+            self._sessions.save(session)
+        except Exception as exc:
+            for key, value in previous.items():
+                if value is _ABSENT:
+                    session.metadata.pop(key, None)
+                else:
+                    session.metadata[key] = value
+            logger.warning(
+                "review.route.interrupted_persist_failed session={} run_id={} reason={}",
+                session.key,
+                result.run_id,
+                exc,
+            )
+            return result
         logger.info(
             "review.route.interrupted session={} run_id={} reason=no_live_executor",
             session.key,
@@ -438,6 +475,21 @@ class SessionCoordinator:
 
     # -- terminal persistence ----------------------------------------------
 
+    def _review_settled(self, session: "Session") -> bool:
+        """Whether the session's review run reached its final ``DONE`` phase.
+
+        A terminal status alone is not enough: ``ReviewLoop`` writes ``DONE``
+        only after child cleanup and result persistence returned, so the
+        handoff and the index wait for that settled phase rather than acting on
+        a bare ``review_status``.
+        """
+        live = self._review_loop.get(session.key)
+        if live is not None:
+            return live.phase is ReviewPhase.DONE
+        return (
+            session.metadata.get(ReviewMetaKey.PHASE) == ReviewPhase.DONE.value
+        )
+
     async def finalize(
         self,
         session_key: str,
@@ -464,9 +516,13 @@ class SessionCoordinator:
 
         The index is small, replayable and idempotent: it names the run, the
         report artifact reference and the coverage/gap summary, and never
-        carries the full report (that stays the artifact's job). Returns True
-        when a new entry was appended.
+        carries the full report (that stays the artifact's job). It is only
+        written for a run that published its final ``DONE`` phase, so the index
+        can never point at a result the run has not settled. Returns True when
+        a new entry was appended.
         """
+        if not self._review_settled(session):
+            return False
         result = self.result(session)
         if result is None or not result.is_terminal:
             return False
@@ -499,15 +555,26 @@ class SessionCoordinator:
         """The handoff the next conversation turn must inject, if any.
 
         Returns ``None`` once the current run's report has already been
-        injected, when the session has no terminal review, or when the run is
-        still running.
+        injected, when the session has no terminal review, when the run is
+        still running, or when the run has not published its final ``DONE``
+        phase yet — a terminal status without ``DONE`` means cleanup or result
+        persistence has not settled, and handing over then would announce a
+        result the run has not finished writing.
 
         A report the coordinator cannot actually load downgrades the handoff to
         ``failed``: a reference without readable content is not a usable report,
         and reporting it as complete would inject a success framing over a
         handoff that has nothing to hand over.
+
+        ``result()`` is called before the settlement check on purpose: for a
+        session restored after a restart (no live executor) the persisted run
+        is still ``running``, and ``result()`` is what normalizes that orphan to
+        a terminal ``error``. Checking settlement first would return ``None``
+        forever and never repair the metadata.
         """
         result = self.result(session)
+        if not self._review_settled(session):
+            return None
         if result is None or not result.is_terminal:
             return None
         if session.metadata.get(ReviewMetaKey.HANDOFF_RUN_ID) == result.run_id:

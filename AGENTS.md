@@ -30,7 +30,6 @@ NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主
 - `.agents/constraints/`：稳定的工程约束和模块契约，记录当前代码应遵守的架构、安全、设计、预算、调试和平台边界。修改相关代码前按影响范围读取；它描述实现约束，不决定产品是否要增加功能。
 - `.agents/plans/`：产品目标与实施规划。`project-roadmap.md` 是长期产品方向的权威来源，区分已确认目标、待评估方向、明确不做和架构原则；`code-adjustment-plan.md` 只记录已经讨论确认、准备执行的短期代码调整节点，可以为空。规划文件描述目标和计划，不等同于当前实现事实。
 - `.agents/references/`：外部项目或历史实现的核查摘要，只用于理解可选技术方案、行为和取舍。它们不定义 NanoReview 的产品目标、当前架构或实施任务；只有当前问题涉及对应参考时才读取。
-- `.agents/` 根目录下的历史规划文件：已删除或迁移规划的保留参考，主要用于回顾 review workflow、ReviewLoop 和压缩设计。它们不是当前目标、当前代码状态或待执行任务的权威来源；如与 `project-roadmap.md` 冲突，以后者为准。包含：`.agents\reviewagent-multi-agent-handoff-implementation-addendum.md`,`.agents\reviewagent-multi-agent-handoff.md`
 
 
 读取顺序按任务判断：先读 `.agents/README.md` 定位文件，再读相关长期规划或约束；涉及具体实施时同时核对 `code-adjustment-plan.md`、当前代码和测试；只有需要比较外部方案或历史取舍时才读 references 和历史规划。不要把规划中的目标当成已实现事实，也不要把历史验证结果当成本次验证结果。

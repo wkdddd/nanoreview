@@ -21,11 +21,10 @@ from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.hooks.lifecycle import AgentHook, CompositeHook
 from nanoreview.agent.hooks.progress import AgentProgressHook
 from nanoreview.agent.memory import Consolidator
-from nanoreview.agent.orchestration import (
-    ReviewExecutionContext,
-    ReviewPlanningError,
+from nanoreview.agent.review_loop import (
+    ReviewLoop,
+    ReviewTurnRequest,
 )
-from nanoreview.agent.review_loop import ReviewLoop
 from nanoreview.agent.review_state import (
     ReviewRunState,
     ReviewRunStatus,
@@ -57,12 +56,7 @@ from nanoreview.review.admission import (
     ReviewAdmissionService,
 )
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
-from nanoreview.review.planning.planner import (
-    ReviewPreparation,
-    prepare_code_review_context,
-)
 from nanoreview.review.profiles import reviewer_execution_profiles
-from nanoreview.review.types import ReviewMetaKey
 from nanoreview.session.coordinator import (
     SessionCoordinator,
     _is_review_turn,
@@ -355,8 +349,12 @@ class AgentLoop:
             subagents=self.subagents,
             model=self.model,
             max_tool_result_chars=self.max_tool_result_chars,
+            max_concurrent_subagents=int(
+                getattr(self.review_config, "max_concurrent_subagents", 4) or 4
+            ),
             context_window_tokens=self.context_window_tokens,
             judge_factory=self._build_review_judge,
+            evidence_provider_getter=self._review_evidence_provider,
         )
         #: Authoritative in-process review runs, owned by ``ReviewLoop``.
         self._review_runs: dict[str, ReviewRunState] = self.review_loop.runs
@@ -619,6 +617,17 @@ class AgentLoop:
             context_window_tokens=int(self.context_window_tokens or 0) or None,
         )
         return ReviewJudge(runner=self.runner, model=self.model, config=config)
+
+    def _review_evidence_provider(self) -> Any | None:
+        """Return the review tool's shared evidence service, if registered.
+
+        The provider is what makes evidence prefetch possible, so ``ReviewLoop``
+        resolves it lazily: tools are registered after the loop is built.
+        """
+        tool = self.tools.get("local_review") or self.tools.get("github_review")
+        if tool is None:
+            return None
+        return getattr(tool, "evidence_provider", None)
 
     def _set_tool_context(
         self,
@@ -939,6 +948,86 @@ class AgentLoop:
         """Move a running review run to a terminal status and persist metadata."""
         await self.review_coordinator.finalize(session_key, status, warning=warning)
 
+    async def _settle_review_run_after_stop(self, session_key: str) -> str | None:
+        """Settle a review run left ``running`` after ``/stop`` cancelled its turn.
+
+        ``/stop`` cancels active turn tasks, but a run whose turn already
+        returned normally while its cleanup or terminal save failed has no live
+        task to cancel, so the session gate would otherwise stay closed
+        forever. When the session still owns a running review run, retry the
+        terminal transition as ``stopped`` and return a short report of the
+        outcome; return ``None`` when there is nothing to settle.
+        """
+        state = self.review_loop.get(session_key)
+        if state is None or state.status is not ReviewRunStatus.RUNNING:
+            return None
+        result = await self.review_coordinator.finalize(
+            session_key, ReviewRunStatus.STOPPED
+        )
+        if result is None:
+            return (
+                "The review run could not be settled; restart nanoreview to "
+                "recover the session."
+            )
+        return f"Settled review run {result.run_id} as stopped."
+
+    async def _execute_review_turn(
+        self,
+        *,
+        session: Session | None,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        message_id: str | None,
+        metadata: dict[str, Any] | None,
+        messages: list[dict[str, Any]],
+        on_progress: Callable[..., Awaitable[None]] | None,
+    ) -> AgentRunResult:
+        """Delegate one admitted review turn to ``ReviewLoop``.
+
+        The loop keeps the turn semantics (bus, queues, cancellation, history
+        persistence); ``ReviewLoop`` owns the review lifecycle. The callback
+        below is the loop's session-persistence responsibility, so reviewer
+        results stay durable in the session while the run executes.
+        """
+
+        async def _persist_automatic_subagent_result(
+            subagent_message: InboundMessage,
+        ) -> None:
+            if session is None:
+                return
+            if self._persist_subagent_followup(session, subagent_message):
+                self.sessions.save(session)
+
+        outcome = await self.review_loop.execute(
+            ReviewTurnRequest(
+                session_key=session_key,
+                session=session,
+                messages=list(messages),
+                metadata=dict(metadata or {}),
+                channel=channel,
+                chat_id=chat_id,
+                message_id=message_id,
+                progress_callback=on_progress,
+                result_callback=_persist_automatic_subagent_result,
+            )
+        )
+        final_content = outcome.report_markdown
+        # A report was produced but the run could not settle (cleanup or
+        # terminal save failed): append the bounded reason so the user learns
+        # the session is still gated, instead of only seeing the report.
+        if outcome.produces_report and outcome.error:
+            final_content = (
+                f"{final_content}\n\n> Review settlement failed: {outcome.error}"
+            )
+        return AgentRunResult(
+            final_content=final_content,
+            messages=list(messages),
+            stop_reason=outcome.stop_reason,
+            error=outcome.error,
+            content_replaced=outcome.produces_report,
+        )
+
     def _replay_token_budget(self) -> int:
         """Derive a token budget for session history replay from the context window."""
         if self.context_window_tokens <= 0:
@@ -985,8 +1074,6 @@ class AgentLoop:
         active_session_key = session.key if session else session_key
         buffered_pending: list[InboundMessage] = []
         injected_subagent_task_ids: set[str] = set()
-        saw_running_subagents = False
-        subagent_barrier_sent = False
 
         def _running_subagents() -> int:
             if not active_session_key:
@@ -1040,13 +1127,7 @@ class AgentLoop:
             ),
             suppress_content_progress=review_turn,
         )
-        review_hook: AgentHook | None = None
-        if review_turn:
-            on_stream = None
-            on_stream_end = None
         hooks: list[AgentHook] = [loop_hook]
-        if review_hook is not None:
-            hooks.append(review_hook)
         hooks.extend(self._extra_hooks)
         hook: AgentHook = CompositeHook(hooks) if len(hooks) > 1 else loop_hook
 
@@ -1060,14 +1141,13 @@ class AgentLoop:
         ) -> list[dict[str, Any]]:
             """Drain follow-up messages from the pending queue.
 
-            Subagent results are a hard dependency for review turns. While
-            same-session subagents are running, wait for each completed result
-            and inject it immediately so validation can run incrementally.
-            Non-subagent messages are buffered until subagents have finished.
+            Subagent results are a hard dependency: while same-session
+            subagents are running, wait for each completed result and inject it
+            immediately so the turn can integrate it. Non-subagent messages are
+            buffered until subagents have finished.
             """
             if pending_queue is None:
                 return []
-            nonlocal saw_running_subagents, subagent_barrier_sent
 
             def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
                 user_content = pending_msg.content
@@ -1077,8 +1157,6 @@ class AgentLoop:
                 return message
 
             items: list[dict[str, Any]] = []
-            running_at_start = _running_subagents() > 0
-            saw_running_subagents = saw_running_subagents or running_at_start
 
             def _accept_pending(pending_msg: InboundMessage) -> bool:
                 if _is_subagent_result(pending_msg):
@@ -1093,30 +1171,6 @@ class AgentLoop:
                     return True
                 buffered_pending.append(pending_msg)
                 return False
-
-            def _subagent_barrier_message() -> dict[str, Any]:
-                return {
-                    "role": "user",
-                    "content": (
-                        "[System] All same-session review subagents have completed. "
-                        "Continue integrating the injected subagent results and finalize "
-                        "only if validation is complete. Do not spawn another subagent "
-                        "for a review dimension that has already returned a result."
-                    ),
-                    "_metadata": {"injected_event": "subagent_barrier"},
-                }
-
-            def _append_subagent_barrier_if_done() -> None:
-                nonlocal subagent_barrier_sent
-                if (
-                    saw_running_subagents
-                    and not subagent_barrier_sent
-                    and _running_subagents() == 0
-                    and review_turn
-                    and len(items) < limit
-                ):
-                    subagent_barrier_sent = True
-                    items.append(_subagent_barrier_message())
 
             while buffered_pending and len(items) < limit and _running_subagents() == 0:
                 items.append(_to_user_message(buffered_pending.pop(0)))
@@ -1149,233 +1203,81 @@ class AgentLoop:
             while buffered_pending and len(items) < limit and _running_subagents() == 0:
                 items.append(_to_user_message(buffered_pending.pop(0)))
 
-            if (
-                not items
-                and saw_running_subagents
-                and not subagent_barrier_sent
-                and _running_subagents() == 0
-                and review_turn
-            ):
-                subagent_barrier_sent = True
-                items.append(_subagent_barrier_message())
-            else:
-                _append_subagent_barrier_if_done()
-
             return items
 
         file_state_token = bind_file_states(
             self._file_state_store.for_session(active_session_key)
         )
         try:
-            from nanoreview.agent.tools.permissions import resolve_policy
-
-            _session_meta = session.metadata if session is not None else {}
-            permission_policy = resolve_policy(
-                getattr(self, "permissions_config", None),
-                _session_meta,
-            )
-
-            review_meta = dict(_session_meta)
-            review_meta.setdefault(
-                ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS,
-                getattr(self.review_config, "max_concurrent_subagents", 4),
-            )
-            review_meta[ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS] = self.context_window_tokens
-            review_tool = self.tools.get("local_review") or self.tools.get(
-                "github_review"
-            )
-            if review_tool is not None:
-                if evidence_provider := getattr(review_tool, "evidence_provider", None):
-                    review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = evidence_provider
-            # Only an admitted review turn resolves review inputs (plan,
-            # evidence, prefetch). Conversation turns skip the whole
-            # preparation: the plan they would build must never be executed.
+            # An admitted review turn is handed to ``ReviewLoop`` whole: it
+            # resolves the plan, evidence and prompt, drives reviewers and the
+            # Judge, persists the report artifact and settles the terminal
+            # state. The loop only delivers the produced report.
             if review_turn:
-                review_preparation = await prepare_code_review_context(
-                    [*frozen_messages, *working_messages],
-                    review_meta,
-                    progress_callback=on_progress,
+                result = await self._execute_review_turn(
+                    session=session,
+                    session_key=active_session_key or "",
+                    channel=channel,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    metadata=metadata,
+                    messages=[*frozen_messages, *working_messages],
+                    on_progress=on_progress,
                 )
-                specialist_prompt = review_preparation.prompt
             else:
-                review_preparation = ReviewPreparation(None, "")
-                specialist_prompt = ""
-            review_meta_keys_to_sync = (
-                ReviewMetaKey.ALLOWED_DIMENSIONS,
-                ReviewMetaKey.GITHUB_PREFETCH_READY,
-                ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS,
-                ReviewMetaKey.GITHUB_PR_HEAD_REF,
-                ReviewMetaKey.LOCAL_ROOT,
-                ReviewMetaKey.LOCAL_TARGET,
-                ReviewMetaKey.LOCAL_SCOPE_KIND,
-            )
-            for key in review_meta_keys_to_sync:
-                if key in review_meta:
-                    _session_meta[key] = review_meta[key]
-                elif key in (
-                    ReviewMetaKey.LOCAL_ROOT,
-                    ReviewMetaKey.LOCAL_TARGET,
-                    ReviewMetaKey.LOCAL_SCOPE_KIND,
-                ):
-                    _session_meta.pop(key, None)
-            if ReviewMetaKey.ALLOWED_DIMENSIONS in review_meta:
-                if review_hook is not None and hasattr(
-                    review_hook, "set_allowed_dimensions"
-                ):
-                    review_hook.set_allowed_dimensions(
-                        review_meta[ReviewMetaKey.ALLOWED_DIMENSIONS]
-                    )
-            validation_workspace = str(
-                review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self.workspace
-            )
-            changed_files: list[str] = []
-            local_target = review_meta.get(ReviewMetaKey.LOCAL_TARGET)
-            remote_diff = None
-            if review_preparation.plan is not None:
-                target_type_value = (
-                    str(review_meta.get(ReviewMetaKey.TARGET_TYPE) or "")
-                    .strip()
-                    .lower()
-                )
-                evidence_provider = review_meta.get(ReviewMetaKey.EVIDENCE_PROVIDER)
-                if target_type_value == "github" and evidence_provider is not None:
-                    diff_evidence = getattr(evidence_provider, "last_diff_evidence", None)
-                    if diff_evidence is not None:
-                        remote_diff = diff_evidence
-                        changed_files = list(getattr(diff_evidence, "changed_files", []))
-                        review_meta[ReviewMetaKey.GITHUB_PR_HEAD_REF] = getattr(
-                            diff_evidence, "head_sha", ""
-                        )
-                    cache_root = getattr(evidence_provider, "last_cache_root", None)
-                    if cache_root is not None:
-                        validation_workspace = str(cache_root)
-                        changed_files = list(
-                            getattr(evidence_provider, "last_changed_files", [])
-                        )
-                        local_target = None
-            if review_meta:
-                updated_tool_meta = {
-                    **dict(metadata or {}),
-                    **{
-                        key: value
-                        for key, value in review_meta.items()
-                        if key != ReviewMetaKey.EVIDENCE_PROVIDER
-                    },
-                }
-                loop_hook.update_metadata(updated_tool_meta)
-                self._set_tool_context(
-                    channel,
-                    chat_id,
-                    message_id,
-                    updated_tool_meta,
-                    session_key=session_key,
-                )
-            if specialist_prompt:
-                # The reviewer system prompt belongs to the frozen envelope: it
-                # is part of the task definition and must never be summarized.
-                frozen_messages.insert(
-                    0, {"role": "system", "content": specialist_prompt}
+                from nanoreview.agent.tools.permissions import resolve_policy
+
+                permission_policy = resolve_policy(
+                    getattr(self, "permissions_config", None),
+                    session.metadata if session is not None else {},
                 )
 
-            async def _permission_request_cb(
-                request_id: str,
-                payload: dict[str, Any],
-                future: asyncio.Future[bool],
-            ) -> bool:
-                self._permission_futures[request_id] = future
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel=channel,
-                        chat_id=chat_id,
-                        content="",
-                        metadata={"_permission_request": payload},
-                    )
-                )
-                try:
-                    return await asyncio.wait_for(future, timeout=300)
-                except asyncio.TimeoutError:
-                    return False
-                finally:
-                    self._permission_futures.pop(request_id, None)
-
-            async def _persist_automatic_subagent_result(
-                subagent_message: InboundMessage,
-            ) -> None:
-                if session is None:
-                    return
-                if self._persist_subagent_followup(session, subagent_message):
-                    self.sessions.save(session)
-
-            if review_preparation.plan is not None and review_preparation.evidence is not None:
-                # ReviewLoop owns the run: it records the plan identity and
-                # fingerprint, drives the orchestrator, persists the report
-                # artifact, and settles the terminal status. The loop only
-                # supplies the turn's messages and execution context.
-                run_state = self.review_loop.get(active_session_key)
-                try:
-                    outcome = await self.review_loop.execute(
-                        run_state=run_state,
-                        session=session,
-                        coordinator_messages=[*frozen_messages, *working_messages],
-                        plan=review_preparation.plan,
-                        evidence=review_preparation.evidence,
-                        execution_context=ReviewExecutionContext(
+                async def _permission_request_cb(
+                    request_id: str,
+                    payload: dict[str, Any],
+                    future: asyncio.Future[bool],
+                ) -> bool:
+                    self._permission_futures[request_id] = future
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
                             channel=channel,
                             chat_id=chat_id,
-                            session_key=active_session_key,
-                            message_id=message_id,
-                            metadata=updated_tool_meta if review_meta else dict(metadata or {}),
-                            max_concurrency=int(
-                                review_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS)
-                                or getattr(self.review_config, "max_concurrent_subagents", 4)
-                            ),
-                            result_callback=_persist_automatic_subagent_result,
-                        ),
-                        validation_workspace=validation_workspace,
-                        changed_files=changed_files,
-                        local_target=local_target if isinstance(local_target, str) else None,
-                        remote_diff=remote_diff,
+                            content="",
+                            metadata={"_permission_request": payload},
+                        )
                     )
-                    result = AgentRunResult(
-                        final_content=outcome.report_markdown,
-                        messages=[*frozen_messages, *working_messages],
-                        content_replaced=True,
-                    )
-                except ReviewPlanningError as exc:
-                    logger.warning("review.orchestration.failed reason={}", exc)
-                    self.review_loop.mark_failed(run_state, str(exc), session)
-                    result = AgentRunResult(
-                        final_content=f"## Code Review Report\n\n### Error\n\n{exc}",
-                        messages=[*frozen_messages, *working_messages],
-                        stop_reason="error",
-                        error=str(exc),
-                    )
-            else:
+                    try:
+                        return await asyncio.wait_for(future, timeout=300)
+                    except asyncio.TimeoutError:
+                        return False
+                    finally:
+                        self._permission_futures.pop(request_id, None)
+
                 result = await self.runner.run(
                     AgentRunSpec(
-                    frozen_messages=frozen_messages,
-                    working_messages=working_messages,
-                    tools=self.tools,
+                        frozen_messages=frozen_messages,
+                        working_messages=working_messages,
+                        tools=self.tools,
 
-                    model=self.model,
-                    max_iterations=self.max_iterations,
-                    max_tool_result_chars=self.max_tool_result_chars,
-                    hook=hook,
-                    error_message="Sorry, I encountered an error calling the AI model.",
-                    concurrent_tools=True,
-                    workspace=self.workspace,
-                    session_key=session.key if session else None,
-                    context_window_tokens=self.context_window_tokens,
-                    context_block_limit=self.context_block_limit,
-                    provider_retry_mode=self.provider_retry_mode,
-                    progress_callback=on_progress,
-                    stream_progress_deltas=on_stream is not None,
-                    retry_wait_callback=on_retry_wait,
-                    checkpoint_callback=_checkpoint,
-                    injection_callback=_drain_pending,
-                    llm_timeout_s=None,
-                    permission_policy=permission_policy,
-                    permission_request_callback=_permission_request_cb,
+                        model=self.model,
+                        max_iterations=self.max_iterations,
+                        max_tool_result_chars=self.max_tool_result_chars,
+                        hook=hook,
+                        error_message="Sorry, I encountered an error calling the AI model.",
+                        concurrent_tools=True,
+                        workspace=self.workspace,
+                        session_key=session.key if session else None,
+                        context_window_tokens=self.context_window_tokens,
+                        context_block_limit=self.context_block_limit,
+                        provider_retry_mode=self.provider_retry_mode,
+                        progress_callback=on_progress,
+                        stream_progress_deltas=on_stream is not None,
+                        retry_wait_callback=on_retry_wait,
+                        checkpoint_callback=_checkpoint,
+                        injection_callback=_drain_pending,
+                        llm_timeout_s=None,
+                        permission_policy=permission_policy,
+                        permission_request_callback=_permission_request_cb,
                     )
                 )
         finally:
@@ -1719,14 +1621,10 @@ class AgentLoop:
 
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
-                    # Persist the terminal review state before the rest of the
-                    # cancellation handling: a second cancellation must not be
-                    # able to leave the run recorded as running.
-                    with suppress(asyncio.CancelledError):
-                        await self._finalize_review_run(
-                            session_key, ReviewRunStatus.STOPPED
-                        )
-
+                    # The terminal transition (``stopped``) is retried by the
+                    # outer cancellation handler, which also covers a cancel
+                    # that landed while this turn was still queued on the
+                    # session lock or the concurrency gate.
                     try:
                         key = self._effective_session_key(msg)
                         session = self.sessions.get_or_create(key)
@@ -1765,6 +1663,18 @@ class AgentLoop:
                     if msg.channel == "websocket":
                         await publish_forced_turn_end()
 
+        except asyncio.CancelledError:
+            # A cancel can land while this turn is still queued on the session
+            # lock or the cross-session concurrency gate, before the inner try
+            # above is entered. Settle the admitted run as ``stopped`` here so
+            # the finally block does not discard a run whose admission metadata
+            # was already persisted as ``running``. A run that stays ``running``
+            # is normalized on restart, never published as ``DONE``.
+            with suppress(asyncio.CancelledError):
+                await self._finalize_review_run(
+                    session_key, ReviewRunStatus.STOPPED
+                )
+            raise
         finally:
             # A review run that never entered the review pipeline (turn failed
             # or was rerouted before planning) releases the gate instead of
@@ -2049,10 +1959,10 @@ class AgentLoop:
             ),
         )
         self._remember_turn_trace(ctx.session_key, ctx.trace)
-        # Persist the review run's terminal phase and publish its index once
-        # the turn that produced the report has fully finished, so any later
-        # conversation turn (or a restart) reads a settled result.
-        self.review_loop.mark_responded(ctx.session)
+        # Publish the review_context index once the turn that produced the
+        # report has fully finished, so any later conversation turn (or a
+        # restart) reads a settled result. The run's terminal metadata is
+        # written by ``ReviewLoop`` itself, not here.
         if ctx.session is not None:
             self.review_coordinator.write_context_index(ctx.session)
         return ctx.outbound
@@ -2346,10 +2256,6 @@ class AgentLoop:
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
-        # No-op unless a *running* run still owns the session (``enter_phase``
-        # rejects a terminal run), so a conversation turn can never drag a
-        # finished review back into an earlier phase.
-        self.review_loop.mark_responding(ctx.session_key)
         ctx.outbound = self._assemble_outbound(
             ctx.msg,
             ctx.final_content,

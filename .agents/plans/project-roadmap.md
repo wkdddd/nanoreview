@@ -1,6 +1,6 @@
 # NanoReview 项目长期规划
 
-更新时间：2026-10-01
+更新时间：2026-10-02
 
 本文记录已确认的产品方向、影响演进的架构原则、暂定执行顺序、待评估方向和明确不做的能力。它不是当前代码状态，也不是具体实施任务。当前代码调整另见 [code-adjustment-plan.md](code-adjustment-plan.md)；稳定模块契约归入 `.agents/constraints/`。
 
@@ -17,8 +17,8 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 - 目标内子路径收窄（`scope`）不接通任何用户入口，保留为未来扩展；准入侧已有的校验、归一化与快照能力不删除，接入时按待评估方向处理。
 - review 必须由用户通过明确入口触发，Conversation Agent 首版不能自主调用 review。
 - review 请求通过校验并被接受、注册后 session 即成立，无须等待 review 完成；不允许创建纯对话 session。
-- review 运行期间不开放普通讨论：普通消息与非控制命令被拒绝且不写入历史或 pending queue；`/status`、`/stop` 和权限响应可用；review session 内 `/new` 被拒绝且不清空 session。
-- review 无论 `completed`、`error` 还是 `stopped`，在资源清理完成且最终 report 或有界失败结果持久化后，都进入同 session 对话。
+- review 完成 `DONE` 后才开放同 session 对话；此前普通消息与非控制命令被拒绝，不写入历史或 pending queue。`/status`、`/stop` 和权限响应可用；review session 内 `/new` 被拒绝且不清空 session。
+- `DONE` 表示资源清理完成，终态及最终 report 或有界失败结果已持久化；最终 status 可以是 `completed`、`error` 或 `stopped`。清理或保存失败必须向用户返回必要错误，并保持对话门禁；失败原因应持久化供重启后读取。完成 `DONE` 后，报告交接失败也必须说明错误、可用结果与覆盖缺口。
 - Conversation Agent 可以读取代码、修改文件、执行命令和运行测试，修复直接发生在原审查仓库，不自动创建 worktree。
 - 两套 Agent 使用独立 `ToolRegistry`；工具实现可以共享，但注册表实例、工具权限和执行 profile 隔离。
 - 完整保留 `ReviewRunState`，供 session detail、API 和 WebUI 读取；Conversation Agent 主要使用 report 和对话 history。
@@ -52,9 +52,9 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 
 | 顺序 | 阶段与预期结果 | 规划理由 |
 |---|---|---|
-| 1 | 本地 review 准入：统一仓库与 diff 校验，按单一 `target` 确定审查边界；接受并注册后立即持久化 session；确定 ReviewAgent 与 Conversation Agent 的角色、session/run 关联、权限隔离和报告交接契约；为 Conversation Agent 预留独立执行 profile 与上下文入口；拒绝远端输入、纯对话创建、重复 review 和运行期普通讨论。 | 先固定 session 成立时机、一次 review 的边界和双 Agent 的交接契约，为生命周期迁移和各入口提供一致基础；本阶段不实现 Conversation Agent 的修改代码、执行命令和测试能力。 |
-| 2 | ReviewLoop 与终态收尾：迁移一次 review 的生命周期，复用现有编排和领域组件；完整保留并持久化 `ReviewRunState`；成功、错误、停止均清理资源并保存报告或有界失败结果。 | 对话交接依赖可靠的终态和可读取结果；先统一收尾，避免仍有子任务运行或结果尚未落盘时开放对话。 |
-| 3 | Conversation Agent 修复能力：实现第 1 阶段预留的独立 prompt、上下文、工具注册表和修复权限；在原审查仓库讨论、修改和验证，并把修复结果关联回原 run/finding。 | 终态门禁解除与报告交接已在第 1 阶段落地，本阶段补齐隔离后的修复执行能力，形成最小用户闭环，避免把 review 工具、内部 transcript 或应用 workspace 误用于修复。 |
+| 1 | 本地 review 准入：统一仓库与 diff 校验，按单一 `target` 确定审查边界；接受并注册后立即持久化 session；确定 ReviewAgent 与 Conversation Agent 的角色、session/run 关联、权限隔离和报告交接契约；为 Conversation Agent 预留独立执行 profile 与上下文入口；拒绝远端输入、纯对话创建和重复 review。 | 先固定 session 成立时机、一次 review 的边界和双 Agent 的交接契约，为生命周期迁移和各入口提供一致基础；本阶段不实现 Conversation Agent 的修改代码、执行命令和测试能力。 |
+| 2 | ReviewLoop 与终态收尾：迁移一次 review 的生命周期，复用现有编排和领域组件；完整保留并持久化 `ReviewRunState`；成功、错误、停止均清理资源并保存报告或有界失败结果，完成 `DONE` 后才开放对话。 | 统一收尾与错误交付，防止子任务未清理或终态未落盘时开放对话。 |
+| 3 | Conversation Agent 修复能力：实现第 1 阶段预留的独立 prompt、上下文、工具注册表和修复权限；在原审查仓库讨论、修改和验证，并把修复结果关联回原 run/finding。 | 在既定报告交接契约上补齐隔离后的修复执行能力，形成最小用户闭环，避免把 review 工具、内部 transcript 或应用 workspace 误用于修复。 |
 | 4 | 长对话治理：让报告与后续历史参与 token Consolidator，沿用 `last_consolidated`；移除 AutoCompact 产品调用路径；验证压缩、刷新和重启后的上下文一致性。 | 报告交接及对话历史契约稳定后，才能明确压缩输入和保留信息，减少上下文丢失或重复注入。 |
 | 5 | 完整闭环验收与遗留收敛：统一 API、CLI、WebUI 的状态读取和交付；验证重连、重启、取消、权限确认及部分修改；核对消费者后评估旧入口与组件的清理范围。 | 通过完整工作流核验跨模块一致性，再决定删除范围，避免过早移除仍承担历史回放、控制或展示职责的实现。 |
 
@@ -62,7 +62,7 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 
 - 当前阶段优先完成后端调整，暂不修改 `review-webui/`；前端功能、布局、交互及契约适配统一留待后续安排。
 - 各阶段同步调整受影响的后端 API/event、CLI、测试和文档；仍须核对前端消费者并记录待适配项，前端适配完成后再进行完整闭环验收。
-- 开放对话必须以资源清理、结果持久化以及权限和上下文隔离完成为前提，不能只依据 review 状态字段；持久化失败须明确可见。
+- 对话准入以 review 完成 `DONE` 为前提；清理、终态和结果持久化必须完成，权限与上下文须隔离。清理、持久化和交接失败须明确可见，不能把内存终态当作已落盘证明。
 - 首次完整报告注入的 token 预算检查已在第 1 阶段落地：超窗时拒绝该 turn 并提示原因，不用自动摘要替代，也不等待后续长对话压缩兜底。
 - 不恢复中断任务的边界随生命周期及对话迁移落实；保留已完成历史和中断记录，核对 checkpoint 与自动重试调用方，避免重复执行有副作用的工具。
 - 暂定顺序的调整不改变已确认目标，也不自动纳入待评估方向；涉及产品范围变化时先与用户确认。
@@ -87,6 +87,7 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 - 首版不支持远端 PR、GitHub 获取或远端仓库拉取。
 - 首版不允许 Conversation Agent 自主触发 review。
 - 首版不支持同 session 多次 review、多报告管理或 `/resume`。
+- 首版不支持定时及自动化能力
 - 不把 reviewer/Judge 的完整 transcript、模型推理或完整工具 payload 注入对话历史。
 - 不因产品专用化删除通用 session、历史、Consolidator、AutoCompact 或对话工具；删除前必须核对消费者。
 - 不把 Kodus 的确定性截短和超窗重跑策略直接当作 NanoReview 的完整压缩方案，尤其不自动重执行可能产生副作用的对话 turn。
