@@ -38,6 +38,10 @@ from nanoreview.command.builtin import builtin_command_palette
 from nanoreview.config.paths import get_media_dir
 from nanoreview.config.schema import Base, Config
 from nanoreview.review import normalize_review_action, normalize_review_target_type
+from nanoreview.review.admission import (
+    ReviewAdmissionError,
+    ReviewAdmissionRequest,
+)
 from nanoreview.review.input import parse_repo_target
 from nanoreview.review.profiles import public_reviewer_profiles
 from nanoreview.review.types import ReviewMetaKey
@@ -492,6 +496,7 @@ class WebSocketChannel(BaseChannel):
         static_dist_path: Path | None = None,
         runtime_model_name: Callable[[], str | None] | None = None,
         runtime_usage: Callable[[], dict[str, Any]] | None = None,
+        agent_loop: Any | None = None,
     ):
         if isinstance(config, dict):
             config = WebSocketConfig.model_validate(config)
@@ -517,6 +522,10 @@ class WebSocketChannel(BaseChannel):
         self._runtime_model_name = runtime_model_name
         self._runtime_usage = runtime_usage
         self._root_config = root_config
+        # Review submissions are admitted through the owning AgentLoop so the
+        # transport never re-implements validation, snapshotting, or registry
+        # ordering.
+        self._agent_loop = agent_loop
         # Process-local secret used to HMAC-sign media URLs. The signed URL is
         # the capability — anyone who holds a valid URL can fetch that one
         # file, nothing else. The secret regenerates on restart so links
@@ -1399,6 +1408,68 @@ class WebSocketChannel(BaseChannel):
         )
         payload["source"] = source
         return payload
+
+    async def _admit_review_submission(
+        self,
+        connection: Any,
+        cid: str,
+        raw_target: Any,
+        raw_target_type: Any,
+        normalized_action: str | None,
+        raw_focus: Any,
+        metadata: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Admit a WebUI review submission through the shared boundary.
+
+        Returns ``(approved, content)``. A rejection answers the connection
+        with an ``error`` event carrying the stable admission ``code``/``field``
+        and leaves session metadata, history, and the pending queue untouched.
+
+        The current WebUI shows the failure through its existing error path;
+        adapting the form to render the structured code is a follow-up frontend
+        task, so rejections deliberately reuse the ``error`` event.
+        """
+        if self._agent_loop is None:
+            await self._send_event(
+                connection,
+                "error",
+                chat_id=cid,
+                detail="Review admission is unavailable in this process.",
+                code="admission_unavailable",
+            )
+            return False, ""
+        try:
+            admission = self._agent_loop.admit_review(
+                ReviewAdmissionRequest(
+                    target=raw_target if isinstance(raw_target, str) else None,
+                    target_type=raw_target_type if isinstance(raw_target_type, str) else None,
+                    action=normalized_action,
+                    focus=raw_focus if isinstance(raw_focus, list) else None,
+                    session_key=f"websocket:{cid}",
+                    enforce_absolute=True,
+                )
+            )
+        except ReviewAdmissionError as exc:
+            self.logger.info("ws.review.rejected cid={} code={}", cid, exc.code.value)
+            await self._send_event(
+                connection,
+                "error",
+                chat_id=cid,
+                detail=f"Review not admitted ({exc.code.value}): {exc.message}",
+                code=exc.code.value,
+                field=exc.field,
+            )
+            return False, ""
+        metadata.update(
+            {
+                "_review_admitted": admission.run_id,
+                "review_target": admission.target,
+                "review_target_type": admission.target_type,
+                "review_action": admission.action.value,
+                "review_focus": admission.metadata.get(ReviewMetaKey.REQUESTED_DIMENSIONS),
+            }
+        )
+        return True, admission.content
 
     def _delete_session_key(self, key: str) -> bool | None:
         if self._session_manager is None:
@@ -2303,66 +2374,33 @@ class WebSocketChannel(BaseChannel):
             # Auto-attach on first use so clients can one-shot without a separate attach.
             self._attach(connection, cid)
             await self._hydrate_after_subscribe(cid)
-            if (
-                self._session_manager is not None
-                and has_review_payload
-            ):
-                session_key = f"websocket:{cid}"
-                session = self._session_manager.get_or_create(session_key)
-                if isinstance(raw_review_target, str):
-                    target = raw_review_target.strip()
-                    if target:
-                        session.metadata["review_target"] = target
-                    else:
-                        session.metadata.pop("review_target", None)
-                if isinstance(raw_review_action, str):
-                    session.metadata["review_action"] = normalized_review_action
-                if isinstance(raw_review_focus, list):
-                    focus = [str(item).strip() for item in raw_review_focus if str(item).strip()]
-                    if focus:
-                        session.metadata["review_focus"] = focus
-                    else:
-                        session.metadata.pop("review_focus", None)
-                target_type = normalize_review_target_type(
-                    raw_review_target_type if isinstance(raw_review_target_type, str) else None,
-                    session.metadata.get("review_target"),
-                )
-                if target_type:
-                    session.metadata["review_target_type"] = target_type
-                else:
-                    session.metadata.pop("review_target_type", None)
-                self._session_manager.save(session)
             metadata: dict[str, Any] = {"remote": getattr(connection, "remote_address", None)}
             if envelope.get("webui") is True:
                 metadata["webui"] = True
-            if isinstance(raw_review_target, str):
-                metadata["review_target"] = raw_review_target.strip()
-            if isinstance(raw_review_target_type, str):
-                metadata["review_target_type"] = raw_review_target_type
-            if isinstance(raw_review_action, str):
-                metadata["review_action"] = normalized_review_action
-            if isinstance(raw_review_focus, list):
-                metadata["review_focus"] = [str(item).strip() for item in raw_review_focus if str(item).strip()]
             if has_review_payload:
+                approved, admitted_content = await self._admit_review_submission(
+                    connection,
+                    cid,
+                    raw_review_target,
+                    raw_review_target_type,
+                    normalized_review_action,
+                    raw_review_focus,
+                    metadata,
+                )
+                if not approved:
+                    return
+                # Review-only turns carry an explicit intent for the model.
+                if not content.strip():
+                    content = admitted_content or "审查"
                 logger.info(
                     "ws.review.request cid={} webui={} target_type={} action={} focus_count={} content_chars={} media_count={}",
                     cid,
                     envelope.get("webui") is True,
-                    raw_review_target_type if isinstance(raw_review_target_type, str) else "",
-                    normalized_review_action or "",
+                    metadata.get("review_target_type", ""),
+                    metadata.get("review_action", ""),
                     len(metadata.get("review_focus", [])) if isinstance(metadata.get("review_focus"), list) else 0,
                     len(content),
                     len(media_paths),
-                )
-            # Normalize empty text for review-only turns so the model receives
-            # an explicit user intent rather than inheriting the previous turn.
-            if has_review_payload and not content.strip():
-                content = "审查"
-                logger.info(
-                    "ws.review_default_prompt cid={} action={} focus_count={}",
-                    cid,
-                    raw_review_action,
-                    len(raw_review_focus) if isinstance(raw_review_focus, list) else 0,
                 )
             await self._handle_message(
                 sender_id=client_id,

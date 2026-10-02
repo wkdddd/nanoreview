@@ -170,7 +170,7 @@ export function NewReviewForm({
 
               <div className="max-w-[240px]">
                 <SegmentedControl
-                  label="Scope"
+                  label="Action"
                   value={action}
                   options={ACTION_OPTIONS}
                   disabledValues={isGithubPrTarget ? ["repo"] : []}

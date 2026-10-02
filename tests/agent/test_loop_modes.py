@@ -10,6 +10,7 @@ import pytest
 from nanoreview.agent.hooks import AgentHookContext
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanoreview.agent.loop import AgentLoop, TurnContext, TurnState, _is_consumed_subagent_result
+from nanoreview.agent.review_state import ReviewPhase, ReviewRunState, ReviewRunStatus
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
@@ -277,6 +278,36 @@ async def _review_fallback_preparation() -> ReviewPreparation:
     return ReviewPreparation(None, "review system prompt")
 
 
+REVIEW_TURN_RUN_ID = "run-test-review"
+
+
+def _admit_review_run(
+    loop: AgentLoop,
+    session_key: str,
+    *,
+    run_id: str = REVIEW_TURN_RUN_ID,
+) -> dict[str, Any]:
+    """Register a live running review run and return the admitted-turn metadata.
+
+    Only the admitted turn of the *live* run enters the review pipeline: a
+    session keeps its ``review_target`` metadata after the review ends, so the
+    persisted target alone must never be enough (a later conversation turn
+    would otherwise silently re-run the review it is meant to discuss).
+
+    Bypassing admission is deliberate here — these tests exercise the turn-time
+    behaviour of the review pipeline, not the admission boundary, which has its
+    own coverage in ``tests/review/test_admission.py``.
+    """
+    loop.review_loop.runs[session_key] = ReviewRunState(
+        run_id=run_id,
+        session_key=session_key,
+        input_fingerprint="fp",
+        status=ReviewRunStatus.RUNNING,
+        phase=ReviewPhase.REVIEW,
+    )
+    return {"_review_admitted": run_id}
+
+
 async def _review_coordinator_preparation() -> ReviewPreparation:
     return ReviewPreparation(
         None,
@@ -361,11 +392,11 @@ def test_agent_loop_state_machine_has_no_review_finalize_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_always_injects_review_context(
+async def test_admitted_review_turn_injects_review_context(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """Review context is always resolved regardless of session metadata."""
+    """The admitted review turn resolves and injects the review prompt."""
 
     async def mock_review(*args: Any, **kwargs: Any) -> ReviewPreparation:
         return ReviewPreparation(None, "review system prompt")
@@ -375,17 +406,59 @@ async def test_agent_loop_always_injects_review_context(
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     loop.runner = runner
-    session = Session(key="test:plain")
+    session = Session(key="test:review")
+    admitted = _admit_review_run(loop, session.key)
 
     await loop._run_agent_loop(
         [{"role": "user", "content": "hello"}],
         [],
         session=session,
         session_key=session.key,
+        metadata=admitted,
     )
 
     assert runner.initial_messages[0] == {"role": "system", "content": "review system prompt"}
     assert runner.initial_messages[1] == {"role": "user", "content": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_conversation_turn_never_resolves_review_context(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A session that owns a review run must not re-enter review from metadata.
+
+    The review target stays on the session after the review ends, so a
+    conversation turn in the same session must skip review preparation
+    entirely — otherwise it would silently re-run the review.
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def mock_review(
+        _messages: list[dict[str, Any]],
+        session_meta: dict[str, Any],
+        **_kwargs: Any,
+    ) -> ReviewPreparation:
+        calls.append(dict(session_meta))
+        return ReviewPreparation(None, "review system prompt")
+
+    monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", mock_review)
+
+    loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
+    runner = CapturingRunner()
+    loop.runner = runner
+    session = Session(key="test:conversation")
+    session.metadata[ReviewMetaKey.TARGET] = "https://github.com/test/repo"
+
+    await loop._run_agent_loop(
+        [{"role": "user", "content": "one more question"}],
+        [],
+        session=session,
+        session_key=session.key,
+    )
+
+    assert calls == []
+    assert runner.initial_messages == [{"role": "user", "content": "one more question"}]
 
 
 @pytest.mark.asyncio
@@ -408,6 +481,7 @@ async def test_agent_loop_pending_drain_waits_for_running_subagent_results(tmp_p
         [],
         session=session,
         session_key=session.key,
+        metadata=_admit_review_run(loop, session.key),
         pending_queue=pending,
     )
 
@@ -438,6 +512,7 @@ async def test_agent_loop_drain_waits_on_subagent_manager_result_queue(tmp_path,
         [],
         session=session,
         session_key=session.key,
+        metadata=_admit_review_run(loop, session.key),
         pending_queue=pending,
     )
 
@@ -1425,7 +1500,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_review_target_injects_code_review_context(tmp_path, monkeypatch) -> None:
+async def test_admitted_review_turn_injects_code_review_context(tmp_path, monkeypatch) -> None:
     loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     loop.runner = runner
@@ -1441,6 +1516,7 @@ async def test_agent_loop_review_target_injects_code_review_context(tmp_path, mo
         [],
         session=session,
         session_key=session.key,
+        metadata=_admit_review_run(loop, session.key),
     )
 
     assert runner.initial_messages is not None
@@ -1477,9 +1553,12 @@ async def test_agent_loop_review_message_metadata_is_visible_same_turn(tmp_path,
         chat_id="review",
         content="请审查登录逻辑",
         metadata={
-            "review_target": "https://github.com/test/repo",
-            "review_target_type": "github",
-            "review_focus": ["dependency"],
+            **{
+                "review_target": "https://github.com/test/repo",
+                "review_target_type": "github",
+                "review_focus": ["dependency"],
+            },
+            **_admit_review_run(loop, session.key),
         },
     )
     ctx = TurnContext(
@@ -1551,7 +1630,7 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, mon
     async def fake_prepare(*_args: Any, **_kwargs: Any) -> ReviewPreparation:
         return ReviewPreparation(plan, "review prompt", evidence)
 
-    monkeypatch.setattr("nanoreview.agent.loop.ReviewOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr("nanoreview.agent.review_loop.ReviewOrchestrator", FakeOrchestrator)
     monkeypatch.setattr("nanoreview.agent.loop.prepare_code_review_context", fake_prepare)
 
     bus = MessageBus()
@@ -1567,6 +1646,7 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path, mon
             "_wants_stream": True,
             ReviewMetaKey.TARGET: "app.py",
             ReviewMetaKey.TARGET_TYPE: "local",
+            **_admit_review_run(loop, session.key),
         },
     )
     ctx = TurnContext(

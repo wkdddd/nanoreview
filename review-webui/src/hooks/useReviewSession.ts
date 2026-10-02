@@ -501,7 +501,7 @@ function formatReviewPrefetchEvent(event: ToolProgressEvent): string | null {
     const elapsed = formatElapsed(metadata.elapsed_ms);
     if (event.result === "empty") {
       if (action === "diff" && targetType === "local") {
-        return "No changed files found for this local target. Switch Scope to Repo to review the current file, or choose a target with uncommitted changes.";
+        return "No changed files found for this local target. Switch Action to Repo to review the current file, or choose a target with uncommitted changes.";
       }
       return "Review context did not contain usable evidence.";
     }

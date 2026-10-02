@@ -38,6 +38,12 @@ class ReviewMetaKey:
     PHASE = "review_phase"
     REPORT_REF = "review_report_ref"
     INPUT_FINGERPRINT = "review_input_fingerprint"
+    #: Wire-safe reference to the immutable input snapshot captured at admission.
+    SNAPSHOT_REF = "review_snapshot_ref"
+    #: Run whose report has already been injected into the first conversation
+    #: turn. Its presence marks the handoff as consumed so a later turn does
+    #: not inject the same report twice.
+    HANDOFF_RUN_ID = "review_handoff_run_id"
 
 ReviewTargetType = Literal["auto", "github", "local"]
 ReviewScopeKind = Literal["file", "directory", "repo"]

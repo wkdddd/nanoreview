@@ -13,15 +13,17 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 ## 已确认目标
 
 - 审查输入只支持本地代码仓库和本地 diff，不支持远端 PR 或远端仓库获取。
+- 首版以单一 `target` 作为唯一审查输入：一个 target 对应一次审查的完整边界，不提供「目标内子路径范围」的选择。
+- 目标内子路径收窄（`scope`）不接通任何用户入口，保留为未来扩展；准入侧已有的校验、归一化与快照能力不删除，接入时按待评估方向处理。
 - review 必须由用户通过明确入口触发，Conversation Agent 首版不能自主调用 review。
 - review 请求通过校验并被接受、注册后 session 即成立，无须等待 review 完成；不允许创建纯对话 session。
-- review 运行期间不开放普通讨论；状态查询和停止可用，被拒绝消息不写入历史或 pending queue。
+- review 运行期间不开放普通讨论：普通消息与非控制命令被拒绝且不写入历史或 pending queue；`/status`、`/stop` 和权限响应可用；review session 内 `/new` 被拒绝且不清空 session。
 - review 无论 `completed`、`error` 还是 `stopped`，在资源清理完成且最终 report 或有界失败结果持久化后，都进入同 session 对话。
 - Conversation Agent 可以读取代码、修改文件、执行命令和运行测试，修复直接发生在原审查仓库，不自动创建 worktree。
 - 两套 Agent 使用独立 `ToolRegistry`；工具实现可以共享，但注册表实例、工具权限和执行 profile 隔离。
 - 完整保留 `ReviewRunState`，供 session detail、API 和 WebUI 读取；Conversation Agent 主要使用 report 和对话 history。
 - report 以带来源标识的 `review_context` 索引消息进入 `Session.messages`，至少关联 `source=review_agent`、`run_id` 和 `report_ref`；完整 report artifact 是权威来源。
-- Conversation Agent 首次上下文注入完整 report，作为明确标注“由 ReviewAgent 生成”的 system context；后续 report 参与 `Consolidator` 压缩。
+- Conversation Agent 首次上下文注入完整 report：system directive 标注来源与只读规则，完整 report 以可重放的 handoff 消息写入历史；report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代；后续 report 参与 `Consolidator` 压缩。
 - `Consolidator` 按 token 自动触发，首版移除 `AutoCompact` 产品路径，沿用现有 `last_consolidated` 机制。
 - 对话首次上下文注入完整最终 report；没有最终报告时注入实际已有结果、结束状态、覆盖缺口和有界错误。
 - report 可以参与后续上下文压缩，压缩需保留 finding 标识、结论、用户决定、修复与验证进展；原报告 artifact 始终可核对。
@@ -50,24 +52,28 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 
 | 顺序 | 阶段与预期结果 | 规划理由 |
 |---|---|---|
-| 1 | 本地 review 准入：统一仓库、diff 和 scope 校验；接受并注册后立即持久化 session；确定 ReviewAgent 与 Conversation Agent 的角色、session/run 关联、权限隔离和报告交接契约；为 Conversation Agent 预留独立执行 profile 与上下文入口；拒绝远端输入、纯对话创建、重复 review 和运行期普通讨论。 | 先固定 session 成立时机、一次 review 的边界和双 Agent 的交接契约，为生命周期迁移和各入口提供一致基础；本阶段不实现 Conversation Agent 的修改代码、执行命令和测试能力。 |
+| 1 | 本地 review 准入：统一仓库与 diff 校验，按单一 `target` 确定审查边界；接受并注册后立即持久化 session；确定 ReviewAgent 与 Conversation Agent 的角色、session/run 关联、权限隔离和报告交接契约；为 Conversation Agent 预留独立执行 profile 与上下文入口；拒绝远端输入、纯对话创建、重复 review 和运行期普通讨论。 | 先固定 session 成立时机、一次 review 的边界和双 Agent 的交接契约，为生命周期迁移和各入口提供一致基础；本阶段不实现 Conversation Agent 的修改代码、执行命令和测试能力。 |
 | 2 | ReviewLoop 与终态收尾：迁移一次 review 的生命周期，复用现有编排和领域组件；完整保留并持久化 `ReviewRunState`；成功、错误、停止均清理资源并保存报告或有界失败结果。 | 对话交接依赖可靠的终态和可读取结果；先统一收尾，避免仍有子任务运行或结果尚未落盘时开放对话。 |
-| 3 | Conversation Agent 与报告交接：实现第 1 阶段预留的独立 prompt、上下文、工具注册表和修复权限；写入 `review_context` 索引并首次注入完整报告或实际失败结果；在原审查仓库讨论、修改和验证。 | 在权限与上下文隔离后实现 Conversation Agent，解除终态门禁并形成最小用户闭环，避免把 review 工具、内部 transcript 或应用 workspace 误用于修复。 |
+| 3 | Conversation Agent 修复能力：实现第 1 阶段预留的独立 prompt、上下文、工具注册表和修复权限；在原审查仓库讨论、修改和验证，并把修复结果关联回原 run/finding。 | 终态门禁解除与报告交接已在第 1 阶段落地，本阶段补齐隔离后的修复执行能力，形成最小用户闭环，避免把 review 工具、内部 transcript 或应用 workspace 误用于修复。 |
 | 4 | 长对话治理：让报告与后续历史参与 token Consolidator，沿用 `last_consolidated`；移除 AutoCompact 产品调用路径；验证压缩、刷新和重启后的上下文一致性。 | 报告交接及对话历史契约稳定后，才能明确压缩输入和保留信息，减少上下文丢失或重复注入。 |
 | 5 | 完整闭环验收与遗留收敛：统一 API、CLI、WebUI 的状态读取和交付；验证重连、重启、取消、权限确认及部分修改；核对消费者后评估旧入口与组件的清理范围。 | 通过完整工作流核验跨模块一致性，再决定删除范围，避免过早移除仍承担历史回放、控制或展示职责的实现。 |
 
 执行时保留以下依赖与验证边界：
 
-- 各阶段同步调整受影响的 API/event、CLI、WebUI、测试和文档；第 5 阶段负责整体验收，不延后前面节点的消费者迁移与定向验证。
+- 当前阶段优先完成后端调整，暂不修改 `review-webui/`；前端功能、布局、交互及契约适配统一留待后续安排。
+- 各阶段同步调整受影响的后端 API/event、CLI、测试和文档；仍须核对前端消费者并记录待适配项，前端适配完成后再进行完整闭环验收。
 - 开放对话必须以资源清理、结果持久化以及权限和上下文隔离完成为前提，不能只依据 review 状态字段；持久化失败须明确可见。
-- 首次完整报告注入的 token 预算检查在第 3 阶段解决，不能等待后续长对话压缩兜底；超窗时的产品行为若未明确，先与用户确认。
+- 首次完整报告注入的 token 预算检查已在第 1 阶段落地：超窗时拒绝该 turn 并提示原因，不用自动摘要替代，也不等待后续长对话压缩兜底。
 - 不恢复中断任务的边界随生命周期及对话迁移落实；保留已完成历史和中断记录，核对 checkpoint 与自动重试调用方，避免重复执行有副作用的工具。
 - 暂定顺序的调整不改变已确认目标，也不自动纳入待评估方向；涉及产品范围变化时先与用户确认。
+- 当`.agents\plans\project-roadmap.md`和`.agents\plans\code-adjustment-plan.md`以后者短期plan为准并同步调整roadmap，但禁止静默修改，必须向用户指出修改位置和理由
+
 
 ## 待评估方向
 
 - 同一 session 再次发起 review 和多报告管理。
 - review 完成后由对话显式请求重新 review 的交互形式。
+- 目标内 `scope` 收窄（按单文件或子目录限定审查范围）：准入侧的校验、归一化、快照写入与错误码已保留可用，但 CLI 与 WebUI 均无输入入口，且执行期尚未消费该 scope，目前不产生任何用户可见行为；接入前必须先补齐执行期传递链路并覆盖端到端测试。
 - 更细粒度的修复状态、finding 关闭和验证结果模型。
 - 更强的工作区隔离或自动 worktree 流程。
 - 报告与对话历史的长期归档、搜索和跨 session 关联。

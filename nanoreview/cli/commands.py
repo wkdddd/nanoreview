@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+import uuid
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -698,6 +699,7 @@ def _run_gateway(
         session_manager=session_manager,
         webui_runtime_model_name=_webui_runtime_model_name,
         webui_runtime_usage=_webui_runtime_usage,
+        agent_loop=agent,
     )
 
     if channels.enabled_channels:
@@ -832,18 +834,18 @@ def review(
 ):
     """Review a local or GitHub repository with CodeReviewAgent."""
     from nanoreview.cli.stream import StreamRenderer
-    from nanoreview.review import (
-        infer_review_target_type,
-        normalize_requested_dimensions,
-        normalize_review_action,
-        normalize_review_target_type,
+    from nanoreview.review.admission import (
+        ReviewAdmissionError,
+        ReviewAdmissionRequest,
     )
+    from nanoreview.review.input import normalize_review_action
+    from nanoreview.review.types import ReviewMetaKey
 
     if target_type not in ("auto", "github", "local"):
         console.print(f"[red]Invalid --target-type '{target_type}'. Must be: auto, github, or local[/red]")
         raise typer.Exit(1)
     try:
-        normalized_action = normalize_review_action(action).value
+        normalize_review_action(action)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
@@ -860,7 +862,6 @@ def review(
     sync_workspace_templates(loaded.workspace_path)
     logger.enable("nanoreview")
 
-
     bus = MessageBus()
     agent_loop = AgentLoop.from_config(loaded, bus)
 
@@ -871,23 +872,28 @@ def review(
 
     async def run_once() -> None:
         try:
-            normalize_requested_dimensions(focus)
             effective_max_subagents = (
                 max_concurrent_subagents
                 or loaded.review.max_concurrent_subagents
             )
-
-            session_key = "cli:review"
-            session = agent_loop.sessions.get_or_create(session_key)
-            session.metadata["review_target"] = target
-            resolved_target_type = normalize_review_target_type(target_type, target)
-            session.metadata["review_target_type"] = (
-                resolved_target_type if resolved_target_type != "auto" else infer_review_target_type(target)
-            )
-            session.metadata["review_focus"] = focus
-            session.metadata["review_action"] = normalized_action
-            session.metadata["max_concurrent_subagents"] = effective_max_subagents
-            agent_loop.sessions.save(session)
+            # Every CLI review gets its own session; the shared admission
+            # boundary validates the target, captures the input snapshot, and
+            # registers the run before any work is delivered.
+            try:
+                admission = agent_loop.admit_review(
+                    ReviewAdmissionRequest(
+                        target=target,
+                        target_type=target_type,
+                        action=action,
+                        focus=focus,
+                        session_key=f"cli:review:{uuid.uuid4().hex[:8]}",
+                        cwd=os.getcwd(),
+                        max_concurrent_subagents=effective_max_subagents,
+                    )
+                )
+            except ReviewAdmissionError as exc:
+                console.print(f"[red]Review not admitted ({exc.code.value}): {exc.message}[/red]")
+                raise typer.Exit(2)
 
             collected: list[str] = []
 
@@ -899,12 +905,19 @@ def review(
                 await renderer.on_end(**kwargs)
 
             await agent_loop.process_direct(
-                content=f"Review {target}",
-                session_key=session_key,
+                content=admission.content,
+                session_key=admission.session_key,
                 channel="cli",
                 chat_id="review",
                 on_stream=_on_stream,
                 on_stream_end=_on_stream_end,
+                metadata={
+                    "_review_admitted": admission.run_id,
+                    "review_target": admission.target,
+                    "review_target_type": admission.target_type,
+                    "review_action": admission.action.value,
+                    "review_focus": admission.metadata.get(ReviewMetaKey.REQUESTED_DIMENSIONS),
+                },
             )
 
             full_output = "".join(collected)
@@ -921,6 +934,8 @@ def review(
             await agent_loop.close_background_tasks()
 
     asyncio.run(run_once())
+
+
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),

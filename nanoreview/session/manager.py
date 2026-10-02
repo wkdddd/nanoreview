@@ -37,6 +37,9 @@ _SESSION_LIST_METADATA_KEYS = {
     "review_status",
     "review_phase",
     "review_report_ref",
+    "review_snapshot_ref",
+    "review_input_fingerprint",
+    "review_handoff_run_id",
     "pinned",
     "custom_title",
 }

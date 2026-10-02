@@ -41,6 +41,11 @@ REVIEW_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024
 # Directory (relative to the workspace) that stores review report artifacts.
 REVIEW_ARTIFACTS_DIR_NAME = "review-artifacts"
 
+#: Bound on ``ReviewRunState.summary`` — a digest is carried in the structured
+#: result so transports and the handoff context can describe a finished review
+#: without loading the full report artifact.
+REVIEW_SUMMARY_MAX_CHARS = 1200
+
 # run_id charset: hex prefix keeps filenames filesystem-safe on every platform.
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -138,6 +143,11 @@ class ReviewRunState:
     findings: list[dict[str, Any]] = field(default_factory=list)
     judge_batches: dict[str, JudgeBatchState] = field(default_factory=dict)
     report_ref: str | None = None
+    #: Wire-safe reference to the immutable input snapshot captured at admission.
+    snapshot_ref: str | None = None
+    #: Bounded digest of the produced report, or the failure reason when no
+    #: report exists. Feeds ``ReviewResult.summary``.
+    summary: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -145,6 +155,10 @@ class ReviewRunState:
         if self.status is not ReviewRunStatus.RUNNING:
             return
         self.phase = phase
+
+    def set_summary(self, text: str, *, limit: int = REVIEW_SUMMARY_MAX_CHARS) -> None:
+        """Record a bounded digest of the produced report or the failure reason."""
+        self.summary = " ".join(str(text or "").split())[:limit]
 
     def add_warning(self, message: str) -> None:
         text = str(message).strip()

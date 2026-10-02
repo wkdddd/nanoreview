@@ -17,6 +17,11 @@ from aiohttp import web
 from loguru import logger
 
 from nanoreview.config.paths import get_media_dir
+from nanoreview.review.admission import (
+    ReviewAdmissionError,
+    ReviewAdmissionRequest,
+)
+from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import safe_filename
 from nanoreview.utils.media_decode import (
     MAX_FILE_SIZE,
@@ -202,6 +207,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     model_name: str = request.app.get("model_name", "nanoreview")
 
     stream = False
+    review_payload: Any = None
     try:
         if content_type.startswith("multipart/"):
             text, media_paths, session_id, requested_model = await _parse_multipart(request)
@@ -214,6 +220,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             requested_model = body.get("model")
             text, media_paths = _parse_json_content(body)
             session_id = body.get("session_id")
+            review_payload = body.get("review")
     except ValueError as e:
         return _error_json(400, str(e))
     except _FileSizeExceeded as e:
@@ -228,6 +235,41 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
     session_key = f"api:{session_id}" if session_id else API_SESSION_KEY
     session_locks: dict[str, asyncio.Lock] = request.app["session_locks"]
     session_lock = session_locks.setdefault(session_key, asyncio.Lock())
+
+    # Structured review entry: a ``review`` object turns this call into a
+    # review admission. Validation, snapshot capture, and registration all
+    # happen before delivery, and a rejection returns a 4xx with a stable code
+    # and writes nothing to the session.
+    review_metadata: dict[str, Any] = {}
+    if review_payload is not None:
+        if not isinstance(review_payload, dict):
+            return _error_json(400, "Field 'review' must be an object")
+        try:
+            admission = agent_loop.admit_review(
+                ReviewAdmissionRequest(
+                    target=review_payload.get("target"),
+                    target_type=review_payload.get("target_type"),
+                    action=review_payload.get("action"),
+                    scope=review_payload.get("scope"),
+                    focus=review_payload.get("focus"),
+                    session_key=session_key,
+                    enforce_absolute=True,
+                )
+            )
+        except ReviewAdmissionError as exc:
+            logger.info(
+                "API review rejected session_key={} code={}", session_key, exc.code.value
+            )
+            return web.json_response(exc.as_payload(), status=exc.status)
+        if not text.strip():
+            text = admission.content
+        review_metadata = {
+            "_review_admitted": admission.run_id,
+            "review_target": admission.target,
+            "review_target_type": admission.target_type,
+            "review_action": admission.action.value,
+            "review_focus": admission.metadata.get(ReviewMetaKey.REQUESTED_DIMENSIONS),
+        }
 
     logger.info(
         "API request session_key={} media={} text={} stream={}",
@@ -271,6 +313,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            metadata=review_metadata,
                         ),
                         timeout=timeout_s,
                     )
@@ -315,6 +358,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        metadata=review_metadata,
                     ),
                     timeout=timeout_s,
                 )
@@ -329,6 +373,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            metadata=review_metadata,
                         ),
                         timeout=timeout_s,
                     )

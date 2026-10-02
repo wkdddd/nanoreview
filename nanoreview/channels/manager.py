@@ -58,12 +58,14 @@ class ChannelManager:
         session_manager: "SessionManager | None" = None,
         webui_runtime_model_name: Callable[[], str | None] | None = None,
         webui_runtime_usage: Callable[[], dict[str, Any]] | None = None,
+        agent_loop: Any | None = None,
     ):
         self.config = config
         self.bus = bus
         self._session_manager = session_manager
         self._webui_runtime_model_name = webui_runtime_model_name
         self._webui_runtime_usage = webui_runtime_usage
+        self._agent_loop = agent_loop
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         self._origin_reply_fingerprints: dict[tuple[str, str, str], str] = {}
@@ -96,6 +98,8 @@ class ChannelManager:
                 kwargs["runtime_model_name"] = self._webui_runtime_model_name
             if self._webui_runtime_usage is not None:
                 kwargs["runtime_usage"] = self._webui_runtime_usage
+            if self._agent_loop is not None:
+                kwargs["agent_loop"] = self._agent_loop
             channel = WebSocketChannel(section, self.bus, **kwargs)
             channel.send_progress = self._resolve_bool_override(
                 section, "send_progress", self.config.channels.send_progress,

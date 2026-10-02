@@ -31,8 +31,6 @@ from nanoreview.review.types import (
 )
 from nanoreview.session.manager import Session
 
-_LEGACY_REVIEW_SCOPE_KEY = "review_" "target_" "paths"
-
 
 @dataclass(frozen=True, slots=True)
 class ReviewPreparation:
@@ -263,7 +261,6 @@ async def prepare_code_review_context(
     )
     if plan is None:
         return ReviewPreparation(None, build_review_fallback_prompt())
-    session_meta.pop(_LEGACY_REVIEW_SCOPE_KEY, None)
     if plan.local_scope:
         session_meta[ReviewMetaKey.LOCAL_ROOT] = plan.local_scope.review_root
         local_root = Path(plan.local_scope.review_root)
@@ -390,8 +387,6 @@ def apply_review_metadata_from_message(
     raw_focus = metadata.get(ReviewMetaKey.REQUESTED_DIMENSIONS)
     if isinstance(raw_focus, (str, list)):
         _set_meta(ReviewMetaKey.REQUESTED_DIMENSIONS, raw_focus)
-
-    _pop_meta(_LEGACY_REVIEW_SCOPE_KEY)
 
     raw_ref = metadata.get(ReviewMetaKey.TARGET_REF)
     if isinstance(raw_ref, str) and raw_ref.strip():
