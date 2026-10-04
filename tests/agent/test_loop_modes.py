@@ -76,6 +76,17 @@ class SlowRunner:
         return AgentRunResult(final_content="late", messages=[*spec.frozen_messages, *spec.working_messages])
 
 
+class BlockingRunner:
+    """Parks until cancelled — for tests that assert a turn is *still* running."""
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        await asyncio.sleep(10)
+        return AgentRunResult(
+            final_content="done",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+        )
+
+
 #: A minimal non-review profile for runtime-plumbing tests.
 #:
 #: The manager no longer has a built-in generic default, so tests that only
@@ -2086,3 +2097,206 @@ async def test_direct_stop_only_stops_its_own_session(tmp_path) -> None:
     assert key_b in coordinator._active_tasks
     reply_b = await asyncio.wait_for(task_b, timeout=1.0)
     assert reply_b is not None and reply_b.content == "late"
+
+
+# ---------------------------------------------------------------------------
+# Leftover internal events are dropped before dispatch
+# ---------------------------------------------------------------------------
+
+
+def _internal_event_msg(
+    *, content: str = "subagent result", session_key: str = "cli:internal"
+) -> InboundMessage:
+    return InboundMessage(
+        channel="system",
+        sender_id="subagent",
+        chat_id=session_key,
+        content=content,
+        session_key_override=session_key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bus_drops_leftover_internal_event_before_dispatch(
+    tmp_path, monkeypatch
+) -> None:
+    """A system/subagent event on the bus starts no turn and writes no history.
+
+    The event reaches the bus entry *after* the permission side-channel, where
+    it must be dropped before command dispatch, gating and pending-queue
+    insertion. A live review run makes the difference observable: the old
+    post-hoc drop let the event through the gate first and published a
+    ``review_gated`` reply, while the pre-dispatch drop is silent and leaves the
+    review untouched.
+    """
+    import nanoreview.agent.coordinator as coordinator_module
+
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    runner = SpecCapturingRunner()
+    coordinator.conversation_loop._runner = runner
+    session_key = "cli:internal"
+    coordinator.review_loop.runs[session_key] = ReviewRunState(
+        run_id="run-live",
+        session_key=session_key,
+        input_fingerprint="fp",
+        status=ReviewRunStatus.RUNNING,
+        phase=ReviewPhase.REVIEW,
+    )
+    drops: list[str] = []
+    monkeypatch.setattr(
+        coordinator_module.logger,
+        "warning",
+        lambda message, *args: drops.append(message.format(*args)),
+    )
+
+    consumed = asyncio.create_task(coordinator.run())
+    try:
+        await bus.publish_inbound(_internal_event_msg(session_key=session_key))
+        await asyncio.sleep(0.05)
+    finally:
+        coordinator._running = False
+        consumed.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumed
+
+    assert runner.specs == []  # no model turn
+    session = coordinator.sessions.get_or_create(session_key)
+    assert session.get_history(max_messages=0) == []  # no history written
+    assert coordinator._pending_queues == {}  # never entered a pending queue
+    # Dropped at the bus entry, before gating: no review_gated reply, and the
+    # drop is attributed to the bus entry rather than ``_execute_turn``.
+    assert bus.outbound_size == 0
+    assert any("entry=bus" in text for text in drops), drops
+    assert not any("gated" in text for text in drops), drops
+
+
+@pytest.mark.asyncio
+async def test_bus_internal_event_does_not_trigger_a_command(tmp_path) -> None:
+    """An internal event whose body looks like ``/stop`` must not run a command.
+
+    Recognition happens on the event identity, before command dispatch, so a
+    dropped event cannot be used to cancel another session's turn.
+    """
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    victim_key = "cli:victim"
+    coordinator.conversation_loop._runner = BlockingRunner()
+
+    victim = asyncio.create_task(
+        coordinator.process_direct(
+            "work", session_key=victim_key, channel="cli", chat_id="victim"
+        )
+    )
+    await asyncio.sleep(0.01)
+
+    consumed = asyncio.create_task(coordinator.run())
+    try:
+        await bus.publish_inbound(
+            _internal_event_msg(content="/stop", session_key=victim_key)
+        )
+        await asyncio.sleep(0.05)
+    finally:
+        coordinator._running = False
+        consumed.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumed
+
+    # The victim turn was not cancelled by the spoofed internal event.
+    assert not victim.done()
+    victim.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await victim
+
+
+@pytest.mark.asyncio
+async def test_bus_internal_event_leaves_the_review_handoff_unconsumed(
+    tmp_path,
+) -> None:
+    """A dropped internal event must not consume the pending review handoff."""
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    session_key = "cli:handoff"
+    session = coordinator.sessions.get_or_create(session_key)
+    runner = SpecCapturingRunner()
+    coordinator.conversation_loop._runner = runner
+
+    # A settled review whose handoff is still waiting for the next turn.
+    coordinator.review_loop.runs[session_key] = ReviewRunState(
+        run_id="run-handoff",
+        session_key=session_key,
+        input_fingerprint="fp",
+        status=ReviewRunStatus.COMPLETED,
+        phase=ReviewPhase.DONE,
+    )
+    session.metadata[ReviewMetaKey.RUN_ID] = "run-handoff"
+    assert coordinator.pending_handoff(session) is not None
+
+    consumed = asyncio.create_task(coordinator.run())
+    try:
+        await bus.publish_inbound(
+            _internal_event_msg(session_key=session_key),
+        )
+        await asyncio.sleep(0.05)
+    finally:
+        coordinator._running = False
+        consumed.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumed
+
+    assert coordinator.pending_handoff(session) is not None  # still unconsumed
+    assert session.metadata.get(ReviewMetaKey.HANDOFF_RUN_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_drops_a_leftover_internal_event(tmp_path) -> None:
+    """The direct entry returns ``None`` for an internal event, without a turn."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    runner = SpecCapturingRunner()
+    coordinator.conversation_loop._runner = runner
+    key = "cli:direct-internal"
+
+    response = await coordinator.process_direct(
+        "subagent result",
+        session_key=key,
+        channel="system",
+        chat_id=key,
+        metadata={"injected_event": "subagent_result"},
+    )
+
+    assert response is None
+    assert runner.specs == []
+    assert coordinator.sessions.get_or_create(key).get_history(max_messages=0) == []
+    assert key not in coordinator._active_tasks  # not registered for cancellation
+
+
+@pytest.mark.asyncio
+async def test_internal_event_is_dropped_at_every_entry(tmp_path) -> None:
+    """Bus, direct and ``_execute_turn`` all drop the same leftover event.
+
+    ``_execute_turn`` keeps its own defensive check for callers that reach the
+    internal entry directly, so a drop is guaranteed however the event arrives.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    runner = SpecCapturingRunner()
+    coordinator.conversation_loop._runner = runner
+
+    assert coordinator._drop_internal_event(
+        _internal_event_msg(session_key="cli:e1"), entry="test"
+    )
+    assert not coordinator._drop_internal_event(
+        InboundMessage(
+            channel="cli", sender_id="user", chat_id="x", content="hi"
+        ),
+        entry="test",
+    )
+
+    response = await coordinator._execute_turn(
+        _internal_event_msg(session_key="cli:e2"),
+        "cli:e2",
+        pending_queue=None,
+        on_progress=None,
+    )
+
+    assert response is None
+    assert runner.specs == []

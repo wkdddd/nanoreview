@@ -162,7 +162,7 @@ def _is_internal_event(msg: InboundMessage) -> bool:
     """Whether *msg* is a legacy system/subagent event.
 
     These bypass review session gating, but they no longer drive a model turn:
-    ``_execute_turn`` drops them (with a warning) instead of running the
+    they are dropped ``(with a warning)`` before dispatch instead of running the
     conversation agent, and they never consume the pending review handoff.
     """
     meta = msg.metadata if isinstance(msg.metadata, dict) else {}
@@ -780,6 +780,30 @@ class SessionCoordinator:
         """
         return session_key
 
+    def _drop_internal_event(self, msg: InboundMessage, *, entry: str) -> bool:
+        """Drop a leftover internal event before dispatch; report whether it was.
+
+        Every entry point (bus loop, direct call, ``_execute_turn``) funnels its
+        leftover system/subagent events through here so the recognition rule
+        lives in exactly one place. Dropping happens *before* command dispatch,
+        gating and pending-queue insertion, so a dropped event cannot run a
+        command, start a model or tool, write history, consume a review handoff
+        or occupy the pending queue. Only the event's identity is logged — never
+        its body.
+        """
+        if not _is_internal_event(msg):
+            return False
+        logger.warning(
+            "Dropping internal event: entry={} channel={} sender={} session={} "
+            "injected_event={}",
+            entry,
+            msg.channel,
+            msg.sender_id,
+            msg.session_key,
+            (msg.metadata or {}).get("injected_event") or "none",
+        )
+        return True
+
     # -- admission ----------------------------------------------------------
 
     def admissions(self) -> ReviewAdmissionService:
@@ -1390,6 +1414,11 @@ class SessionCoordinator:
         """
         self._refresh_provider_snapshot()
         raw = msg.content.strip()
+        # Defensive check for callers that reach this internal entry directly
+        # (bypassing the bus/direct drop): a leftover internal event must not be
+        # routed as a turn, run a command, or consume the review handoff.
+        if self._drop_internal_event(msg, entry="execute_turn"):
+            return None
         session = self.sessions.get_or_create(session_key)
 
         # Review-phase gate: while a review run is live, an ordinary message is
@@ -1428,19 +1457,6 @@ class SessionCoordinator:
 
         target_root = self._resolve_target_root(session)
         turn_id = f"{session_key}:{time.time_ns()}"
-
-        if _is_internal_event(msg):
-            # Legacy subagent/system events no longer drive a model turn and
-            # must not consume the pending review handoff; drop them loudly.
-            logger.warning(
-                "Dropping internal event: channel={} sender={} session={} "
-                "injected_event={}",
-                msg.channel,
-                msg.sender_id,
-                session_key,
-                (msg.metadata or {}).get("injected_event") or "none",
-            )
-            return None
 
         handoff = self.pending_handoff(session)
         if handoff is not None and not handoff.fits:
@@ -1527,6 +1543,10 @@ class SessionCoordinator:
                     if not fut.done():
                         fut.set_result(False)
                 self._permission_futures.clear()
+                continue
+            # Leftover internal events must not reach command dispatch, gating
+            # or the pending queue: they are dropped here, before routing.
+            if self._drop_internal_event(msg, entry="bus"):
                 continue
             if self.commands.is_priority(raw):
                 # Control commands target the same key the turns are
@@ -1960,6 +1980,11 @@ class SessionCoordinator:
             session_key_override=key,
         )
         raw = content.strip()
+
+        # A leftover internal event must not run as a turn nor be registered as
+        # a cancellable task; report "nothing to answer" to the caller.
+        if self._drop_internal_event(msg, entry="direct"):
+            return None
 
         if self.commands.is_priority(raw):
             # Control commands must run even while this session's lock is held.
