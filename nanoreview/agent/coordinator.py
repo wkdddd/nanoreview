@@ -134,6 +134,20 @@ INTERRUPTED_RUN_REASON = (
     "the review was interrupted before it produced a result and cannot be resumed"
 )
 
+#: Cancellation message stamped on the tasks ``/stop`` cancels, so a cancelled
+#: entry point can tell a deliberate stop from a timeout, a client disconnect
+#: or a caller-initiated cancel (those keep their own cancellation semantics and
+#: must not be reported as a stop).
+STOP_CANCEL_REASON = "nanoreview.stop"
+
+#: Reply body for a direct request whose turn was cancelled by ``/stop``.
+STOPPED_REPLY_CONTENT = "Stopped."
+
+#: Metadata flag set on the stopped reply so transports can treat it as a
+#: deliberate terminal outcome (no empty-reply retry, not a model failure).
+STOP_REASON_META_KEY = "stop_reason"
+STOPPED_STOP_REASON = "stopped"
+
 #: Placeholder for "key absent" when snapshotting session metadata before a
 #: repair write, so a failed save can restore the exact previous state.
 _ABSENT = object()
@@ -157,6 +171,16 @@ def _is_internal_event(msg: InboundMessage) -> bool:
         or msg.sender_id == "subagent"
         or meta.get("injected_event") in ("subagent_result", "subagent_barrier")
     )
+
+
+def _is_stop_cancellation(exc: BaseException) -> bool:
+    """Whether *exc* is the ``CancelledError`` raised by a ``/stop``.
+
+    ``/stop`` cancels its targets with :data:`STOP_CANCEL_REASON`; a timeout,
+    a disconnected client or a caller-initiated cancel uses a bare
+    ``task.cancel()`` and carries no reason, so only a deliberate stop matches.
+    """
+    return bool(exc.args) and exc.args[0] == STOP_CANCEL_REASON
 
 
 def _stream_chunks(text: str, *, chunk_size: int = 2048) -> list[str]:
@@ -715,12 +739,29 @@ class SessionCoordinator:
             logger.warning("Command '{}' matched but dispatch returned None", raw)
 
     async def _cancel_active_tasks(self, key: str) -> int:
-        """Cancel and await all active tasks and subagents for *key*."""
+        """Fully stop one session: drop its queued messages, then cancel its work.
+
+        Order matters. The pending queue is removed (and discarded, never
+        re-published) *before* the tasks are cancelled, so a cancelled
+        ``_dispatch`` finds no queue of its own left to re-publish in its
+        ``finally`` — a stop must not resurrect the messages it just dropped.
+        Both the already-running turn and the requests still parked on the
+        session lock are cancelled. Only *key*'s own queue and tasks are
+        touched, so other sessions keep running.
+        """
+        self._pending_queues.pop(key, None)
         tasks = self._active_tasks.pop(key, [])
-        cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
-        for t in tasks:
+        cancelled = 0
+        for task in tasks:
+            if task.done():
+                continue
+            # Stamp the reason so the cancelled entry point can tell a stop
+            # from a timeout/disconnect/caller cancel.
+            task.cancel(STOP_CANCEL_REASON)
+            cancelled += 1
+        for task in tasks:
             with suppress(asyncio.CancelledError, Exception):
-                await t
+                await task
         sub_cancelled = await self.subagents.cancel_by_session(key)
         return cancelled + sub_cancelled
 
@@ -1285,11 +1326,25 @@ class SessionCoordinator:
         logger.info("review.report.stream.end session={}", session_key)
 
     async def _settle_review_run_after_stop(self, session_key: str) -> str | None:
-        """Settle a review run left ``running`` after ``/stop`` cancelled its turn."""
+        """Settle a review run left ``running`` after ``/stop`` cancelled its turn.
+
+        A settlement that cannot be proven (cleanup or terminal save failed)
+        stays unsettled, so the failure is reported instead of the gate
+        silently staying closed.
+        """
         state = self.review_loop.get(session_key)
         if state is None or state.status is not ReviewRunStatus.RUNNING:
             return None
-        result = await self.finalize(session_key, ReviewRunStatus.STOPPED)
+        try:
+            result = await self.finalize(session_key, ReviewRunStatus.STOPPED)
+        except Exception as exc:
+            logger.warning(
+                "review.stop.settle_failed session={} reason={}", session_key, exc
+            )
+            return (
+                f"The review run could not be settled ({exc}); restart "
+                "nanoreview to recover the session."
+            )
         if result is None:
             return (
                 "The review run could not be settled; restart nanoreview to "
@@ -1457,9 +1512,12 @@ class SessionCoordinator:
                 self._permission_futures.clear()
                 continue
             if self.commands.is_priority(raw):
+                # Control commands target the same key the turns are
+                # registered under, so ``/stop`` cancels *this* session's
+                # current and waiting work (unified sessions included).
                 await self._dispatch_command_inline(
                     msg,
-                    msg.session_key,
+                    self._effective_session_key(msg),
                     raw,
                     self.commands.dispatch_priority,
                 )
@@ -1733,7 +1791,14 @@ class SessionCoordinator:
             raise
         finally:
             self.review_loop.discard_unstarted(session_key)
-            queue = self._pending_queues.pop(session_key, None)
+            # Only drain the queue this turn owns: ``/stop`` pops it first so a
+            # stopped turn re-publishes nothing, and a queue registered by a
+            # fresh turn for the same key must not be drained here.
+            queue = self._pending_queues.get(session_key)
+            if queue is pending:
+                self._pending_queues.pop(session_key, None)
+            else:
+                queue = None
             if queue is not None:
                 leftover = 0
                 while True:
@@ -1845,6 +1910,12 @@ class SessionCoordinator:
         are dispatched inline instead: they never wait for the execution lock
         and are not added to the cancellation set (a ``/stop`` must not cancel
         itself).
+
+        A ``/stop``-cancelled request is not an error: it returns an explicit
+        "stopped" reply (``metadata["stop_reason"] == "stopped"``) so the
+        transport can answer the caller instead of reporting a failure. Any
+        other cancellation (timeout, disconnect, caller cancel) keeps its own
+        semantics and propagates untouched.
         """
         key = UNIFIED_SESSION_KEY if self._unified_session else session_key
         msg = InboundMessage(
@@ -1892,9 +1963,73 @@ class SessionCoordinator:
                 session = self.sessions.get_or_create(key)
                 self.write_context_index(session)
                 return response
+        except asyncio.CancelledError as exc:
+            if not _is_stop_cancellation(exc):
+                raise
+            # Deliberate stop: absorb the cancellation and answer the caller.
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+            return await self._stopped_direct_reply(
+                msg,
+                key,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+            )
         finally:
             if task is not None:
                 self._remove_active_task(key, task)
+
+    async def _stopped_direct_reply(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+        *,
+        on_stream: Callable[[str], Awaitable[None]] | None,
+        on_stream_end: Callable[..., Awaitable[None]] | None,
+    ) -> OutboundMessage:
+        """Build the explicit reply for a request cancelled by ``/stop``.
+
+        A stopped turn keeps whatever it already did (files, already-streamed
+        text) and only its unfinished history is backfilled through the runtime
+        checkpoint, exactly like an interrupted bus turn — no tool is re-run.
+        A request that never started has no checkpoint, so it writes no history
+        at all. Streaming transports get the stop explanation appended once and
+        their stream closed; the same text is returned for non-streaming
+        callers.
+        """
+        notes: list[str] = []
+        try:
+            session = self.sessions.get_or_create(session_key)
+            if self.conversation_loop.restore_runtime_checkpoint(session):
+                self.conversation_loop.clear_pending_user_turn(session)
+                self.sessions.save(session)
+        except Exception as exc:
+            logger.warning(
+                "agent.stop.persist_failed session={} reason={}", session_key, exc
+            )
+            notes.append(f"the interrupted turn could not be persisted ({exc})")
+
+        content = STOPPED_REPLY_CONTENT
+        if notes:
+            content = f"{content} {'; '.join(notes)}"
+
+        if on_stream is not None:
+            with suppress(Exception):
+                await on_stream(content)
+            if on_stream_end is not None:
+                with suppress(Exception):
+                    await on_stream_end(resuming=False)
+
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={
+                **dict(msg.metadata or {}),
+                STOP_REASON_META_KEY: STOPPED_STOP_REASON,
+            },
+        )
 
 
 __all__ = [
@@ -1903,6 +2038,10 @@ __all__ = [
     "REVIEW_ALLOWED_COMMANDS",
     "REVIEW_CONTEXT_EVENT",
     "REVIEW_HANDOFF_EVENT",
+    "STOP_CANCEL_REASON",
+    "STOPPED_REPLY_CONTENT",
+    "STOPPED_STOP_REASON",
+    "STOP_REASON_META_KEY",
     "ReviewHandoff",
     "SessionCoordinator",
     "SessionRoute",

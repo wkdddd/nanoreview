@@ -1602,3 +1602,233 @@ async def test_direct_uses_passed_session_key_for_review_lookup(tmp_path) -> Non
 
     assert len(requests) == 1
     assert requests[0].session_key == session_key
+
+
+# ---------------------------------------------------------------------------
+# /stop: complete stop semantics
+# ---------------------------------------------------------------------------
+
+
+class StreamingThenBlockRunner:
+    """Emits one streamed delta, then parks so ``/stop`` can cancel the turn."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+        self.started = asyncio.Event()
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.runs += 1
+        assert spec.hook is not None
+        context = AgentHookContext(
+            iteration=0, messages=[*spec.frozen_messages, *spec.working_messages]
+        )
+        await spec.hook.on_stream(context, "partial ")
+        self.started.set()
+        await asyncio.sleep(10)
+        return AgentRunResult(
+            final_content="done",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+        )
+
+
+async def _no_pending_inbound(coordinator: SessionCoordinator) -> bool:
+    """Whether the bus has no inbound message waiting."""
+    try:
+        await asyncio.wait_for(coordinator.bus.consume_inbound(), timeout=0.05)
+    except asyncio.TimeoutError:
+        return True
+    return False
+
+
+@pytest.mark.asyncio
+async def test_stop_drops_the_pending_queue_without_republishing(tmp_path) -> None:
+    """A stop discards the session's queued messages instead of requeueing them."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    key = "cli:queued"
+    pending: asyncio.Queue = asyncio.Queue()
+    await pending.put(_inbound("later", sender_id="user"))
+    coordinator._pending_queues[key] = pending
+
+    cancelled = asyncio.Event()
+
+    async def _turn() -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = asyncio.create_task(_turn())
+    coordinator._active_tasks.setdefault(key, []).append(task)
+    await asyncio.sleep(0)
+
+    stopped = await coordinator._cancel_active_tasks(key)
+
+    assert stopped >= 1
+    assert cancelled.is_set()
+    assert key not in coordinator._pending_queues
+    # The dropped message must not be re-published behind the stop.
+    assert await _no_pending_inbound(coordinator)
+
+
+@pytest.mark.asyncio
+async def test_stop_leaves_other_sessions_running(tmp_path) -> None:
+    """A stop only touches its own session's queue and tasks."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    queue_a: asyncio.Queue = asyncio.Queue()
+    queue_b: asyncio.Queue = asyncio.Queue()
+    coordinator._pending_queues["cli:a"] = queue_a
+    coordinator._pending_queues["cli:b"] = queue_b
+
+    async def _turn() -> None:
+        await asyncio.sleep(10)
+
+    task_a = asyncio.create_task(_turn())
+    task_b = asyncio.create_task(_turn())
+    coordinator._active_tasks["cli:a"] = [task_a]
+    coordinator._active_tasks["cli:b"] = [task_b]
+    await asyncio.sleep(0)
+
+    await coordinator._cancel_active_tasks("cli:a")
+
+    assert "cli:a" not in coordinator._pending_queues
+    assert coordinator._pending_queues.get("cli:b") is queue_b
+    assert task_a.cancelled() or task_a.done()
+    assert not task_b.done()
+
+    task_b.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task_b
+
+
+@pytest.mark.asyncio
+async def test_stopped_waiting_direct_request_returns_a_stop_reply(tmp_path) -> None:
+    """A direct request parked on the lock is cancelled into an explicit reply.
+
+    It must not surface as a ``CancelledError`` (the transport would report a
+    failure) and, because it never executed, it must leave no history behind.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = SpecCapturingRunner()
+    key = "cli:stopped"
+    lock = coordinator._session_locks.setdefault(key, asyncio.Lock())
+    await lock.acquire()  # another turn holds the session
+    try:
+        waiting = asyncio.create_task(
+            coordinator.process_direct(
+                "hello", session_key=key, channel="cli", chat_id="stopped"
+            )
+        )
+        await asyncio.sleep(0.01)
+        assert not waiting.done()  # parked on the lock, registered as active
+
+        stopped = await coordinator._cancel_active_tasks(key)
+        reply = await asyncio.wait_for(waiting, timeout=1.0)
+    finally:
+        lock.release()
+
+    assert stopped >= 1
+    assert reply is not None
+    assert reply.metadata["stop_reason"] == "stopped"
+    assert reply.content
+    # Waiting-but-not-executed: nothing was written to history.
+    session = coordinator.sessions.get_or_create(key)
+    assert session.get_history(max_messages=0) == []
+
+
+@pytest.mark.asyncio
+async def test_stopped_streaming_turn_keeps_content_and_appends_one_note(
+    tmp_path,
+) -> None:
+    """A stopped in-flight turn keeps streamed text and adds one stop note."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    runner = StreamingThenBlockRunner()
+    coordinator.conversation_loop._runner = runner
+    key = "cli:streamstop"
+    deltas: list[str] = []
+    ends: list[bool] = []
+
+    async def on_stream(delta: str) -> None:
+        deltas.append(delta)
+
+    async def on_stream_end(*, resuming: bool = False) -> None:
+        ends.append(resuming)
+
+    request = asyncio.create_task(
+        coordinator.process_direct(
+            "long task",
+            session_key=key,
+            channel="cli",
+            chat_id="streamstop",
+            on_stream=on_stream,
+            on_stream_end=on_stream_end,
+        )
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+    stopped = await coordinator._cancel_active_tasks(key)
+    reply = await asyncio.wait_for(request, timeout=1.0)
+
+    assert stopped == 1
+    assert reply is not None
+    assert reply.metadata["stop_reason"] == "stopped"
+    # Already-emitted content is kept; exactly one explanation is appended.
+    assert len(deltas) == 2
+    assert deltas[0].strip() == "partial"
+    assert deltas[1] == reply.content
+    assert ends == [False]
+
+
+@pytest.mark.asyncio
+async def test_after_stop_a_new_turn_runs_and_the_stop_is_backfilled(
+    tmp_path,
+) -> None:
+    """After a stop the session accepts new work; the stopped turn is closed."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    runner = StreamingThenBlockRunner()
+    coordinator.conversation_loop._runner = runner
+    key = "cli:afterstop"
+
+    request = asyncio.create_task(
+        coordinator.process_direct(
+            "long", session_key=key, channel="cli", chat_id="afterstop"
+        )
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+    await coordinator._cancel_active_tasks(key)
+    await asyncio.wait_for(request, timeout=1.0)
+
+    assert runner.runs == 1  # the stopped turn was not re-run
+
+    follow_up_runner = SpecCapturingRunner()
+    coordinator.conversation_loop._runner = follow_up_runner
+    follow_up = await coordinator.process_direct(
+        "second", session_key=key, channel="cli", chat_id="afterstop"
+    )
+
+    assert follow_up is not None and follow_up.content == "ok"
+    assert len(follow_up_runner.specs) == 1
+    # The interrupted turn's history was backfilled before the new turn.
+    contents = [
+        str(m.get("content"))
+        for m in coordinator.sessions.get_or_create(key).get_history(max_messages=0)
+    ]
+    assert any("interrupted" in text.lower() for text in contents)
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_is_not_reported_as_a_stop(tmp_path) -> None:
+    """Only a ``/stop`` becomes a stop reply; other cancels propagate as-is."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = SlowRunner()
+    key = "cli:callercancel"
+
+    request = asyncio.create_task(
+        coordinator.process_direct(
+            "hi", session_key=key, channel="cli", chat_id="callercancel"
+        )
+    )
+    await asyncio.sleep(0.01)
+    request.cancel()  # a bare cancel carries no stop marker
+
+    with pytest.raises(asyncio.CancelledError):
+        await request

@@ -84,6 +84,20 @@ def _response_text(value: Any) -> str:
         return str(getattr(value, "content") or "")
     return str(value)
 
+
+def _response_stop_reason(value: Any) -> str:
+    """Read the ``stop_reason`` a direct request reports (``""`` when absent).
+
+    A ``"stopped"`` reason marks a deliberate ``/stop``: the reply is terminal
+    even though it may carry no model text, so the API must never treat it as
+    an empty-response failure and retry.
+    """
+    metadata = getattr(value, "metadata", None)
+    if not isinstance(metadata, dict):
+        return ""
+    reason = metadata.get("stop_reason")
+    return reason if isinstance(reason, str) else ""
+
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
@@ -314,6 +328,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                     ),
                     timeout=timeout_s,
                 )
+                # A stopped request already appended its explanation through
+                # the stream callback; only fill in when nothing was streamed,
+                # so the explanation is never sent twice.
                 if not emitted_content:
                     response_text = _response_text(response)
                     if response_text.strip():
@@ -358,8 +375,11 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             timeout=timeout_s,
         )
         response_text = _response_text(response)
+        # A stopped request is a deliberate terminal outcome, not an
+        # empty-response failure: answer it as-is, never retry.
+        is_stopped = _response_stop_reason(response) == "stopped"
 
-        if not response_text or not response_text.strip():
+        if not is_stopped and (not response_text or not response_text.strip()):
             logger.warning("Empty response for session {}, retrying", session_key)
             retry_response = await asyncio.wait_for(
                 agent_loop.process_direct(
