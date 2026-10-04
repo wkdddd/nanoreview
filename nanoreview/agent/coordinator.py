@@ -487,10 +487,6 @@ class SessionCoordinator:
             return subagent_effort
         return self._default_reasoning_effort
 
-    def _sync_subagent_runtime_limits(self) -> None:
-        self.subagents.max_iterations = self.max_iterations
-        self.subagents.reasoning_effort = self._resolve_subagent_reasoning_effort()
-
     def _apply_provider_snapshot(
         self,
         snapshot: ProviderSnapshot,
