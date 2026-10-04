@@ -30,6 +30,10 @@ from loguru import logger
 
 from nanoreview.agent.autocompact import AutoCompact
 from nanoreview.agent.context import ContextBuilder
+from nanoreview.agent.finding_refs import (
+    collect_finding_references,
+    report_finding_ids,
+)
 from nanoreview.agent.handoff import ReviewHandoff, consume_handoff
 from nanoreview.agent.hooks.lifecycle import AgentHook, CompositeHook
 from nanoreview.agent.hooks.progress import AgentProgressHook
@@ -174,6 +178,13 @@ class _TurnContext:
     pending_queue: asyncio.Queue | None = None
     consumed_subagent_task_ids: set[str] | None = None
 
+    #: Report-local finding IDs valid in the report currently in context.
+    valid_finding_ids: frozenset[str] = frozenset()
+    #: User texts actually consumed this turn (first message + injected ones).
+    consumed_user_texts: list[str] = field(default_factory=list)
+    #: Confirmed finding IDs this turn's user messages explicitly named.
+    finding_refs: list[str] = field(default_factory=list)
+
     on_progress: Callable[..., Awaitable[None]] | None = None
     on_stream: Callable[[str], Awaitable[None]] | None = None
     on_stream_end: Callable[..., Awaitable[None]] | None = None
@@ -316,6 +327,7 @@ class ConversationLoop:
             self._compact(ctx)
             await self._build(ctx, handoff)
             await self._run(ctx)
+            self._collect_finding_refs(ctx)
             self._save(ctx)
             await self._respond(ctx)
             return ctx.outbound
@@ -357,6 +369,7 @@ class ConversationLoop:
             self._compact(ctx)
             await self._build(ctx, None)
             await self._run(ctx)
+            self._collect_finding_refs(ctx)
             self._save(ctx)
             await self._respond(ctx)
             return ctx.outbound
@@ -419,6 +432,7 @@ class ConversationLoop:
             self._sessions.save(ctx.session)
 
         ctx.history = self._session_history(ctx.session)
+        ctx.valid_finding_ids = report_finding_ids(ctx.history)
         ctx.tools = self._build_turn_tools(ctx)
         self._set_tool_context(ctx)
         if (message_tool := ctx.tools.get("message")) and isinstance(
@@ -449,6 +463,30 @@ class ConversationLoop:
             logger.error(
                 "LLM returned error: {}", (result.final_content or "")[:200]
             )
+
+    def _collect_finding_refs(self, ctx: _TurnContext) -> None:
+        """Record the report finding IDs this turn's user messages named.
+
+        Purely transient: the references stay on the turn's own context and in
+        the log. They are never persisted, associated with a finding record, or
+        used to infer repair status.
+        """
+        if not ctx.valid_finding_ids:
+            return
+        texts: list[str] = []
+        if ctx.current_role == "user" and isinstance(ctx.msg.content, str):
+            texts.append(ctx.msg.content)
+        texts.extend(ctx.consumed_user_texts)
+        references = collect_finding_references(texts, ctx.valid_finding_ids)
+        if not references:
+            return
+        ctx.finding_refs = references
+        logger.info(
+            "conversation.finding_refs session={} turn={} refs={}",
+            ctx.session_key,
+            ctx.turn_id,
+            ",".join(references),
+        )
 
     def _save(self, ctx: _TurnContext) -> None:
         """Persist the turn's incremental history and clean up turn state."""
@@ -638,6 +676,11 @@ class ConversationLoop:
                 message["_metadata"] = dict(pending_msg.metadata)
             return message
 
+        def _record_consumed_user_text(pending_msg: InboundMessage) -> None:
+            content = pending_msg.content
+            if isinstance(content, str) and content:
+                ctx.consumed_user_texts.append(content)
+
         def _accept_pending(
             items: list[dict[str, Any]], pending_msg: InboundMessage
         ) -> None:
@@ -663,7 +706,9 @@ class ConversationLoop:
             while (
                 buffered_pending and len(items) < limit and _running_subagents() == 0
             ):
-                items.append(_to_user_message(buffered_pending.pop(0)))
+                pending_msg = buffered_pending.pop(0)
+                _record_consumed_user_text(pending_msg)
+                items.append(_to_user_message(pending_msg))
 
             for result_msg in _drain_subagent_results(limit - len(items)):
                 _accept_pending(items, result_msg)
@@ -690,7 +735,9 @@ class ConversationLoop:
                     if pending_msg is not None:
                         _accept_pending(items, pending_msg)
                 elif buffered_pending and _running_subagents() == 0:
-                    items.append(_to_user_message(buffered_pending.pop(0)))
+                    pending_msg = buffered_pending.pop(0)
+                    _record_consumed_user_text(pending_msg)
+                    items.append(_to_user_message(pending_msg))
                 else:
                     break
 

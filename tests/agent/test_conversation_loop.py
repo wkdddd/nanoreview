@@ -171,3 +171,65 @@ def test_set_runtime_model_moves_model_and_window(tmp_path) -> None:
 
     assert loop._model == "switched-model"
     assert loop._context_window_tokens == 131_072
+
+
+def _handoff_with_report(report: str) -> ReviewHandoff:
+    handoff = _handoff()
+    return ReviewHandoff(result=handoff.result, report_markdown=report, fits=True)
+
+
+_REPORT_WITH_IDS = (
+    "## Code Review Report: repo\n\n### Findings\n\n"
+    "| ID | Dimension | File | Issue | Impact |\n"
+    "|----|-----------|------|-------|--------|\n"
+    "| F001 | bug | a.py:1 | Null deref | crash |\n"
+)
+
+
+def _capture_finding_refs(loop: ConversationLoop) -> dict[str, Any]:
+    """Spy on the transient reference collection without changing behaviour."""
+    captured: dict[str, Any] = {}
+    original = loop._collect_finding_refs
+
+    def spy(ctx) -> None:
+        original(ctx)
+        captured["valid"] = set(ctx.valid_finding_ids)
+        captured["refs"] = list(ctx.finding_refs)
+
+    loop._collect_finding_refs = spy
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_turn_collects_the_finding_ids_the_user_named(tmp_path) -> None:
+    loop = _loop(tmp_path)
+    loop._runner = SpecCapturingRunner()
+    captured = _capture_finding_refs(loop)
+
+    await loop.process_message(
+        _msg("please fix F001, and ignore F999"),
+        session_key="cli:review",
+        turn_id="t1",
+        target_root=tmp_path,
+        handoff=_handoff_with_report(_REPORT_WITH_IDS),
+    )
+
+    assert captured["valid"] == {"F001"}
+    # Only IDs present in the report survive; the phantom F999 is dropped.
+    assert captured["refs"] == ["F001"]
+
+
+@pytest.mark.asyncio
+async def test_turn_without_a_report_collects_no_references(tmp_path) -> None:
+    loop = _loop(tmp_path)
+    loop._runner = SpecCapturingRunner()
+    captured = _capture_finding_refs(loop)
+
+    await loop.process_message(
+        _msg("fix F001"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+    )
+
+    assert captured["refs"] == []

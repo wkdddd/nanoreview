@@ -22,8 +22,64 @@ from nanoreview.agent.review_state import (
     compute_input_fingerprint,
     compute_review_input_fingerprint,
     new_review_run_id,
+    serialize_finalizer_result,
 )
-from nanoreview.review.types import ReviewMetaKey
+from nanoreview.review.output.finalizer import ReviewFinalizerResult
+from nanoreview.review.result import result_from_run_state
+from nanoreview.review.types import (
+    FindingVerdict,
+    ReviewDimensionResult,
+    ReviewFindingCandidate,
+    ReviewFindingVerdict,
+    ReviewJudgeDecision,
+    ReviewJudgedFinding,
+    ReviewJudgeVerdict,
+    ReviewMetaKey,
+)
+
+
+def _candidate(
+    title: str,
+    *,
+    severity: str = "high",
+    file: str = "src/app.py",
+    line: int | None = 1,
+    dimension: str = "security",
+) -> ReviewFindingCandidate:
+    return ReviewFindingCandidate(
+        severity=severity,
+        dimension=dimension,
+        file=file,
+        line=line,
+        title=title,
+        evidence="evidence",
+        impact="impact",
+        recommendation="fix it",
+    )
+
+
+def _accepted(title: str, **kw) -> ReviewJudgedFinding:
+    return ReviewJudgedFinding(
+        candidate=_candidate(title, **kw),
+        hard_verdict=ReviewFindingVerdict(
+            verdict=FindingVerdict.ACCEPTED, reason="hard validation accepted"
+        ),
+        judge_verdict=ReviewJudgeVerdict(
+            decision=ReviewJudgeDecision.ACCEPT, reason="supported", confidence="high"
+        ),
+    )
+
+
+def _uncertain(title: str, **kw) -> ReviewJudgedFinding:
+    return ReviewJudgedFinding(
+        candidate=_candidate(title, **kw),
+        hard_verdict=ReviewFindingVerdict(
+            verdict=FindingVerdict.UNCERTAIN, reason="unclear evidence"
+        ),
+        judge_verdict=ReviewJudgeVerdict(
+            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION, reason="unclear", confidence="low"
+        ),
+    )
 
 
 def _run_state(**overrides) -> ReviewRunState:
@@ -207,7 +263,7 @@ def test_build_report_artifact_uses_run_state_fields() -> None:
 def test_build_report_artifact_status_overrides_running_state() -> None:
     """The artifact is persisted before the run status flips to terminal.
 
-    ``AgentLoop`` must therefore pass the decided terminal status, otherwise
+    ``ReviewLoop`` must therefore pass the decided terminal status, otherwise
     a completed report would be written with ``status: running`` and later
     consumers would treat a finished report as still in flight.
     """
@@ -228,6 +284,35 @@ def test_build_report_artifact_can_record_a_failed_run() -> None:
         state, report_markdown="", status=ReviewRunStatus.ERROR
     )
     assert artifact["status"] == "error"
+
+
+def test_serialize_finalizer_result_ids_confirmed_findings_only() -> None:
+    """Only confirmed findings get a user-facing report-local ID."""
+    dimension = ReviewDimensionResult(
+        dimension="security",
+        status="validated",
+        judged=[_accepted("Real bug"), _uncertain("Maybe", file="b.py")],
+    )
+
+    findings, verdicts = serialize_finalizer_result(
+        ReviewFinalizerResult(report_markdown="# report", dimensions=[dimension])
+    )
+
+    by_title = {finding["title"]: finding for finding in findings}
+    assert by_title["Real bug"]["id"] == "F001"
+    assert "id" not in by_title["Maybe"]
+    assert len(verdicts) == 2
+
+
+def test_finding_ids_reach_the_artifact_and_the_result() -> None:
+    """The artifact and ``ReviewResult.findings`` mirror the Markdown IDs."""
+    state = _run_state(status=ReviewRunStatus.COMPLETED)
+    state.findings = [{"id": "F001", "title": "Real bug"}]
+
+    artifact = build_report_artifact(state, report_markdown="# report")
+
+    assert artifact["findings"][0]["id"] == "F001"
+    assert result_from_run_state(state).findings[0]["id"] == "F001"
 
 
 def test_review_run_state_add_usage_accumulates_counters() -> None:

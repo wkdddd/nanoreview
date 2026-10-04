@@ -1,7 +1,10 @@
 """Tests for the fixed Markdown report renderer."""
 from __future__ import annotations
 
-from nanoreview.review.output.report import render_review_report
+from nanoreview.review.output.report import (
+    collect_confirmed_findings,
+    render_review_report,
+)
 from nanoreview.review.types import (
     FindingVerdict,
     ReviewDimensionResult,
@@ -78,8 +81,8 @@ class TestReportStructure:
 
     def test_finding_dimension_is_rendered_in_table(self):
         report = render_review_report("repo", [_dim("security", accepted=[_candidate()])])
-        row = next(line for line in report.splitlines() if line.startswith("| 1 |"))
-        assert row.startswith("| 1 | security |")
+        row = next(line for line in report.splitlines() if line.startswith("| F001 |"))
+        assert row.startswith("| F001 | security |")
 
     def test_needs_confirmation_section(self):
         uncertain = [(_candidate(title="Maybe bug"), ReviewFindingVerdict(
@@ -140,6 +143,67 @@ class TestReportStructure:
         assert "Pipe \\| issue second line" in report
         assert "Breaks \\| table and layout" in report
         assert "Use parser \\| not split then validate" in report
-        finding_rows = [line for line in report.splitlines() if line.startswith("| 1 |")]
+        finding_rows = [line for line in report.splitlines() if line.startswith("| F001 |")]
         assert len(finding_rows) == 1
         assert "| security |" in finding_rows[0]
+
+
+class TestFindingIds:
+    """Stable report-local IDs (``F001``) for confirmed findings."""
+
+    def test_ids_follow_the_display_order_across_dimensions(self):
+        dims = [
+            _dim("security", accepted=[_candidate(severity="medium", title="M1")]),
+            _dim("bug", accepted=[
+                _candidate(severity="critical", title="C1", file="a.py"),
+                _candidate(severity="high", title="H1", file="b.py"),
+            ]),
+        ]
+
+        report = render_review_report("repo", dims)
+
+        rows = [line for line in report.splitlines() if line.startswith("| F")]
+        cells = [row.split("|")[1].strip() for row in rows]
+        assert cells == ["F001", "F002", "F003"]
+        # Severity order drives both the IDs and the row bodies.
+        assert "C1" in rows[0] and "H1" in rows[1] and "M1" in rows[2]
+
+    def test_details_repeat_the_same_ids(self):
+        report = render_review_report(
+            "repo", [_dim("security", accepted=[_candidate(title="Only one")])]
+        )
+
+        assert "**F001 — Only one**" in report
+
+    def test_unconfirmed_candidates_get_no_id(self):
+        uncertain = [(_candidate(title="Maybe"), ReviewFindingVerdict(
+            verdict=FindingVerdict.UNCERTAIN, reason="unclear"
+        ))]
+        rejected = [(_candidate(title="Nope"), ReviewFindingVerdict(
+            verdict=FindingVerdict.REJECTED, reason="not found"
+        ))]
+        dims = [_dim(
+            "security",
+            accepted=[_candidate(title="Real")],
+            uncertain=uncertain,
+            rejected=rejected,
+        )]
+
+        report = render_review_report("repo", dims)
+
+        assert "F001" in report
+        assert "F002" not in report
+
+    def test_collect_confirmed_findings_is_the_id_source_of_truth(self):
+        dims = [
+            _dim("security", accepted=[
+                _candidate(severity="low", title="Low"),
+                _candidate(severity="critical", title="Critical", file="c.py"),
+            ])
+        ]
+
+        collected = collect_confirmed_findings(dims)
+
+        assert [finding_id for finding_id, _ in collected] == ["F001", "F002"]
+        assert [finding.title for _, finding in collected] == ["Critical", "Low"]
+

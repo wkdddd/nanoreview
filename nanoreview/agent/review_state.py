@@ -326,8 +326,8 @@ def compute_review_input_fingerprint(
 # ---------------------------------------------------------------------------
 
 
-def _serialize_candidate(candidate: Any) -> dict[str, Any]:
-    return {
+def _serialize_candidate(candidate: Any, *, finding_id: str | None = None) -> dict[str, Any]:
+    payload = {
         "severity": candidate.severity,
         "dimension": candidate.dimension,
         "file": candidate.file,
@@ -339,6 +339,10 @@ def _serialize_candidate(candidate: Any) -> dict[str, Any]:
         "confidence": candidate.confidence,
         "source": candidate.source,
     }
+    #: Only confirmed findings get a user-facing report-local ID (``F001``).
+    if finding_id:
+        payload["id"] = finding_id
+    return payload
 
 
 def _serialize_verdict(judged: Any) -> dict[str, Any]:
@@ -364,12 +368,30 @@ def _serialize_verdict(judged: Any) -> dict[str, Any]:
 def serialize_finalizer_result(
     result: "ReviewFinalizerResult",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Extract (findings, verdicts) wire payloads from a finalizer result."""
+    """Extract (findings, verdicts) wire payloads from a finalizer result.
+
+    Confirmed findings carry their stable report-local ID (``F001``) so the
+    report artifact, ``ReviewResult.findings`` and the Web/API state agree with
+    the rendered Markdown. Rejected and uncertain candidates get no ID: those
+    IDs are user-facing and only name actionable findings.
+    """
+    # Local import: ``report`` -> ``judge`` -> this module would otherwise cycle.
+    from nanoreview.review.output.report import (
+        confirmed_finding_ids_by_key,
+        finding_key,
+    )
+
+    ids_by_key = confirmed_finding_ids_by_key(result.dimensions)
     findings: list[dict[str, Any]] = []
     verdicts: list[dict[str, Any]] = []
     for dimension in result.dimensions:
         for judged in dimension.judged:
-            findings.append(_serialize_candidate(judged.candidate))
+            findings.append(
+                _serialize_candidate(
+                    judged.candidate,
+                    finding_id=ids_by_key.get(finding_key(judged.candidate)),
+                )
+            )
             verdicts.append(_serialize_verdict(judged))
     return findings, verdicts
 

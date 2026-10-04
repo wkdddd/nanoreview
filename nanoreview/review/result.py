@@ -30,6 +30,11 @@ from nanoreview.review.types import ReviewMetaKey
 #: Conversation Agent output.
 REVIEW_REPORT_SOURCE = "review_agent"
 
+#: Header line that marks the injected handoff block in conversation history.
+#: The conversation loop uses it to locate the current report without reading
+#: the report artifact.
+REVIEW_HANDOFF_HEADER = "[ReviewAgent handoff]"
+
 #: Gap text is bounded so a huge provider trace cannot inflate the result.
 GAP_MAX_CHARS = 300
 
@@ -300,7 +305,7 @@ def render_review_context_index(result: ReviewResult) -> str:
 def _handoff_framing(result: ReviewResult) -> str:
     """Provenance + read-only + completeness header for the handoff block."""
     lines = [
-        "[ReviewAgent handoff]",
+        REVIEW_HANDOFF_HEADER,
         f"source={REVIEW_REPORT_SOURCE}",
         f"run_id={result.run_id}",
         f"status={result.status.value}",
@@ -378,6 +383,7 @@ def render_handoff_directive(result: ReviewResult) -> str:
 
 __all__ = [
     "GAP_MAX_CHARS",
+    "REVIEW_HANDOFF_HEADER",
     "REVIEW_REPORT_SOURCE",
     "ReviewHandoffState",
     "ReviewResult",

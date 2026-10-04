@@ -12,6 +12,45 @@ from nanoreview.review.types import (
     ReviewFindingVerdict,
 )
 
+#: Stable, report-local finding ID prefix and zero-padded width (``F001``).
+FINDING_ID_PREFIX = "F"
+FINDING_ID_WIDTH = 3
+
+
+def format_finding_id(position: int) -> str:
+    """Stable ID for the *position*-th confirmed finding (1-based)."""
+    return f"{FINDING_ID_PREFIX}{position:0{FINDING_ID_WIDTH}d}"
+
+
+def finding_key(finding: ReviewFindingCandidate) -> tuple[str, str, int, str]:
+    """Identity of one candidate, used to look up its report-local ID.
+
+    Two candidates that agree on dimension, file, line and title are treated as
+    the same finding; they render identically, so they cannot be told apart.
+    """
+    return (finding.dimension, finding.file, finding.line or 0, finding.title)
+
+
+def collect_confirmed_findings(
+    dims: list[ReviewDimensionResult],
+) -> list[tuple[str, ReviewFindingCandidate]]:
+    """Confirmed findings in final display order, each paired with its ID.
+
+    This is the single source of truth for both the report's numbering and the
+    ``ReviewResult.findings`` IDs, so ``F001`` always names the same finding:
+    rejected and uncertain candidates are excluded, and the order matches the
+    severity-sorted Findings section exactly.
+    """
+    accepted = _collect_accepted(dims)
+    return [(format_finding_id(i), finding) for i, finding in enumerate(accepted, 1)]
+
+
+def confirmed_finding_ids_by_key(
+    dims: list[ReviewDimensionResult],
+) -> dict[tuple[str, str, int, str], str]:
+    """Map each confirmed finding's identity to its report-local ID."""
+    return {finding_key(finding): finding_id for finding_id, finding in collect_confirmed_findings(dims)}
+
 
 def _clean_text(value: object) -> str:
     """Normalize model-provided text before embedding it in Markdown."""
@@ -57,7 +96,8 @@ def render_review_report(
     judge_stats: ReviewJudgeStats | None = None,
 ) -> str:
     """Render final Markdown report from validated dimension results."""
-    all_accepted = _collect_accepted(dimensions)
+    confirmed = collect_confirmed_findings(dimensions)
+    all_accepted = [finding for _, finding in confirmed]
     all_uncertain = _collect_uncertain(dimensions)
     all_rejected = _collect_rejected(dimensions)
 
@@ -78,7 +118,7 @@ def render_review_report(
     if skipped_files:
         sections.append(_render_skipped_files(skipped_files))
     sections.append(_render_findings(
-        all_accepted,
+        confirmed,
         uncertain_count=len(all_uncertain),
         rejected_count=len(all_rejected),
         incomplete=incomplete,
@@ -195,7 +235,7 @@ def _has_incomplete_checks(dims: list[ReviewDimensionResult]) -> bool:
 
 
 def _render_findings(
-    findings: list[ReviewFindingCandidate],
+    findings: list[tuple[str, ReviewFindingCandidate]],
     *,
     uncertain_count: int = 0,
     rejected_count: int = 0,
@@ -211,26 +251,27 @@ def _render_findings(
         return "### Findings\n\nNo actionable issues found.\n"
     lines = ["### Findings\n"]
     current_sev = ""
-    idx = 0
-    for f in findings:
+    for finding_id, f in findings:
         if f.severity != current_sev:
             current_sev = f.severity
             lines.append(f"#### {current_sev.capitalize()}\n")
-            lines.append("| # | Dimension | File | Issue | Impact |")
-            lines.append("|---|-----------|------|-------|--------|")
-        idx += 1
+            lines.append("| ID | Dimension | File | Issue | Impact |")
+            lines.append("|----|-----------|------|-------|--------|")
         loc = _location(f.file, f.line)
         lines.append(
-            f"| {idx} | {_table_cell(f.dimension)} | {_table_cell(loc)} | "
+            f"| {finding_id} | {_table_cell(f.dimension)} | {_table_cell(loc)} | "
             f"{_table_cell(f.title)} | {_table_cell(f.impact)} |"
         )
     lines.append("")
     lines.append("**Details:**\n")
-    for i, f in enumerate(findings, 1):
+    for finding_id, f in findings:
         loc = _location(f.file, f.line)
-        lines.append(f"{i}. **{_escape_markdown_inline(f.title)}** (`{_clean_text(loc)}`)")
-        lines.append(f"   - Impact: {_escape_markdown_inline(f.impact)}")
-        lines.append(f"   - Recommendation: {_escape_markdown_inline(f.recommendation)}")
+        lines.append(
+            f"- **{finding_id} — {_escape_markdown_inline(f.title)}** "
+            f"(`{_clean_text(loc)}`)"
+        )
+        lines.append(f"  - Impact: {_escape_markdown_inline(f.impact)}")
+        lines.append(f"  - Recommendation: {_escape_markdown_inline(f.recommendation)}")
         profile = get_reviewer_profile(f.dimension)
         if profile is not None:
             for key, label in profile.report_fields:
@@ -238,7 +279,7 @@ def _render_findings(
                 if isinstance(value, list):
                     value = ", ".join(str(item) for item in value)
                 lines.append(
-                    f"   - {_escape_markdown_inline(label)}: {_escape_markdown_inline(value)}"
+                    f"  - {_escape_markdown_inline(label)}: {_escape_markdown_inline(value)}"
                 )
     lines.append("")
     return "\n".join(lines)

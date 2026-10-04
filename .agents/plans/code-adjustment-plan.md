@@ -120,7 +120,8 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 
 - 已完成：步骤 1（`0902ef09`），步骤 2、3 与 6 的代码迁移（`728e47f9`）。`SessionCoordinator` 已合并 `AgentLoop` 运行时，`ConversationLoop` 完成完整对话 turn，`nanoreview/agent/loop.py` 与 `AgentLoop` 已删除，API/CLI/channel/包导出与相关测试均已迁移；全量 `pytest` 通过。
 - 已完成：步骤 4。`BOOTSTRAP_FILES` 改为读取 `COMMON_RULES.md`，模板由 `templates/SOUL.md` 重命名并重写；reviewer `prompt_builder`（经 `metadata["common_rules_workspace"]`）与 Judge `_system_prompt`（构造参数 `common_rules_workspace`）在每次 run/batch 读取一次，缺失或不可读时跳过并告警，运行内不刷新；`MemoryStore` 移除无调用方的 SOUL API，memory skill 文档与相关测试同步。不再回退旧 `SOUL.md`。
-- 待办：步骤 5（report findings 稳定 ID 与显式引用收集）。
+- 已完成：步骤 5。`report.py` 以 `collect_confirmed_findings`（按 severity 展示顺序）作为稳定 ID（`F001`…）的单一来源，写入报告 Markdown 的 ID 列与 Details；`serialize_finalizer_result` 通过 `confirmed_finding_ids_by_key` 只给 confirmed finding 附加 `id`，因此 artifact 与 `ReviewResult.findings` 与 Markdown 一致，rejected/uncertain 不生成 ID。新增 `agent/finding_refs.py`：从历史中最近的 handoff block（头部常量 `REVIEW_HANDOFF_HEADER`）取得当前 report 的有效 ID，收集本轮实际消费的用户消息中显式出现且有效的 ID，去重后仅留在 `_TurnContext` 与日志，不持久化、不建立 finding 状态、不改写报告。
+- 本节点步骤 1-6 均已完成；最后一个提交为步骤 5。
 - `turn_trace` 前端待适配（本节点不修改 `review-webui/`）：删除状态机后不再生成该字段，现有消费点如下，需后续节点核对保留或移除。
   - `nanoreview/channels/websocket.py`：`_turn_end` 分支读取 `metadata["turn_trace"]` 并透传给 `send_turn_end`，该键现已无生产者。
   - `review-webui/src/lib/types.ts`：`TurnTraceItem` 接口及 `turn_end.turn_trace` 字段现已恒缺省，WebUI 消费方需适配。
