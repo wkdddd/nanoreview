@@ -411,6 +411,7 @@ class SessionCoordinator:
             permission_requester=self._request_tool_permission,
             hooks=self._extra_hooks,
             hooks_getter=lambda: self._extra_hooks,
+            usage_recorder=self._record_result_usage,
         )
 
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
@@ -1116,6 +1117,9 @@ class SessionCoordinator:
         result = await self.review_loop.finalize(session_key, status, warning=warning)
         if result is None:
             return None
+        # The run's total usage (reviewers + judge + planner) is returned once,
+        # on its single terminal result — record it here, never per child.
+        self._record_result_usage(result.usage)
         session = self.sessions.get_or_create(session_key)
         self.write_context_index(session)
         return result
@@ -1272,6 +1276,10 @@ class SessionCoordinator:
             )
         )
         final_content = outcome.report_markdown
+        # The review run's total usage is returned once with its terminal
+        # result; record it here so a review turn is counted like any other.
+        if outcome.result is not None:
+            self._record_result_usage(outcome.result.usage)
         if outcome.produces_report and outcome.error:
             final_content = (
                 f"{final_content}\n\n> Review settlement failed: {outcome.error}"
@@ -1849,6 +1857,21 @@ class SessionCoordinator:
         """Stop the coordinator."""
         self._running = False
         log_event(logger, "info", "agent.loop.stopping", status="running")
+
+    def _record_result_usage(self, usage: dict[str, int] | None) -> None:
+        """Fold one returned result's usage into ``_last_usage``/``_total_usage``.
+
+        Called exactly once per returned result — for a conversation turn with
+        the ``AgentRunResult.usage`` the loop hands back, and for a review run
+        with the ``ReviewResult.usage`` of its single terminal result (which
+        already totals its reviewers, judge and planner, so it must not be
+        summed again per child). Recording happens as the result comes back, so
+        a later persistence failure cannot wipe usage that was already produced.
+        """
+        if not usage:
+            return
+        self._last_usage = dict(usage)
+        self._accumulate_total_usage(usage)
 
     def _accumulate_total_usage(self, usage: dict[str, int]) -> None:
         usage_total: int | None = None

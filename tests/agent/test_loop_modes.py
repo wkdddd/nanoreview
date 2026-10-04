@@ -25,6 +25,7 @@ from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanoreview.review.profiles import reviewer_execution_profiles
+from nanoreview.review.result import ReviewHandoffState, ReviewResult
 from nanoreview.review.types import (
     ReviewMetaKey,
 )
@@ -232,6 +233,7 @@ def _stub_review_execution(
     produces_report: bool = True,
     stop_reason: str = "",
     error: str | None = None,
+    result: ReviewResult | None = None,
 ) -> list[ReviewTurnRequest]:
     """Replace ``ReviewLoop.execute`` and record the delegated requests.
 
@@ -245,6 +247,7 @@ def _stub_review_execution(
         requests.append(request)
         return ReviewLoopOutcome(
             report_markdown=report_markdown,
+            result=result,
             stop_reason=stop_reason,
             error=error,
             produces_report=produces_report,
@@ -1602,6 +1605,40 @@ async def test_direct_uses_passed_session_key_for_review_lookup(tmp_path) -> Non
 
     assert len(requests) == 1
     assert requests[0].session_key == session_key
+
+
+@pytest.mark.asyncio
+async def test_a_review_turn_records_its_result_usage(tmp_path) -> None:
+    """A review turn counts its run's usage once, from the returned result."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    usage = {"prompt_tokens": 21, "completion_tokens": 9, "total_tokens": 30}
+    session_key = "websocket:review-usage"
+    _stub_review_execution(
+        coordinator,
+        result=ReviewResult(
+            run_id=REVIEW_TURN_RUN_ID,
+            session_key=session_key,
+            status=ReviewRunStatus.COMPLETED,
+            handoff=ReviewHandoffState.COMPLETE,
+            usage=usage,
+        ),
+    )
+    admitted = _admit_review_run(coordinator, session_key)
+
+    await coordinator.process_direct(
+        "审查",
+        session_key=session_key,
+        channel="websocket",
+        chat_id="review",
+        metadata={
+            ReviewMetaKey.TARGET: "app.py",
+            ReviewMetaKey.TARGET_TYPE: "local",
+            **admitted,
+        },
+    )
+
+    assert coordinator._last_usage == usage
+    assert coordinator._total_usage["total_tokens"] == 30
 
 
 # ---------------------------------------------------------------------------

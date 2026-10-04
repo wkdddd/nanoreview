@@ -173,6 +173,7 @@ class ConversationLoop:
         ) = None,
         hooks: list[AgentHook] | None = None,
         hooks_getter: Callable[[], list[AgentHook]] | None = None,
+        usage_recorder: Callable[[dict[str, int]], None] | None = None,
     ) -> None:
         self._bus = bus
         self._provider = provider
@@ -200,6 +201,11 @@ class ConversationLoop:
         # Dynamic accessor so the owner (coordinator/SDK) can swap its hook
         # list between turns; falls back to the static list when absent.
         self._hooks_getter = hooks_getter
+        #: In-memory hand-off of each returned run's usage to the owner
+        #: (the coordinator aggregates last/total usage). Reported right after
+        #: the runner returns, so it is independent of whether a reply body was
+        #: delivered and survives a later persistence failure.
+        self._usage_recorder = usage_recorder
         # One loader instance keeps the (package-scan) discovery cache warm;
         # each turn still registers a fresh registry from it.
         self._tool_loader = ToolLoader()
@@ -343,6 +349,11 @@ class ConversationLoop:
         ctx.stop_reason = result.stop_reason
         ctx.had_injections = result.had_injections
         ctx.content_replaced = result.content_replaced
+        # Report the returned run's usage before anything else can fail: the
+        # owner must count it even when the ``message`` tool already sent the
+        # reply (``None`` outbound) and even if persisting this turn fails.
+        if self._usage_recorder is not None:
+            self._usage_recorder(dict(result.usage or {}))
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self._max_iterations)
             if ctx.on_stream and ctx.on_stream_end:

@@ -38,6 +38,7 @@ from nanoreview.agent.coordinator import (
     SessionCoordinator,
     SessionRoute,
 )
+from nanoreview.agent.runner import AgentRunResult, AgentRunSpec
 from nanoreview.bus.queue import MessageBus
 from nanoreview.providers.base import LLMProvider, LLMResponse
 from nanoreview.session.manager import SessionManager
@@ -503,3 +504,120 @@ async def test_finalize_settles_a_run_that_never_started(env: _Env) -> None:
     # A fresh process reads the settled run and its reason from disk.
     reloaded = SessionManager(env.workspace).get_or_create(SESSION_KEY)
     assert reloaded.metadata[ReviewMetaKey.ERROR] == result.error
+
+
+# ---------------------------------------------------------------------------
+# Usage aggregation of returned results
+# ---------------------------------------------------------------------------
+
+
+class _UsageRunner:
+    """Runner stub that returns a fixed usage payload for every run."""
+
+    def __init__(self, usage: dict[str, int]) -> None:
+        self.usage = usage
+        self.runs = 0
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.runs += 1
+        return AgentRunResult(
+            final_content="ok",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+            usage=dict(self.usage),
+        )
+
+
+CONVERSATION_USAGE = {
+    "prompt_tokens": 10,
+    "completion_tokens": 4,
+    "total_tokens": 14,
+}
+
+
+async def _direct(env: _Env, key: str) -> Any:
+    return await env.coordinator.process_direct(
+        "hi", session_key=key, channel="cli", chat_id=key
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_turns_usage_updates_last_and_total(env: _Env) -> None:
+    env.coordinator.conversation_loop._runner = _UsageRunner(CONVERSATION_USAGE)
+
+    await _direct(env, "cli:usage")
+
+    assert env.coordinator._last_usage == CONVERSATION_USAGE
+    assert env.coordinator._total_usage == CONVERSATION_USAGE
+
+
+@pytest.mark.asyncio
+async def test_usage_is_summed_once_per_returned_turn(env: _Env) -> None:
+    """Two turns sum into the total; ``_last_usage`` is the latest turn's."""
+    env.coordinator.conversation_loop._runner = _UsageRunner(
+        {"prompt_tokens": 5, "total_tokens": 5}
+    )
+
+    await _direct(env, "cli:sum")
+    await _direct(env, "cli:sum")
+
+    assert env.coordinator._last_usage == {"prompt_tokens": 5, "total_tokens": 5}
+    assert env.coordinator._total_usage["prompt_tokens"] == 10
+    assert env.coordinator._total_usage["total_tokens"] == 10
+
+
+@pytest.mark.asyncio
+async def test_usage_is_recorded_even_when_no_reply_body_is_sent(
+    env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``None`` outbound (the reply went out through a tool) keeps its usage."""
+    loop = env.coordinator.conversation_loop
+    loop._runner = _UsageRunner(CONVERSATION_USAGE)
+    monkeypatch.setattr(loop, "_assemble_outbound", lambda *a, **k: None)
+
+    result = await _direct(env, "cli:nobody")
+
+    assert result is None
+    assert env.coordinator._last_usage == CONVERSATION_USAGE
+    assert env.coordinator._total_usage == CONVERSATION_USAGE
+
+
+@pytest.mark.asyncio
+async def test_a_failed_turn_save_keeps_the_returned_usage(env: _Env) -> None:
+    """Usage is recorded as the run returns, so a later save failure cannot
+    wipe it — the turn's answer was already produced and paid for."""
+    env.coordinator.conversation_loop._runner = _UsageRunner(CONVERSATION_USAGE)
+    original_save = env.sessions.save
+    calls = {"n": 0}
+
+    def _flaky_save(session: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] > 1:  # the early user-message write still succeeds
+            raise OSError("disk full (injected)")
+        original_save(session)
+
+    env.sessions.save = _flaky_save  # type: ignore[method-assign]
+    try:
+        with pytest.raises(OSError):
+            await _direct(env, "cli:savefail")
+    finally:
+        env.sessions.save = original_save  # type: ignore[method-assign]
+
+    assert env.coordinator._last_usage == CONVERSATION_USAGE
+    assert env.coordinator._total_usage == CONVERSATION_USAGE
+
+
+@pytest.mark.asyncio
+async def test_a_review_runs_usage_is_recorded_once(env: _Env) -> None:
+    """The run's single terminal result carries reviewers + judge + planner."""
+    state = _live_run(env)
+    state.add_usage({"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40})
+
+    result = await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.STOPPED)
+
+    assert result is not None
+    assert env.coordinator._last_usage == {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}
+    assert env.coordinator._total_usage["total_tokens"] == 40
+
+    # The run is terminal: settling again yields nothing and adds nothing.
+    assert await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.STOPPED) is None
+    assert env.coordinator._total_usage["total_tokens"] == 40
