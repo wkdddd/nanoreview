@@ -16,7 +16,8 @@ from typing import Any
 
 import pytest
 
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.review_loop import ReviewLoopOutcome
 from nanoreview.agent.review_state import (
     JudgeBatchState,
     ReviewPhase,
@@ -72,9 +73,9 @@ class _DummyProvider(LLMProvider):
         return "dummy"
 
 
-def _review_session_loop(tmp_path: Path, *, status: str) -> AgentLoop:
+def _review_session_loop(tmp_path: Path, *, status: str) -> SessionCoordinator:
     """Build a loop whose persisted session carries a review status."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     session.add_message("user", "review this repo")
     session.add_message("assistant", "## Code Review Report")
@@ -95,7 +96,7 @@ def _ordinary_message() -> InboundMessage:
     )
 
 
-async def _drain_outbound(loop: AgentLoop) -> list[Any]:
+async def _drain_outbound(loop: SessionCoordinator) -> list[Any]:
     events = []
     while loop.bus.outbound_size:
         events.append(await loop.bus.consume_outbound())
@@ -118,7 +119,7 @@ def _gate_codes(events: list[Any]) -> list[str]:
 @pytest.mark.asyncio
 async def test_running_review_rejects_follow_up_without_persisting(tmp_path) -> None:
     """While a review runs, ordinary messages are refused and write nothing."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     state = ReviewRunState(
         run_id="run-live",
         session_key=REVIEW_SESSION_KEY,
@@ -150,7 +151,7 @@ async def test_running_review_rejects_follow_up_without_persisting(tmp_path) -> 
 
 
 def test_running_gate_passes_only_the_admitted_turn(tmp_path) -> None:
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     state = ReviewRunState(
         run_id="run-live",
         session_key=REVIEW_SESSION_KEY,
@@ -190,7 +191,7 @@ def test_running_gate_passes_only_the_admitted_turn(tmp_path) -> None:
 
 
 def _terminal_run(
-    loop: AgentLoop,
+    loop: SessionCoordinator,
     *,
     status: ReviewRunStatus = ReviewRunStatus.COMPLETED,
     report_ref: str | None = None,
@@ -215,7 +216,7 @@ def _terminal_run(
 @pytest.mark.asyncio
 async def test_terminal_review_opens_conversation_and_injects_handoff(tmp_path) -> None:
     """A finished review routes to conversation and injects its handoff."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     _terminal_run(loop)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     messages_before = len(session.messages)
@@ -257,7 +258,7 @@ async def test_interrupted_run_is_normalized_and_session_reopens(tmp_path) -> No
     assert loop.review_loop.get(REVIEW_SESSION_KEY) is None
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
 
-    assert loop.review_coordinator.route(session) is SessionRoute.CONVERSATION
+    assert loop.route(session) is SessionRoute.CONVERSATION
     assert session.metadata[ReviewMetaKey.STATUS] == "error"
 
     await loop._dispatch(_ordinary_message())
@@ -271,7 +272,7 @@ async def test_interrupted_run_is_normalized_and_session_reopens(tmp_path) -> No
 @pytest.mark.asyncio
 async def test_second_review_turn_is_refused_after_terminal(tmp_path) -> None:
     """A review session never starts a second review, terminal or not."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     _terminal_run(loop)
     second = InboundMessage(
         channel="cli",
@@ -296,7 +297,7 @@ async def test_second_review_turn_is_refused_after_terminal(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_unadmitted_review_turn_registers_no_run(tmp_path, monkeypatch) -> None:
     """A review turn that never went through admission is refused."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     session.add_message("user", "hello")
     loop.sessions.save(session)
@@ -306,7 +307,7 @@ async def test_unadmitted_review_turn_registers_no_run(tmp_path, monkeypatch) ->
         executed.append(msg.content)
         return None
 
-    monkeypatch.setattr(loop, "_process_message", _fake_process)
+    monkeypatch.setattr(loop.conversation_loop, "process_message", _fake_process)
     msg = InboundMessage(
         channel="cli",
         sender_id="user",
@@ -331,7 +332,7 @@ async def test_unadmitted_review_turn_registers_no_run(tmp_path, monkeypatch) ->
 
 def test_gate_leaves_internal_events_and_plain_sessions_alone(tmp_path) -> None:
     """The gate must stay conditional, or commands and subagent results break."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     _terminal_run(loop)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     msg = _ordinary_message()
@@ -344,13 +345,13 @@ def test_gate_leaves_internal_events_and_plain_sessions_alone(tmp_path) -> None:
         session_key_override=REVIEW_SESSION_KEY,
         metadata={"injected_event": "subagent_result"},
     )
-    assert loop.review_coordinator.gate_message(internal, None, internal.content) is None
+    assert loop.gate_message(internal, None, internal.content) is None
 
     plain_session = loop.sessions.get_or_create("cli:no-review")
-    assert loop.review_coordinator.gate_message(msg, None, msg.content) is None
-    assert loop.review_coordinator.gate_review_turn("cli:no-review", msg, None) is None
-    assert loop.review_coordinator.route(plain_session) is SessionRoute.CONVERSATION
-    assert loop.review_coordinator.pending_handoff(plain_session) is None
+    assert loop.gate_message(msg, None, msg.content) is None
+    assert loop.gate_review_turn("cli:no-review", msg, None) is None
+    assert loop.route(plain_session) is SessionRoute.CONVERSATION
+    assert loop.pending_handoff(plain_session) is None
 
     # A live run made by another session must not leak into this one.
     assert session.key == REVIEW_SESSION_KEY
@@ -361,7 +362,7 @@ def test_gate_leaves_internal_events_and_plain_sessions_alone(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _live_run(loop: AgentLoop) -> ReviewRunState:
+def _live_run(loop: SessionCoordinator) -> ReviewRunState:
     state = ReviewRunState(
         run_id="run-cancel",
         session_key=REVIEW_SESSION_KEY,
@@ -382,7 +383,7 @@ def _live_run(loop: AgentLoop) -> ReviewRunState:
 @pytest.mark.asyncio
 async def test_stopped_run_marks_inflight_reviewer_and_judge_stopped(tmp_path) -> None:
     """/stop finalizes the run; unfinished work is ``stopped``, never completed."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     state = _live_run(loop)
 
     await loop._finalize_review_run(REVIEW_SESSION_KEY, ReviewRunStatus.STOPPED)
@@ -398,13 +399,13 @@ async def test_stopped_run_marks_inflight_reviewer_and_judge_stopped(tmp_path) -
     persisted = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     assert persisted.metadata[ReviewMetaKey.STATUS] == "stopped"
     # And the session immediately routes to conversation.
-    assert loop.review_coordinator.route(persisted) is SessionRoute.CONVERSATION
+    assert loop.route(persisted) is SessionRoute.CONVERSATION
 
 
 @pytest.mark.asyncio
 async def test_error_run_marks_inflight_reviewer_and_judge_error(tmp_path) -> None:
     """A failed finalize (e.g. artifact write) records in-flight work as error."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     state = _live_run(loop)
 
     await loop._finalize_review_run(
@@ -423,7 +424,7 @@ async def test_error_run_marks_inflight_reviewer_and_judge_error(tmp_path) -> No
 @pytest.mark.asyncio
 async def test_unstarted_run_is_released_instead_of_finalized(tmp_path) -> None:
     """A run that never reached planning releases the gate instead of closing."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     state = ReviewRunState(
         run_id="run-unstarted",
         session_key=REVIEW_SESSION_KEY,
@@ -436,19 +437,19 @@ async def test_unstarted_run_is_released_instead_of_finalized(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Admission boundary wired through AgentLoop
+# Admission boundary wired through SessionCoordinator
 # ---------------------------------------------------------------------------
 
 
-def _admission_loop(tmp_path: Path) -> tuple[AgentLoop, Path]:
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+def _admission_loop(tmp_path: Path) -> tuple[SessionCoordinator, Path]:
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     target = tmp_path / "admitted-pkg"
     target.mkdir()
     (target / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
     return loop, target
 
 
-def _admit(loop: AgentLoop, target: Path, session_key: str = REVIEW_SESSION_KEY):
+def _admit(loop: SessionCoordinator, target: Path, session_key: str = REVIEW_SESSION_KEY):
     return loop.admit_review(
         ReviewAdmissionRequest(
             target=str(target),
@@ -506,12 +507,12 @@ async def test_admitted_turn_reaches_processing_without_reregistering(
     admission = _admit(loop, target)
     executed: list[str | None] = []
 
-    async def _fake_process(msg, **kwargs):
+    async def _fake_execute(request):
         state = loop.review_loop.get(REVIEW_SESSION_KEY)
         executed.append(state.run_id if state else None)
-        return None
+        return ReviewLoopOutcome(report_markdown="ok", produces_report=False)
 
-    monkeypatch.setattr(loop, "_process_message", _fake_process)
+    monkeypatch.setattr(loop.review_loop, "execute", _fake_execute)
     msg = InboundMessage(
         channel="cli",
         sender_id="user",
@@ -584,7 +585,7 @@ def test_status_and_stop_stay_available_during_a_running_review(tmp_path) -> Non
 
 
 def test_commands_are_untouched_outside_review_sessions(tmp_path) -> None:
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     session = loop.sessions.get_or_create("cli:plain")
 
     assert loop._review_command_gate(session, _ordinary_message(), "/new") is None
@@ -617,7 +618,7 @@ async def test_stop_settles_a_leftover_run_without_an_active_turn(tmp_path) -> N
 @pytest.mark.asyncio
 async def test_stop_settle_is_a_noop_without_a_live_run(tmp_path) -> None:
     """A plain session (no live run) settles nothing and returns None."""
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
 
     assert await loop._settle_review_run_after_stop("cli:plain") is None
 

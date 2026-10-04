@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.review_state import (
     REVIEW_TERMINAL_STATUSES,
     JudgeBatchState,
@@ -55,6 +56,7 @@ from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
+from nanoreview.bus.events import InboundMessage
 from nanoreview.review.admission import (
     ReviewAdmission,
     register_review_run,
@@ -76,6 +78,7 @@ from nanoreview.review.types import (
 
 if TYPE_CHECKING:
     from nanoreview.agent.subagent import SubagentManager
+    from nanoreview.providers.base import LLMProvider
     from nanoreview.review.output.judge import ReviewJudge
     from nanoreview.session.manager import Session, SessionManager
 
@@ -92,6 +95,9 @@ _ERROR_REPORT_HEADER = "## Code Review Report\n\n### Error"
 #: Placeholder for "key absent" when snapshotting session metadata before a
 #: terminal write, so a failed save can restore the exact previous state.
 _ABSENT = object()
+
+#: Session metadata flag marking a review turn whose user message is persisted.
+_PENDING_USER_TURN_KEY = "pending_user_turn"
 
 #: Session metadata cleared when a review session is reset via ``/new``.
 _RESET_METADATA_KEYS = (
@@ -166,23 +172,34 @@ def validation_repository_root(plan: ReviewPlan, fallback: Path) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ReviewTurnRequest:
-    """Minimal context ``AgentLoop`` hands to :meth:`ReviewLoop.execute`.
+    """Minimal context the coordinator hands to :meth:`ReviewLoop.execute`.
 
-    The loop owns transport and turn persistence; it passes the admitted turn's
-    messages plus two callbacks that stay with the loop (progress publication
-    and subagent-result persistence). Everything review-domain — plan, evidence,
-    prompt, execution context — is resolved inside ``ReviewLoop``.
+    The coordinator admits the turn, routes and gates it, then hands over the
+    admitted :class:`InboundMessage` plus the live session. ``ReviewLoop`` owns
+    the whole review turn from there: it builds the review context (system
+    prompt + ``COMMON_RULES`` via ``ContextBuilder``), persists the user
+    message, resolves plan/evidence/execution and returns the report outcome.
     """
 
     session_key: str
     session: "Session | None"
-    messages: list[dict[str, Any]]
+    msg: InboundMessage
     metadata: dict[str, Any]
-    channel: str
-    chat_id: str
-    message_id: str | None = None
     progress_callback: Callable[..., Awaitable[None]] | None = None
     result_callback: Callable[[Any], Awaitable[None]] | None = None
+
+    @property
+    def channel(self) -> str:
+        return self.msg.channel
+
+    @property
+    def chat_id(self) -> str:
+        return self.msg.chat_id
+
+    @property
+    def message_id(self) -> str | None:
+        metadata = self.msg.metadata if isinstance(self.msg.metadata, dict) else {}
+        return metadata.get("message_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +252,8 @@ class ReviewLoop:
         subagents: "SubagentManager",
         model: str,
         max_tool_result_chars: int,
+        context_builder: ContextBuilder | None = None,
+        max_messages: int = 120,
         max_concurrent_subagents: int = 4,
         context_window_tokens: int | None = None,
         judge_factory: Callable[[], "ReviewJudge | None"] | None = None,
@@ -247,6 +266,8 @@ class ReviewLoop:
         self._subagents = subagents
         self._model = model
         self._max_tool_result_chars = max_tool_result_chars
+        self._context = context_builder or ContextBuilder(self._workspace)
+        self._max_messages = max_messages if max_messages > 0 else 120
         self._max_concurrent_subagents = int(max_concurrent_subagents or 1)
         self._context_window_tokens = context_window_tokens
         self._judge_factory = judge_factory
@@ -267,6 +288,22 @@ class ReviewLoop:
     @property
     def artifacts(self) -> ReviewArtifactStore:
         return self._artifacts
+
+    def set_runtime_model(
+        self,
+        provider: "LLMProvider",
+        model: str,
+        context_window_tokens: int | None,
+    ) -> None:
+        """Swap the model/window used by future review turns.
+
+        The provider itself is shared through the coordinator's runner and
+        subagents; the loop only tracks the model id and context window that
+        its token estimates and subagent task construction depend on.
+        """
+        self._model = model
+        if context_window_tokens is not None:
+            self._context_window_tokens = context_window_tokens
 
     def get(self, session_key: str) -> ReviewRunState | None:
         return self.runs.get(session_key)
@@ -363,6 +400,8 @@ class ReviewLoop:
             return await self._abort(
                 request, run_state, f"{type(exc).__name__}: {exc}"
             )
+        finally:
+            self._release_inflight_marker(request)
         # The artifact decides success: a run whose report could not be
         # persisted must never be handed over as a complete review.
         if run_state.report_ref is None:
@@ -418,6 +457,96 @@ class ReviewLoop:
             produces_report=True,
         )
 
+    # -- review turn context ------------------------------------------------
+
+    def _review_messages(
+        self, request: ReviewTurnRequest, session: "Session | None"
+    ) -> list[dict[str, Any]]:
+        """Build the review turn's frozen/working context from the session.
+
+        The review agent shares the conversation agent's ``ContextBuilder``
+        (system prompt, ``COMMON_RULES``, skills), but keeps its own review task
+        envelope. History is read *before* the user message is persisted so the
+        current message is not replayed twice in the same request.
+        """
+        msg = request.msg
+        history: list[dict[str, Any]] = []
+        if session is not None:
+            history = [
+                m
+                for m in session.get_history(
+                    max_messages=self._max_messages,
+                    max_tokens=self._replay_token_budget(),
+                    include_timestamps=True,
+                )
+                if m.get("_metadata", {}).get("injected_event")
+                != "subagent_result"
+            ]
+        frozen, working = self._context.build_partitioned_messages(
+            history=history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=str(
+                (msg.metadata or {}).get("context_chat_id") or msg.chat_id
+            ),
+            sender_id=msg.sender_id,
+            session_metadata=session.metadata if session is not None else None,
+        )
+        if session is not None:
+            self._persist_review_user_message(session, msg)
+        return [*frozen, *working]
+
+    def _persist_review_user_message(
+        self, session: "Session", msg: InboundMessage
+    ) -> bool:
+        """Persist the review turn's user message and mark the turn in flight."""
+        media_paths = [p for p in (msg.media or []) if isinstance(p, str) and p]
+        has_text = isinstance(msg.content, str) and msg.content.strip()
+        if not (has_text or media_paths):
+            return False
+        extra: dict[str, Any] = {"media": list(media_paths)} if media_paths else {}
+        text = msg.content if isinstance(msg.content, str) else ""
+        session.add_message("user", text, **extra)
+        session.metadata[_PENDING_USER_TURN_KEY] = True
+        self._sessions.save(session)
+        return True
+
+    def _clear_pending_user_turn(self, session: "Session") -> None:
+        session.metadata.pop(_PENDING_USER_TURN_KEY, None)
+
+    def _release_inflight_marker(self, request: ReviewTurnRequest) -> None:
+        """Clear the in-flight user-turn marker once the review turn is done.
+
+        Whether the run completed, failed or was cancelled, the review turn is
+        over: leaving the marker set would make the next turn append a spurious
+        "turn interrupted" placeholder. Best-effort — the marker is a recovery
+        hint, not authoritative state.
+        """
+        session = request.session
+        if session is None:
+            return
+        try:
+            if session.metadata.pop(_PENDING_USER_TURN_KEY, None) is not None:
+                self._sessions.save(session)
+        except Exception:  # pragma: no cover - defensive, recovery hint only
+            logger.debug(
+                "review.run.pending_marker.clear_failed session={}",
+                request.session_key,
+                exc_info=True,
+            )
+
+    def _replay_token_budget(self) -> int:
+        """Derive a token budget for session history replay from the window."""
+        if not self._context_window_tokens or self._context_window_tokens <= 0:
+            return 0
+        budget = self._context_window_tokens - 4096 - 1024
+        return (
+            budget
+            if budget > 0
+            else max(128, self._context_window_tokens // 2)
+        )
+
     async def _prepare_review(
         self, request: ReviewTurnRequest, run_state: ReviewRunState
     ) -> _ReviewInputs:
@@ -445,8 +574,12 @@ class ReviewLoop:
         if evidence_provider is not None:
             review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = evidence_provider
 
+        # The review turn's frozen/working context is built once here: the
+        # planner consumes it, and the reviewer agent's message list is derived
+        # from the same build so the user message is persisted exactly once.
+        review_messages = self._review_messages(request, session)
         preparation = await prepare_code_review_context(
-            list(request.messages),
+            review_messages,
             review_meta,
             progress_callback=request.progress_callback,
         )
@@ -471,7 +604,7 @@ class ReviewLoop:
                 if key != ReviewMetaKey.EVIDENCE_PROVIDER
             },
         }
-        coordinator_messages = [dict(message) for message in request.messages]
+        coordinator_messages = [dict(message) for message in review_messages]
         if preparation.prompt:
             # The reviewer system prompt belongs to the frozen envelope: it is
             # part of the task definition and must never be summarized.

@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import ReviewConfig
 from nanoreview.providers.base import LLMProvider, LLMResponse
@@ -32,8 +32,8 @@ def _make_loop(
     *,
     review_config: ReviewConfig | None = None,
     default_reasoning_effort: str | None = None,
-) -> AgentLoop:
-    return AgentLoop(
+) -> SessionCoordinator:
+    return SessionCoordinator(
         MessageBus(),
         _DummyProvider(),
         tmp_path,

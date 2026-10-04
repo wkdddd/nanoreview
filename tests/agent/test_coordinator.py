@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -38,10 +38,32 @@ from nanoreview.agent.coordinator import (
     SessionCoordinator,
     SessionRoute,
 )
+from nanoreview.bus.queue import MessageBus
+from nanoreview.providers.base import LLMProvider, LLMResponse
 from nanoreview.session.manager import SessionManager
 
 SESSION_KEY = "cli:review"
 REPORT_MARKDOWN = "## Code Review Report\n\nNo actionable issues found."
+
+
+class _DummyProvider(LLMProvider):
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        _ = (messages, tools, model, max_tokens, temperature, reasoning_effort)
+        _ = (tool_choice, response_format)
+        return LLMResponse(content="ok")
+
+    def get_default_model(self) -> str:
+        return "dummy"
 
 
 @dataclass
@@ -55,26 +77,17 @@ class _Env:
 @pytest.fixture
 def env(tmp_path: Path) -> _Env:
     sessions = SessionManager(tmp_path)
-    review_loop = ReviewLoop(
-        workspace=tmp_path,
-        sessions=sessions,
-        # Routing, handoff, and indexing never execute a run, so the executor
-        # dependencies are intentionally absent.
-        runner=cast(Any, None),
-        subagents=cast(Any, None),
-        model="dummy",
-        max_tool_result_chars=4000,
-    )
     coordinator = SessionCoordinator(
-        sessions=sessions,
-        workspace=tmp_path,
-        review_loop=review_loop,
+        MessageBus(),
+        _DummyProvider(),
+        tmp_path,
         context_window_tokens=200_000,
         reserved_output_tokens=4096,
+        session_manager=sessions,
     )
     return _Env(
         sessions=sessions,
-        review_loop=review_loop,
+        review_loop=coordinator.review_loop,
         coordinator=coordinator,
         workspace=tmp_path,
     )
@@ -370,11 +383,12 @@ def test_an_oversized_report_rejects_the_first_turn(env: _Env) -> None:
     _register(env, state)
     session = env.sessions.get_or_create(SESSION_KEY)
     coordinator = SessionCoordinator(
-        sessions=env.sessions,
-        workspace=env.workspace,
-        review_loop=env.review_loop,
+        MessageBus(),
+        _DummyProvider(),
+        env.workspace,
         context_window_tokens=8_192,
         reserved_output_tokens=4_096,
+        session_manager=env.sessions,
     )
 
     handoff = coordinator.pending_handoff(session)
@@ -395,10 +409,11 @@ def test_an_unknown_context_window_never_blocks_a_handoff(env: _Env) -> None:
     _terminal_completed(env)
     session = env.sessions.get_or_create(SESSION_KEY)
     coordinator = SessionCoordinator(
-        sessions=env.sessions,
-        workspace=env.workspace,
-        review_loop=env.review_loop,
+        MessageBus(),
+        _DummyProvider(),
+        env.workspace,
         context_window_tokens=0,
+        session_manager=env.sessions,
     )
 
     handoff = coordinator.pending_handoff(session)

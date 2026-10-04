@@ -398,10 +398,13 @@ def _request(**overrides: Any) -> ReviewTurnRequest:
     params: dict[str, Any] = {
         "session_key": SESSION_KEY,
         "session": None,
-        "messages": [{"role": "system", "content": "plan"}],
+        "msg": InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="review",
+            content="Review target",
+        ),
         "metadata": {},
-        "channel": "cli",
-        "chat_id": "review",
     }
     params.update(overrides)
     return ReviewTurnRequest(**params)

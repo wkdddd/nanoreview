@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.bus.queue import MessageBus
 from nanoreview.providers.base import LLMProvider, LLMResponse
 from nanoreview.review import (
@@ -268,7 +268,7 @@ def test_max_severity_and_order() -> None:
 
 
 def test_code_review_is_not_registered_as_a_tool(tmp_path) -> None:
-    loop = AgentLoop(MessageBus(), DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
 
     assert "code_review" not in loop.tool_names
     assert "github_repo_read" not in loop.tool_names

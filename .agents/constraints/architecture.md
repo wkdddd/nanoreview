@@ -2,14 +2,14 @@
 
 ## 当前链路
 
-本节基于主工作区 `850aeb6b` 之上的当前实现（含 ReviewLoop 收敛改动）；候选分支与目标方案不等于已落地实现。
+本节基于主工作区 `850aeb6b` 之上的当前实现（含 Conversation Agent 收敛改动：`AgentLoop` 已并入 `SessionCoordinator` 并删除）；候选分支与目标方案不等于已落地实现。
 
-`channels -> MessageBus -> AgentLoop(SessionCoordinator) -> AgentRunner / ReviewLoop -> MessageBus -> channels`
+`channels -> MessageBus -> SessionCoordinator -> AgentRunner / ReviewLoop -> MessageBus -> channels`
 
-- `agent/loop.py`：消息与 turn 编排、session/context、取消和结果交付；review 与 conversation 的准入、路由和门禁已委托给 `agent/coordinator.py`。对已准入的 review turn 只构造 `ReviewTurnRequest` 并交给 `ReviewLoop`，不写 review 状态。
-- `agent/review_loop.py`：一次 review run 的唯一 supervisor——准备、计划、reviewer/Judge 执行、报告持久化、资源清理与终态写入，内部按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序执行；同时拥有状态迁移和结构化结果。
-- `agent/coordinator.py`：进程级路由与门禁（准入调用、session 路由、命令门禁、review→conversation 交接与索引）；不调用模型、不执行工具、不建立独立持久化状态机。
-- `agent/conversation_loop.py`：conversation 阶段的输入/输出契约占位，无执行。
+- `agent/coordinator.py`：进程运行时与唯一决策点——MessageBus 接收/发送、per-session 串行与有界 pending 队列、命令分发、权限响应、取消调度、review/conversation 路由与门禁、handoff 准备与结果发布。自身不调用模型、不执行工具、不写对话历史：review turn 整体交给 `ReviewLoop`，conversation turn 交给 `ConversationLoop`。
+- `agent/review_loop.py`：一次 review run 的唯一 supervisor——准备、计划、reviewer/Judge 执行、用户消息与报告持久化、资源清理与终态写入，内部按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序执行；同时拥有状态迁移和结构化结果。
+- `agent/conversation_loop.py`：一个完整 conversation turn——读取 session/历史、消费 handoff、构建 frozen/working 上下文与 per-turn 核心 `ToolRegistry`、单次 `AgentRunner` 运行、历史持久化与回复组装；不含 `local_review`/`github_review`。
+- `agent/handoff.py`：review → conversation 交接值对象（`ReviewHandoff`）及其唯一一次 session 写入（`consume_handoff`），供 coordinator 与 conversation_loop 共享而不互相导入。
 - `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
 - `agent/subagent.py`：子代理任务生命周期；`agent/review_state.py`：run 状态、fingerprint 与报告 artifact。
 - `review/`：`admission.py` 准入边界，`result.py` 终态结果与交接渲染，`input/`、`planning/`、`source/`、`output/` 输入、证据、源码、finding 校验、Judge 与报告领域逻辑。
@@ -21,8 +21,8 @@
 
 ## 本地 review 准入
 
-- `review/admission.py` 是 WebUI、结构化 API、CLI 共用的准入边界，transport 只做协议解析、交付和状态读取；`AgentLoop.admit_review` 是各入口调用的唯一入口。
-- 准入按「校验 → 快照 → 注册」一次完成：`ReviewAdmissionService.admit` 校验本地目标与 scope、采集相对 `HEAD` 的净 diff（`review/input/local_git.py`）、写入输入快照（`review/input/snapshot.py`），并持久化 session 导航 metadata；`AgentLoop` 随后注册 `ReviewRunState`。
+- `review/admission.py` 是 WebUI、结构化 API、CLI 共用的准入边界，transport 只做协议解析、交付和状态读取；`SessionCoordinator.admit_review` 是各入口调用的唯一入口。
+- 准入按「校验 → 快照 → 注册」一次完成：`ReviewAdmissionService.admit` 校验本地目标与 scope、采集相对 `HEAD` 的净 diff（`review/input/local_git.py`）、写入输入快照（`review/input/snapshot.py`），并持久化 session 导航 metadata；`SessionCoordinator` 随后注册 `ReviewRunState`。
 - 拒绝是原子的：抛出 `ReviewAdmissionError`（稳定 `code` + HTTP `status`），不写 session、不建 run、不落快照、不留历史。重复提交同一 session 返回 `duplicate_review`。
 - 执行只读 `review_run_id` 对应的 run；准入 turn 以 `_review_admitted` 标记放行。
 - 远端 GitHub 目标本轮仍走既有计划路径，不做本地校验。

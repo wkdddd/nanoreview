@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import (
@@ -116,7 +116,7 @@ class RecordingRunner:
 
 
 class StubPlanProvider(LLMProvider):
-    """Minimal provider so an ``AgentLoop`` can be constructed in tests."""
+    """Minimal provider so an ``SessionCoordinator`` can be constructed in tests."""
 
     async def chat(
         self,
@@ -828,7 +828,7 @@ async def test_judge_permanently_invalid_arguments_fail_the_batch() -> None:
 
 async def test_judge_ignores_configured_model_preset(tmp_path: Path) -> None:
     """``review.judge.model_preset`` must not fork the judge onto another model."""
-    loop = AgentLoop(
+    loop = SessionCoordinator(
         MessageBus(),
         StubPlanProvider(),
         tmp_path,
@@ -854,7 +854,7 @@ async def test_judge_ignores_configured_model_preset(tmp_path: Path) -> None:
 
 async def test_judge_disabled_setting_yields_no_judge(tmp_path: Path) -> None:
     """A disabled judge keeps its original meaning: no judge object at all."""
-    loop = AgentLoop(
+    loop = SessionCoordinator(
         MessageBus(),
         StubPlanProvider(),
         tmp_path,

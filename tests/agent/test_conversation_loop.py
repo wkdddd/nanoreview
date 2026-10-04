@@ -1,41 +1,87 @@
-"""Contract tests for the reserved ConversationLoop boundary.
+"""Contract tests for the real ``ConversationLoop``.
 
-The module is a placeholder: it freezes the conversation phase's input/output
-shape before any of its execution exists. These tests pin two things the
-review side is already built against:
+``ConversationLoop`` owns one complete conversation turn: session/history,
+handoff consumption, frozen/working context, a core-only ``ToolRegistry``, one
+``AgentRunner`` run, history persistence and reply assembly. These tests pin the
+boundary the coordinator and the review side rely on:
 
-* the boundary stays **execution-free** — no runner, no provider, no loop, only
-  the two frozen dataclasses and one pure helper, so a later phase cannot
-  accidentally start executing through it;
-* the shapes are immutable and carry the review association *by reference*,
-  never the report artifact contents, so the conversation side cannot rewrite
-  the authoritative report or the review run state.
+* the conversation core never sees the review-only tools (``local_review`` /
+  ``github_review``);
+* one turn runs exactly one runner and persists the user/assistant history;
+* the review handoff is consumed *once*, as a replayable history message, and
+  the report artifact is never copied into session metadata;
+* ``set_runtime_model`` moves the model id and context window for later turns.
 """
 
 from __future__ import annotations
 
-import ast
-import inspect
-from dataclasses import FrozenInstanceError
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-import nanoreview.agent.conversation_loop as boundary
 from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
-    ConversationTurnRequest,
-    ConversationTurnResult,
-    review_context_for,
+    ConversationLoop,
 )
+from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.handoff import REVIEW_HANDOFF_EVENT, ReviewHandoff
 from nanoreview.agent.review_state import ReviewRunStatus
+from nanoreview.agent.runner import AgentRunResult, AgentRunSpec
+from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.bus.events import InboundMessage
+from nanoreview.bus.queue import MessageBus
+from nanoreview.providers.base import LLMProvider, LLMResponse
 from nanoreview.review.result import ReviewHandoffState, ReviewResult
-from nanoreview.agent.coordinator import ReviewHandoff
+from nanoreview.review.types import ReviewMetaKey
 
 REPORT_REF = "review-artifacts/run-a.json"
 
 
-def _result() -> ReviewResult:
-    return ReviewResult(
+class DummyProvider(LLMProvider):
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        _ = (tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
+        _ = response_format
+        return LLMResponse(content="ok")
+
+    def get_default_model(self) -> str:
+        return "dummy"
+
+
+class SpecCapturingRunner:
+    def __init__(self) -> None:
+        self.specs: list[AgentRunSpec] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        return AgentRunResult(
+            final_content="ok",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+        )
+
+
+def _loop(tmp_path: Path) -> ConversationLoop:
+    return SessionCoordinator(MessageBus(), DummyProvider(), tmp_path).conversation_loop
+
+
+def _msg(content: str = "hello", *, chat_id: str = "direct") -> InboundMessage:
+    return InboundMessage(
+        channel="cli", sender_id="user", chat_id=chat_id, content=content
+    )
+
+
+def _handoff() -> ReviewHandoff:
+    result = ReviewResult(
         run_id="run-a",
         session_key="cli:review",
         status=ReviewRunStatus.COMPLETED,
@@ -43,98 +89,85 @@ def _result() -> ReviewResult:
         report_ref=REPORT_REF,
         coverage=("security",),
     )
+    return ReviewHandoff(
+        result=result, report_markdown="## Report\n\nNo issues.", fits=True
+    )
 
 
 def test_the_pending_cap_is_the_documented_bound() -> None:
     assert MAX_PENDING_CONVERSATION_MESSAGES == 20
 
 
-def test_the_boundary_exposes_no_execution() -> None:
-    """Only the contract lives here: adding a runner here is a phase-3 change."""
-    defined = {
-        name
-        for name, value in vars(boundary).items()
-        if not name.startswith("_")
-        and (inspect.isclass(value) or inspect.isfunction(value))
-        and getattr(value, "__module__", None) == boundary.__name__
-    }
+@pytest.mark.asyncio
+async def test_review_tools_are_excluded_from_the_conversation_turn(tmp_path) -> None:
+    loop = _loop(tmp_path)
+    runner = SpecCapturingRunner()
+    loop._runner = runner
 
-    assert set(boundary.__all__) == {
-        "MAX_PENDING_CONVERSATION_MESSAGES",
-        "ConversationTurnRequest",
-        "ConversationTurnResult",
-        "review_context_for",
-    }
-    assert defined == {
-        "ConversationTurnRequest",
-        "ConversationTurnResult",
-        "review_context_for",
-    }
-    assert {
-        name for name in defined if inspect.isfunction(getattr(boundary, name))
-    } == {"review_context_for"}
-
-    # The boundary pulls in nothing that could execute a turn: the review-side
-    # types are imported only under ``TYPE_CHECKING``, so a runtime import here
-    # would already be a phase-3 change.
-    tree = ast.parse(inspect.getsource(boundary))
-    runtime_imports: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, ast.ImportFrom):
-            runtime_imports.add(node.module or "")
-        elif isinstance(node, ast.Import):
-            runtime_imports.update(alias.name for alias in node.names)
-    assert runtime_imports == {"__future__", "dataclasses", "typing"}
-
-
-def test_a_turn_request_defaults_to_no_handoff() -> None:
-    """The handoff is populated only for the first turn after a review."""
-    request = ConversationTurnRequest(session_key="cli:review", content="hello")
-
-    assert request.handoff is None
-    assert request.media == ()
-    assert request.metadata == {}
-
-
-def test_turn_dataclasses_are_immutable_and_do_not_share_defaults() -> None:
-    request = ConversationTurnRequest(session_key="cli:review", content="hello")
-    other = ConversationTurnRequest(session_key="cli:review", content="again")
-    request.metadata["message_id"] = "m-1"
-
-    assert other.metadata == {}
-    with pytest.raises(FrozenInstanceError):
-        request.content = "changed"  # type: ignore[misc]
-
-    outcome = ConversationTurnResult(
-        session_key="cli:review", conversation_turn_id="t-1"
+    await loop.process_message(
+        _msg(), session_key="cli:direct", turn_id="t1", target_root=tmp_path
     )
-    assert outcome.repairs == ()
-    with pytest.raises(FrozenInstanceError):
-        outcome.final_content = "changed"  # type: ignore[misc]
+
+    assert len(runner.specs) == 1
+    tools = runner.specs[0].tools
+    assert isinstance(tools, ToolRegistry)
+    assert not tools.has("local_review")
+    assert not tools.has("github_review")
+    # The ordinary conversation tools stay available.
+    assert tools.has("read_file")
+    assert tools.has("spawn")
 
 
-def test_a_turn_request_accepts_the_coordinator_handoff() -> None:
-    handoff = ReviewHandoff(result=_result(), report_markdown="## Report", fits=True)
+@pytest.mark.asyncio
+async def test_a_conversation_turn_persists_history_and_returns_a_reply(
+    tmp_path,
+) -> None:
+    loop = _loop(tmp_path)
 
-    request = ConversationTurnRequest(
+    response = await loop.process_message(
+        _msg("hello there"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+    )
+
+    assert response is not None
+    assert response.content == "ok"
+    session = loop._sessions.get_or_create("cli:direct")
+    roles = [message.get("role") for message in session.messages]
+    assert roles == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_the_handoff_is_consumed_once_and_by_reference(tmp_path) -> None:
+    loop = _loop(tmp_path)
+    handoff = _handoff()
+
+    await loop.process_message(
+        _msg("follow-up"),
         session_key="cli:review",
-        content="follow-up",
+        turn_id="t1",
+        target_root=tmp_path,
         handoff=handoff,
     )
 
-    assert request.handoff is handoff
-    assert request.handoff.block
-    assert request.handoff.directive
+    session = loop._sessions.get_or_create("cli:review")
+    injected = [
+        message
+        for message in session.messages
+        if message.get("injected_event") == REVIEW_HANDOFF_EVENT
+    ]
+    assert len(injected) == 1
+    assert injected[0]["review_run_id"] == "run-a"
+    assert session.metadata[ReviewMetaKey.HANDOFF_RUN_ID] == "run-a"
+    # The report artifact is referenced, never copied into session metadata.
+    assert "report_markdown" not in str(session.metadata)
 
 
-def test_review_context_is_by_reference_and_never_the_report_body() -> None:
-    result = _result()
+def test_set_runtime_model_moves_model_and_window(tmp_path) -> None:
+    loop = _loop(tmp_path)
 
-    context = review_context_for(result)
+    loop.set_runtime_model(DummyProvider(), "switched-model", 131_072)
 
-    assert context == result.as_payload()
-    assert context["run_id"] == "run-a"
-    assert context["report_ref"] == REPORT_REF
-    assert context["source"] == "review_agent"
-    assert "report_markdown" not in context
-    assert not any(isinstance(value, str) and value.startswith("##") for value in context.values())
+    assert loop._model == "switched-model"
+    assert loop._context_window_tokens == 131_072

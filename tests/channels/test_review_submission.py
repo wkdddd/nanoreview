@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.bus.queue import MessageBus
 from nanoreview.channels.websocket import WebSocketChannel
 from nanoreview.providers.base import LLMProvider, LLMResponse
@@ -41,7 +41,7 @@ class _FakeConnection:
 
 @pytest.fixture()
 def channel(tmp_path: Path) -> WebSocketChannel:
-    loop = AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     return WebSocketChannel({}, MessageBus(), agent_loop=loop)
 
 

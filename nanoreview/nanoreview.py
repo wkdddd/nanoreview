@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.hooks.sdk import SDKCaptureHook
-from nanoreview.agent.loop import AgentLoop
 
 
 @dataclass(slots=True)
@@ -30,7 +30,7 @@ class Nanobot:
         print(result.content)
     """
 
-    def __init__(self, loop: AgentLoop) -> None:
+    def __init__(self, loop: SessionCoordinator) -> None:
         self._loop = loop
 
     @classmethod
@@ -62,7 +62,7 @@ class Nanobot:
                 Path(workspace).expanduser().resolve()
             )
 
-        loop = AgentLoop.from_config(config)
+        loop = SessionCoordinator.from_config(config)
         return cls(loop)
 
     async def run(

@@ -49,7 +49,7 @@ from rich.table import Table
 from rich.text import Text
 
 from nanoreview import __logo__, __version__
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -527,7 +527,7 @@ def serve(
     bus = MessageBus()
     session_manager = SessionManager(runtime_config.workspace_path)
     try:
-        agent_loop = AgentLoop.from_config(
+        agent_loop = SessionCoordinator.from_config(
             runtime_config, bus,
             session_manager=session_manager,
         )
@@ -616,7 +616,7 @@ def _run_gateway(
         raise typer.Exit(1) from exc
     session_manager = SessionManager(config.workspace_path)
 
-    agent = AgentLoop.from_config(
+    agent = SessionCoordinator.from_config(
         config, bus,
         provider=provider_snapshot.provider,
         model=provider_snapshot.model,
@@ -631,7 +631,7 @@ def _run_gateway(
         provider_signature=provider_snapshot.signature,
     )
 
-    from nanoreview.agent.loop import UNIFIED_SESSION_KEY
+    from nanoreview.agent.coordinator import UNIFIED_SESSION_KEY
     from nanoreview.bus.events import OutboundMessage
 
     def _channel_session_key(channel: str, chat_id: str) -> str:
@@ -863,7 +863,7 @@ def review(
     logger.enable("nanoreview")
 
     bus = MessageBus()
-    agent_loop = AgentLoop.from_config(loaded, bus)
+    agent_loop = SessionCoordinator.from_config(loaded, bus)
 
     renderer = StreamRenderer(
         render_markdown=markdown,
@@ -961,7 +961,7 @@ def agent(
         logger.disable("nanoreview")
 
     try:
-        agent_loop = AgentLoop.from_config(
+        agent_loop = SessionCoordinator.from_config(
             config, bus,
         )
     except ValueError as exc:

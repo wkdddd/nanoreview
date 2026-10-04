@@ -14,7 +14,8 @@ from typing import Any
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from nanoreview.agent.loop import AgentLoop
+from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.review_loop import ReviewLoopOutcome
 from nanoreview.agent.review_state import ReviewRunState
 from nanoreview.api.server import create_app
 from nanoreview.bus.queue import MessageBus
@@ -31,11 +32,11 @@ class _DummyProvider(LLMProvider):
 
 
 @pytest.fixture()
-def loop(tmp_path: Path) -> AgentLoop:
-    return AgentLoop(MessageBus(), _DummyProvider(), tmp_path)
+def loop(tmp_path: Path) -> SessionCoordinator:
+    return SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
 
 
-async def _client(loop: AgentLoop) -> TestClient:
+async def _client(loop: SessionCoordinator) -> TestClient:
     client = TestClient(TestServer(create_app(loop, model_name="dummy")))
     await client.start_server()
     return client
@@ -43,7 +44,7 @@ async def _client(loop: AgentLoop) -> TestClient:
 
 @pytest.mark.asyncio
 async def test_relative_target_is_rejected_with_structured_code(
-    tmp_path: Path, loop: AgentLoop
+    tmp_path: Path, loop: SessionCoordinator
 ) -> None:
     client = await _client(loop)
     try:
@@ -63,7 +64,7 @@ async def test_relative_target_is_rejected_with_structured_code(
 
 
 @pytest.mark.asyncio
-async def test_missing_target_returns_404(tmp_path: Path, loop: AgentLoop) -> None:
+async def test_missing_target_returns_404(tmp_path: Path, loop: SessionCoordinator) -> None:
     client = await _client(loop)
     try:
         response = await client.post(
@@ -83,7 +84,7 @@ async def test_missing_target_returns_404(tmp_path: Path, loop: AgentLoop) -> No
 
 @pytest.mark.asyncio
 async def test_accepted_review_delegates_the_registered_run(
-    tmp_path: Path, loop: AgentLoop, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, loop: SessionCoordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "pkg"
     target.mkdir()
@@ -91,13 +92,13 @@ async def test_accepted_review_delegates_the_registered_run(
 
     observed: dict[str, Any] = {}
 
-    async def _fake_process(msg, **kwargs):
+    async def _fake_execute(request):
         state: ReviewRunState | None = loop._review_runs.get("api:default")
         observed["run_id"] = state.run_id if state else None
-        observed["metadata"] = dict(msg.metadata)
-        return None
+        observed["metadata"] = dict(request.msg.metadata)
+        return ReviewLoopOutcome(report_markdown="ok", produces_report=False)
 
-    monkeypatch.setattr(loop, "_process_message", _fake_process)
+    monkeypatch.setattr(loop.review_loop, "execute", _fake_execute)
     client = await _client(loop)
     try:
         response = await client.post(
