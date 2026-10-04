@@ -7,11 +7,9 @@ import pytest
 from nanoreview.agent.runner import AgentRunResult
 from nanoreview.agent.subagent_profiles import (
     BUG_REVIEWER_SCOPE,
-    GENERIC_SUBAGENT_PROFILE,
     MAINTAINABILITY_REVIEWER_SCOPE,
     PERFORMANCE_REVIEWER_SCOPE,
     SECURITY_REVIEWER_SCOPE,
-    SUBAGENT_SCOPE,
 )
 from nanoreview.agent.tools.loader import ToolLoader
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver
@@ -30,7 +28,6 @@ def test_registry_exposes_only_four_reviewer_profiles() -> None:
 
 
 def test_execution_profiles_use_dedicated_scopes_and_require_shared_tools() -> None:
-    assert GENERIC_SUBAGENT_PROFILE.scope == SUBAGENT_SCOPE
     profiles = {key: value.execution_profile() for key, value in REVIEWER_PROFILES.items()}
     assert profiles["bug"].scope == BUG_REVIEWER_SCOPE
     assert profiles["security"].scope == SECURITY_REVIEWER_SCOPE
@@ -42,7 +39,6 @@ def test_execution_profiles_use_dedicated_scopes_and_require_shared_tools() -> N
 
 
 def test_execution_profiles_use_independent_scopes_and_required_tools() -> None:
-    assert GENERIC_SUBAGENT_PROFILE.scope == SUBAGENT_SCOPE
     profiles = reviewer_execution_profiles()
     assert {profile.scope for profile in profiles.values()} == {
         BUG_REVIEWER_SCOPE,
@@ -90,10 +86,22 @@ def test_reviewer_profiles_preserve_review_submit_result() -> None:
     )
 
 
-def test_generic_profile_preserves_no_tool_result() -> None:
-    """The generic profile keeps no review tool and no preserved result."""
-    assert GENERIC_SUBAGENT_PROFILE.terminal_tools == frozenset()
-    assert GENERIC_SUBAGENT_PROFILE.preserve_tool_result_tools == frozenset()
+def test_reviewer_profiles_declare_their_own_terminal_contract() -> None:
+    """Every registered reviewer profile declares its tools explicitly.
+
+    The manager has no built-in default profile (the generic fallback was
+    removed), so each profile must carry its own terminal/preserved contract;
+    a profile that forgot to would otherwise run with the wrong boundary.
+    """
+    profiles = reviewer_execution_profiles()
+    assert all(
+        profile.terminal_tools == frozenset({"review_submit"})
+        for profile in profiles.values()
+    )
+    assert all(
+        profile.preserve_tool_result_tools == frozenset({"review_submit"})
+        for profile in profiles.values()
+    )
 
 
 def _submit_payload(*, marker: str) -> str:

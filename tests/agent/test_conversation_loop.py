@@ -115,7 +115,9 @@ async def test_review_tools_are_excluded_from_the_conversation_turn(tmp_path) ->
     assert not tools.has("github_review")
     # The ordinary conversation tools stay available.
     assert tools.has("read_file")
-    assert tools.has("spawn")
+    # Sub-agent dispatch is review-only now: the conversation turn must not
+    # expose a spawn tool.
+    assert not tools.has("spawn")
 
 
 @pytest.mark.asyncio

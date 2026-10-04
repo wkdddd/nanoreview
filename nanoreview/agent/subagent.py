@@ -1,4 +1,10 @@
-"""Profile-driven manager for concurrent subagent execution."""
+"""Profile-driven manager for concurrent review subagent execution.
+
+The manager is dispatched by ``ReviewLoop`` only: it runs one registered
+execution profile per task and hands the result back through an in-process
+per-session queue. It never publishes a subagent result to the message bus —
+review results are not conversation inbound events.
+"""
 
 import asyncio
 import time
@@ -12,7 +18,6 @@ from loguru import logger
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent_profiles import (
-    GENERIC_SUBAGENT_PROFILE,
     SubagentCompletion,
     SubagentExecutionLimits,
     SubagentExecutionProfile,
@@ -87,10 +92,7 @@ class SubagentManager:
         self.context_block_limit = context_block_limit
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
-        self._execution_profiles = {
-            GENERIC_SUBAGENT_PROFILE.id: GENERIC_SUBAGENT_PROFILE,
-            **(execution_profiles or {}),
-        }
+        self._execution_profiles = dict(execution_profiles or {})
         # Validate profiles before any task can be dispatched.  A typo in a
         # scope should fail configuration at startup rather than silently
         # producing an agent with no capabilities.
@@ -127,13 +129,12 @@ class SubagentManager:
 
     def _build_tools(
         self,
+        profile: SubagentExecutionProfile,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
-        profile: SubagentExecutionProfile | None = None,
         target_type: str = "",
     ) -> ToolRegistry:
         """Build an isolated tool registry authorized by the profile scope."""
-        profile = profile or GENERIC_SUBAGENT_PROFILE
         target_type = str(target_type or "").strip().lower()
         denied_names: set[str] = set()
         # Review profiles declare both transport tools, but only the active
@@ -208,7 +209,14 @@ class SubagentManager:
             )
 
     def resolve_profile(self, metadata: dict[str, Any]) -> SubagentExecutionProfile:
-        profile_id = str(metadata.get("profile_id") or "generic").strip()
+        """Resolve the explicitly declared profile a task must run under.
+
+        There is no default profile: a task without a ``profile_id`` (or with an
+        unregistered one) is a programming error, not a generic run.
+        """
+        profile_id = str(metadata.get("profile_id") or "").strip()
+        if not profile_id:
+            raise ValueError("Subagent execution requires an explicit profile_id.")
         profile = self._execution_profiles.get(profile_id)
         if profile is None:
             raise ValueError(f"Unknown subagent execution profile: {profile_id}")
@@ -222,7 +230,9 @@ class SubagentManager:
     def build_tools(
         self, profile: SubagentExecutionProfile, workspace: Path, *, target_type: str = ""
     ) -> ToolRegistry:
-        return self._build_tools(workspace=workspace, profile=profile, target_type=target_type)
+        return self._build_tools(
+            profile, workspace=workspace, target_type=target_type
+        )
 
     @staticmethod
     def build_system_prompt(
@@ -273,10 +283,14 @@ class SubagentManager:
         session_key: str | None = None,
         origin_message_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
-        deliver_to_bus: bool = True,
         execution_limits: SubagentExecutionLimits | None = None,
     ) -> str:
-        """Start a dedicated subagent for same-turn result integration."""
+        """Start a dedicated review subagent whose result returns to the caller.
+
+        The result is delivered to the owning session's in-process result queue
+        (drained by ``ReviewLoop``); it is never published as a conversation
+        inbound message.
+        """
         if session_key:
             state = self._session_task_state.setdefault(session_key, {})
             current = state.get(label)
@@ -296,7 +310,6 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
-            "deliver_to_bus": deliver_to_bus,
         }
         status = SubagentStatus(
             task_id=task_id,
@@ -337,10 +350,7 @@ class SubagentManager:
 
         bg_task.add_done_callback(_cleanup)
         logger.info("Spawned subagent [{}]: {}", task_id, label)
-        return (
-            f"Subagent [{label}] started (id: {task_id}). "
-            "The coordinator will wait for and integrate its result before finalizing."
-        )
+        return f"Subagent [{label}] started (id: {task_id})."
 
     async def _run_subagent(
         self,
@@ -695,7 +705,7 @@ class SubagentManager:
         usage: dict[str, int] | None = None,
         execution_limits: SubagentExecutionLimits | None = None,
     ) -> None:
-        """Announce the subagent result to the main agent via the message bus."""
+        """Hand the finished subagent result to the owning session's queue."""
         session_key = (
             origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         )
@@ -716,11 +726,9 @@ class SubagentManager:
             result=result,
         )
 
-        # Inject as system message to trigger main agent.
-        # Use session_key_override to align with the main agent's effective
-        # session key (which accounts for unified sessions) so the result is
-        # routed to the correct pending queue (mid-turn injection) instead of
-        # being dispatched as a competing independent task.
+        # Deliver the result to the owning session's in-process queue only: the
+        # session key is the review run's key, so ``ReviewLoop`` drains exactly
+        # the results it dispatched. Nothing is published to the message bus.
         override = (
             origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         )
@@ -749,8 +757,6 @@ class SubagentManager:
             metadata=metadata,
         )
 
-        if origin.get("deliver_to_bus", True):
-            await self.bus.publish_inbound(msg)
         self._publish_session_result(override, msg)
         self._set_task_state(
             override,

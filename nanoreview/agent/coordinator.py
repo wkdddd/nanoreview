@@ -60,8 +60,6 @@ from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
     ConversationLoop,
-    _is_consumed_subagent_result,
-    persist_subagent_followup,
 )
 from nanoreview.agent.handoff import (
     REVIEW_CONTEXT_EVENT,
@@ -71,7 +69,11 @@ from nanoreview.agent.handoff import (
 )
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.memory import Consolidator
-from nanoreview.agent.review_loop import ReviewLoop, ReviewTurnRequest
+from nanoreview.agent.review_loop import (
+    ReviewLoop,
+    ReviewTurnRequest,
+    persist_review_subagent_result,
+)
 from nanoreview.agent.review_state import (
     ReviewArtifactError,
     ReviewPhase,
@@ -143,7 +145,12 @@ def _is_review_turn(metadata: dict[str, Any] | None) -> bool:
 
 
 def _is_internal_event(msg: InboundMessage) -> bool:
-    """Subagent results and system events bypass review session gating."""
+    """Whether *msg* is a legacy system/subagent event.
+
+    These bypass review session gating, but they no longer drive a model turn:
+    ``_execute_turn`` drops them (with a warning) instead of running the
+    conversation agent, and they never consume the pending review handoff.
+    """
     meta = msg.metadata if isinstance(msg.metadata, dict) else {}
     return (
         msg.channel == "system"
@@ -362,7 +369,6 @@ class SessionCoordinator:
             sessions=self.sessions,
             context=self.context,
             runner=self.runner,
-            subagents=self.subagents,
             consolidator=self.consolidator,
             auto_compact=self.auto_compact,
             file_state_store=self._file_state_store,
@@ -573,7 +579,6 @@ class SessionCoordinator:
             model=self.model,
             review_config=self.review_config,
             bus=self.bus,
-            subagent_manager=self.subagents,
             sessions=self.sessions,
             provider_snapshot_loader=self._provider_snapshot_loader,
             timezone=self.context.timezone or "UTC",
@@ -1212,7 +1217,7 @@ class SessionCoordinator:
         ) -> None:
             if session is None:
                 return
-            if persist_subagent_followup(session, subagent_message):
+            if persist_review_subagent_result(session, subagent_message):
                 self.sessions.save(session)
 
         outcome = await self.review_loop.execute(
@@ -1300,7 +1305,6 @@ class SessionCoordinator:
         session_key: str,
         *,
         pending_queue: asyncio.Queue | None,
-        consumed_subagent_task_ids: set[str] | None,
         on_progress: Callable[..., Awaitable[None]] | None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -1309,8 +1313,8 @@ class SessionCoordinator:
         """Route one already-admitted, already-gated turn to the right loop.
 
         Commands are dispatched here (the coordinator owns the command router);
-        an admitted review turn goes to ``ReviewLoop``; everything else —
-        including system/subagent events — is a conversation turn.
+        an admitted review turn goes to ``ReviewLoop``; a user message is a
+        conversation turn.
         """
         self._refresh_provider_snapshot()
         raw = msg.content.strip()
@@ -1353,17 +1357,18 @@ class SessionCoordinator:
         target_root = self._resolve_target_root(session)
         turn_id = f"{session_key}:{time.time_ns()}"
 
-        if msg.channel == "system":
-            return await self.conversation_loop.process_system_message(
-                msg,
-                session_key=session_key,
-                turn_id=turn_id,
-                target_root=target_root,
-                on_progress=on_progress,
-                on_stream=on_stream,
-                on_stream_end=on_stream_end,
-                pending_queue=pending_queue,
+        if _is_internal_event(msg):
+            # Legacy subagent/system events no longer drive a model turn and
+            # must not consume the pending review handoff; drop them loudly.
+            logger.warning(
+                "Dropping internal event: channel={} sender={} session={} "
+                "injected_event={}",
+                msg.channel,
+                msg.sender_id,
+                session_key,
+                (msg.metadata or {}).get("injected_event") or "none",
             )
+            return None
 
         handoff = self.pending_handoff(session)
         if handoff is not None and not handoff.fits:
@@ -1380,7 +1385,6 @@ class SessionCoordinator:
             on_stream_end=on_stream_end,
             on_retry_wait=on_retry_wait,
             pending_queue=pending_queue,
-            consumed_subagent_task_ids=consumed_subagent_task_ids,
         )
 
     def _resolve_target_root(self, session: Session) -> Path:
@@ -1532,7 +1536,6 @@ class SessionCoordinator:
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
         pending = asyncio.Queue(maxsize=MAX_PENDING_CONVERSATION_MESSAGES)
-        consumed_subagent_task_ids: set[str] = set()
         self._pending_queues[session_key] = pending
         turn_end_sent = False
         stream_base_id = f"{msg.session_key}:{time.time_ns()}"
@@ -1617,7 +1620,6 @@ class SessionCoordinator:
                         msg,
                         session_key,
                         pending_queue=pending,
-                        consumed_subagent_task_ids=consumed_subagent_task_ids,
                         on_progress=on_progress,
                         on_stream=on_stream,
                         on_stream_end=on_stream_end,
@@ -1739,10 +1741,6 @@ class SessionCoordinator:
                         item = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-                    if _is_consumed_subagent_result(
-                        item, consumed_subagent_task_ids
-                    ):
-                        continue
                     await self.bus.publish_inbound(item)
                     leftover += 1
                 if leftover:
@@ -1865,7 +1863,6 @@ class SessionCoordinator:
                 msg,
                 key,
                 pending_queue=None,
-                consumed_subagent_task_ids=None,
                 on_progress=on_progress,
                 on_stream=on_stream,
                 on_stream_end=on_stream_end,

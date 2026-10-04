@@ -605,7 +605,13 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
     outcome = await loop.execute(_request())
 
     assert [call["label"] for call in subagents.calls] == ["security", "bug"]
-    assert all(call["deliver_to_bus"] is False for call in subagents.calls)
+    # Review results are never published to the bus: the program dispatches each
+    # dimension with an explicit reviewer profile and collects from the queue.
+    assert all("deliver_to_bus" not in call for call in subagents.calls)
+    assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == [
+        "security",
+        "bug",
+    ]
     assert "No actionable issues found" in (outcome.report_markdown or "")
 
 

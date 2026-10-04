@@ -113,6 +113,40 @@ _RESET_METADATA_KEYS = (
 )
 
 
+def persist_review_subagent_result(session: "Session", msg: InboundMessage) -> bool:
+    """Persist a review subagent result before prompt assembly; dedupe by task id.
+
+    The review run's own audit trail lives in the session: each reviewer result
+    is recorded once as an injected assistant message (and filtered out of
+    replay). Returns True when a new entry was appended, False when it was
+    deduped (same ``subagent_task_id`` already present) or carried no content.
+    """
+    if not msg.content:
+        return False
+    metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
+    task_id = metadata.get("subagent_task_id")
+    if task_id and any(
+        m.get("injected_event") == "subagent_result"
+        and m.get("subagent_task_id") == task_id
+        for m in session.messages
+    ):
+        return False
+    structured = {
+        key: metadata[key]
+        for key in ("subagent_label", "subagent_status", "subagent_result")
+        if key in metadata
+    }
+    session.add_message(
+        "assistant",
+        msg.content,
+        sender_id=msg.sender_id,
+        injected_event="subagent_result",
+        subagent_task_id=task_id,
+        **structured,
+    )
+    return True
+
+
 class ReviewPlanningError(RuntimeError):
     """Raised when the review cannot move past preparation or planning."""
 
@@ -1099,7 +1133,6 @@ class ReviewLoop:
                         ),
                         "common_rules_workspace": str(self._workspace),
                     },
-                    deliver_to_bus=False,
                     execution_limits=limits_by_dimension.get(assignment.dimension),
                 )
                 if started.startswith("Error:"):
@@ -1510,4 +1543,5 @@ __all__ = [
     "ReviewPersistenceError",
     "ReviewPlanningError",
     "ReviewTurnRequest",
+    "persist_review_subagent_result",
 ]

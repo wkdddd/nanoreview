@@ -9,13 +9,15 @@ import pytest
 
 from nanoreview.agent.hooks import AgentHookContext
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
-from nanoreview.agent.conversation_loop import _is_consumed_subagent_result
 from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.agent.review_loop import ReviewLoopOutcome, ReviewTurnRequest
 from nanoreview.agent.review_state import ReviewPhase, ReviewRunState, ReviewRunStatus
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent import SubagentManager
-from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
+from nanoreview.agent.subagent_profiles import (
+    SubagentExecutionLimits,
+    SubagentExecutionProfile,
+)
 from nanoreview.agent.tools.context import current_request_context
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.events import InboundMessage
@@ -72,32 +74,25 @@ class SlowRunner:
         return AgentRunResult(final_content="late", messages=[*spec.frozen_messages, *spec.working_messages])
 
 
-class SpawnExecutingRunner:
-    def __init__(self) -> None:
-        self.result: Any | None = None
+#: A minimal non-review profile for runtime-plumbing tests.
+#:
+#: The manager no longer has a built-in generic default, so tests that only
+#: exercise the runtime plumbing (limits, timeout, context window, hooks)
+#: declare their own explicit profile instead of relying on an implicit
+#: fallback. ``core`` is always a declared scope, so the profile validates.
+_TEST_PROFILE_ID = "test-plumbing"
 
-    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        from nanoreview.agent.hooks import AgentHookContext
 
-        call = ToolCallRequest(
-            id="call_spawn",
-            name="spawn",
-            arguments={"task": "review performance", "label": "Performance Reviewer"},
-        )
-        context = AgentHookContext(
-            iteration=0,
-            messages=[*spec.frozen_messages, *spec.working_messages],
-            response=LLMResponse(content="spawning reviewer", tool_calls=[call]),
-            tool_calls=[call],
-        )
-        assert spec.hook is not None
-        await spec.hook.before_execute_tools(context)
-        tool = spec.tools.get("spawn")
-        assert tool is not None
-        self.result = await tool.execute(**call.arguments)
-        return AgentRunResult(
-            final_content="ok", messages=[*spec.frozen_messages, *spec.working_messages], tools_used=["spawn"]
-        )
+def _explicit_profile_manager(tmp_path: Path, **kwargs: Any) -> SubagentManager:
+    profile = SubagentExecutionProfile(id=_TEST_PROFILE_ID, scope="core")
+    return SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+        execution_profiles={_TEST_PROFILE_ID: profile},
+        **kwargs,
+    )
 
 
 class InjectionRunner:
@@ -182,89 +177,17 @@ class StreamingChoiceProvider(DummyProvider):
         return LLMResponse(content="streamed final")
 
 
-class RunningSubagents:
-    def __init__(self, running: int = 1) -> None:
-        self.running = running
-        self.results: asyncio.Queue = asyncio.Queue()
+class OrdinaryUserDrainRunner:
+    """Injector probe: the mid-turn drain only ever yields ordinary user text."""
 
-    def get_running_count_by_session(self, session_key: str) -> int:
-        return self.running
-
-    def publish(self, msg: Any) -> None:
-        self.results.put_nowait(msg)
-
-    def drain_session_results(self, session_key: str, *, limit: int) -> list[Any]:
-        items: list[Any] = []
-        while len(items) < limit:
-            try:
-                items.append(self.results.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        return items
-
-    async def wait_for_session_result(self, session_key: str, *, timeout: float = 0.1) -> Any:
-        try:
-            return await asyncio.wait_for(self.results.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
-
-
-class MultiDrainRunner:
-    def __init__(self, pending: asyncio.Queue, subagents: RunningSubagents) -> None:
+    def __init__(self, pending: asyncio.Queue) -> None:
         self.pending = pending
-        self.subagents = subagents
-        self.injected_batches: list[list[dict[str, Any]]] = []
-
-    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
-        assert spec.injection_callback is not None
-
-        await self.pending.put(_inbound("user interjection", sender_id="user"))
-        first_wait = asyncio.create_task(spec.injection_callback(limit=3))
-        await asyncio.sleep(0)
-        assert not first_wait.done()
-
-        self.subagents.publish(_subagent_result("first", "security"))
-        first = await asyncio.wait_for(first_wait, timeout=0.5)
-        self.injected_batches.append(first)
-        assert len(first) == 1
-        assert first[0]["_metadata"]["subagent_task_id"] == "first"
-
-        second_wait = asyncio.create_task(spec.injection_callback(limit=3))
-        await asyncio.sleep(0)
-        assert not second_wait.done()
-
-        self.subagents.running = 0
-        self.subagents.publish(_subagent_result("second", "tests"))
-        second = await asyncio.wait_for(second_wait, timeout=0.5)
-        self.injected_batches.append(second)
-        task_ids = [item.get("_metadata", {}).get("subagent_task_id") for item in second]
-        assert "second" in task_ids
-        assert any(item.get("content") == "user interjection" for item in second)
-        assert all(
-            item.get("_metadata", {}).get("injected_event") != "subagent_barrier"
-            for item in second
-        )
-
-        messages = [*spec.frozen_messages, *spec.working_messages]
-        for batch in self.injected_batches:
-            messages.extend(batch)
-        return AgentRunResult(final_content="ok", messages=messages, had_injections=True)
-
-
-class ManagerQueueDrainRunner:
-    def __init__(self, subagents: RunningSubagents) -> None:
-        self.subagents = subagents
         self.injected: list[dict[str, Any]] = []
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         assert spec.injection_callback is not None
-        wait = asyncio.create_task(spec.injection_callback(limit=3))
-        await asyncio.sleep(0)
-        assert not wait.done()
-
-        self.subagents.running = 0
-        self.subagents.publish(_subagent_result("direct", "security"))
-        self.injected = await asyncio.wait_for(wait, timeout=0.5)
+        await self.pending.put(_inbound("user interjection", sender_id="user"))
+        self.injected = await spec.injection_callback(limit=3)
         return AgentRunResult(
             final_content="ok",
             messages=[*spec.frozen_messages, *spec.working_messages] + list(self.injected),
@@ -346,19 +269,6 @@ def _inbound(
         content=content,
         session_key_override="test:pending",
         metadata=metadata or {},
-    )
-
-
-def _subagent_result(task_id: str, label: str) -> Any:
-    return _inbound(
-        f"subagent {task_id} result",
-        metadata={
-            "injected_event": "subagent_result",
-            "subagent_task_id": task_id,
-            "subagent_label": label,
-            "subagent_status": "ok",
-            "subagent_result": '{"submitted": true, "findings": [], "errors": []}',
-        },
     )
 
 
@@ -484,15 +394,18 @@ async def test_conversation_turn_never_delegates_to_review_loop(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_conversation_pending_drain_waits_for_running_subagent_results(
+async def test_conversation_drain_only_yields_ordinary_user_messages(
     tmp_path,
 ) -> None:
+    """The conversation drain never waits on or consumes subagent results.
+
+    Sub-agent results now belong to ``ReviewLoop``'s own result queue; the
+    conversation turn only injects ordinary user messages queued behind it.
+    """
     coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
-    subagents = RunningSubagents(running=1)
-    coordinator.conversation_loop._subagents = subagents
     session_key = "cli:pending"
     pending: asyncio.Queue = asyncio.Queue()
-    runner = MultiDrainRunner(pending, subagents)
+    runner = OrdinaryUserDrainRunner(pending)
     coordinator.conversation_loop._runner = runner
     msg = InboundMessage(
         channel="cli", sender_id="user", chat_id="pending", content="hello"
@@ -506,36 +419,9 @@ async def test_conversation_pending_drain_waits_for_running_subagent_results(
         pending_queue=pending,
     )
 
-    assert [
-        batch[0]["_metadata"]["subagent_task_id"] for batch in runner.injected_batches
-    ] == ["first", "second"]
-
-
-@pytest.mark.asyncio
-async def test_conversation_drain_waits_on_subagent_manager_result_queue(
-    tmp_path,
-) -> None:
-    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
-    subagents = RunningSubagents(running=1)
-    coordinator.conversation_loop._subagents = subagents
-    session_key = "cli:pending"
-    pending: asyncio.Queue = asyncio.Queue()
-    runner = ManagerQueueDrainRunner(subagents)
-    coordinator.conversation_loop._runner = runner
-    msg = InboundMessage(
-        channel="cli", sender_id="user", chat_id="pending", content="hello"
-    )
-
-    await coordinator.conversation_loop.process_message(
-        msg,
-        session_key=session_key,
-        turn_id="turn",
-        target_root=tmp_path,
-        pending_queue=pending,
-    )
-
-    assert len(runner.injected) == 1
-    assert runner.injected[0]["_metadata"]["subagent_task_id"] == "direct"
+    assert runner.injected == [
+        {"role": "user", "content": "user interjection"}
+    ]
 
 
 def test_invalid_max_concurrent_requests_falls_back_to_default(monkeypatch) -> None:
@@ -608,15 +494,13 @@ def test_session_history_preserves_subagent_result_metadata() -> None:
     ]
 
 
-def test_consumed_subagent_result_helper_matches_consumed_task() -> None:
-    msg = _subagent_result("task-1", "security")
+def test_subagent_profile_is_required_and_has_no_generic_fallback(tmp_path) -> None:
+    """A subagent task must name a registered profile; there is no default.
 
-    assert _is_consumed_subagent_result(msg, {"task-1"}) is True
-    assert _is_consumed_subagent_result(msg, {"other"}) is False
-    assert _is_consumed_subagent_result(msg, set()) is False
-
-
-def test_generic_subagent_tools_are_read_only(tmp_path) -> None:
+    The old generic profile (core tools, read-only) was the implicit fallback —
+    removing it means an unlabelled task fails loudly instead of running with a
+    silently wrong scope.
+    """
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -625,12 +509,9 @@ def test_generic_subagent_tools_are_read_only(tmp_path) -> None:
         execution_profiles=reviewer_execution_profiles(),
     )
 
-    tools = manager._build_tools()
-
-    assert tools.tool_names == ["grep", "list_dir", "read_file"]
-    assert not tools.has("review_submit")
-    assert not tools.has("spawn")
-    assert not tools.has("message")
+    for missing in ({}, {"profile_id": ""}, {"profile_id": "generic"}):
+        with pytest.raises(ValueError):
+            manager.resolve_profile(missing)
 
 
 def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
@@ -642,12 +523,10 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
         execution_profiles=reviewer_execution_profiles(),
     )
 
-    generic = manager._build_tools()
     reviewer_profile = manager.resolve_profile({"profile_id": "security"})
     reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="local")
     github_reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="github")
 
-    assert generic.tool_names == ["grep", "list_dir", "read_file"]
     assert reviewer.tool_names == [
         "grep",
         "list_dir",
@@ -693,12 +572,7 @@ def test_review_subagent_inherits_subagent_tool_config(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> None:
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
-    )
+    manager = _explicit_profile_manager(tmp_path)
     runner = SpecCapturingRunner()
     manager.runner = runner  # type: ignore[assignment]
     limits = SubagentExecutionLimits(
@@ -708,7 +582,7 @@ async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> No
     )
     status = SubagentStatus(
         task_id="task-limits",
-        label="generic",
+        label=_TEST_PROFILE_ID,
         task_description="bounded task",
         started_at=0.0,
     )
@@ -716,9 +590,10 @@ async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> No
     await manager._run_subagent(
         "task-limits",
         "bounded task",
-        "generic",
+        _TEST_PROFILE_ID,
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
         execution_limits=limits,
     )
 
@@ -732,16 +607,11 @@ async def test_subagent_execution_limits_are_forwarded_to_runner(tmp_path) -> No
 
 @pytest.mark.asyncio
 async def test_subagent_timeout_announces_error_with_budget_metadata(tmp_path) -> None:
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
-    )
+    manager = _explicit_profile_manager(tmp_path)
     manager.runner = SlowRunner()  # type: ignore[assignment]
     status = SubagentStatus(
         task_id="task-timeout",
-        label="generic",
+        label=_TEST_PROFILE_ID,
         task_description="slow task",
         started_at=0.0,
     )
@@ -749,9 +619,10 @@ async def test_subagent_timeout_announces_error_with_budget_metadata(tmp_path) -
     await manager._run_subagent(
         "task-timeout",
         "slow task",
-        "generic",
+        _TEST_PROFILE_ID,
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
         execution_limits=SubagentExecutionLimits(
             max_iterations=10,
             max_tokens=100,
@@ -788,18 +659,13 @@ async def test_subagent_compression_stop_marks_reviewer_error(
     tmp_path, stop_reason: str
 ) -> None:
     """A compression-stopped reviewer run is an error, so its dimension is incomplete."""
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
-    )
+    manager = _explicit_profile_manager(tmp_path)
     manager.runner = CompressionStopRunner(  # type: ignore[assignment]
         stop_reason, "sync compression failed after 2 attempts: no content"
     )
     status = SubagentStatus(
         task_id="task-compress",
-        label="generic",
+        label=_TEST_PROFILE_ID,
         task_description="review task",
         started_at=0.0,
     )
@@ -807,9 +673,10 @@ async def test_subagent_compression_stop_marks_reviewer_error(
     await manager._run_subagent(
         "task-compress",
         "review task",
-        "generic",
+        _TEST_PROFILE_ID,
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
     )
 
     assert status.phase == "error"
@@ -868,18 +735,12 @@ async def test_subagent_forwards_context_window_tokens_to_runner(tmp_path) -> No
     unset, so ``runner._snip_history`` skipped trimming and long reviewer
     runs grew unbounded.
     """
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
-        context_window_tokens=32_768,
-    )
+    manager = _explicit_profile_manager(tmp_path, context_window_tokens=32_768)
     runner = SpecCapturingRunner()
     manager.runner = runner  # type: ignore[assignment]
     status = SubagentStatus(
         task_id="task-window",
-        label="generic",
+        label=_TEST_PROFILE_ID,
         task_description="windowed task",
         started_at=0.0,
     )
@@ -887,9 +748,10 @@ async def test_subagent_forwards_context_window_tokens_to_runner(tmp_path) -> No
     await manager._run_subagent(
         "task-window",
         "windowed task",
-        "generic",
+        _TEST_PROFILE_ID,
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
     )
 
     assert len(runner.specs) == 1
@@ -904,29 +766,24 @@ async def test_subagent_set_provider_updates_context_window_tokens(tmp_path) -> 
     snapshot's window so subagents spawned after the switch trim against
     the new model's context window.
     """
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
-        context_window_tokens=32_768,
-    )
+    manager = _explicit_profile_manager(tmp_path, context_window_tokens=32_768)
     runner = SpecCapturingRunner()
     manager.runner = runner  # type: ignore[assignment]
     manager.set_provider(DummyProvider(), "switched-model", 131_072)
 
     status = SubagentStatus(
         task_id="task-switch",
-        label="generic",
+        label=_TEST_PROFILE_ID,
         task_description="post-switch task",
         started_at=0.0,
     )
     await manager._run_subagent(
         "task-switch",
         "post-switch task",
-        "generic",
+        _TEST_PROFILE_ID,
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
     )
 
     assert len(runner.specs) == 1
@@ -1095,12 +952,7 @@ async def test_review_subagent_without_submit_announces_error_not_success(tmp_pa
 
 @pytest.mark.asyncio
 async def test_subagent_manager_rejects_duplicate_dimension_lifecycle(tmp_path) -> None:
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
-    )
+    manager = _explicit_profile_manager(tmp_path)
     runner = BlockingSubmitRunner()
     manager.runner = runner  # type: ignore[assignment]
 
@@ -1110,6 +962,7 @@ async def test_subagent_manager_rejects_duplicate_dimension_lifecycle(tmp_path) 
         origin_channel="cli",
         origin_chat_id="direct",
         session_key="cli:direct",
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
     )
     running_duplicate = await manager.spawn(
         "review security again",
@@ -1117,6 +970,7 @@ async def test_subagent_manager_rejects_duplicate_dimension_lifecycle(tmp_path) 
         origin_channel="cli",
         origin_chat_id="direct",
         session_key="cli:direct",
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
     )
 
     assert "started" in first
@@ -1140,6 +994,7 @@ async def test_subagent_manager_rejects_duplicate_dimension_lifecycle(tmp_path) 
         origin_channel="cli",
         origin_chat_id="direct",
         session_key="cli:direct",
+        origin_metadata={"profile_id": _TEST_PROFILE_ID},
     )
 
     assert "already completed" in completed_duplicate
@@ -1218,13 +1073,10 @@ async def test_subagent_workspace_uses_local_root(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_subagent_hook_sets_request_context(tmp_path) -> None:
     """SubagentHook.before_execute_tools sets current_request_context with metadata."""
-    manager = SubagentManager(
-        DummyProvider(),
-        tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
+    manager = _explicit_profile_manager(tmp_path)
+    tools = manager.build_tools(
+        manager.resolve_profile({"profile_id": _TEST_PROFILE_ID}), tmp_path
     )
-    tools = manager._build_tools()
 
     hook = SubagentHook(
         "task1",
@@ -1260,13 +1112,12 @@ async def test_subagent_read_file_blocked_for_github_target(tmp_path) -> None:
     """read_file blocks local workspace reads when target_type is github."""
     (tmp_path / "local.py").write_text("x = 1\n", encoding="utf-8")
 
-    manager = SubagentManager(
-        DummyProvider(),
+    manager = _explicit_profile_manager(tmp_path)
+    tools = manager.build_tools(
+        manager.resolve_profile({"profile_id": _TEST_PROFILE_ID}),
         tmp_path,
-        MessageBus(),
-        max_tool_result_chars=1000,
+        target_type="github",
     )
-    tools = manager._build_tools()
 
     hook = SubagentHook(
         "task1",
@@ -1389,7 +1240,7 @@ async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
-        origin_metadata={ReviewMetaKey.TARGET_TYPE: "local"},
+        origin_metadata={"profile_id": "security", ReviewMetaKey.TARGET_TYPE: "local"},
     )
 
     assert status.phase == "done"
@@ -1406,6 +1257,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
         tmp_path,
         MessageBus(),
         max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
     )
 
     class GithubEvidenceRunner:
@@ -1438,7 +1290,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
-        origin_metadata={ReviewMetaKey.TARGET_TYPE: "github"},
+        origin_metadata={"profile_id": "security", ReviewMetaKey.TARGET_TYPE: "github"},
     )
 
     assert status.phase == "done"
@@ -1520,14 +1372,20 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_coordinator_keeps_manual_spawn_tool_registered(tmp_path) -> None:
+async def test_coordinator_has_no_spawn_tool(tmp_path) -> None:
+    """Sub-agent dispatch is review-only; the default registry exposes no spawn."""
     coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
 
-    assert coordinator.tools.has("spawn")
+    assert not coordinator.tools.has("spawn")
 
 
 @pytest.mark.asyncio
-async def test_process_system_message_accepts_conversation_return_shape(tmp_path) -> None:
+async def test_legacy_internal_event_is_dropped_without_a_model_turn(tmp_path) -> None:
+    """A legacy system/subagent event must not start a turn or consume handoff.
+
+    Such events no longer drive the conversation agent; the coordinator logs a
+    warning and drops them instead of running a model call.
+    """
     coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
     runner = CapturingRunner()
     coordinator.conversation_loop._runner = runner
@@ -1536,14 +1394,18 @@ async def test_process_system_message_accepts_conversation_return_shape(tmp_path
         sender_id="subagent",
         chat_id="websocket:parent",
         content="subagent result",
+        session_key_override="websocket:parent",
     )
 
-    response = await coordinator.conversation_loop.process_system_message(
-        msg, session_key="websocket:parent", turn_id="turn", target_root=tmp_path
+    response = await coordinator._execute_turn(
+        msg,
+        "websocket:parent",
+        pending_queue=None,
+        on_progress=None,
     )
 
-    assert response is not None
-    assert response.content == "ok"
+    assert response is None
+    assert runner.initial_messages is None
 
 
 @pytest.mark.asyncio

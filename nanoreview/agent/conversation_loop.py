@@ -44,7 +44,6 @@ from nanoreview.agent.runner import (
     AgentRunResult,
     AgentRunSpec,
 )
-from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.tools.context import (
     ContextAware,
     RequestContext,
@@ -85,57 +84,6 @@ _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 _PENDING_USER_TURN_KEY = "pending_user_turn"
 
 
-def _is_consumed_subagent_result(
-    msg: InboundMessage,
-    consumed_task_ids: set[str] | None,
-) -> bool:
-    if not consumed_task_ids:
-        return False
-    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
-    task_id = meta.get("subagent_task_id")
-    return (
-        meta.get("injected_event") == "subagent_result"
-        and isinstance(task_id, str)
-        and task_id in consumed_task_ids
-    )
-
-
-def persist_subagent_followup(session: "Session", msg: InboundMessage) -> bool:
-    """Persist a subagent follow-up before prompt assembly; dedupe by task id.
-
-    Returns True when a new entry was appended, False when it was deduped (same
-    ``subagent_task_id`` already in the session) or carried no content.
-    """
-    if not msg.content:
-        return False
-    task_id = (
-        msg.metadata.get("subagent_task_id")
-        if isinstance(msg.metadata, dict)
-        else None
-    )
-    if task_id and any(
-        m.get("injected_event") == "subagent_result"
-        and m.get("subagent_task_id") == task_id
-        for m in session.messages
-    ):
-        return False
-    metadata = msg.metadata if isinstance(msg.metadata, dict) else {}
-    structured = {
-        key: metadata[key]
-        for key in ("subagent_label", "subagent_status", "subagent_result")
-        if key in metadata
-    }
-    session.add_message(
-        "assistant",
-        msg.content,
-        sender_id=msg.sender_id,
-        injected_event="subagent_result",
-        subagent_task_id=task_id,
-        **structured,
-    )
-    return True
-
-
 @dataclass
 class _TurnContext:
     """Mutable state for exactly one turn; never shared or persisted."""
@@ -146,11 +94,7 @@ class _TurnContext:
     target_root: Path
     session: "Session | None" = None
 
-    #: ``user`` for a normal turn, ``assistant`` for a system/subagent turn.
-    current_role: str = "user"
-    #: Reply delivered when a system turn produced no model content.
-    default_content: str = ""
-    #: Outbound routing (system turns derive it from the message's chat id).
+    #: Outbound routing, derived from the message's channel/chat id.
     outbound_channel: str | None = None
     outbound_chat_id: str | None = None
 
@@ -176,7 +120,6 @@ class _TurnContext:
     handoff_directive: str | None = None
 
     pending_queue: asyncio.Queue | None = None
-    consumed_subagent_task_ids: set[str] | None = None
 
     #: Report-local finding IDs valid in the report currently in context.
     valid_finding_ids: frozenset[str] = frozenset()
@@ -206,7 +149,6 @@ class ConversationLoop:
         sessions: "SessionManager",
         context: ContextBuilder,
         runner: AgentRunner,
-        subagents: SubagentManager,
         consolidator: Consolidator,
         auto_compact: AutoCompact,
         file_state_store: FileStateStore,
@@ -238,7 +180,6 @@ class ConversationLoop:
         self._sessions = sessions
         self._context = context
         self._runner = runner
-        self._subagents = subagents
         self._consolidator = consolidator
         self._auto_compact = auto_compact
         self._file_state_store = file_state_store
@@ -300,7 +241,6 @@ class ConversationLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
-        consumed_subagent_task_ids: set[str] | None = None,
     ) -> OutboundMessage | None:
         """Run one conversation turn and return its reply (or ``None``).
 
@@ -320,10 +260,9 @@ class ConversationLoop:
             on_stream_end=on_stream_end,
             on_retry_wait=on_retry_wait,
             pending_queue=pending_queue,
-            consumed_subagent_task_ids=consumed_subagent_task_ids,
         )
         try:
-            await self._load_session(ctx, system=False)
+            await self._load_session(ctx)
             self._compact(ctx)
             await self._build(ctx, handoff)
             await self._run(ctx)
@@ -334,51 +273,9 @@ class ConversationLoop:
         finally:
             self._cleanup(ctx)
 
-    async def process_system_message(
-        self,
-        msg: InboundMessage,
-        *,
-        session_key: str,
-        turn_id: str,
-        target_root: Path,
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
-        pending_queue: asyncio.Queue | None = None,
-    ) -> OutboundMessage | None:
-        """Run one internal (system/subagent) event as an assistant turn."""
-        channel, chat_id = (
-            msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
-        )
-        ctx = _TurnContext(
-            msg=msg,
-            session_key=session_key,
-            turn_id=turn_id,
-            target_root=Path(target_root),
-            current_role="assistant" if msg.sender_id == "subagent" else "user",
-            default_content="Background task completed.",
-            outbound_channel=channel,
-            outbound_chat_id=chat_id,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            pending_queue=pending_queue,
-        )
-        try:
-            await self._load_session(ctx, system=True)
-            self._compact(ctx)
-            await self._build(ctx, None)
-            await self._run(ctx)
-            self._collect_finding_refs(ctx)
-            self._save(ctx)
-            await self._respond(ctx)
-            return ctx.outbound
-        finally:
-            self._cleanup(ctx)
-
     # -- pipeline helpers ---------------------------------------------------
 
-    async def _load_session(self, ctx: _TurnContext, *, system: bool) -> None:
+    async def _load_session(self, ctx: _TurnContext) -> None:
         """Load the session and restore any interrupted turn's placeholder."""
         msg = ctx.msg
         if msg.media:
@@ -392,10 +289,9 @@ class ConversationLoop:
         )
 
         session = self._sessions.get_or_create(ctx.session_key)
-        if not system:
-            mark_webui_session(session, msg.metadata)
-            if apply_review_metadata_from_message(session, msg.metadata):
-                self._sessions.save(session)
+        mark_webui_session(session, msg.metadata)
+        if apply_review_metadata_from_message(session, msg.metadata):
+            self._sessions.save(session)
         if self._restore_runtime_checkpoint(session):
             self._sessions.save(session)
         if self._restore_pending_user_turn(session):
@@ -423,13 +319,6 @@ class ConversationLoop:
         # report is available to this turn and every later one.
         if handoff is not None:
             consume_handoff(ctx.session, handoff, self._sessions)
-
-        # A subagent follow-up is persisted before prompt assembly so history
-        # stays durable; it is deduped by ``subagent_task_id``.
-        if ctx.msg.sender_id == "subagent" and self._persist_subagent_followup(
-            ctx.session, ctx.msg
-        ):
-            self._sessions.save(ctx.session)
 
         ctx.history = self._session_history(ctx.session)
         ctx.valid_finding_ids = report_finding_ids(ctx.history)
@@ -474,7 +363,7 @@ class ConversationLoop:
         if not ctx.valid_finding_ids:
             return
         texts: list[str] = []
-        if ctx.current_role == "user" and isinstance(ctx.msg.content, str):
+        if isinstance(ctx.msg.content, str):
             texts.append(ctx.msg.content)
         texts.extend(ctx.consumed_user_texts)
         references = collect_finding_references(texts, ctx.valid_finding_ids)
@@ -491,7 +380,7 @@ class ConversationLoop:
     def _save(self, ctx: _TurnContext) -> None:
         """Persist the turn's incremental history and clean up turn state."""
         if ctx.final_content is None or not ctx.final_content.strip():
-            ctx.final_content = ctx.default_content or EMPTY_FINAL_RESPONSE_MESSAGE
+            ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
         ctx.save_skip = 1 + len(ctx.history) + (1 if ctx.user_persisted_early else 0)
         skip_msgs = ctx.all_messages[ctx.save_skip :]
@@ -637,35 +526,14 @@ class ConversationLoop:
     def _make_pending_drain(
         self, ctx: _TurnContext
     ) -> Callable[..., Awaitable[list[dict[str, Any]]]]:
+        """Build the mid-turn injector for ordinary user messages.
+
+        The drain only consumes queued *user* messages: the coordinator routes
+        them here while this turn holds the session lock. Review subagent
+        results never enter this queue (they are drained by ``ReviewLoop``), so
+        no subagent waiting, deduping or filtering happens here.
+        """
         pending_queue = ctx.pending_queue
-        consumed_subagent_task_ids = ctx.consumed_subagent_task_ids
-        active_session_key = ctx.session_key
-        buffered_pending: list[InboundMessage] = []
-        injected_subagent_task_ids: set[str] = set()
-
-        def _running_subagents() -> int:
-            getter = getattr(self._subagents, "get_running_count_by_session", None)
-            if not callable(getter):
-                return 0
-            return int(getter(active_session_key))
-
-        def _is_subagent_result(msg: InboundMessage) -> bool:
-            return (
-                msg.sender_id == "subagent"
-                or (msg.metadata or {}).get("injected_event") == "subagent_result"
-            )
-
-        def _drain_subagent_results(limit: int) -> list[InboundMessage]:
-            drain = getattr(self._subagents, "drain_session_results", None)
-            if not callable(drain):
-                return []
-            return list(drain(active_session_key, limit=limit))
-
-        async def _wait_subagent_result() -> InboundMessage | None:
-            wait = getattr(self._subagents, "wait_for_session_result", None)
-            if not callable(wait):
-                return None
-            return await wait(active_session_key, timeout=0.1)
 
         def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
             message: dict[str, Any] = {
@@ -684,17 +552,8 @@ class ConversationLoop:
         def _accept_pending(
             items: list[dict[str, Any]], pending_msg: InboundMessage
         ) -> None:
-            if _is_subagent_result(pending_msg):
-                task_id = (pending_msg.metadata or {}).get("subagent_task_id")
-                if isinstance(task_id, str) and task_id:
-                    if task_id in injected_subagent_task_ids:
-                        return
-                    injected_subagent_task_ids.add(task_id)
-                    if consumed_subagent_task_ids is not None:
-                        consumed_subagent_task_ids.add(task_id)
-                items.append(_to_user_message(pending_msg))
-                return
-            buffered_pending.append(pending_msg)
+            _record_consumed_user_text(pending_msg)
+            items.append(_to_user_message(pending_msg))
 
         async def _drain_pending(
             *, limit: int = _MAX_INJECTIONS_PER_TURN
@@ -703,43 +562,12 @@ class ConversationLoop:
             if pending_queue is None:
                 return items
 
-            while (
-                buffered_pending and len(items) < limit and _running_subagents() == 0
-            ):
-                pending_msg = buffered_pending.pop(0)
-                _record_consumed_user_text(pending_msg)
-                items.append(_to_user_message(pending_msg))
-
-            for result_msg in _drain_subagent_results(limit - len(items)):
-                _accept_pending(items, result_msg)
-
             while len(items) < limit:
                 try:
                     pending_msg = pending_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 _accept_pending(items, pending_msg)
-
-            while len(items) < limit:
-                if _running_subagents() > 0 and not items:
-                    pending_msg = await _wait_subagent_result()
-                    if pending_msg is None and not callable(
-                        getattr(self._subagents, "wait_for_session_result", None)
-                    ):
-                        try:
-                            pending_msg = await asyncio.wait_for(
-                                pending_queue.get(), timeout=0.1
-                            )
-                        except asyncio.TimeoutError:
-                            pending_msg = None
-                    if pending_msg is not None:
-                        _accept_pending(items, pending_msg)
-                elif buffered_pending and _running_subagents() == 0:
-                    pending_msg = buffered_pending.pop(0)
-                    _record_consumed_user_text(pending_msg)
-                    items.append(_to_user_message(pending_msg))
-                else:
-                    break
 
             return items
 
@@ -766,11 +594,11 @@ class ConversationLoop:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         return self._context.build_partitioned_messages(
             history=ctx.history,
-            current_message="" if ctx.current_role == "assistant" else ctx.msg.content,
+            current_message=ctx.msg.content,
             media=ctx.msg.media if ctx.msg.media else None,
             channel=ctx.outbound_channel or ctx.msg.channel,
             chat_id=self._runtime_chat_id(ctx.msg),
-            current_role=ctx.current_role,
+            current_role="user",
             sender_id=ctx.msg.sender_id,
             session_summary=ctx.pending_summary,
             session_metadata=ctx.session.metadata,
@@ -787,7 +615,6 @@ class ConversationLoop:
             model=self._model,
             review_config=self._review_config,
             bus=self._bus,
-            subagent_manager=self._subagents,
             sessions=self._sessions,
             file_state_store=self._file_state_store,
             provider_snapshot_loader=self._provider_snapshot_loader,
@@ -870,8 +697,6 @@ class ConversationLoop:
     # -- persistence helpers ------------------------------------------------
 
     def _persist_user_message_early(self, ctx: _TurnContext) -> bool:
-        if ctx.current_role == "assistant":
-            return False
         media_paths = [p for p in (ctx.msg.media or []) if isinstance(p, str) and p]
         has_text = isinstance(ctx.msg.content, str) and ctx.msg.content.strip()
         if not (has_text or media_paths):
@@ -882,11 +707,6 @@ class ConversationLoop:
         self._mark_pending_user_turn(ctx.session)
         self._sessions.save(ctx.session)
         return True
-
-    def _persist_subagent_followup(
-        self, session: "Session", msg: InboundMessage
-    ) -> bool:
-        return persist_subagent_followup(session, msg)
 
     def _write_turn(
         self,
@@ -1186,5 +1006,4 @@ class ConversationLoop:
 __all__ = [
     "MAX_PENDING_CONVERSATION_MESSAGES",
     "ConversationLoop",
-    "persist_subagent_followup",
 ]

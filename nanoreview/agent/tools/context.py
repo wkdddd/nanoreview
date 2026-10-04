@@ -49,7 +49,6 @@ class ToolContext:
     model: str | None = None
     review_config: Any | None = None
     bus: Any | None = None
-    subagent_manager: Any | None = None
     sessions: Any | None = None
     file_state_store: Any = field(default=None)
     provider_snapshot_loader: Callable[[], Any] | None = None
