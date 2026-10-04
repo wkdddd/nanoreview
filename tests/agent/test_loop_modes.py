@@ -1668,6 +1668,31 @@ class StreamingThenBlockRunner:
         )
 
 
+class CheckpointThenBlockRunner:
+    """Writes a runtime checkpoint, then parks until ``/stop`` cancels it."""
+
+    def __init__(self) -> None:
+        self.runs = 0
+        self.started = asyncio.Event()
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.runs += 1
+        assert spec.checkpoint_callback is not None
+        await spec.checkpoint_callback(
+            {
+                "assistant_message": {"role": "assistant", "content": "partial answer"},
+                "completed_tool_results": [],
+                "pending_tool_calls": [],
+            }
+        )
+        self.started.set()
+        await asyncio.sleep(10)
+        return AgentRunResult(
+            final_content="done",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+        )
+
+
 async def _no_pending_inbound(coordinator: SessionCoordinator) -> bool:
     """Whether the bus has no inbound message waiting."""
     try:
@@ -1869,3 +1894,68 @@ async def test_caller_cancellation_is_not_reported_as_a_stop(tmp_path) -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await request
+
+
+@pytest.mark.asyncio
+async def test_stopped_turn_backfills_its_runtime_checkpoint(tmp_path) -> None:
+    """The stopped turn keeps its partial work and closes its history once."""
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    runner = CheckpointThenBlockRunner()
+    coordinator.conversation_loop._runner = runner
+    key = "cli:stopcheckpoint"
+
+    request = asyncio.create_task(
+        coordinator.process_direct(
+            "long", session_key=key, channel="cli", chat_id="stopcheckpoint"
+        )
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+    stopped = await coordinator._cancel_active_tasks(key)
+    reply = await asyncio.wait_for(request, timeout=1.0)
+
+    assert stopped == 1
+    assert reply is not None and reply.metadata["stop_reason"] == "stopped"
+    contents = [
+        str(m.get("content"))
+        for m in coordinator.sessions.get_or_create(key).get_history(max_messages=0)
+    ]
+    assert "partial answer" in contents  # the checkpoint was materialized
+    assert runner.runs == 1  # the interrupted turn was never re-run
+
+
+@pytest.mark.asyncio
+async def test_stopped_turn_reports_a_failed_history_backfill(tmp_path) -> None:
+    """A stop whose history backfill cannot be saved says so, not silently.
+
+    The interrupted turn's checkpoint is materialized into history; if that
+    write fails the user must learn the session is not fully consistent.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    runner = CheckpointThenBlockRunner()
+    coordinator.conversation_loop._runner = runner
+    key = "cli:stopsavefail"
+
+    request = asyncio.create_task(
+        coordinator.process_direct(
+            "long", session_key=key, channel="cli", chat_id="stopsavefail"
+        )
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=1.0)
+
+    original_save = coordinator.sessions.save
+
+    def _flaky_save(_session: Any) -> None:
+        raise OSError("disk full (injected)")
+
+    coordinator.sessions.save = _flaky_save  # type: ignore[method-assign]
+    try:
+        stopped = await coordinator._cancel_active_tasks(key)
+        reply = await asyncio.wait_for(request, timeout=1.0)
+    finally:
+        coordinator.sessions.save = original_save  # type: ignore[method-assign]
+
+    assert stopped == 1
+    assert reply is not None
+    assert reply.metadata["stop_reason"] == "stopped"
+    assert "could not be persisted" in reply.content
+    assert "OSError" in reply.content

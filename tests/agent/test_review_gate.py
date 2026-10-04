@@ -624,6 +624,28 @@ async def test_stop_settle_is_a_noop_without_a_live_run(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_reports_a_failed_review_settlement(tmp_path) -> None:
+    """A settle that raises is reported to the user, never silently swallowed.
+
+    The gate stays closed when the terminal state cannot be written, so ``/stop``
+    must tell the caller why instead of replying as if the run were settled.
+    """
+    loop, target = _admission_loop(tmp_path)
+    _admit(loop, target)
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("the terminal state could not be persisted")
+
+    loop.finalize = _boom  # type: ignore[method-assign]
+
+    note = await loop._settle_review_run_after_stop(REVIEW_SESSION_KEY)
+
+    assert note is not None
+    assert "could not be settled" in note
+    assert "OSError" in note
+
+
+@pytest.mark.asyncio
 async def test_cancel_while_queued_on_the_lock_settles_instead_of_discarding(
     tmp_path,
 ) -> None:

@@ -1350,8 +1350,9 @@ class SessionCoordinator:
                 "review.stop.settle_failed session={} reason={}", session_key, exc
             )
             return (
-                f"The review run could not be settled ({exc}); restart "
-                "nanoreview to recover the session."
+                f"The review run could not be settled "
+                f"({type(exc).__name__}: {exc}); restart nanoreview to recover "
+                "the session."
             )
         if result is None:
             return (
@@ -2031,7 +2032,10 @@ class SessionCoordinator:
             logger.warning(
                 "agent.stop.persist_failed session={} reason={}", session_key, exc
             )
-            notes.append(f"the interrupted turn could not be persisted ({exc})")
+            notes.append(
+                f"the interrupted turn could not be persisted "
+                f"({type(exc).__name__}: {exc})"
+            )
 
         content = STOPPED_REPLY_CONTENT
         if notes:
