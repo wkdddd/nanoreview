@@ -1,20 +1,24 @@
 """Contract tests for the real ``ConversationLoop``.
 
 ``ConversationLoop`` owns one complete conversation turn: session/history,
-handoff consumption, frozen/working context, a core-only ``ToolRegistry``, one
-``AgentRunner`` run, history persistence and reply assembly. These tests pin the
-boundary the coordinator and the review side rely on:
+frozen/working context, a core-only ``ToolRegistry``, one ``AgentRunner`` run,
+history persistence and reply assembly. These tests pin the boundary the
+coordinator and the review side rely on:
 
 * the conversation core never sees the review-only tools (``local_review`` /
   ``github_review``);
 * one turn runs exactly one runner and persists the user/assistant history;
-* the review handoff is consumed *once*, as a replayable history message, and
-  the report artifact is never copied into session metadata;
+* the review handoff reaches the first turn through the coordinator's own
+  writer — the report artifact is never copied into session metadata, and the
+  injection happens once even across later turns and a session reload;
+* history consolidation runs before that write, and a failing write stops the
+  turn before the runner starts;
 * ``set_runtime_model`` moves the model id and context window for later turns.
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +28,17 @@ from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
     ConversationLoop,
 )
-from nanoreview.agent.coordinator import SessionCoordinator
-from nanoreview.agent.handoff import REVIEW_HANDOFF_EVENT, ReviewHandoff
+from nanoreview.agent.coordinator import (
+    REVIEW_HANDOFF_EVENT,
+    ReviewHandoff,
+    SessionCoordinator,
+)
 from nanoreview.agent.review_state import ReviewRunStatus
-from nanoreview.agent.runner import AgentRunResult, AgentRunSpec
+from nanoreview.agent.runner import (
+    _MAX_INJECTIONS_PER_TURN,
+    AgentRunResult,
+    AgentRunSpec,
+)
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
@@ -36,6 +47,7 @@ from nanoreview.review.result import ReviewHandoffState, ReviewResult
 from nanoreview.review.types import ReviewMetaKey
 
 REPORT_REF = "review-artifacts/run-a.json"
+REPORT_MARKDOWN = "## Code Review Report: repo\n\n### Findings\n\nNo issues.\n"
 
 
 class DummyProvider(LLMProvider):
@@ -70,6 +82,29 @@ class SpecCapturingRunner:
         )
 
 
+class InjectingRunner(SpecCapturingRunner):
+    """Runner that pulls mid-turn injections the way the real runner does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.injected: list[dict[str, Any]] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        if spec.injection_callback is not None:
+            self.injected = await spec.injection_callback()
+        return AgentRunResult(
+            final_content="ok",
+            messages=[
+                *spec.frozen_messages,
+                *spec.working_messages,
+                *self.injected,
+                {"role": "assistant", "content": "ok"},
+            ],
+            had_injections=bool(self.injected),
+        )
+
+
 def _loop(tmp_path: Path) -> ConversationLoop:
     return SessionCoordinator(MessageBus(), DummyProvider(), tmp_path).conversation_loop
 
@@ -90,7 +125,7 @@ def _handoff() -> ReviewHandoff:
         coverage=("security",),
     )
     return ReviewHandoff(
-        result=result, report_markdown="## Report\n\nNo issues.", fits=True
+        result=result, report_markdown=REPORT_MARKDOWN, fits=True
     )
 
 
@@ -175,63 +210,195 @@ def test_set_runtime_model_moves_model_and_window(tmp_path) -> None:
     assert loop._context_window_tokens == 131_072
 
 
-def _handoff_with_report(report: str) -> ReviewHandoff:
-    handoff = _handoff()
-    return ReviewHandoff(result=handoff.result, report_markdown=report, fits=True)
-
-
-_REPORT_WITH_IDS = (
-    "## Code Review Report: repo\n\n### Findings\n\n"
-    "| ID | Dimension | File | Issue | Impact |\n"
-    "|----|-----------|------|-------|--------|\n"
-    "| F001 | bug | a.py:1 | Null deref | crash |\n"
-)
-
-
-def _capture_finding_refs(loop: ConversationLoop) -> dict[str, Any]:
-    """Spy on the transient reference collection without changing behaviour."""
-    captured: dict[str, Any] = {}
-    original = loop._collect_finding_refs
-
-    def spy(ctx) -> None:
-        original(ctx)
-        captured["valid"] = set(ctx.valid_finding_ids)
-        captured["refs"] = list(ctx.finding_refs)
-
-    loop._collect_finding_refs = spy
-    return captured
+def _handoff_messages(loop: ConversationLoop, session_key: str) -> list[dict[str, Any]]:
+    session = loop._sessions.get_or_create(session_key)
+    return [
+        message
+        for message in session.messages
+        if message.get("injected_event") == REVIEW_HANDOFF_EVENT
+    ]
 
 
 @pytest.mark.asyncio
-async def test_turn_collects_the_finding_ids_the_user_named(tmp_path) -> None:
+async def test_the_first_turn_carries_the_report_and_its_directive(tmp_path) -> None:
+    """The injected report reaches the runner, and the directive the system."""
     loop = _loop(tmp_path)
-    loop._runner = SpecCapturingRunner()
-    captured = _capture_finding_refs(loop)
+    runner = SpecCapturingRunner()
+    loop._runner = runner
 
     await loop.process_message(
-        _msg("please fix F001, and ignore F999"),
+        _msg("what did you find?"),
         session_key="cli:review",
         turn_id="t1",
         target_root=tmp_path,
-        handoff=_handoff_with_report(_REPORT_WITH_IDS),
+        handoff=_handoff(),
     )
 
-    assert captured["valid"] == {"F001"}
-    # Only IDs present in the report survive; the phantom F999 is dropped.
-    assert captured["refs"] == ["F001"]
+    spec = runner.specs[0]
+    # The complete report — not a summary — is what the model sees, replayed
+    # from history in the working zone.
+    assert len(spec.working_messages) == 1
+    handoff_message = spec.working_messages[0]
+    assert handoff_message["role"] == "assistant"
+    assert handoff_message["content"].startswith("[ReviewAgent handoff]")
+    assert REPORT_MARKDOWN in handoff_message["content"]
+    # The provenance directive rides in the frozen system zone, which is never
+    # summarized away mid-run.
+    system = spec.frozen_messages[0]
+    assert system["role"] == "system"
+    assert _handoff().directive in system["content"]
+    # The current user message stays in the frozen zone, after the system.
+    assert spec.frozen_messages[1]["role"] == "user"
+    assert "what did you find?" in spec.frozen_messages[1]["content"]
 
 
 @pytest.mark.asyncio
-async def test_turn_without_a_report_collects_no_references(tmp_path) -> None:
+async def test_a_later_turn_does_not_repeat_the_injection(tmp_path) -> None:
     loop = _loop(tmp_path)
-    loop._runner = SpecCapturingRunner()
-    captured = _capture_finding_refs(loop)
 
     await loop.process_message(
-        _msg("fix F001"),
-        session_key="cli:direct",
+        _msg("first"),
+        session_key="cli:review",
         turn_id="t1",
+        target_root=tmp_path,
+        handoff=_handoff(),
+    )
+    await loop.process_message(
+        _msg("second"),
+        session_key="cli:review",
+        turn_id="t2",
         target_root=tmp_path,
     )
 
-    assert captured["refs"] == []
+    assert len(_handoff_messages(loop, "cli:review")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reloaded_session_does_not_repeat_the_injection(tmp_path) -> None:
+    """The consumed marker is on disk, so a restart cannot re-inject."""
+    loop = _loop(tmp_path)
+
+    await loop.process_message(
+        _msg("first"),
+        session_key="cli:review",
+        turn_id="t1",
+        target_root=tmp_path,
+        handoff=_handoff(),
+    )
+
+    reloaded = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    reloaded_loop = reloaded.conversation_loop
+    session = reloaded.sessions.get_or_create("cli:review")
+    assert reloaded.pending_handoff(session) is None
+    assert len(_handoff_messages(reloaded_loop, "cli:review")) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_is_consolidated_before_the_handoff_is_written(
+    tmp_path,
+) -> None:
+    order: list[str] = []
+    loop = _loop(tmp_path)
+    original_consolidate = loop._consolidator.maybe_consolidate_by_tokens
+
+    async def _traced_consolidate(*args, **kwargs):
+        order.append("consolidate")
+        return await original_consolidate(*args, **kwargs)
+
+    loop._consolidator.maybe_consolidate_by_tokens = _traced_consolidate  # type: ignore[method-assign]
+    loop._handoff_consumer = lambda session, handoff: order.append("handoff")  # type: ignore[assignment]
+
+    await loop.process_message(
+        _msg("hello"),
+        session_key="cli:review",
+        turn_id="t1",
+        target_root=tmp_path,
+        handoff=_handoff(),
+    )
+
+    assert order == ["consolidate", "handoff"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_handoff_write_stops_the_turn_before_the_runner(
+    tmp_path,
+) -> None:
+    loop = _loop(tmp_path)
+    runner = SpecCapturingRunner()
+    loop._runner = runner
+
+    def _failing_consumer(session, handoff) -> None:
+        raise OSError("disk full (injected)")
+
+    loop._handoff_consumer = _failing_consumer
+
+    with pytest.raises(OSError, match="disk full"):
+        await loop.process_message(
+            _msg("hello"),
+            session_key="cli:review",
+            turn_id="t1",
+            target_root=tmp_path,
+            handoff=_handoff(),
+        )
+
+    assert runner.specs == []
+
+
+@pytest.mark.asyncio
+async def test_queued_messages_are_injected_and_saved(tmp_path) -> None:
+    """A message queued mid-turn enters the run and the saved history."""
+    loop = _loop(tmp_path)
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content="also check the tests",
+            metadata={"message_id": "m-2"},
+        )
+    )
+    runner = InjectingRunner()
+    loop._runner = runner
+
+    await loop.process_message(
+        _msg("first"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+        pending_queue=queue,
+    )
+
+    # The drain handed the queued message to the run, metadata included.
+    assert runner.injected == [
+        {"role": "user", "content": "also check the tests", "_metadata": {"message_id": "m-2"}}
+    ]
+    session = loop._sessions.get_or_create("cli:direct")
+    assert [m.get("role") for m in session.messages] == [
+        "user",
+        "user",
+        "assistant",
+    ]
+    assert "also check the tests" in session.messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_the_drain_respects_the_injection_cap(tmp_path) -> None:
+    loop = _loop(tmp_path)
+    queue: asyncio.Queue = asyncio.Queue()
+    for index in range(_MAX_INJECTIONS_PER_TURN + 3):
+        queue.put_nowait(_msg(f"queued {index}"))
+    runner = InjectingRunner()
+    loop._runner = runner
+
+    await loop.process_message(
+        _msg("first"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+        pending_queue=queue,
+    )
+
+    # The cap still holds and the surplus stays queued for a later turn.
+    assert len(runner.injected) == _MAX_INJECTIONS_PER_TURN
+    assert queue.qsize() == 3

@@ -480,11 +480,22 @@ class ReviewLoop:
         The artifact exists, so the report text is still delivered, but the run
         stays ``running``: no live ``DONE`` and no terminal metadata mean the
         session gate stays closed and the next ``/stop`` (or a restart) is what
-        settles it. The bounded reason tells the user what blocked the exit.
+        settles it.
+
+        The bounded reason is appended to the delivered report here rather than
+        in the turn loop: the run's outcome owns the whole "the report exists
+        but the exit is not settled" framing, so ``SessionCoordinator`` only
+        delivers ``report_markdown`` verbatim and never has to reason about
+        review state to decide what the user is told.
         """
         bounded = bound_child_error(reason) or "the review run could not be settled"
+        report = finalizer_result.report_markdown
+        settled_note = f"> Review settlement failed: {bounded}"
+        report_markdown = (
+            f"{report}\n\n{settled_note}" if report else settled_note
+        )
         return ReviewLoopOutcome(
-            report_markdown=finalizer_result.report_markdown,
+            report_markdown=report_markdown,
             result=None,
             stop_reason="error",
             error=bounded,

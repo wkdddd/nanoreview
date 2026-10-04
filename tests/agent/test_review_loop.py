@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -1045,6 +1046,29 @@ async def test_terminal_save_failure_keeps_the_run_running(tmp_path, prepared) -
     assert session.metadata.get(ReviewMetaKey.PHASE) != "done"
     reloaded = SessionManager(tmp_path).get_or_create(SESSION_KEY)
     assert reloaded.metadata.get(ReviewMetaKey.PHASE) != "done"
+    # The delivered report itself carries the settle failure, so the user is
+    # told the exit is blocked instead of only seeing a clean report.
+    assert outcome.produces_report is True
+    assert "Review settlement failed" in (outcome.report_markdown or "")
+    assert "could not be persisted" in (outcome.report_markdown or "")
+
+
+@pytest.mark.asyncio
+async def test_unsettled_report_without_report_text_still_names_the_failure(
+    tmp_path,
+) -> None:
+    """A settle failure with no report text still delivers the bounded reason."""
+    finalizer_result = cast(Any, SimpleNamespace(report_markdown=None))
+    reason = "review cleanup could not cancel all child tasks (RuntimeError)"
+
+    outcome = ReviewLoop._unsettled_outcome(finalizer_result, reason)
+
+    assert isinstance(outcome, ReviewLoopOutcome)
+    assert outcome.produces_report is True
+    assert outcome.stop_reason == "error"
+    assert "Review settlement failed" in (outcome.report_markdown or "")
+    # The bounded reason is also still available on the outcome itself.
+    assert "cancel all child tasks" in (outcome.error or "")
 
 
 @pytest.mark.asyncio

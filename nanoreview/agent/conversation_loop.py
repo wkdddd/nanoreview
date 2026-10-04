@@ -1,20 +1,24 @@
 """ConversationLoop: one complete conversation turn for one session.
 
 ``ConversationLoop`` owns the whole ordinary (non-review) conversation turn:
-it loads the session, injects and consumes the first review handoff, builds the
-frozen/working context, creates a core-only ``ToolRegistry`` for the turn, runs
-one ``AgentRunner`` run (the model/tool loop lives in the runner), persists the
-turn's history and assembles the outbound reply.
+it loads the session, consumes the first review handoff through the
+coordinator, builds the frozen/working context, creates a core-only
+``ToolRegistry`` for the turn, runs one ``AgentRunner`` run (the model/tool loop
+lives in the runner), persists the turn's history and assembles the outbound
+reply.
 
 It never decides *whether* the conversation is open: the ``SessionCoordinator``
 routes, gates, and prepares the read-only handoff inside the session lock, then
-calls :meth:`ConversationLoop.process_message`. The loop also never reads the
+calls :meth:`ConversationLoop.process_message`. The handoff is written by the
+coordinator through the injected ``handoff_consumer``; the loop only chooses
+*when* in its turn sequence that write happens. The loop also never reads the
 review report artifact or rewrites the review run state.
 
 Turn shape (linear helper calls, no state machine, no transition table):
 
-    load session -> restore checkpoint -> compact -> build context/tools
-      -> run -> persist history -> assemble reply -> cleanup
+    load session -> restore checkpoint -> compact -> consume handoff
+      -> build context/tools -> run -> persist history -> assemble reply
+      -> cleanup
 """
 
 from __future__ import annotations
@@ -30,11 +34,6 @@ from loguru import logger
 
 from nanoreview.agent.autocompact import AutoCompact
 from nanoreview.agent.context import ContextBuilder
-from nanoreview.agent.finding_refs import (
-    collect_finding_references,
-    report_finding_ids,
-)
-from nanoreview.agent.handoff import ReviewHandoff, consume_handoff
 from nanoreview.agent.hooks.lifecycle import AgentHook, CompositeHook
 from nanoreview.agent.hooks.progress import AgentProgressHook
 from nanoreview.agent.memory import Consolidator
@@ -70,6 +69,7 @@ from nanoreview.utils.webui_titles import mark_webui_session
 from nanoreview.utils.webui_turn_helpers import publish_turn_run_status
 
 if TYPE_CHECKING:
+    from nanoreview.agent.coordinator import ReviewHandoff
     from nanoreview.config.schema import ToolsConfig
     from nanoreview.providers.base import LLMProvider
     from nanoreview.session.manager import Session, SessionManager
@@ -121,13 +121,6 @@ class _TurnContext:
 
     pending_queue: asyncio.Queue | None = None
 
-    #: Report-local finding IDs valid in the report currently in context.
-    valid_finding_ids: frozenset[str] = frozenset()
-    #: User texts actually consumed this turn (first message + injected ones).
-    consumed_user_texts: list[str] = field(default_factory=list)
-    #: Confirmed finding IDs this turn's user messages explicitly named.
-    finding_refs: list[str] = field(default_factory=list)
-
     on_progress: Callable[..., Awaitable[None]] | None = None
     on_stream: Callable[[str], Awaitable[None]] | None = None
     on_stream_end: Callable[..., Awaitable[None]] | None = None
@@ -143,6 +136,7 @@ class ConversationLoop:
     def __init__(
         self,
         *,
+        handoff_consumer: Callable[["Session", "ReviewHandoff"], None],
         bus: MessageBus,
         provider: "LLMProvider",
         workspace: Path,
@@ -206,6 +200,10 @@ class ConversationLoop:
         #: the runner returns, so it is independent of whether a reply body was
         #: delivered and survives a later persistence failure.
         self._usage_recorder = usage_recorder
+        #: Writes the prepared review handoff into the session. Injected by the
+        #: coordinator, which owns that single replayable write; the loop only
+        #: calls it between history consolidation and the history read.
+        self._handoff_consumer = handoff_consumer
         # One loader instance keeps the (package-scan) discovery cache warm;
         # each turn still registers a fresh registry from it.
         self._tool_loader = ToolLoader()
@@ -241,7 +239,7 @@ class ConversationLoop:
         session_key: str,
         turn_id: str,
         target_root: Path,
-        handoff: ReviewHandoff | None = None,
+        handoff: "ReviewHandoff | None" = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
@@ -272,7 +270,6 @@ class ConversationLoop:
             self._compact(ctx)
             await self._build(ctx, handoff)
             await self._run(ctx)
-            self._collect_finding_refs(ctx)
             self._save(ctx)
             await self._respond(ctx)
             return ctx.outbound
@@ -312,7 +309,7 @@ class ConversationLoop:
         ctx.pending_summary = pending
 
     async def _build(
-        self, ctx: _TurnContext, handoff: ReviewHandoff | None
+        self, ctx: _TurnContext, handoff: "ReviewHandoff | None"
     ) -> None:
         """Consume the handoff, build the context and create the tool registry."""
         await self._consolidator.maybe_consolidate_by_tokens(
@@ -320,14 +317,15 @@ class ConversationLoop:
             replay_max_messages=self._max_messages,
         )
 
-        # The handoff was prepared (and size-checked) by the coordinator; the
-        # loop owns the one replayable write, before history is read, so the
-        # report is available to this turn and every later one.
+        # The handoff was prepared (and size-checked) by the coordinator, which
+        # also owns the single replayable write. The loop calls it after history
+        # consolidation and before reading history, so the report is available to
+        # this turn and every later one; a failed write propagates and the
+        # runner never starts.
         if handoff is not None:
-            consume_handoff(ctx.session, handoff, self._sessions)
+            self._handoff_consumer(ctx.session, handoff)
 
         ctx.history = self._session_history(ctx.session)
-        ctx.valid_finding_ids = report_finding_ids(ctx.history)
         ctx.tools = self._build_turn_tools(ctx)
         self._set_tool_context(ctx)
         if (message_tool := ctx.tools.get("message")) and isinstance(
@@ -363,30 +361,6 @@ class ConversationLoop:
             logger.error(
                 "LLM returned error: {}", (result.final_content or "")[:200]
             )
-
-    def _collect_finding_refs(self, ctx: _TurnContext) -> None:
-        """Record the report finding IDs this turn's user messages named.
-
-        Purely transient: the references stay on the turn's own context and in
-        the log. They are never persisted, associated with a finding record, or
-        used to infer repair status.
-        """
-        if not ctx.valid_finding_ids:
-            return
-        texts: list[str] = []
-        if isinstance(ctx.msg.content, str):
-            texts.append(ctx.msg.content)
-        texts.extend(ctx.consumed_user_texts)
-        references = collect_finding_references(texts, ctx.valid_finding_ids)
-        if not references:
-            return
-        ctx.finding_refs = references
-        logger.info(
-            "conversation.finding_refs session={} turn={} refs={}",
-            ctx.session_key,
-            ctx.turn_id,
-            ",".join(references),
-        )
 
     def _save(self, ctx: _TurnContext) -> None:
         """Persist the turn's incremental history and clean up turn state."""
@@ -546,26 +520,6 @@ class ConversationLoop:
         """
         pending_queue = ctx.pending_queue
 
-        def _to_user_message(pending_msg: InboundMessage) -> dict[str, Any]:
-            message: dict[str, Any] = {
-                "role": "user",
-                "content": pending_msg.content,
-            }
-            if pending_msg.metadata:
-                message["_metadata"] = dict(pending_msg.metadata)
-            return message
-
-        def _record_consumed_user_text(pending_msg: InboundMessage) -> None:
-            content = pending_msg.content
-            if isinstance(content, str) and content:
-                ctx.consumed_user_texts.append(content)
-
-        def _accept_pending(
-            items: list[dict[str, Any]], pending_msg: InboundMessage
-        ) -> None:
-            _record_consumed_user_text(pending_msg)
-            items.append(_to_user_message(pending_msg))
-
         async def _drain_pending(
             *, limit: int = _MAX_INJECTIONS_PER_TURN
         ) -> list[dict[str, Any]]:
@@ -578,7 +532,13 @@ class ConversationLoop:
                     pending_msg = pending_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                _accept_pending(items, pending_msg)
+                message: dict[str, Any] = {
+                    "role": "user",
+                    "content": pending_msg.content,
+                }
+                if pending_msg.metadata:
+                    message["_metadata"] = dict(pending_msg.metadata)
+                items.append(message)
 
             return items
 

@@ -11,21 +11,24 @@ between the two agent phases a NanoReview session can be in:
 
 It owns the process skeleton — MessageBus receive/send, per-session serial
 locks and the bounded pending queue, command dispatch and permission responses,
-cancellation scheduling, the review/conversation route and gates, handoff
-preparation, and final result publication — and delegates the actual turn
-algorithms:
+cancellation scheduling, the review/conversation route and gates, the handoff
+value object with its single session write, and final result publication — and
+delegates the actual turn algorithms:
 
 * ``ReviewLoop`` owns a complete review turn: it builds the review context
   (``ContextBuilder`` + ``COMMON_RULES``), persists the user message and the
   report artifact, drives the lifecycle and returns the structured result.
 * ``ConversationLoop`` owns a complete conversation turn: session/history,
-  handoff consumption, context and per-turn ``ToolRegistry``, the single
-  ``AgentRunner`` run, history persistence and reply assembly.
+  the per-turn context and ``ToolRegistry``, the single ``AgentRunner`` run,
+  history persistence and reply assembly. It consumes the handoff by calling
+  back into :meth:`SessionCoordinator.consume_handoff`, so the coordinator
+  stays the only writer of the injected handoff.
 
 The coordinator itself calls no model and executes no tool: a review turn is
 handed over whole and only its produced report is published (including the
 report chunk stream); a conversation turn's history is built and saved by the
-conversation loop, never here.
+conversation loop, never here — apart from the one handoff injection, which the
+coordinator writes before that turn reads history.
 
 Handoff states
 --------------
@@ -60,12 +63,6 @@ from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
     ConversationLoop,
-)
-from nanoreview.agent.handoff import (
-    REVIEW_CONTEXT_EVENT,
-    REVIEW_HANDOFF_EVENT,
-    ReviewHandoff,
-    consume_handoff,
 )
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.memory import Consolidator
@@ -107,6 +104,7 @@ from nanoreview.review.result import (
     ReviewHandoffState,
     ReviewResult,
     render_handoff_block,
+    render_handoff_directive,
     render_review_context_index,
     result_from_session_metadata,
 )
@@ -124,6 +122,10 @@ UNIFIED_SESSION_KEY = "unified:default"
 
 #: Commands that stay usable while a review run owns the session.
 REVIEW_ALLOWED_COMMANDS = frozenset({"/status", "/stop"})
+
+#: Index / handoff markers stored on the persisted session messages.
+REVIEW_CONTEXT_EVENT = "review_context"
+REVIEW_HANDOFF_EVENT = "review_handoff"
 
 #: How much of the context window is held back from the handoff check for the
 #: system prompt, runtime block and the model's own output.
@@ -194,6 +196,34 @@ class SessionRoute(StrEnum):
 
     REVIEW = "review"
     CONVERSATION = "conversation"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ReviewHandoff:
+    """The review result about to be handed to the first conversation turn.
+
+    The handoff is the boundary between ``ReviewLoop`` (which owns the report
+    artifact and the run state) and ``ConversationLoop`` (which owns the
+    conversation history). It is deliberately a plain, immutable value: the
+    coordinator *prepares* it read-only inside the session lock, the
+    conversation loop *calls back* to persist it through
+    :meth:`SessionCoordinator.consume_handoff`, and neither side may rewrite the
+    authoritative report.
+    """
+
+    result: ReviewResult
+    report_markdown: str | None
+    fits: bool
+
+    @property
+    def block(self) -> str:
+        """Full injected context: framing, gaps, and the complete report."""
+        return render_handoff_block(self.result, self.report_markdown)
+
+    @property
+    def directive(self) -> str:
+        """Short system-level directive naming provenance and handoff state."""
+        return render_handoff_directive(self.result)
 
 
 class SessionCoordinator:
@@ -412,6 +442,7 @@ class SessionCoordinator:
             hooks=self._extra_hooks,
             hooks_getter=lambda: self._extra_hooks,
             usage_recorder=self._record_result_usage,
+            handoff_consumer=self.consume_handoff,
         )
 
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
@@ -1220,8 +1251,33 @@ class SessionCoordinator:
         )
 
     def consume_handoff(self, session: Session, handoff: ReviewHandoff) -> None:
-        """Persist the injected handoff so later turns keep the same context."""
-        consume_handoff(session, handoff, self.sessions)
+        """Persist the injected handoff so later turns keep the same context.
+
+        The coordinator owns this single replayable write; the conversation loop
+        only calls it at the point the prepared handoff must enter history. The
+        block goes into the conversation history (an assistant message that names
+        ReviewAgent as its source) instead of being re-added to every system
+        prompt, so it stays available to later turns and to consolidation while
+        the report artifact remains the authoritative copy.
+        """
+        session.add_message(
+            "assistant",
+            handoff.block,
+            injected_event=REVIEW_HANDOFF_EVENT,
+            review_run_id=handoff.result.run_id,
+            review_report_ref=handoff.result.report_ref,
+            review_source="review_agent",
+            review_handoff=handoff.result.handoff.value,
+        )
+        session.metadata[ReviewMetaKey.HANDOFF_RUN_ID] = handoff.result.run_id
+        self.sessions.save(session)
+        logger.info(
+            "review.handoff.injected session={} run_id={} handoff={} report_chars={}",
+            session.key,
+            handoff.result.run_id,
+            handoff.result.handoff.value,
+            len(handoff.report_markdown or ""),
+        )
 
     def _read_report(self, result: ReviewResult) -> str | None:
         """Load the authoritative report markdown for *result*."""
@@ -1307,15 +1363,15 @@ class SessionCoordinator:
                 result_callback=_persist_automatic_subagent_result,
             )
         )
+        # The settle-failure wording is owned by ``ReviewLoop``: it appends the
+        # bounded reason to the report it produces, so this turn host delivers
+        # ``report_markdown`` verbatim and never re-decides what the user is
+        # told from review state.
         final_content = outcome.report_markdown
         # The review run's total usage is returned once with its terminal
         # result; record it here so a review turn is counted like any other.
         if outcome.result is not None:
             self._record_result_usage(outcome.result.usage)
-        if outcome.produces_report and outcome.error:
-            final_content = (
-                f"{final_content}\n\n> Review settlement failed: {outcome.error}"
-            )
         if not final_content:
             return None
         if outcome.produces_report and wants_stream:

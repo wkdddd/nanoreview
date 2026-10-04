@@ -33,10 +33,10 @@
 
 | 项目摘要 | 参考用途 | 已核查 commit |
 |---|---|---|
-| [nanobot](references/nanobot.md) | 对话、session、上下文与 Runner | `4de728a5` |
+| [nanobot](references/nanobot.md) | 对话、session、上下文与 Runner | `432421bc` |
 | [open-code-review](references/open-code-review.md) | 审查流程、LLM loop、预算与显式 resume | `e95bdda` |
 | [kodus-ai](references/kodus-ai.md) | 审查与对话分流、共享执行内核 | `1df08e5` |
 
 按问题选择项目摘要，再定位相关源码；不默认加载全部摘要或仓库。路径、核查范围与日期见各文件。参考文件只记录外部事实和必要差异，不定义产品目标；本项目职责见约束，候选分支取舍见计划。
 
-参考更新时比较已核查 commit，仅重读变化文件及直接消费者；无 Git 时使用内容 hash。摘要保留路径、版本、范围、入口、行为/契约、差异和验证局限，不复制密钥、会话或无关源码。
+参考更新与历史笔记保留规则见根 `AGENTS.md` 的“约束文档入口”。核查时仅重读变化文件及直接消费者；无 Git 时使用内容 hash。摘要保留路径、版本、范围、入口、行为/契约、差异和验证局限，不复制密钥、会话或无关源码。

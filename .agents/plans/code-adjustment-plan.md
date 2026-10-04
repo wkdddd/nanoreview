@@ -11,7 +11,7 @@
 - 将 `SessionCoordinator` 从 `nanoreview/session/coordinator.py` 移至 `nanoreview/agent/coordinator.py`，保留类名并删除旧模块及其导入路径；不再单独建立 `SessionRuntime`。
 - `SessionCoordinator` 作为 session 核心入口，承接 MessageBus 收发、session 锁与最多 20 条的待处理队列、命令与权限响应、取消调度、review/conversation 路由与门禁、handoff 准备及最终结果发布。进入 review turn 后，它不构造或保存 review 上下文，只接收并发布 `ReviewLoop` 结果（包括报告分块推流）；它可读取 session metadata、维护 review 索引，但不承担普通对话 turn 的历史构造、追加和保存。按职责拆分私有 helper。
 - Coordinator 调用 `ReviewLoop` 或 `ConversationLoop`，不把 Agent 执行算法并入自身。`ReviewLoop` 负责完整的 review turn：从 session 构造 `ContextBuilder` + `COMMON_RULES` 上下文，保存用户消息和报告，管理 review 生命周期、run 状态和 report artifact，并返回结果；`AgentRunner` 继续执行单个模型/工具 run。
-- `ConversationLoop` 拥有完整对话 turn：读取 session/history、写入并消费 handoff、构造上下文与工具、调用 `AgentRunner`、错误与取消收尾、保存历史及组装回复。它使用现有 `SessionManager`，不建立第二套存储。
+- `ConversationLoop` 拥有完整对话 turn：读取 session/history、调用 handoff consumer 完成交接写入、构造上下文与工具、调用 `AgentRunner`、错误与取消收尾、保存历史及组装回复。它使用现有 `SessionManager`，不建立第二套存储。交接值对象 `ReviewHandoff` 与唯一一次 session 写入由 `SessionCoordinator` 拥有（`handoff_consumer` 为 Loop 构造函数必需参数，装配时传入绑定方法）。
 - review 未完成清理、终态及结果持久化前继续拒绝普通消息；完成 `DONE` 后才路由到 conversation。首次 handoff 注入完整 report 或既有的有界失败上下文，报告只读且超出上下文预算时拒绝该 turn。
 - Review Agent 与 Conversation Agent 保持独立 prompt、上下文、`ToolRegistry` 和权限执行 profile；Conversation Agent 沿用通用 core（含 `message`、`spawn` 和已注册插件），排除 review 专属工具，权限行为沿用现有 `approval_enabled`。工作区解析与路径限制复用 nanobot，目标仓库 root 作为文件路径基准和默认命令 cwd。
 - 以现有继承 nanobot 的 `AgentLoop` 为迁移起点，复用其消息注入、流式输出、保存和交付策略；本次删除 `nanoreview/agent/loop.py`、`AgentLoop` 类及其导出、导入，不保留兼容门面，不引入正式 conversation 状态机。
@@ -35,9 +35,9 @@ async def process_message(
 ```
 
 - 删除占位的 `ConversationTurnRequest`、`ConversationTurnResult`，不新增外部 `ConversationTurnContext` 或回调包装类。输入复用 `InboundMessage`，Runner 输出复用 `AgentRunResult`，最终回复复用 `OutboundMessage`。
-- 内部使用私有 `_TurnContext`，保存本轮 Session、history、消息分区、工具注册表、Runner 结果、瞬时 finding 引用和回复状态。每次调用独立创建；不把本轮可变状态保存在共享 Loop 实例中，不持久化该对象。
-- Coordinator 在 session 锁内完成路由、门禁及 handoff 准备，传入已确定的 session/turn 标识、目标 root 和一致的模型/预算配置。它负责读取权威 report 并准备只读 handoff；ConversationLoop 不决定是否开放 conversation，也不再次读取 report artifact。
-- ConversationLoop 通过 `SessionManager` 取得 Session。首次 handoff 在完整报告预算检查通过后，由 Loop 写入可重放的历史消息和已消费标记并保存，再读取 history；超窗拒绝不得消费 handoff。后续 turn 不重复注入。
+- 内部使用私有 `_TurnContext`，保存本轮 Session、history、消息分区、工具注册表、Runner 结果和回复状态。每次调用独立创建；不把本轮可变状态保存在共享 Loop 实例中，不持久化该对象。
+- Coordinator 在 session 锁内完成路由、门禁及 handoff 准备，传入已确定的 session/turn 标识、目标 root 和一致的模型/预算配置。它负责读取权威 report、准备只读 handoff 并拥有其唯一一次 session 写入；ConversationLoop 不决定是否开放 conversation，也不再次读取 report artifact。
+- ConversationLoop 通过 `SessionManager` 取得 Session。turn 顺序固定为「加载 session → 恢复中断历史 → AutoCompact 准备 → token Consolidator → 调用 handoff consumer → 读取历史 → 构建模型上下文」：完整报告预算检查通过后才写入可重放的历史消息和已消费标记并保存，写入失败向上传播且不进入 Runner；超窗拒绝不得消费 handoff。后续 turn 与重新加载 session 后均不重复注入。
 - 使用 `ContextBuilder.build_partitioned_messages()`：system prompt、共同规则、技能和当前 user/media 位于 frozen 区，history 位于 working 区；handoff directive 追加到 frozen system message。不得注入完整 reviewer/Judge transcript，保留既有历史整理接线，长对话治理调整仍留待后续节点。
 - 为本轮创建独立 `ToolRegistry`，通过现有 `ToolLoader` 加载 core，仅排除 `local_review`、`github_review`。`submit_review_plan`、`submit_verdicts` 的实际名称均为 `_plugin_discoverable=False`，本来不会自动加载；`review_submit` 只在 reviewer scope 中，不进入 core。绑定 request context、工作区及 `FileStateStore.for_session(session_key)`；`message`/`spawn` 的发送和子任务依赖由统一装配接入，不新增 MessageBus 消费循环。
 - 组装 `AgentRunSpec` 调用共享 Runner。模型/工具迭代、运行内压缩、usage 和逐工具 permission callback 保留在 Runner；权限响应、进度/流式发布和 pending injection 通过现有回调接入 Coordinator。
@@ -54,7 +54,7 @@ Coordinator.receive
   -> route/gate/lock/queue
   -> prepare read-only handoff + resolve turn configuration
   -> ConversationLoop.process_message(InboundMessage)
-       -> load Session + persist one handoff + read history
+       -> load Session + consolidate + call handoff consumer + read history
        -> build ContextBuilder partition
        -> create core-only tools + bind FileStates/permissions
        -> AgentRunner.run(AgentRunSpec)
@@ -86,9 +86,8 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 ### Finding 引用
 
 - 为最终 report 中的 confirmed findings 按最终展示顺序生成稳定的 report-local ID（如 `F001`），写入 Markdown、report artifact 和 `ReviewResult.findings`；内部 rejected/uncertain candidates 不生成面向用户的 ID。
-- 收集本轮实际消费的用户消息中明确出现、且存在于当前 report 的 finding ID，允许多个并去重；无效 ID 忽略，不从标题、路径、修复 diff 或模型输出推断。
-- `finding_ids` 只保留在本轮内存和日志，不保存结构化 turn/finding 关联，不写入 Session metadata；用户原文中的 ID 仍作为普通历史内容保留。
-- 引用不建立 finding 修复状态机，不自动关闭 finding，不改写原 report，也不表示修复已验证或重新审查通过。
+- 这些 ID 保留在报告与结果中，供用户和模型讨论具体问题；Conversation Agent 不再提取、临时记录或消费用户消息中的 finding 引用（`agent/finding_refs.py` 及其日志、字段和测试已删除），pending drain 也不再为本目的记录用户文本。
+- 不建立 finding 修复状态机，不自动关闭 finding，不改写原 report，也不表示修复已验证或重新审查通过；用户原文中的 ID 仍作为普通历史内容保留。
 
 ### 实施顺序
 
@@ -96,7 +95,7 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 2. 将 `AgentLoop` 的装配、MessageBus 主循环、session 串行和队列、命令、取消调度、权限响应、双 Agent 路由迁入 Coordinator；把 review turn 的 `ContextBuilder`/`COMMON_RULES` 上下文构造、用户消息和报告保存、结果返回收敛到 `ReviewLoop`，Coordinator 只发布结果（包括报告分块推流），不引入第二个 runtime 类。
 3. 将完整对话 turn 迁入 ConversationLoop：InboundMessage 输入、内部 `_TurnContext`、handoff 历史写入、上下文与工具、Runner 调用、历史保存、取消收尾及 OutboundMessage 输出。删除占位 Request/Result 类，复用 nanobot 的注入、工作区、流式和交付策略。
 4. 通过 `ContextBuilder.BOOTSTRAP_FILES` 将 SOUL 文件和模板接入 `COMMON_RULES.md`，显式接入 reviewer `prompt_builder` 与 Judge `_system_prompt`；不假定旧 workspace 的 `SOUL.md` 内容自动迁移，验证内部迭代不刷新。
-5. 为最终 report findings 增加稳定 ID，接入多个显式 finding 引用的瞬时收集和日志；不增加独立 sidecar 或文件/shell 审计。
+5. 为最终 report findings 增加稳定 ID（`report.py` + artifact/`ReviewResult`），不增加独立 sidecar 或文件/shell 审计。
 6. 迁移 API、CLI、channel、包导出及测试，完整删除 `nanoreview/agent/loop.py`、`AgentLoop` 及旧 coordinator 导入路径，不保留兼容门面；记录 `turn_trace` 消失对应的前端待适配项。本节点不修改 `review-webui/`。
 
 当前核查的迁移影响面为 9 个源文件和 8 个测试文件，重点核对 `test_review_gate`（21 处引用）与 `test_loop_modes`（19 处引用）。每个实施步骤单独提交；步骤完成后运行受影响测试并保持 pytest 通过，最后运行全量 pytest。
@@ -104,12 +103,12 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 ### 测试与验收
 
 - Coordinator 路由只在 review `DONE` 后开放 conversation；review handoff 只注入一次，普通消息门禁、队列上限、命令、权限响应、取消与 outbound 行为保持一致。
-- `AgentLoop` 类、模块、导出及旧 coordinator 导入路径全部移除；API/CLI 和总线入口共用 Coordinator 调度。ConversationLoop 独立完成对话历史读取、handoff 消费、保存和回复组装，Coordinator 不重复追加历史。
+- `AgentLoop` 类、模块、导出及旧 coordinator 导入路径全部移除；API/CLI 和总线入口共用 Coordinator 调度。ConversationLoop 独立完成对话历史读取、保存和回复组装，Coordinator 不重复追加历史；交接写入由 Coordinator 拥有，Loop 在固定位置回调调用。
 - 多轮对话回放连续；注入消息只保存一次，未消费消息继续调度；`None` 返回和 message 工具发送不会导致重复回复或误判失败。system/subagent 消息在 conversation 阶段按 assistant turn 执行，在 review 阶段按 `result_callback` 和队列交付。
 - Conversation Agent 只收到自己的工具注册表、目标工作区和权限配置；仅 `local_review`/`github_review` 从 core 排除，`submit_review_plan`/`submit_verdicts` 不因 discoverability 被自动加载，`review_submit` 不进入 core；core 的 message/spawn 行为保持一致，拒绝单次权限不强制结束 turn。
 - `COMMON_RULES.md` 按 ContextBuilder、reviewer `prompt_builder` 和 Judge `_system_prompt` 在指定 turn/run/batch 开始读取，内部迭代不刷新，下一次执行读取最新文件；缺失/不可读不会中断调用，旧 `SOUL.md` 不自动迁移或读取。
 - 流式输出可先于保存，成功终态必须在保存后；保存失败明确可见，取消通过现有 runtime checkpoint 保留部分历史，并在下一个 turn 补齐中断 turn 的占位历史且不重跑；已发生修改保留并清理绑定后传播取消。
-- 不生成 conversation sidecar 或新增文件/shell 审计；Finding ID 在 report Markdown、artifact、ReviewResult 和 Web/API 状态中一致；多个有效引用只留在内存和日志，不新增持久化关联，report 内容及 finding 状态不被 Conversation Agent 修改。
+- 不生成 conversation sidecar 或新增文件/shell 审计；Finding ID 在 report Markdown、artifact、ReviewResult 和 Web/API 状态中一致；不收集或持久化 finding 引用关联，report 内容及 finding 状态不被 Conversation Agent 修改。
 - 删除状态机后默认不输出 `turn_trace`，记录 `websocket.py` 与 WebUI `types.ts` 的前端待适配项；session 删除沿用既有关联数据清理，重启只回读已保存历史和结果，不恢复未完成执行或队列。运行最近的 coordinator/conversation、Runner 取消、report/result、session 和入口相关 pytest，并执行全量 pytest。ruff 验收以不新增错误为准；当前已有 47 个错误均不在本节点涉及文件内，不要求本次清零。
 
 ### 本节点之外
@@ -120,8 +119,9 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 
 - 已完成：步骤 1（`0902ef09`），步骤 2、3 与 6 的代码迁移（`728e47f9`）。`SessionCoordinator` 已合并 `AgentLoop` 运行时，`ConversationLoop` 完成完整对话 turn，`nanoreview/agent/loop.py` 与 `AgentLoop` 已删除，API/CLI/channel/包导出与相关测试均已迁移；全量 `pytest` 通过。
 - 已完成：步骤 4。`BOOTSTRAP_FILES` 改为读取 `COMMON_RULES.md`，模板由 `templates/SOUL.md` 重命名并重写；reviewer `prompt_builder`（经 `metadata["common_rules_workspace"]`）与 Judge `_system_prompt`（构造参数 `common_rules_workspace`）在每次 run/batch 读取一次，缺失或不可读时跳过并告警，运行内不刷新；`MemoryStore` 移除无调用方的 SOUL API，memory skill 文档与相关测试同步。不再回退旧 `SOUL.md`。
-- 已完成：步骤 5。`report.py` 以 `collect_confirmed_findings`（按 severity 展示顺序）作为稳定 ID（`F001`…）的单一来源，写入报告 Markdown 的 ID 列与 Details；`serialize_finalizer_result` 通过 `confirmed_finding_ids_by_key` 只给 confirmed finding 附加 `id`，因此 artifact 与 `ReviewResult.findings` 与 Markdown 一致，rejected/uncertain 不生成 ID。新增 `agent/finding_refs.py`：从历史中最近的 handoff block（头部常量 `REVIEW_HANDOFF_HEADER`）取得当前 report 的有效 ID，收集本轮实际消费的用户消息中显式出现且有效的 ID，去重后仅留在 `_TurnContext` 与日志，不持久化、不建立 finding 状态、不改写报告。
-- 本节点步骤 1-6 均已完成；最后一个提交为步骤 5。
+- 已完成：步骤 5。`report.py` 以 `collect_confirmed_findings`（按 severity 展示顺序）作为稳定 ID（`F001`…）的单一来源，写入报告 Markdown 的 ID 列与 Details；`serialize_finalizer_result` 通过 `confirmed_finding_ids_by_key` 只给 confirmed finding 附加 `id`，因此 artifact 与 `ReviewResult.findings` 与 Markdown 一致，rejected/uncertain 不生成 ID。本轮收敛：瞬时引用收集（`agent/finding_refs.py`、`_TurnContext` 的 `valid_finding_ids`/`consumed_user_texts`/`finding_refs`、`conversation.finding_refs` 日志）已全部删除，pending drain 直接构造并追加注入消息，只保留队列消费上限、metadata 传递和历史保存行为；报告中的稳定 ID 保留。
+- 已完成：handoff 收敛进 `SessionCoordinator`。`ReviewHandoff` 与 `REVIEW_CONTEXT_EVENT`/`REVIEW_HANDOFF_EVENT` 迁入 `agent/coordinator.py`，独立 `consume_handoff()` 并入 `SessionCoordinator.consume_handoff()`，`agent/handoff.py` 已删除且不留兼容入口。`ConversationLoop` 构造函数新增必需 `handoff_consumer`，由 coordinator 装配时传入绑定方法，`ReviewHandoff` 仅在 `TYPE_CHECKING` 下导入；`process_message()` 的 handoff 参数不变。执行顺序固定为「加载 session → 恢复中断历史 → AutoCompact → token Consolidator → 调用 consumer → 读取历史 → 构建模型上下文」，写入失败向上传播且不进入 Runner。测试侧删除 refs 专用文件与 ConversationLoop 的 spy/fixture/两个引用收集测试，并新增交接集成测试（报告完整进入 Runner、directive 位于 frozen system、消费标记落盘、后续 turn 与重新加载 session 不重复注入、整理先于写入、写入失败时 Runner 未执行、排队消息注入与历史保存、注入上限）。全量 `pytest` 通过（641 passed）；`ruff` 与 HEAD 基线一致（nanoreview 47 + tests 5），未新增告警。
+- 本节点步骤 1-6 均已完成；最后一个提交为步骤 5，其后的 handoff 收敛与 finding 引用删除为本轮追加调整。
 - `turn_trace` 前端待适配（本节点不修改 `review-webui/`）：删除状态机后不再生成该字段，现有消费点如下，需后续节点核对保留或移除。
   - `nanoreview/channels/websocket.py`：`_turn_end` 分支读取 `metadata["turn_trace"]` 并透传给 `send_turn_end`，该键现已无生产者。
   - `review-webui/src/lib/types.ts`：`TurnTraceItem` 接口及 `turn_end.turn_trace` 字段现已恒缺省，WebUI 消费方需适配。

@@ -1429,14 +1429,21 @@ async def test_unsettled_review_report_appends_the_settlement_failure(
 ) -> None:
     """A produced report whose run could not settle names the failure.
 
-    The coordinator must not deliver the bare report as if nothing went wrong:
-    when ``ReviewLoop`` produced a report but reported a settle failure, the
-    bounded reason is appended so the user learns the session is still gated.
+    The settlement note is owned by ``ReviewLoop``: its unsettled outcome
+    appends the bounded reason to the report it produces (the stub below
+    replays that produced report). The coordinator must deliver it
+    verbatim — the user still learns the session is gated, and the note
+    reaches them exactly once, with no host-side re-decision from review
+    state.
     """
     coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
     _stub_review_execution(
         coordinator,
-        report_markdown="## Code Review Report\n\nNo actionable issues found.",
+        report_markdown=(
+            "## Code Review Report\n\nNo actionable issues found.\n\n"
+            "> Review settlement failed: the terminal review state could "
+            "not be persisted (OSError)"
+        ),
         produces_report=True,
         stop_reason="error",
         error="the terminal review state could not be persisted (OSError)",
@@ -1459,6 +1466,8 @@ async def test_unsettled_review_report_appends_the_settlement_failure(
     assert response is not None
     assert "Review settlement failed" in response.content
     assert "OSError" in response.content
+    # Delivered verbatim: the loop-owned note appears exactly once.
+    assert response.content.count("Review settlement failed") == 1
 
 
 # ---------------------------------------------------------------------------
