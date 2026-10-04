@@ -768,6 +768,18 @@ class SessionCoordinator:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    def _direct_session_key(self, session_key: str) -> str:
+        """Resolve the key a direct call runs under.
+
+        A direct caller's ``session_key`` is authoritative and is always
+        honoured, ``unified_session`` included: a direct entry point owns its
+        own session key and must not be silently folded into the shared
+        "unified" session, otherwise admitted CLI/API sessions collide and lose
+        their history isolation. Callers that genuinely want the unified
+        session pass :data:`UNIFIED_SESSION_KEY` explicitly.
+        """
+        return session_key
+
     # -- admission ----------------------------------------------------------
 
     def admissions(self) -> ReviewAdmissionService:
@@ -1937,7 +1949,7 @@ class SessionCoordinator:
         other cancellation (timeout, disconnect, caller cancel) keeps its own
         semantics and propagates untouched.
         """
-        key = UNIFIED_SESSION_KEY if self._unified_session else session_key
+        key = self._direct_session_key(session_key)
         msg = InboundMessage(
             channel=channel,
             sender_id="user",

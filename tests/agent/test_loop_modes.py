@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -1959,3 +1960,129 @@ async def test_stopped_turn_reports_a_failed_history_backfill(tmp_path) -> None:
     assert reply.metadata["stop_reason"] == "stopped"
     assert "could not be persisted" in reply.content
     assert "OSError" in reply.content
+
+
+@pytest.mark.asyncio
+async def test_direct_honours_its_key_even_in_unified_session_mode(tmp_path) -> None:
+    """A direct caller's key wins over the unified-session fold.
+
+    ``unified_session`` exists so *bus* traffic from many channels converges on
+    one session. A direct caller has already chosen its own session key (the CLI
+    random id, the API ``session_id``), so folding it into ``unified:default``
+    would collide admitted reviews and lose history isolation. Only an explicit
+    :data:`UNIFIED_SESSION_KEY` may reach the unified session from a direct call.
+    """
+    from nanoreview.agent.coordinator import UNIFIED_SESSION_KEY
+
+    coordinator = SessionCoordinator(
+        MessageBus(), DummyProvider(), tmp_path, unified_session=True
+    )
+    runner = SpecCapturingRunner()
+    coordinator.conversation_loop._runner = runner
+
+    api_key = "api:session-a"
+    await coordinator.process_direct(
+        "one", session_key=api_key, channel="api", chat_id="chat"
+    )
+    cli_key = "cli:rand0m"
+    await coordinator.process_direct(
+        "two", session_key=cli_key, channel="cli", chat_id="rand0m"
+    )
+
+    # Each direct call landed on its own key: no fold to unified:default.
+    assert UNIFIED_SESSION_KEY not in coordinator.sessions.list_sessions()
+    assert len(runner.specs) == 2
+
+    history_a = coordinator.sessions.get_or_create(api_key).get_history(max_messages=0)
+    history_cli = coordinator.sessions.get_or_create(cli_key).get_history(max_messages=0)
+    assert any("one" in str(m.get("content")) for m in history_a)
+    assert any("two" in str(m.get("content")) for m in history_cli)
+    # ...and the two histories stayed isolated from each other.
+    assert not any("two" in str(m.get("content")) for m in history_a)
+
+
+@pytest.mark.asyncio
+async def test_direct_and_bus_share_one_lock_for_the_same_explicit_key(
+    tmp_path,
+) -> None:
+    """Under unified mode an explicit key makes a direct call and a bus turn serialise.
+
+    The bus turn resolves to ``unified:default``; a direct call that passes that
+    same key explicitly must contend on the *same* session lock, so the two
+    never run concurrently and their histories interleave cleanly.
+    """
+    from nanoreview.agent.coordinator import UNIFIED_SESSION_KEY
+
+    bus = MessageBus()
+    coordinator = SessionCoordinator(
+        bus, DummyProvider(), tmp_path, unified_session=True
+    )
+    runner = SerializationProbeRunner()
+    coordinator.conversation_loop._runner = runner
+
+    consumed = asyncio.create_task(coordinator.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="msg",
+                content="bus turn",
+            ),
+        )
+        await asyncio.sleep(0.05)
+
+        direct = asyncio.create_task(
+            coordinator.process_direct(
+                "direct turn",
+                session_key=UNIFIED_SESSION_KEY,
+                channel="api",
+                chat_id="api",
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not direct.done()  # blocked on the bus turn's lock
+
+        response = await asyncio.wait_for(direct, timeout=2.0)
+    finally:
+        coordinator._running = False
+        consumed.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumed
+
+    assert response is not None and response.content == "ok"
+    assert runner.max_active == 1  # direct and bus never overlapped
+
+
+@pytest.mark.asyncio
+async def test_direct_stop_only_stops_its_own_session(tmp_path) -> None:
+    """A direct ``/stop`` targets its own session, not the unified one.
+
+    Stopping session A must leave session B's in-flight turn alone: a direct
+    entry point's key is its routing key, so the control command resolves to the
+    same session as the turn it is meant to cancel.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = SlowRunner()
+    key_a = "cli:a"
+    key_b = "cli:b"
+
+    task_a = asyncio.create_task(
+        coordinator.process_direct("a", session_key=key_a, channel="cli", chat_id="a")
+    )
+    task_b = asyncio.create_task(
+        coordinator.process_direct("b", session_key=key_b, channel="cli", chat_id="b")
+    )
+    await asyncio.sleep(0.01)
+
+    await coordinator.process_direct(
+        "/stop", session_key=key_a, channel="cli", chat_id="a"
+    )
+
+    reply_a = await asyncio.wait_for(task_a, timeout=1.0)
+    assert reply_a is not None and reply_a.metadata["stop_reason"] == "stopped"
+    # Session B was never touched by A's stop.
+    assert not task_b.done()
+    assert key_b in coordinator._active_tasks
+    reply_b = await asyncio.wait_for(task_b, timeout=1.0)
+    assert reply_b is not None and reply_b.content == "late"
