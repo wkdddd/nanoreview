@@ -19,7 +19,7 @@ Contract this boundary must keep
 * Nothing is restored after a restart: a queued turn or an interrupted turn
   is dropped, and only persisted history and results are read back.
 * The first turn after a review injects the complete report (or the explicit
-  failure context) from :class:`~nanoreview.session.coordinator.ReviewHandoff`.
+  failure context) from :class:`~nanoreview.agent.coordinator.ReviewHandoff`.
   A report that does not fit the model context window rejects the turn; it is
   never silently replaced by a summary.
 * Reading tools are allowed by default; writes, edits, commands and tests ask
@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from nanoreview.review.result import ReviewResult
-    from nanoreview.session.coordinator import ReviewHandoff
+    from nanoreview.agent.coordinator import ReviewHandoff
 
 #: Maximum number of messages a session may queue while a turn is running.
 MAX_PENDING_CONVERSATION_MESSAGES = 20

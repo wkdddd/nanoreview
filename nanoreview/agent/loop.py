@@ -57,7 +57,7 @@ from nanoreview.review.admission import (
 )
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.profiles import reviewer_execution_profiles
-from nanoreview.session.coordinator import (
+from nanoreview.agent.coordinator import (
     SessionCoordinator,
     _is_review_turn,
 )

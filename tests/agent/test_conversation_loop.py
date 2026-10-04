@@ -29,7 +29,7 @@ from nanoreview.agent.conversation_loop import (
 )
 from nanoreview.agent.review_state import ReviewRunStatus
 from nanoreview.review.result import ReviewHandoffState, ReviewResult
-from nanoreview.session.coordinator import ReviewHandoff
+from nanoreview.agent.coordinator import ReviewHandoff
 
 REPORT_REF = "review-artifacts/run-a.json"
 

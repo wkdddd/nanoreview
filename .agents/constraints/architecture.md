@@ -6,9 +6,9 @@
 
 `channels -> MessageBus -> AgentLoop(SessionCoordinator) -> AgentRunner / ReviewLoop -> MessageBus -> channels`
 
-- `agent/loop.py`：消息与 turn 编排、session/context、取消和结果交付；review 与 conversation 的准入、路由和门禁已委托给 `session/coordinator.py`。对已准入的 review turn 只构造 `ReviewTurnRequest` 并交给 `ReviewLoop`，不写 review 状态。
+- `agent/loop.py`：消息与 turn 编排、session/context、取消和结果交付；review 与 conversation 的准入、路由和门禁已委托给 `agent/coordinator.py`。对已准入的 review turn 只构造 `ReviewTurnRequest` 并交给 `ReviewLoop`，不写 review 状态。
 - `agent/review_loop.py`：一次 review run 的唯一 supervisor——准备、计划、reviewer/Judge 执行、报告持久化、资源清理与终态写入，内部按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序执行；同时拥有状态迁移和结构化结果。
-- `session/coordinator.py`：进程级路由与门禁（准入调用、session 路由、命令门禁、review→conversation 交接与索引）；不调用模型、不执行工具、不建立独立持久化状态机。
+- `agent/coordinator.py`：进程级路由与门禁（准入调用、session 路由、命令门禁、review→conversation 交接与索引）；不调用模型、不执行工具、不建立独立持久化状态机。
 - `agent/conversation_loop.py`：conversation 阶段的输入/输出契约占位，无执行。
 - `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
 - `agent/subagent.py`：子代理任务生命周期；`agent/review_state.py`：run 状态、fingerprint 与报告 artifact。

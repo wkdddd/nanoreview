@@ -31,7 +31,7 @@ from nanoreview.agent.review_state import (
 from nanoreview.bus.events import InboundMessage
 from nanoreview.review.result import ReviewHandoffState
 from nanoreview.review.types import ReviewMetaKey
-from nanoreview.session.coordinator import (
+from nanoreview.agent.coordinator import (
     INTERRUPTED_RUN_REASON,
     REVIEW_CONTEXT_EVENT,
     REVIEW_HANDOFF_EVENT,

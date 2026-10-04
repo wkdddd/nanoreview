@@ -32,7 +32,7 @@ from nanoreview.review.admission import (
     ReviewAdmissionRequest,
 )
 from nanoreview.review.types import ReviewMetaKey
-from nanoreview.session.coordinator import (
+from nanoreview.agent.coordinator import (
     REVIEW_CONTEXT_EVENT,
     REVIEW_HANDOFF_EVENT,
     SessionRoute,
