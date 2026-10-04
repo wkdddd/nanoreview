@@ -1444,3 +1444,161 @@ async def test_unsettled_review_report_appends_the_settlement_failure(
     assert response is not None
     assert "Review settlement failed" in response.content
     assert "OSError" in response.content
+
+
+# ---------------------------------------------------------------------------
+# Direct entry: session routing, serialisation and cancellation registration
+# ---------------------------------------------------------------------------
+
+
+def _current_user_text(spec: AgentRunSpec) -> str:
+    """The turn's own user message (last user block in the frozen zone)."""
+    for message in reversed(spec.frozen_messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
+
+
+class SerializationProbeRunner:
+    """Runner that records overlap so serialisation of direct turns is visible."""
+
+    def __init__(self) -> None:
+        self.specs: list[AgentRunSpec] = []
+        self.active = 0
+        self.max_active = 0
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.02)
+        self.active -= 1
+        return AgentRunResult(
+            final_content="ok",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+        )
+
+
+@pytest.mark.asyncio
+async def test_same_session_direct_requests_serialize_and_each_get_replies(
+    tmp_path,
+) -> None:
+    """Two direct requests for one session run one after another.
+
+    The second request waits for the session lock instead of injecting itself
+    into the running turn, so each request gets its own run, its own user
+    message and its own reply.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    probe = SerializationProbeRunner()
+    coordinator.conversation_loop._runner = probe
+    key = "cli:serial"
+
+    first = asyncio.create_task(
+        coordinator.process_direct(
+            "one", session_key=key, channel="cli", chat_id="serial"
+        )
+    )
+    await asyncio.sleep(0.005)  # let the first request acquire the lock
+    second = asyncio.create_task(
+        coordinator.process_direct(
+            "two", session_key=key, channel="cli", chat_id="serial"
+        )
+    )
+    r1, r2 = await asyncio.gather(first, second)
+
+    assert probe.max_active == 1  # serialised: never two concurrent runs
+    assert r1 is not None and r1.content == "ok"
+    assert r2 is not None and r2.content == "ok"
+    assert len(probe.specs) == 2
+    assert _current_user_text(probe.specs[0]).startswith("one")
+    assert _current_user_text(probe.specs[1]).startswith("two")
+    # The second request did not inject itself into the first turn's context.
+    first_context = json.dumps(
+        [*probe.specs[0].frozen_messages, *probe.specs[0].working_messages]
+    )
+    assert "two" not in first_context
+
+
+@pytest.mark.asyncio
+async def test_direct_request_waits_on_the_coordinator_session_lock(tmp_path) -> None:
+    """Direct requests share the coordinator's per-session lock.
+
+    The HTTP layer no longer keeps its own lock registry, so a direct request
+    and a bus turn for the same session serialise against the same lock.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = SpecCapturingRunner()
+    key = "cli:shared"
+    lock = coordinator._session_locks.setdefault(key, asyncio.Lock())
+
+    await lock.acquire()  # simulate a bus turn holding the session
+    direct = asyncio.create_task(
+        coordinator.process_direct(
+            "hi", session_key=key, channel="cli", chat_id="shared"
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert not direct.done()  # blocked on the shared lock, not a private one
+    lock.release()
+
+    response = await asyncio.wait_for(direct, timeout=1.0)
+    assert response is not None and response.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_priority_control_command_does_not_wait_for_the_lock(tmp_path) -> None:
+    """``/stop`` via the direct entry runs without the execution lock.
+
+    It must be dispatchable while the session lock is held — cancelling a
+    running turn is the whole point of a stop — and it must not register itself
+    in the cancellation set, or a later stop would cancel the previous stop.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    key = "cli:control"
+    lock = coordinator._session_locks.setdefault(key, asyncio.Lock())
+
+    await lock.acquire()
+    try:
+        response = await asyncio.wait_for(
+            coordinator.process_direct(
+                "/stop", session_key=key, channel="cli", chat_id="control"
+            ),
+            timeout=1.0,
+        )
+    finally:
+        lock.release()
+
+    assert response is not None
+    assert "stop" in response.content.lower()
+    assert key not in coordinator._active_tasks
+
+
+@pytest.mark.asyncio
+async def test_direct_uses_passed_session_key_for_review_lookup(tmp_path) -> None:
+    """An admitted review runs even when its session key is not channel:chat_id.
+
+    The CLI admits a run under an arbitrary key (e.g. ``review:<id>``) and then
+    calls the direct entry with ``chat_id="review"``. The turn must look the run
+    up by the passed session key, otherwise the review silently degrades into a
+    plain conversation turn for the wrong session.
+    """
+    coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
+    requests = _stub_review_execution(coordinator)
+    session_key = "review:abc123def456"
+    admitted = _admit_review_run(coordinator, session_key)
+
+    await coordinator.process_direct(
+        "请审查登录逻辑",
+        session_key=session_key,
+        channel="cli",
+        chat_id="review",
+        metadata={
+            **admitted,
+            ReviewMetaKey.TARGET: "app.py",
+            ReviewMetaKey.TARGET_TYPE: "local",
+        },
+    )
+
+    assert len(requests) == 1
+    assert requests[0].session_key == session_key

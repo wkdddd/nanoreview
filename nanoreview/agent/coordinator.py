@@ -1829,12 +1829,24 @@ class SessionCoordinator:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
-        """Process a message directly, serialised on the session lock.
+        """Process one request directly, serialised on the session lock.
 
-        Used by the API/CLI entry points: the message never joins the pending
-        queue of a running turn — it waits for the session lock instead — so a
-        concurrent direct request cannot inject itself into another turn.
+        Used by the API/CLI/SDK entry points. The caller-supplied ``session_key``
+        is authoritative: it is stamped as the message override so gating,
+        locking, task registration, history and the review-run query all use the
+        same key, while ``channel``/``chat_id`` only decide where the reply is
+        delivered. The message never joins a running turn's pending queue — it
+        waits for the session lock instead — so a concurrent direct request
+        always gets its own reply instead of injecting into another turn.
+
+        The request is registered as an active task *before* it waits for the
+        lock, so ``/stop`` can cancel it while it is queued and so it counts
+        against the concurrency limit. Priority control commands (``/stop`` …)
+        are dispatched inline instead: they never wait for the execution lock
+        and are not added to the cancellation set (a ``/stop`` must not cancel
+        itself).
         """
+        key = UNIFIED_SESSION_KEY if self._unified_session else session_key
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
@@ -1842,34 +1854,47 @@ class SessionCoordinator:
             content=content,
             media=media or [],
             metadata=dict(metadata or {}),
+            session_key_override=key,
         )
-        key = self._effective_session_key(msg)
-        if key != msg.session_key:
-            msg = dataclasses.replace(msg, session_key_override=key)
         raw = content.strip()
+
+        if self.commands.is_priority(raw):
+            # Control commands must run even while this session's lock is held.
+            return await self.commands.dispatch_priority(
+                CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
+            )
+
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tasks.setdefault(key, []).append(task)
         lock = self._session_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            gate_response = self.gate_message(msg, self.review_loop.get(key), raw)
-            if gate_response is not None:
-                return gate_response
-            admission_rejection = self.gate_review_turn(
-                key, msg, self.review_loop.get(key)
-            )
-            if admission_rejection is not None:
-                return admission_rejection
-            if on_progress is None:
-                on_progress = await self._build_bus_progress_callback(msg)
-            response = await self._execute_turn(
-                msg,
-                key,
-                pending_queue=None,
-                on_progress=on_progress,
-                on_stream=on_stream,
-                on_stream_end=on_stream_end,
-            )
-            session = self.sessions.get_or_create(key)
-            self.write_context_index(session)
-            return response
+        gate = self._concurrency_gate or nullcontext()
+        try:
+            async with lock, gate:
+                gate_response = self.gate_message(msg, self.review_loop.get(key), raw)
+                if gate_response is not None:
+                    return gate_response
+                admission_rejection = self.gate_review_turn(
+                    key, msg, self.review_loop.get(key)
+                )
+                if admission_rejection is not None:
+                    return admission_rejection
+                if on_progress is None:
+                    on_progress = await self._build_bus_progress_callback(msg)
+                response = await self._execute_turn(
+                    msg,
+                    key,
+                    pending_queue=None,
+                    on_progress=on_progress,
+                    on_stream=on_stream,
+                    on_stream_end=on_stream_end,
+                )
+                session = self.sessions.get_or_create(key)
+                self.write_context_index(session)
+                return response
+        finally:
+            if task is not None:
+                self._remove_active_task(key, task)
 
 
 __all__ = [
