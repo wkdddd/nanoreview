@@ -8,7 +8,7 @@ always: true
 
 ## Structure
 
-- `SOUL.md` — Bot personality and communication style.
+- `COMMON_RULES.md` — shared rules for every agent (conversation, planner, reviewers, judge).
 - `sessions/*.jsonl` — per-session conversation history, metadata, and compact summaries.
 
 ## Session Memory
@@ -30,5 +30,5 @@ Examples (replace `keyword`):
 ## Important
 
 - Do not write durable cross-session memory.
-- Treat `SOUL.md` as a user-editable personalization file.
+- Treat `COMMON_RULES.md` as a user-editable shared-rules file.
 - Compact summaries live in session metadata and must stay scoped to that session.

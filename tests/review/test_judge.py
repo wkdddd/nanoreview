@@ -869,3 +869,33 @@ def test_judge_execution_result_is_immutable() -> None:
     result = JudgeExecutionResult(verdicts={}, stats=None, usage={})
     with pytest.raises(Exception):
         result.error = "mutated"  # type: ignore[misc]
+
+
+def _workspace_judge(tmp_path: Path) -> ReviewJudge:
+    return ReviewJudge(
+        runner=RecordingRunner(FakeJudgeProvider([[]])),
+        model="test-model",
+        config=ReviewJudgeConfig(context_window_tokens=_LARGE_WINDOW),
+        common_rules_workspace=tmp_path,
+    )
+
+
+def test_judge_system_prompt_appends_common_rules(tmp_path: Path) -> None:
+    (tmp_path / "COMMON_RULES.md").write_text("judge shared rule", encoding="utf-8")
+
+    prompt = _workspace_judge(tmp_path)._system_prompt()  # noqa: SLF001
+
+    assert "strict code-review judge" in prompt
+    assert "# Shared Rules" in prompt
+    assert "judge shared rule" in prompt
+
+
+def test_judge_system_prompt_without_workspace_skips_shared_rules() -> None:
+    judge = _judge(FakeJudgeProvider([[]]))
+
+    assert "# Shared Rules" not in judge._system_prompt()  # noqa: SLF001
+
+
+def test_judge_system_prompt_missing_rules_skips_shared_rules(tmp_path: Path) -> None:
+    # A workspace without COMMON_RULES.md must not raise nor append a stub.
+    assert "# Shared Rules" not in _workspace_judge(tmp_path)._system_prompt()  # noqa: SLF001

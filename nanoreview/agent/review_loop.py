@@ -1097,6 +1097,7 @@ class ReviewLoop:
                         "repository_root": validation_repository_root(
                             plan, self._workspace
                         ),
+                        "common_rules_workspace": str(self._workspace),
                     },
                     deliver_to_bus=False,
                     execution_limits=limits_by_dimension.get(assignment.dimension),

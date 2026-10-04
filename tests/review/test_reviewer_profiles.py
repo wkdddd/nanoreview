@@ -228,3 +228,39 @@ def test_review_submit_preserves_details() -> None:
     ])
     assert result.submitted
     assert result.findings[0]["details"]["trust_boundary"].startswith("HTTP")
+
+
+def _reviewer_prompt(profile_id: str, metadata: dict, workspace) -> str:
+    profile = REVIEWER_PROFILES[profile_id]
+    builder = profile.execution_profile().prompt_builder
+    return builder(metadata, workspace)
+
+
+def test_reviewer_prompt_injects_common_rules_from_workspace(tmp_path) -> None:
+    rules_root = tmp_path / "nanoreview-workspace"
+    rules_root.mkdir()
+    (rules_root / "COMMON_RULES.md").write_text("shared reviewer rule", encoding="utf-8")
+
+    prompt = _reviewer_prompt(
+        "bug", {"common_rules_workspace": str(rules_root)}, tmp_path
+    )
+
+    assert "## Shared Rules" in prompt
+    assert "shared reviewer rule" in prompt
+
+
+def test_reviewer_prompt_omits_shared_rules_without_workspace(tmp_path) -> None:
+    prompt = _reviewer_prompt("bug", {}, tmp_path)
+
+    assert "## Shared Rules" not in prompt
+
+
+def test_reviewer_prompt_omits_shared_rules_when_file_missing(tmp_path) -> None:
+    rules_root = tmp_path / "empty-workspace"
+    rules_root.mkdir()
+
+    prompt = _reviewer_prompt(
+        "bug", {"common_rules_workspace": str(rules_root)}, tmp_path
+    )
+
+    assert "## Shared Rules" not in prompt

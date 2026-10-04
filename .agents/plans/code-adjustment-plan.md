@@ -115,3 +115,12 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 ### 本节点之外
 
 `REVIEW_RULES.md`、`CONVERSATION_RULES.md` 的角色专用规则拆分；更细的工具权限与 approval 策略；finding 修复状态、自动关闭或重新审查；多次 review/多报告、自动 worktree、scope 用户入口；长对话 Consolidator/AutoCompact 收敛及 WebUI 交互改造均不在本节点实现。
+
+### 实施进展与前端待适配项
+
+- 已完成：步骤 1（`0902ef09`），步骤 2、3 与 6 的代码迁移（`728e47f9`）。`SessionCoordinator` 已合并 `AgentLoop` 运行时，`ConversationLoop` 完成完整对话 turn，`nanoreview/agent/loop.py` 与 `AgentLoop` 已删除，API/CLI/channel/包导出与相关测试均已迁移；全量 `pytest` 通过。
+- 已完成：步骤 4。`BOOTSTRAP_FILES` 改为读取 `COMMON_RULES.md`，模板由 `templates/SOUL.md` 重命名并重写；reviewer `prompt_builder`（经 `metadata["common_rules_workspace"]`）与 Judge `_system_prompt`（构造参数 `common_rules_workspace`）在每次 run/batch 读取一次，缺失或不可读时跳过并告警，运行内不刷新；`MemoryStore` 移除无调用方的 SOUL API，memory skill 文档与相关测试同步。不再回退旧 `SOUL.md`。
+- 待办：步骤 5（report findings 稳定 ID 与显式引用收集）。
+- `turn_trace` 前端待适配（本节点不修改 `review-webui/`）：删除状态机后不再生成该字段，现有消费点如下，需后续节点核对保留或移除。
+  - `nanoreview/channels/websocket.py`：`_turn_end` 分支读取 `metadata["turn_trace"]` 并透传给 `send_turn_end`，该键现已无生产者。
+  - `review-webui/src/lib/types.ts`：`TurnTraceItem` 接口及 `turn_end.turn_trace` 字段现已恒缺省，WebUI 消费方需适配。

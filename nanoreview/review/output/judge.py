@@ -20,6 +20,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -196,10 +197,13 @@ class ReviewJudge:
         runner: AgentRunner,
         model: str,
         config: ReviewJudgeConfig | None = None,
+        common_rules_workspace: Path | None = None,
     ) -> None:
         self._runner = runner
         self._model = model
         self._config = config or ReviewJudgeConfig()
+        #: NanoReview workspace whose ``COMMON_RULES.md`` is read once per batch.
+        self._common_rules_workspace = common_rules_workspace
         #: Emits the tokenizer-fallback warning at most once per judge.
         self._tokenizer_fallback_warned = False
 
@@ -694,12 +698,25 @@ class ReviewJudge:
             )
         return receiver.submission, dict(result.usage)
 
-    @staticmethod
-    def _system_prompt() -> str:
-        return (
+    def _system_prompt(self) -> str:
+        base = (
             "You are a strict code-review judge. Decide whether each candidate is "
             "actionable and supported. Call submit_verdicts with your decisions."
         )
+        if self._common_rules_workspace is None:
+            return base
+        # Read once per batch so a rules edit reaches later batches without the
+        # judge holding a stale snapshot across a long run.
+        from nanoreview.agent.context import ContextBuilder
+
+        rules = ContextBuilder.load_common_rules(self._common_rules_workspace)
+        if not rules:
+            logger.warning(
+                "review.judge.common_rules.missing root={}",
+                self._common_rules_workspace,
+            )
+            return base
+        return f"{base}\n\n# Shared Rules\n\n{rules}"
 
     @staticmethod
     def _candidate_payload_entry(

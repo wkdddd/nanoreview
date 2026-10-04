@@ -28,7 +28,7 @@ class SummaryProvider(LLMProvider):
 
 
 def test_system_prompt_uses_personalization_without_long_term_memory(tmp_path) -> None:
-    (tmp_path / "SOUL.md").write_text("soul voice", encoding="utf-8")
+    (tmp_path / "COMMON_RULES.md").write_text("shared rules voice", encoding="utf-8")
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
     (memory_dir / "MEMORY.md").write_text("old global fact", encoding="utf-8")
@@ -39,11 +39,27 @@ def test_system_prompt_uses_personalization_without_long_term_memory(tmp_path) -
 
     prompt = ContextBuilder(tmp_path).build_system_prompt()
 
-    assert "soul voice" in prompt
+    assert "shared rules voice" in prompt
     assert "old global fact" not in prompt
     assert "old review" not in prompt
     assert "Recent History" not in prompt
     assert "Long-term Memory" not in prompt
+
+
+def test_bootstrap_files_read_common_rules_instead_of_soul() -> None:
+    assert "COMMON_RULES.md" in ContextBuilder.BOOTSTRAP_FILES
+    assert not any(name.upper().startswith("SOUL") for name in ContextBuilder.BOOTSTRAP_FILES)
+
+
+def test_load_common_rules_reads_and_strips_workspace_file(tmp_path) -> None:
+    (tmp_path / "COMMON_RULES.md").write_text("  shared rules  \n", encoding="utf-8")
+
+    assert ContextBuilder.load_common_rules(tmp_path) == "shared rules"
+
+
+def test_load_common_rules_missing_file_returns_empty(tmp_path) -> None:
+    # A missing rules file must never raise; callers skip the section.
+    assert ContextBuilder.load_common_rules(tmp_path) == ""
 
 
 @pytest.mark.asyncio

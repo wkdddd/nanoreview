@@ -601,7 +601,12 @@ class SessionCoordinator:
             max_tokens=int(getattr(judge_settings, "max_tokens", 2048)),
             context_window_tokens=int(self.context_window_tokens or 0) or None,
         )
-        return ReviewJudge(runner=self.runner, model=self.model, config=config)
+        return ReviewJudge(
+            runner=self.runner,
+            model=self.model,
+            config=config,
+            common_rules_workspace=self.workspace,
+        )
 
     def _review_evidence_provider(self) -> Any | None:
         """Return the review tool's shared evidence service, if registered."""

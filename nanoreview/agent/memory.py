@@ -26,11 +26,15 @@ if TYPE_CHECKING:
 
 
 class MemoryStore:
-    """Pure file I/O for user-editable personalization files."""
+    """Pure file I/O for user-editable personalization files.
+
+    The shared rules live in ``COMMON_RULES.md`` and are loaded through
+    ``ContextBuilder.BOOTSTRAP_FILES``; this store stays a thin, extensible
+    workspace file abstraction.
+    """
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.soul_file = workspace / "SOUL.md"
 
     @staticmethod
     def read_file(path: Path) -> str:
@@ -38,12 +42,6 @@ class MemoryStore:
             return path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return ""
-
-    def read_soul(self) -> str:
-        return self.read_file(self.soul_file)
-
-    def write_soul(self, content: str) -> None:
-        self.soul_file.write_text(content, encoding="utf-8")
 
 
 _RAW_ARCHIVE_MAX_CHARS = 16_000

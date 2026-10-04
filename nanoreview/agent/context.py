@@ -6,6 +6,8 @@ import platform
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from loguru import logger
+
 from nanoreview.agent.memory import MemoryStore
 from nanoreview.agent.skills import SkillsLoader
 
@@ -19,9 +21,13 @@ from nanoreview.utils.prompt_templates import render_template
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
-    BOOTSTRAP_FILES = ["SOUL.md", "TOOLS.md"]
+    BOOTSTRAP_FILES = ["COMMON_RULES.md", "TOOLS.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
+
+    #: Shared rule file read once per turn/run/batch for the conversation agent,
+    #: the review planner, each reviewer and each judge batch.
+    COMMON_RULES_FILE = "COMMON_RULES.md"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):
         self.workspace = workspace
@@ -103,16 +109,43 @@ class ContextBuilder:
         return _to_blocks(left) + _to_blocks(right)
 
     def _load_bootstrap_files(self) -> str:
-        """Load all bootstrap files from workspace."""
+        """Load all bootstrap files from workspace.
+
+        A missing file is normal; an unreadable one is skipped with a warning so
+        a broken ``COMMON_RULES.md`` never interrupts the turn.
+        """
         parts = []
 
         for filename in self.BOOTSTRAP_FILES:
             file_path = self.workspace / filename
-            if file_path.exists():
+            if not file_path.exists():
+                continue
+            try:
                 content = file_path.read_text(encoding="utf-8")
-                parts.append(f"## {filename}\n\n{content}")
+            except OSError:
+                logger.warning(
+                    "Skipping unreadable bootstrap file {}", file_path, exc_info=True
+                )
+                continue
+            parts.append(f"## {filename}\n\n{content}")
 
         return "\n\n".join(parts) if parts else ""
+
+    @classmethod
+    def load_common_rules(cls, workspace: Path) -> str:
+        """Read ``COMMON_RULES.md`` once for a run/batch.
+
+        Used by the reviewer ``prompt_builder`` and the judge system prompt,
+        which do not build a full ``ContextBuilder`` prompt. A missing or
+        unreadable file returns an empty string (the caller skips the section
+        and logs), so the read never interrupts the run.
+        """
+        try:
+            return (Path(workspace) / cls.COMMON_RULES_FILE).read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            return ""
 
     def build_messages(
         self,

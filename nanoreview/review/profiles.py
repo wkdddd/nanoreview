@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from nanoreview.agent.subagent_profiles import (
     BUG_REVIEWER_SCOPE,
     MAINTAINABILITY_REVIEWER_SCOPE,
@@ -172,11 +174,22 @@ def _build_reviewer_prompt(
     from nanoreview.agent.context import ContextBuilder
 
     fragment = render_template(profile.prompt_template, strip=True)
+    # The shared rules live in the NanoReview workspace, which is not the
+    # reviewer's target repository; the loop passes its path in the metadata.
+    common_rules = ""
+    rules_root = metadata.get("common_rules_workspace")
+    if rules_root:
+        common_rules = ContextBuilder.load_common_rules(Path(str(rules_root)))
+        if not common_rules:
+            logger.warning(
+                "review.reviewer.common_rules.missing root={}", rules_root
+            )
     return render_template(
         "agent/review_subagent_system.md",
         time_ctx=ContextBuilder._build_runtime_context(None, None),
         workspace=str(workspace),
         skills_summary="",
+        common_rules=common_rules,
         reviewer_label=profile.label,
         reviewer_fragment=fragment,
         context_policy=profile.context_policy,

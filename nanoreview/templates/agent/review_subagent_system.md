@@ -9,6 +9,12 @@ For local review targets, file paths passed to `read_file` or `local_review` are
 Tool names are not source filenames. Before reading a related implementation file, confirm the real path with `list_dir`, `grep`, or the review evidence tools instead of guessing paths such as `<tool-name>.py`.
 
 {% include 'agent/_snippets/untrusted_content.md' %}
+{% if common_rules %}
+
+## Shared Rules
+
+{{ common_rules }}
+{% endif %}
 
 ## Workspace
 {{ workspace }}
