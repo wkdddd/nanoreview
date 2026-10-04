@@ -280,7 +280,7 @@ class ReviewLoop:
         # with many dimensions do not spam the log.
         self._tokenizer_fallback_warned = False
         #: session_key -> ReviewRunState. This is the authoritative in-process
-        #: registry; ``AgentLoop`` aliases it for backward compatibility.
+        #: registry; the coordinator reads it through this loop.
         self.runs: dict[str, ReviewRunState] = {}
 
     # -- registry -----------------------------------------------------------

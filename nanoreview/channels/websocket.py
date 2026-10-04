@@ -209,7 +209,7 @@ def _default_model_name_from_config() -> str | None:
 def _resolve_bootstrap_model_name(
     runtime_name: Callable[[], str | None] | None,
 ) -> str | None:
-    """Prefer an in-process resolver (e.g. AgentLoop); else config-derived default."""
+    """Prefer an in-process resolver (e.g. SessionCoordinator); else config-derived default."""
     if runtime_name is not None:
         try:
             raw = runtime_name()
@@ -522,9 +522,9 @@ class WebSocketChannel(BaseChannel):
         self._runtime_model_name = runtime_model_name
         self._runtime_usage = runtime_usage
         self._root_config = root_config
-        # Review submissions are admitted through the owning AgentLoop so the
-        # transport never re-implements validation, snapshotting, or registry
-        # ordering.
+        # Review submissions are admitted through the owning SessionCoordinator
+        # so the transport never re-implements validation, snapshotting, or
+        # registry ordering.
         self._agent_loop = agent_loop
         # Process-local secret used to HMAC-sign media URLs. The signed URL is
         # the capability — anyone who holds a valid URL can fetch that one
@@ -992,8 +992,9 @@ class WebSocketChannel(BaseChannel):
 
         if changed:
             save_config(config)
-        # LLM provider/model changes are hot-reloaded by AgentLoop before each
-        # new turn via the provider snapshot loader, so a restart is unnecessary.
+        # LLM provider/model changes are hot-reloaded by SessionCoordinator
+        # before each new turn via the provider snapshot loader, so a restart
+        # is unnecessary.
         return _http_json_response(self._settings_payload(requires_restart=False))
 
     def _handle_settings_provider_update(self, request: WsRequest) -> Response:

@@ -75,7 +75,7 @@ class SubagentManager:
             else defaults.max_concurrent_subagents
         )
         self.reasoning_effort = reasoning_effort
-        # Context window wiring mirrors AgentLoop: the runner trims history
+        # Context window wiring mirrors the main agent: the runner trims history
         # to this window, so subagents get the same protection as the main
         # agent. None keeps the runner's no-trim behaviour for callers that
         # manage context themselves.

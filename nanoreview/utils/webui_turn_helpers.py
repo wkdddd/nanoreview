@@ -1,7 +1,7 @@
 """Outbound helpers for the WebSocket/WebUI wire contract.
 
-AgentLoop uses these without importing a concrete channel plugin; only
-``channel == "websocket"`` messages are affected.
+The conversation loop uses these without importing a concrete channel
+plugin; only ``channel == "websocket"`` messages are affected.
 """
 
 from __future__ import annotations

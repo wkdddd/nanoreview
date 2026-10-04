@@ -35,7 +35,7 @@ class _FsTool(Tool):
         self._allowed_dir = allowed_dir
         self._extra_allowed_dirs = extra_allowed_dirs
         # Explicit state is used by isolated runners like subagents.
-        # Main AgentLoop tools leave this unset and resolve state from the
+        # Main agent tools leave this unset and resolve state from the
         # current async task, which keeps shared tool instances session-safe.
         self._explicit_file_states = file_states
         self._fallback_file_states = FileStates()

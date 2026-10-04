@@ -428,7 +428,7 @@ def create_app(
     """Create the aiohttp application.
 
     Args:
-        agent_loop: An initialized AgentLoop instance.
+        agent_loop: An initialized SessionCoordinator instance.
         model_name: Model name reported in responses.
         request_timeout: Per-request timeout in seconds.
     """
