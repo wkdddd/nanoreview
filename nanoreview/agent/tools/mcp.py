@@ -250,6 +250,40 @@ def _describe_mcp_exception(exc: BaseException) -> str:
     return _redact_urls_in_text(message)
 
 
+def _log_mcp_call_failure(
+    kind: str,
+    name: str,
+    exc: BaseException,
+    *,
+    after_retry: bool = False,
+) -> None:
+    """Log a failed MCP tool/resource/prompt call without leaking credentials.
+
+    Two independent leaks have to be closed here:
+
+    * the formatted message, which for transport errors embeds the full
+      request URL (credentials in the path or query included), and
+    * ``logger.opt(exception=exc)``, which re-renders the *raw* traceback and
+      therefore reintroduces the same URL even when the message above is
+      redacted.
+
+    So the exception object is never attached, and its rendered form always goes
+    through :func:`_describe_mcp_exception`. The ``log_content`` switch still
+    decides whether a message is shown at all; it is not relied upon to hide
+    URLs, because it defaults to true whenever no request context is set.
+    """
+    detail = _describe_mcp_exception(exc) if tool_log_content_allowed() else "[content hidden]"
+    suffix = " after retry" if after_retry else ""
+    logger.error(
+        "MCP {} '{}' failed{}: {}: {}",
+        kind,
+        name,
+        suffix,
+        type(exc).__name__,
+        detail,
+    )
+
+
 def _log_mcp_connection_failure(name: str, exc: BaseException, hint: str = "") -> None:
     # Never attach the raw exception here: the connection path runs without a
     # request context, so the "may log content" switch does not protect the
@@ -718,20 +752,13 @@ class MCPToolWrapper(_MCPWrapperBase):
                         await asyncio.sleep(1)  # Brief backoff before retry
                         continue
                     # Second transient failure — give up with retry-specific message
-                    logger.opt(exception=tool_log_content_allowed()).error(
-                        "MCP tool '{}' failed after retry: {}",
-                        self._name,
-                        type(exc).__name__,
+                    _log_mcp_call_failure(
+                        "tool", self._name, exc, after_retry=True
                     )
                     return ToolResult.error(
                         f"(MCP tool call failed after retry: {type(exc).__name__})"
                     )
-                logger.opt(exception=tool_log_content_allowed()).error(
-                    "MCP tool '{}' failed: {}: {}",
-                    self._name,
-                    type(exc).__name__,
-                    exc if tool_log_content_allowed() else "[content hidden]",
-                )
+                _log_mcp_call_failure("tool", self._name, exc)
                 return ToolResult.error(
                     f"(MCP tool call failed: {type(exc).__name__})"
                 )
@@ -746,12 +773,7 @@ class MCPToolWrapper(_MCPWrapperBase):
                         return ToolResult.error(rendered)
                     return ToolResult(rendered)
                 except Exception as exc:
-                    logger.opt(exception=tool_log_content_allowed()).error(
-                        "MCP tool '{}' failed while rendering result: {}: {}",
-                        self._name,
-                        type(exc).__name__,
-                        exc if tool_log_content_allowed() else "[content hidden]",
-                    )
+                    _log_mcp_call_failure("tool", self._name, exc)
                     return ToolResult.error(
                         f"(MCP tool returned malformed content: {type(exc).__name__})"
                     )
@@ -893,20 +915,13 @@ class MCPResourceWrapper(_MCPWrapperBase):
                         )
                         await asyncio.sleep(1)
                         continue
-                    logger.opt(exception=tool_log_content_allowed()).error(
-                        "MCP resource '{}' failed after retry: {}",
-                        self._name,
-                        type(exc).__name__,
+                    _log_mcp_call_failure(
+                        "resource", self._name, exc, after_retry=True
                     )
                     return ToolResult.error(
                         f"(MCP resource read failed after retry: {type(exc).__name__})"
                     )
-                logger.opt(exception=tool_log_content_allowed()).error(
-                    "MCP resource '{}' failed: {}: {}",
-                    self._name,
-                    type(exc).__name__,
-                    exc if tool_log_content_allowed() else "[content hidden]",
-                )
+                _log_mcp_call_failure("resource", self._name, exc)
                 return ToolResult.error(
                     f"(MCP resource read failed: {type(exc).__name__})"
                 )
@@ -1008,11 +1023,13 @@ class MCPPromptWrapper(_MCPWrapperBase):
                 ):
                     refreshed_session = True
                     continue
-                logger.opt(exception=tool_log_content_allowed()).error(
+                logger.error(
                     "MCP prompt '{}' failed: code={} message={}",
                     self._name,
                     exc.error.code,
-                    exc.error.message if tool_log_content_allowed() else "[content hidden]",
+                    _redact_urls_in_text(exc.error.message)
+                    if tool_log_content_allowed()
+                    else "[content hidden]",
                 )
                 return ToolResult.error(
                     f"(MCP prompt call failed: {exc.error.message} [code {exc.error.code}])"
@@ -1035,20 +1052,13 @@ class MCPPromptWrapper(_MCPWrapperBase):
                         )
                         await asyncio.sleep(1)
                         continue
-                    logger.opt(exception=tool_log_content_allowed()).error(
-                        "MCP prompt '{}' failed after retry: {}",
-                        self._name,
-                        type(exc).__name__,
+                    _log_mcp_call_failure(
+                        "prompt", self._name, exc, after_retry=True
                     )
                     return ToolResult.error(
                         f"(MCP prompt call failed after retry: {type(exc).__name__})"
                     )
-                logger.opt(exception=tool_log_content_allowed()).error(
-                    "MCP prompt '{}' failed: {}: {}",
-                    self._name,
-                    type(exc).__name__,
-                    exc if tool_log_content_allowed() else "[content hidden]",
-                )
+                _log_mcp_call_failure("prompt", self._name, exc)
                 return ToolResult.error(f"(MCP prompt call failed: {type(exc).__name__})")
             else:
                 parts: list[str] = []

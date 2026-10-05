@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
@@ -13,6 +14,11 @@ from mcp import types as mcp_types
 
 from nanoreview.agent.tools import mcp as mcp_module
 from nanoreview.agent.tools.base import Tool, ToolResult, tool_result_is_error
+from nanoreview.agent.tools.context import (
+    RequestContext,
+    reset_current_request_context,
+    set_current_request_context,
+)
 from nanoreview.agent.tools.mcp import (
     CONNECT_TIMEOUT_SECONDS,
     MCPPromptWrapper,
@@ -22,6 +28,7 @@ from nanoreview.agent.tools.mcp import (
     MCPToolWrapper,
     _describe_mcp_exception,
     _limit_tool_name,
+    _log_mcp_call_failure,
     _mcp_image_tool_result,
     _normalize_schema_for_openai,
     _normalize_windows_stdio_command,
@@ -185,6 +192,113 @@ class TestConnectionFailureLogging:
         records = "\n".join(sink_logs)
         assert "transient connection failure" in records
         assert "token-abc" not in records
+
+
+class TestCallFailureLogging:
+    """Tool-call failures must not leak credentials either.
+
+    Redacting the formatted message is not enough on its own: the old call
+    sites used ``logger.opt(exception=exc)``, and loguru then re-renders the
+    *raw* traceback -- putting the full URL back into the log even though the
+    message argument had been scrubbed. These tests pin both halves.
+    """
+
+    _LEAKY = "401 for https://example.com/mcp/secret-token-abc/call?api_key=SUPERSECRET"
+
+    def test_message_argument_is_redacted(self, sink_logs):
+        _log_mcp_call_failure("tool", "docs_search", RuntimeError(self._LEAKY))
+
+        records = "\n".join(sink_logs)
+        assert "docs_search" in records
+        assert "RuntimeError" in records
+        assert "example.com" in records
+        assert "secret-token-abc" not in records
+        assert "SUPERSECRET" not in records
+
+    def test_raw_traceback_is_not_attached(self, sink_logs):
+        """The regression: ``opt(exception=...)`` re-renders the raw message.
+
+        Raising first matters -- loguru only appends a traceback when there is
+        an active exception context, so a bare ``Exception(...)`` would not
+        reproduce the leak.
+        """
+        try:
+            raise RuntimeError(self._LEAKY)
+        except RuntimeError as exc:
+            _log_mcp_call_failure("tool", "docs_search", exc)
+
+        records = "\n".join(sink_logs)
+        assert "secret-token-abc" not in records
+        assert "SUPERSECRET" not in records
+        assert "Traceback" not in records
+
+    def test_log_content_switch_still_hides_the_message(self, sink_logs):
+        with _hide_request_content():
+            _log_mcp_call_failure("tool", "docs_search", RuntimeError(self._LEAKY))
+
+        records = "\n".join(sink_logs)
+        assert "[content hidden]" in records
+        assert "secret-token-abc" not in records
+
+    def test_after_retry_is_marked(self, sink_logs):
+        _log_mcp_call_failure(
+            "tool", "docs_search", RuntimeError(self._LEAKY), after_retry=True
+        )
+
+        assert "after retry" in "\n".join(sink_logs)
+
+    def test_every_capability_kind_is_redacted(self, sink_logs):
+        for kind in ("tool", "resource", "prompt"):
+            _log_mcp_call_failure(kind, f"docs_{kind}", RuntimeError(self._LEAKY))
+
+        records = "\n".join(sink_logs)
+        assert "secret-token-abc" not in records
+        assert "SUPERSECRET" not in records
+        assert "docs_tool" in records
+        assert "docs_resource" in records
+        assert "docs_prompt" in records
+
+    @pytest.mark.asyncio
+    async def test_tool_wrapper_failure_does_not_leak(self, sink_logs):
+        """End-to-end through the wrapper's own failure path.
+
+        ``_FakeSession`` raises any ``BaseException`` item it is scripted with,
+        so this drives the real ``MCPToolWrapper.execute`` error path.
+        """
+        session = _FakeSession([RuntimeError(self._LEAKY)])
+        wrapper = MCPToolWrapper(session, "docs", _tool_def("search"))
+        result = await wrapper.execute()
+
+        assert tool_result_is_error(result)
+        records = "\n".join(sink_logs)
+        assert "secret-token-abc" not in records
+        assert "SUPERSECRET" not in records
+
+    @pytest.mark.asyncio
+    async def test_resource_wrapper_failure_does_not_leak(self, sink_logs):
+        session = _FakeSession([RuntimeError(self._LEAKY)])
+        resource = mcp_types.Resource(
+            uri="file:///doc.txt",  # type: ignore[attr-defined]
+            name="doc",
+        )
+        wrapper = MCPResourceWrapper(session, "docs", resource)
+        result = await wrapper.execute()
+
+        assert tool_result_is_error(result)
+        records = "\n".join(sink_logs)
+        assert "secret-token-abc" not in records
+        assert "SUPERSECRET" not in records
+
+
+@contextmanager
+def _hide_request_content():
+    """Run a block with ``RequestContext.log_content`` switched off."""
+    ctx = RequestContext(channel="cli", chat_id="direct", log_content=False)
+    token = set_current_request_context(ctx)
+    try:
+        yield
+    finally:
+        reset_current_request_context(token)
 
 
 @pytest.fixture

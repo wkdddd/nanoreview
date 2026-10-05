@@ -2089,7 +2089,20 @@ class SessionCoordinator:
         transport can answer the caller instead of reporting a failure. Any
         other cancellation (timeout, disconnect, caller cancel) keeps its own
         semantics and propagates untouched.
+
+        A request that arrives after ``aclose()`` is refused the same way as an
+        inbound bus message: the direct entry points (API/CLI/SDK) share the
+        coordinator's admission switch, so ``_closed`` must be checked before a
+        turn is started or registered as an active task.
         """
+        # ``aclose()`` may have run before this request was issued. Refuse it
+        # here, before the message is registered as an active task, so a
+        # shutting-down coordinator never services a new direct turn.
+        if self._closed:
+            logger.debug(
+                "Refusing direct request after shutdown: session={}", session_key
+            )
+            return None
         key = self._direct_session_key(session_key)
         msg = InboundMessage(
             channel=channel,

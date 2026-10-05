@@ -518,6 +518,47 @@ class TestShutdown:
 
         assert called == []
 
+    @pytest.mark.asyncio
+    async def test_process_direct_is_refused_after_close(self, tmp_path) -> None:
+        """The direct entry points share the coordinator's admission switch.
+
+        API/CLI/SDK callers reach ``process_direct`` rather than the bus, so
+        closing the bus loop alone is not enough: without a check here a request
+        issued after ``aclose()`` still reaches the model and gets a reply.
+        """
+        coordinator = _coordinator(tmp_path)
+        called: list[str] = []
+
+        async def _process(*args, **kwargs):
+            called.append("process")
+            raise AssertionError("process_direct must not reach the loop")
+
+        coordinator.conversation_loop.process_message = _process  # type: ignore[method-assign]
+
+        await coordinator.aclose()
+        reply = await coordinator.process_direct("hello", session_key="cli:direct")
+
+        assert reply is None
+        assert called == []
+        # The request must not even be registered as an active task.
+        assert coordinator._active_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_process_direct_still_admitted_while_open(self, tmp_path) -> None:
+        """Guard against over-correcting: an open coordinator still serves."""
+        coordinator = _coordinator(tmp_path)
+        seen: list[str] = []
+
+        async def _process(msg, **kwargs):
+            seen.append(msg.content)
+            return None
+
+        coordinator.conversation_loop.process_message = _process  # type: ignore[method-assign]
+
+        await coordinator.process_direct("hello", session_key="cli:direct")
+
+        assert seen == ["hello"]
+
 
 class _FakeReadStream:
     """Blocks forever like a live server's stdout, never yielding a message."""
