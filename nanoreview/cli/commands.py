@@ -791,7 +791,9 @@ def _run_gateway(
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
         finally:
-            await agent.close_background_tasks()
+            # aclose() stops admission, drains active/background tasks and
+            # closes MCP connections, so no server subprocess outlives the CLI.
+            await agent.aclose()
             agent.stop()
             await channels.stop_all()
             # Flush all cached sessions to durable storage before exit.
@@ -931,7 +933,7 @@ def review(
                     raise typer.Exit(exit_code)
 
         finally:
-            await agent_loop.close_background_tasks()
+            await agent_loop.aclose()
 
     asyncio.run(run_once())
 
@@ -1027,7 +1029,7 @@ def agent(
                         **print_kwargs,
                     )
             finally:
-                await agent_loop.close_background_tasks()
+                await agent_loop.aclose()
 
         asyncio.run(run_once())
     else:
@@ -1173,7 +1175,7 @@ def agent(
                 agent_loop.stop()
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
-                await agent_loop.close_background_tasks()
+                await agent_loop.aclose()
 
         asyncio.run(run_interactive())
 

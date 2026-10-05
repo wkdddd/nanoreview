@@ -206,6 +206,26 @@ def ensure_config_models_rebuilt() -> None:
         _resolving_tool_config_refs = False
 
 
+class MCPServerConfig(Base):
+    """MCP server connection configuration (stdio, SSE or Streamable HTTP).
+
+    Restored from nanobot ``432421bc``; OAuth is intentionally not supported in
+    this project, so ``auth`` only exists to reject unsupported configuration
+    loudly instead of silently connecting without credentials.
+    """
+
+    type: Literal["stdio", "sse", "streamableHttp"] | None = None  # auto-detected if omitted
+    auth: Literal["oauth"] | None = None  # unsupported here; rejected at connect time
+    command: str = ""  # stdio: command to run (e.g. "npx")
+    args: list[str] = Field(default_factory=list)  # stdio: command arguments
+    env: dict[str, str] = Field(default_factory=dict)  # stdio: extra env vars
+    cwd: str = ""  # stdio: working directory for MCP server runtime artifacts
+    url: str = ""  # HTTP/SSE: endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
+    tool_timeout: int = 30  # seconds before a tool call is cancelled
+    enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
+
+
 class ToolsConfig(Base):
     """Tools configuration.
 
@@ -221,6 +241,7 @@ class ToolsConfig(Base):
     github_repo: GitHubRepoConfig = Field(
         default_factory=lambda: _lazy_default("nanoreview.review.source.github", "GitHubRepoConfig")
     )
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
         ensure_config_models_rebuilt()

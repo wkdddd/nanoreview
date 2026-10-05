@@ -80,6 +80,7 @@ from nanoreview.agent.review_state import (
 from nanoreview.agent.runner import AgentRunner
 from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.tools.file_state import FileStateStore
+from nanoreview.agent.tools.mcp import MCPProvider
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.events import InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
@@ -334,6 +335,10 @@ class SessionCoordinator:
         )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        # MCP belongs to the Conversation Agent only, so it owns a separate
+        # registry and connection set. Registering these wrappers into
+        # ``self.tools`` would expose them to planner/reviewer/Judge.
+        self.mcp = MCPProvider.from_config(_tc)
         # One file-read/write tracker per logical session. Each turn binds its
         # own registry to the session's state via a contextvar.
         self._file_state_store = FileStateStore()
@@ -362,6 +367,7 @@ class SessionCoordinator:
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
         self._running = False
+        self._closed = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
@@ -443,6 +449,7 @@ class SessionCoordinator:
             hooks_getter=lambda: self._extra_hooks,
             usage_recorder=self._record_result_usage,
             handoff_consumer=self.consume_handoff,
+            mcp_provider=self.mcp,
         )
 
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
@@ -1927,6 +1934,45 @@ class SessionCoordinator:
             await asyncio.gather(*tasks, return_exceptions=True)
             for task in tasks:
                 self._remove_background_task(task)
+
+    async def aclose(self) -> None:
+        """Shut the coordinator down: stop admission, then release owned resources.
+
+        Idempotent, and the single shutdown entry for the gateway, CLI and API
+        callers — SDK callers must call it explicitly so no MCP subprocess or
+        owner task outlives the coordinator. Order matters: admission stops
+        first so no new turn can register MCP proxies, then active turn and
+        subagent tasks are cancelled and awaited, then background tasks are
+        drained, and only then are MCP connections closed.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._running = False
+
+        for tasks in list(self._active_tasks.values()):
+            for task in tasks:
+                task.cancel()
+        active = [task for tasks in self._active_tasks.values() for task in tasks]
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
+        self._active_tasks.clear()
+
+        pending_queues = list(self._pending_queues.values())
+        self._pending_queues.clear()
+        for queue in pending_queues:
+            while not queue.empty():
+                with suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+        self._session_locks.clear()
+
+        for future in list(self._permission_futures.values()):
+            if not future.done():
+                future.cancel()
+        self._permission_futures.clear()
+
+        await self.close_background_tasks()
+        await self.mcp.aclose()
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

@@ -70,6 +70,7 @@ from nanoreview.utils.webui_turn_helpers import publish_turn_run_status
 
 if TYPE_CHECKING:
     from nanoreview.agent.coordinator import ReviewHandoff
+    from nanoreview.agent.tools.mcp import MCPProvider
     from nanoreview.config.schema import ToolsConfig
     from nanoreview.providers.base import LLMProvider
     from nanoreview.session.manager import Session, SessionManager
@@ -168,6 +169,7 @@ class ConversationLoop:
         hooks: list[AgentHook] | None = None,
         hooks_getter: Callable[[], list[AgentHook]] | None = None,
         usage_recorder: Callable[[dict[str, int]], None] | None = None,
+        mcp_provider: "MCPProvider | None" = None,
     ) -> None:
         self._bus = bus
         self._provider = provider
@@ -204,6 +206,11 @@ class ConversationLoop:
         #: coordinator, which owns that single replayable write; the loop only
         #: calls it between history consolidation and the history read.
         self._handoff_consumer = handoff_consumer
+        # MCP is Conversation-only. The provider owns the connections and the
+        # live wrappers; each turn registers proxies that resolve the current
+        # wrapper at call time, so a reconnect does not require rebuilding an
+        # in-flight turn's registry.
+        self._mcp_provider = mcp_provider
         # One loader instance keeps the (package-scan) discovery cache warm;
         # each turn still registers a fresh registry from it.
         self._tool_loader = ToolLoader()
@@ -326,7 +333,7 @@ class ConversationLoop:
             self._handoff_consumer(ctx.session, handoff)
 
         ctx.history = self._session_history(ctx.session)
-        ctx.tools = self._build_turn_tools(ctx)
+        ctx.tools = await self._build_turn_tools(ctx)
         self._set_tool_context(ctx)
         if (message_tool := ctx.tools.get("message")) and isinstance(
             message_tool, MessageTool
@@ -575,7 +582,7 @@ class ConversationLoop:
             session_metadata=ctx.session.metadata,
         )
 
-    def _build_turn_tools(self, ctx: _TurnContext) -> ToolRegistry:
+    async def _build_turn_tools(self, ctx: _TurnContext) -> ToolRegistry:
         from nanoreview.agent.tools.context import ToolContext
 
         registry = ToolRegistry()
@@ -597,13 +604,40 @@ class ConversationLoop:
             scope="core",
             denied_names=_CONVERSATION_DENIED_TOOLS,
         )
+        mcp_count = await self._register_mcp_proxies(ctx, registry)
         logger.debug(
-            "conversation.tools.registered session={} count={} tools={}",
+            "conversation.tools.registered session={} count={} tools={} mcp={}",
             ctx.session_key,
             len(registered),
             ",".join(registered),
+            mcp_count,
         )
         return registry
+
+    async def _register_mcp_proxies(
+        self, ctx: _TurnContext, registry: ToolRegistry
+    ) -> int:
+        """Connect configured MCP servers, then register per-turn proxies.
+
+        Connection preparation runs first so a turn only exposes capabilities
+        that are actually reachable. Servers that are configured but not yet
+        connected are retried on the next turn; a failure here never fails the
+        conversation turn itself. An external cancellation propagates so
+        ``/stop`` stays responsive.
+        """
+        provider = self._mcp_provider
+        if provider is None or not provider.configured_server_names:
+            return 0
+        await provider.connect()
+        count = provider.build_turn_proxies(registry)
+        logger.debug(
+            "conversation.mcp.registered session={} proxies={} connected={} status={}",
+            ctx.session_key,
+            count,
+            sorted(provider.connected_server_names),
+            provider.runtime_status(),
+        )
+        return count
 
     @staticmethod
     def _apply_handoff_directive(

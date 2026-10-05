@@ -449,6 +449,13 @@ def create_app(
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
 
+    async def _close_agent(_app: web.Application) -> None:
+        # Release coordinator-owned resources (MCP connections and their owner
+        # tasks) when the API stops, so no server subprocess outlives the app.
+        await agent_loop.aclose()
+
+    app.on_cleanup.append(_close_agent)
+
     app.router.add_post("/v1/chat/completions", handle_chat_completions)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)

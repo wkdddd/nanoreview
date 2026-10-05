@@ -26,6 +26,7 @@ from nanoreview.agent.compression import (
     split_units,
 )
 from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.agent.tools.base import tool_result_is_error
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.safety_boundary import classify_violation
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -99,6 +100,12 @@ def _bounded(reason: Any) -> str:
 
 
 def _is_tool_error_result(result: Any) -> bool:
+    # Prefer the explicit status a tool may report (e.g. MCP) so a successful
+    # result whose text starts with "Error" is not misread as a failure; plain
+    # string results keep the historical prefix convention.
+    explicit_error = tool_result_is_error(result)
+    if explicit_error is not None:
+        return explicit_error
     return isinstance(result, str) and result.startswith(_TOOL_ERROR_PREFIXES)
 
 

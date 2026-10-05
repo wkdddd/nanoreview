@@ -41,6 +41,18 @@ class Schema(ABC):
         return t  # type: ignore[return-value]
 
     @staticmethod
+    def match_json_schema_type(val: Any, types: list[Any]) -> str | None:
+        """Select a union member matching the value without coercion."""
+        for t in types:
+            if not isinstance(t, str) or t not in _JSON_TYPE_MAP:
+                continue
+            if t in ("integer", "number") and isinstance(val, bool):
+                continue
+            if isinstance(val, _JSON_TYPE_MAP[t]):
+                return t
+        return None
+
+    @staticmethod
     def subpath(path: str, key: str) -> str:
         return f"{path}.{key}" if path else key
 
@@ -57,6 +69,12 @@ class Schema(ABC):
 
         if nullable and val is None:
             return []
+        if isinstance(raw_type, list):
+            union_types = [item for item in raw_type if item != "null"]
+            if len(union_types) > 1:
+                matched = Schema.match_json_schema_type(val, union_types)
+                if matched is None:
+                    return [f"{label} should match one of the types {union_types}"]
         if t == "integer" and (not isinstance(val, int) or isinstance(val, bool)):
             return [f"{label} should be integer"]
         if t == "number" and (
@@ -121,6 +139,35 @@ class Schema(ABC):
     def validate_value(self, value: Any, path: str = "") -> list[str]:
         """Validate a single value; returns error messages (empty means pass). Subclasses may override for extra rules."""
         return Schema.validate_json_schema_value(value, self.to_json_schema(), path)
+
+
+class ToolResult(str):
+    """String-compatible tool output with structured status.
+
+    Restored from nanobot ``432421bc``. Existing tools still return plain
+    ``str``; consumers must therefore keep their string-prefix check as a
+    fallback and only prefer :attr:`is_error` when it is present.
+    """
+
+    is_error: bool
+
+    def __new__(cls, content: str, *, is_error: bool = False) -> ToolResult:
+        obj = str.__new__(cls, content)
+        obj.is_error = is_error
+        return obj
+
+    @classmethod
+    def error(cls, content: str) -> ToolResult:
+        return cls(content, is_error=True)
+
+
+def tool_result_is_error(result: Any) -> bool | None:
+    """Return the explicit error flag, or ``None`` for a plain string result.
+
+    ``None`` means the caller should fall back to its own string convention.
+    """
+    flag = getattr(result, "is_error", None)
+    return flag if isinstance(flag, bool) else None
 
 
 class Tool(ABC):
@@ -205,7 +252,16 @@ class Tool(ABC):
         return self._cast_object(params, schema)
 
     def _cast_value(self, val: Any, schema: dict[str, Any]) -> Any:
-        t = self._resolve_type(schema.get("type"))
+        raw_type = schema.get("type")
+        t = self._resolve_type(raw_type)
+        if isinstance(raw_type, list):
+            union_types = [item for item in raw_type if item != "null"]
+            if len(union_types) > 1:
+                # A union does not imply a preferred type or a safe conversion
+                # target, so keep the model's value untouched.
+                t = Schema.match_json_schema_type(val, union_types)
+                if t is None:
+                    return val
 
         if t == "boolean" and isinstance(val, bool):
             return val

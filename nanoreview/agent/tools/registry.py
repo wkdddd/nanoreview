@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from nanoreview.agent.tools.base import Tool
+from nanoreview.agent.tools.base import Tool, tool_result_is_error
 
 
 class ToolRegistry:
@@ -94,7 +94,13 @@ class ToolRegistry:
         try:
             assert tool is not None  # guarded by prepare_call()
             result = await tool.execute(**params)
-            if isinstance(result, str) and result.startswith("Error"):
+            # An explicit is_error wins, so a successful MCP result whose text
+            # happens to start with "Error" is not misread as a failure. Plain
+            # string results keep the historical prefix convention.
+            explicit_error = tool_result_is_error(result)
+            if explicit_error is None and isinstance(result, str) and result.startswith("Error"):
+                explicit_error = True
+            if explicit_error:
                 return result + _HINT
             return result
         except Exception as e:

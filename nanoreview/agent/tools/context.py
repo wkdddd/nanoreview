@@ -14,6 +14,10 @@ class RequestContext:
     message_id: str | None = None
     session_key: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Whether diagnostics raised while serving this request may include the
+    #: request's own content. Callers handling untrusted external payloads (MCP
+    #: servers) turn this off so credentials and tool output stay out of logs.
+    log_content: bool = True
 
 
 _current_request_context: ContextVar[RequestContext | None] = ContextVar(
@@ -25,6 +29,12 @@ _current_request_context: ContextVar[RequestContext | None] = ContextVar(
 def current_request_context() -> RequestContext | None:
     """Return the request context for the current tool execution task."""
     return _current_request_context.get()
+
+
+def tool_log_content_allowed() -> bool:
+    """Whether diagnostics may include content from the current tool request."""
+    ctx = current_request_context()
+    return ctx is None or ctx.log_content
 
 
 def set_current_request_context(ctx: RequestContext) -> Token[RequestContext | None]:
