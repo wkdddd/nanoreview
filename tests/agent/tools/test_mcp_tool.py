@@ -6,7 +6,9 @@ import asyncio
 import json
 from typing import Any
 
+import httpx
 import pytest
+from loguru import logger
 from mcp import types as mcp_types
 
 from nanoreview.agent.tools import mcp as mcp_module
@@ -18,11 +20,13 @@ from nanoreview.agent.tools.mcp import (
     MCPResourceWrapper,
     MCPToolProxy,
     MCPToolWrapper,
+    _describe_mcp_exception,
     _limit_tool_name,
     _mcp_image_tool_result,
     _normalize_schema_for_openai,
     _normalize_windows_stdio_command,
     _redact_url,
+    _redact_urls_in_text,
     _sanitize_mcp_tool_name,
     _windows_command_basename,
 )
@@ -126,6 +130,72 @@ class TestNameHandling:
         assert "user" not in redacted
         assert "/private" not in redacted
         assert redacted.startswith("https://example.com")
+
+
+class TestConnectionFailureLogging:
+    """Connection diagnostics must not leak the server URL.
+
+    ``_log_mcp_connection_failure`` runs while establishing a session, i.e.
+    outside any ``RequestContext``. ``tool_log_content_allowed()`` is therefore
+    true, so the per-request switch cannot be relied upon; httpx exceptions
+    carry the full request URL, including any token embedded in the path.
+    """
+
+    def test_url_bearing_exception_is_redacted_in_the_log(self):
+        exc = httpx.ConnectError(
+            "failed to connect to "
+            "https://example.com/mcp/secret-token-abc123/xyz?api_key=SUPERSECRET"
+        )
+        assert "SUPERSECRET" not in _describe_mcp_exception(exc)
+        assert "secret-token-abc123" not in _describe_mcp_exception(exc)
+
+    def test_every_url_in_the_message_is_redacted(self):
+        text = (
+            "connection refused for https://a.example.com/path-one/tok "
+            "after fallback to https://b.example.com/path-two?k=v"
+        )
+        scrubbed = _redact_urls_in_text(text)
+
+        assert "path-one" not in scrubbed
+        assert "path-two" not in scrubbed
+        assert "tok" not in scrubbed.replace("blocked", "")
+        assert "a.example.com" in scrubbed and "b.example.com" in scrubbed
+
+    def test_schemeless_and_empty_text_are_left_alone(self):
+        assert _redact_urls_in_text("") == ""
+        assert _redact_urls_in_text("no url here") == "no url here"
+
+    def test_failure_log_records_the_redacted_detail(self, sink_logs):
+        # A non-transient failure takes the error path, which carries the hint.
+        exc = RuntimeError("boom for https://example.com/mcp/token-xyz?secret=1")
+        mcp_module._log_mcp_connection_failure("docs", exc, "cannot reach server")
+
+        records = "\n".join(sink_logs)
+        assert "cannot reach server" in records
+        assert "token-xyz" not in records
+        assert "secret=1" not in records
+        assert "example.com" in records
+
+    def test_transient_failure_logs_redacted_detail_at_debug(self, sink_logs):
+        exc = httpx.ConnectTimeout(
+            "timed out for https://example.com/sse/token-abc"
+        )
+        mcp_module._log_mcp_connection_failure("docs", exc)
+
+        records = "\n".join(sink_logs)
+        assert "transient connection failure" in records
+        assert "token-abc" not in records
+
+
+@pytest.fixture
+def sink_logs():
+    """Capture loguru records emitted during a test."""
+    sink: list[str] = []
+    handler_id = logger.add(sink.append, level="DEBUG", format="{message}")
+    try:
+        yield sink
+    finally:
+        logger.remove(handler_id)
 
 
 class TestWindowsStdioLauncher:

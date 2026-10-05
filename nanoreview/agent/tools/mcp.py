@@ -39,6 +39,10 @@ from nanoreview.security.network import (
 )
 from nanoreview.utils.cancellation import task_is_cancelling
 
+#: Matches http(s) URLs inside an exception message so they can be redacted
+#: before logging. Mirrors the pattern used by the network guards.
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
+
 if TYPE_CHECKING:
     from mcp import ClientSession
     from mcp.types import Prompt, Resource
@@ -226,15 +230,41 @@ def _is_transient_connection_failure(exc: BaseException) -> bool:
     return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)) or _is_transient(exc)
 
 
+def _redact_urls_in_text(text: str) -> str:
+    """Replace every URL in ``text`` with its redacted form.
+
+    Connection diagnostics are logged outside any request context, so
+    ``tool_log_content_allowed()`` is true there and an ``httpx`` exception
+    would put the full request URL — including credentials embedded in the path
+    or query — straight into the log. Scrub the message instead of relying on
+    the per-request switch.
+    """
+    if not text:
+        return text
+    return _URL_IN_TEXT_RE.sub(lambda match: _redact_url(match.group(0)), text)
+
+
+def _describe_mcp_exception(exc: BaseException) -> str:
+    """Render an exception for connection diagnostics with URLs redacted."""
+    message = str(exc).strip() or type(exc).__name__
+    return _redact_urls_in_text(message)
+
+
 def _log_mcp_connection_failure(name: str, exc: BaseException, hint: str = "") -> None:
-    exception = exc if tool_log_content_allowed() else False
+    # Never attach the raw exception here: the connection path runs without a
+    # request context, so the "may log content" switch does not protect the
+    # server URL that the exception embeds.
+    detail = _describe_mcp_exception(exc)
     if _is_transient_connection_failure(exc):
         logger.warning("MCP server '{}': transient connection failure", name)
-        logger.opt(exception=exception).debug(
-            "MCP server '{}' transient connection failure details", name
-        )
+        logger.debug("MCP server '{}' transient connection failure details: {}", name, detail)
         return
-    logger.opt(exception=exception).error("MCP server '{}': failed to connect: {}", name, hint)
+    logger.error(
+        "MCP server '{}': failed to connect: {} ({})",
+        name,
+        hint,
+        detail,
+    )
 
 
 def _is_session_terminated(exc: BaseException) -> bool:

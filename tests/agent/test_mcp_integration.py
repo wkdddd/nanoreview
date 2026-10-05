@@ -469,6 +469,55 @@ class TestShutdown:
 
         assert not coordinator.mcp.registry.has("mcp_docs_search")
 
+    @pytest.mark.asyncio
+    async def test_message_received_during_shutdown_does_not_start_a_turn(
+        self, tmp_path
+    ) -> None:
+        """A message that arrives while aclose() runs must not be dispatched.
+
+        The bus loop can already hold a message when shutdown begins, and the
+        dispatch task only starts after a yield, so admission has to be closed
+        before tasks are cancelled - otherwise a turn runs after aclose()
+        returned.
+        """
+        coordinator = _coordinator(tmp_path)
+        ran: list[str] = []
+
+        async def _record(msg) -> None:
+            ran.append(msg.session_key)
+
+        coordinator._dispatch = _record  # type: ignore[method-assign]
+
+        async def _bus() -> None:
+            await asyncio.sleep(0)
+            await coordinator.bus.publish_inbound(_msg(content="late"))
+
+        bus_task = asyncio.create_task(_bus())
+        await asyncio.sleep(0)
+        await coordinator.aclose()
+        await asyncio.gather(bus_task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        assert ran == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_returns_early_after_close(self, tmp_path) -> None:
+        coordinator = _coordinator(tmp_path)
+        called: list[str] = []
+
+        async def _process(*args, **kwargs):
+            called.append("process")
+            raise AssertionError("dispatch must not reach the loop")
+
+        coordinator.conversation_loop.process_message = _process  # type: ignore[method-assign]
+
+        await coordinator.aclose()
+        # Simulates a dispatch task that was created before shutdown and only
+        # got scheduled afterwards.
+        await coordinator._dispatch(_msg())
+
+        assert called == []
+
 
 class _FakeReadStream:
     """Blocks forever like a live server's stdout, never yielding a message."""

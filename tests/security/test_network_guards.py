@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
 
 import httpx
 import pytest
@@ -27,9 +28,15 @@ from nanoreview.security.network import (
 @pytest.fixture(autouse=True)
 def _restore_resolver_state():
     original = socket.getaddrinfo
+    allowed = list(network_module._allowed_networks)
     yield
     socket.getaddrinfo = original
     network_module._resolver_depth[0] = 0
+    # The SSRF whitelist is process-global too; leaking it makes later tests
+    # observe a policy they never configured.
+    network_module.configure_ssrf_whitelist(
+        [str(net) for net in allowed]
+    )
 
 
 class _RecordingTransport:
@@ -84,6 +91,57 @@ class TestPinnedTransportAcrossEventLoops:
         request = httpx.Request("GET", "http://169.254.169.254/latest/meta-data")
         with pytest.raises(UnsafeURLRequestError):
             await transport.handle_async_request(request)
+        assert network_module._resolver_depth[0] == 0
+
+    async def test_slow_resolution_does_not_block_the_event_loop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A slow resolver must not stall unrelated coroutines.
+
+        ``resolve_url_target`` calls ``socket.getaddrinfo``, which is blocking.
+        Running it inline on the loop freezes every other session -- including
+        ``/stop`` handling -- for the whole lookup. The transport must hand the
+        lookup to a worker thread.
+
+        The fake resolver holds for 250ms, released by a plain timer thread so
+        the gate does not depend on the loop making progress. A short ticker is
+        expected to finish well before the lookup returns: if the resolve ran
+        inline, the ticker would only start after the gate opened.
+        """
+        release = threading.Event()
+        threading.Timer(0.25, release.set).start()
+
+        def _slow_resolve(url: str, *, allow_loopback: bool = False):
+            release.wait(timeout=5)
+            return True, "", ["127.0.0.1"]
+
+        monkeypatch.setattr(network_module, "resolve_url_target", _slow_resolve)
+        network_module.configure_ssrf_whitelist(["127.0.0.0/8"])
+        transport = PinnedDNSAsyncTransport(
+            allow_loopback=True, inner=_RecordingTransport()
+        )
+
+        ticker_done_at: list[float] = []
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        async def _ticker() -> None:
+            # 5 ticks * 10ms = 50ms, comfortably inside the 250ms gate.
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+            ticker_done_at.append(loop.time() - started)
+
+        async def _run_request() -> None:
+            await transport.handle_async_request(
+                httpx.Request("GET", "http://localhost:8931/mcp")
+            )
+
+        await asyncio.gather(_run_request(), _ticker())
+
+        assert ticker_done_at, "ticker never ran"
+        # The lookup held for 250ms. A blocked loop would push the ticker past
+        # that; a decoupled one lets it finish in ~50ms.
+        assert ticker_done_at[0] < 0.2, f"ticker starved: {ticker_done_at[0]:.3f}s"
         assert network_module._resolver_depth[0] == 0
 
 

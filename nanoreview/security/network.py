@@ -310,7 +310,12 @@ class PinnedDNSAsyncTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        ok, error, resolved_ips = resolve_url_target(url, allow_loopback=self._allow_loopback)
+        # Resolution calls socket.getaddrinfo, which is blocking. Keep it off
+        # the event loop: a slow resolver would otherwise stall every other
+        # session (including /stop handling) for the duration of the lookup.
+        ok, error, resolved_ips = await asyncio.to_thread(
+            resolve_url_target, url, allow_loopback=self._allow_loopback
+        )
         if not ok:
             raise UnsafeURLRequestError(error, request=request)
         async with self._loop_lock():

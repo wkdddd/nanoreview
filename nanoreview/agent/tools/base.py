@@ -75,6 +75,9 @@ class Schema(ABC):
                 matched = Schema.match_json_schema_type(val, union_types)
                 if matched is None:
                     return [f"{label} should match one of the types {union_types}"]
+                # Validate against the branch that actually matched, not the
+                # first listed one; otherwise ["string", "integer"] rejects 7.
+                t = matched
         if t == "integer" and (not isinstance(val, int) or isinstance(val, bool)):
             return [f"{label} should be integer"]
         if t == "number" and (

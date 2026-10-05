@@ -1592,6 +1592,15 @@ class SessionCoordinator:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            # ``aclose()`` may have run while this turn was waiting on the bus.
+            # Admission is closed at that point, so the message must be dropped
+            # rather than dispatched into a shutting-down coordinator.
+            if self._closed:
+                logger.debug(
+                    "Dropping inbound message after shutdown: session={}", msg.session_key
+                )
+                continue
+
             raw = msg.content.strip()
             if msg.metadata.get("_permission_response"):
                 resp = msg.metadata["_permission_response"]
@@ -1682,6 +1691,12 @@ class SessionCoordinator:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
+        # The task is created by the bus loop and only starts after a yield, so
+        # shutdown can win the race. Re-check admission here: a turn that has
+        # not started yet must not run after ``aclose()``.
+        if self._closed:
+            logger.debug("Skipping dispatch after shutdown: session={}", msg.session_key)
+            return
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
@@ -1949,6 +1964,10 @@ class SessionCoordinator:
             return
         self._closed = True
         self._running = False
+        # ``_closed`` is the real admission switch: the bus loop, the dispatch
+        # entry and the MCP proxy registration all check it. It is set before
+        # any await so no new turn can be admitted while the tasks below are
+        # being cancelled.
 
         for tasks in list(self._active_tasks.values()):
             for task in tasks:
