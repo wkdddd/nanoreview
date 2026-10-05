@@ -25,12 +25,16 @@ from nanoreview.agent.compression import (
     serialize_transcript,
     split_units,
 )
-from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.agent.hooks.lifecycle import (
+    AgentHook,
+    AgentHookContext,
+    AgentRunHookContext,
+    finalize_content_result,
+)
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.safety_boundary import classify_violation
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanoreview.utils.helpers import (
-    IncrementalThinkExtractor,
     build_assistant_message,
     estimate_message_tokens,
     estimate_prompt_tokens_chain,
@@ -38,7 +42,6 @@ from nanoreview.utils.helpers import (
     find_legal_message_start,
     maybe_persist_tool_result,
     merge_token_usage,
-    strip_think,
     truncate_text,
 )
 from nanoreview.utils.prompt_templates import render_template
@@ -146,8 +149,6 @@ class AgentRunSpec:
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
-    progress_callback: Any | None = None
-    stream_progress_deltas: bool = True
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
@@ -207,6 +208,10 @@ class _IterationOutcome:
     terminal_attempts: int
     terminal_error: str | None
     had_injections: bool
+    #: True once any iteration produced an explicit hook replacement of the
+    #: final content. Carried forward so ``AgentRunResult`` can report it
+    #: without re-deriving it from the public hook context.
+    content_replaced: bool = False
     stop_reason: str | None = None
     final_content: str | None = None
     error: str | None = None
@@ -402,7 +407,11 @@ class AgentRunner:
         terminal_error: str | None = None
         content_replaced = False
 
+        # The run hook gets its own transcript: an observer appending to
+        # ``context.messages`` must not reach the history this run persists.
+        run_context = AgentRunHookContext(messages=deepcopy(messages))
         try:
+            await hook.before_run(run_context)
             for iteration in range(spec.max_iterations):
                 # The first business request skips run-level 60%/80%
                 # compression, but its context is already built as
@@ -428,6 +437,7 @@ class AgentRunner:
                 # provider chain must never reach the raw history or the state.
                 messages_for_model = deepcopy(self._model_context(spec, state))
                 context = AgentHookContext(iteration=iteration, messages=messages)
+                context.session_key = spec.session_key
                 await hook.before_iteration(context)
                 ##请求模型
                 response = await self._request_model(spec, messages_for_model, hook, context)
@@ -465,7 +475,7 @@ class AgentRunner:
                 terminal_attempts = iteration_outcome.terminal_attempts
                 terminal_error = iteration_outcome.terminal_error
                 had_injections = had_injections or iteration_outcome.had_injections
-                content_replaced = content_replaced or context.content_replaced
+                content_replaced = content_replaced or iteration_outcome.content_replaced
                 if iteration_outcome.stop_reason is not None:
                     stop_reason = iteration_outcome.stop_reason
                     error = iteration_outcome.error
@@ -499,13 +509,81 @@ class AgentRunner:
                 )
                 if drained_after_max_iterations:
                     had_injections = True
+        except asyncio.CancelledError as exc:
+            # A cancelled run is not a run failure: ``on_error`` stays silent so
+            # error reporting never races the caller's own cancellation.
+            await self._settle_run_accounting(spec, state, usage)
+            self._fill_run_context(
+                run_context,
+                messages=messages,
+                final_content=final_content,
+                tools_used=tools_used,
+                usage=usage,
+                stop_reason="cancelled",
+                error=None,
+                tool_events=tool_events,
+                had_injections=had_injections,
+                exception=exc,
+            )
+            run_context.usage = dict(usage)
+            raise
+        except Exception as exc:
+            await self._settle_run_accounting(spec, state, usage)
+            self._fill_run_context(
+                run_context,
+                messages=messages,
+                final_content=final_content,
+                tools_used=tools_used,
+                usage=usage,
+                stop_reason="error",
+                error=f"Error: {type(exc).__name__}: {exc}",
+                tool_events=tool_events,
+                had_injections=had_injections,
+                exception=exc,
+            )
+            run_context.usage = dict(usage)
+            await hook.on_error(run_context)
+            raise
+        else:
+            # Settle compression *before* snapshotting: ``after_run`` is the
+            # run-level result hook, so it must observe the same usage (and the
+            # same finalized transcript) the caller receives from
+            # ``AgentRunResult``, not a pre-settlement partial sum.
+            await self._settle_run_accounting(spec, state, usage)
+            self._fill_run_context(
+                run_context,
+                messages=messages,
+                final_content=final_content,
+                tools_used=tools_used,
+                usage=usage,
+                stop_reason=stop_reason,
+                error=error,
+                tool_events=tool_events,
+                had_injections=had_injections,
+                exception=None,
+            )
+            run_context.usage = dict(usage)
+            if error is not None:
+                await hook.on_error(run_context)
+            await hook.after_run(run_context)
         finally:
-            # Always settle the in-flight compression task: normal completion,
-            # terminal tool success, business error, max iterations and external
-            # cancellation all go through here. Usage recorded by compression is
-            # part of the run and must survive every exit path.
-            await self._close_compression(spec, state, usage)
-            merge_token_usage(usage, state.usage)
+            # Exit-path safety net. On the normal path accounting already ran
+            # above; on the error/cancel paths it ran before the snapshot. This
+            # call is idempotent (a settled state is a no-op), so it only does
+            # work if a future exit path forgets to settle early.
+            await self._settle_run_accounting(spec, state, usage)
+            if run_context.exception is None:
+                await hook.on_finally(run_context)
+            else:
+                # A failing finally hook must never mask the in-flight
+                # exception or cancellation.
+                try:
+                    await hook.on_finally(run_context)
+                except Exception:
+                    logger.exception(
+                        "AgentHook.on_finally error after {}",
+                        run_context.stop_reason or "run exception",
+                    )
 
         return AgentRunResult(
             final_content=final_content,
@@ -520,6 +598,36 @@ class AgentRunner:
             terminal_attempts=terminal_attempts,
             terminal_error=terminal_error,
         )
+
+    @staticmethod
+    def _fill_run_context(
+        run_context: AgentRunHookContext,
+        *,
+        messages: list[dict[str, Any]],
+        final_content: str | None,
+        tools_used: list[str],
+        usage: dict[str, int],
+        stop_reason: str,
+        error: str | None,
+        tool_events: list[dict[str, Any]],
+        had_injections: bool,
+        exception: BaseException | None,
+    ) -> None:
+        """Snapshot the run's end state for run-level hooks.
+
+        Every collection is copied: the context is what hooks observe, never
+        the runner's live state, so a misbehaving observer cannot rewrite the
+        result the caller receives (or the history it persists).
+        """
+        run_context.messages = deepcopy(messages)
+        run_context.final_content = final_content
+        run_context.tools_used = list(tools_used)
+        run_context.usage = dict(usage)
+        run_context.stop_reason = stop_reason
+        run_context.error = error
+        run_context.tool_events = deepcopy(tool_events)
+        run_context.had_injections = had_injections
+        run_context.exception = exception
 
 
     async def _run_iteration(
@@ -569,6 +677,8 @@ class AgentRunner:
             terminal_error=terminal_error,
             had_injections=had_injections,
         )
+        #: Set once ``finalize_content_result`` reports an explicit replacement.
+        is_replaced = False
 
         if response.should_execute_tools:
             context.tool_calls = list(response.tool_calls)
@@ -614,6 +724,8 @@ class AgentRunner:
                 response.tool_calls,
                 external_lookup_counts,
                 workspace_violation_counts,
+                hook,
+                context,
             )
             tool_events.extend(new_events)
             context.tool_results = list(results)
@@ -755,7 +867,10 @@ class AgentRunner:
                 spec.session_key or "default",
             )
 
-        clean = hook.finalize_content(context, response.content)
+        finalized = finalize_content_result(hook, context, response.content)
+        clean = finalized.content
+        is_replaced = finalized.is_replaced
+        outcome.content_replaced = is_replaced
         if response.finish_reason != "error" and is_blank_text(clean):
             outcome.empty_content_retries += 1
             if outcome.empty_content_retries < _MAX_EMPTY_RETRIES:
@@ -785,7 +900,10 @@ class AgentRunner:
             context.response = response
             context.usage = dict(raw_usage)
             context.tool_calls = list(response.tool_calls)
-            clean = hook.finalize_content(context, response.content)
+            finalized = finalize_content_result(hook, context, response.content)
+            clean = finalized.content
+            is_replaced = finalized.is_replaced
+            outcome.content_replaced = is_replaced
         _ = raw_usage
 
         if response.finish_reason == "length" and not is_blank_text(clean):
@@ -822,10 +940,11 @@ class AgentRunner:
             )
 
         # Check for mid-turn injections BEFORE signaling stream end.
-        # If a hook replaced the content, that replacement is authoritative
-        # for the turn and must not be overwritten by follow-up prose from
-        # injected messages.
-        if context.content_replaced:
+        # If a hook explicitly replaced the content, that replacement is
+        # authoritative for the turn and must not be overwritten by follow-up
+        # prose from injected messages. Plain cleaning (DSML stripping) is not
+        # a replacement and still drains injections.
+        if is_replaced:
             should_continue = False
         else:
             should_continue, injection_cycles = await self._try_drain_injections(
@@ -902,7 +1021,7 @@ class AgentRunner:
         # A terminal-tool run that answers with prose instead of submitting
         # keeps the same AgentRun: inject one fixed prompt asking for the
         # terminal tool and count this as a terminal submission attempt.
-        if spec.terminal_tools and not context.content_replaced:
+        if spec.terminal_tools and not is_replaced:
             self._append_raw(
                 messages,
                 state,
@@ -1361,6 +1480,29 @@ class AgentRunner:
         with suppress(asyncio.CancelledError, Exception):
             await pending
 
+    async def _settle_run_accounting(
+        self,
+        spec: AgentRunSpec,
+        state: RunCompressionState,
+        usage: dict[str, int],
+    ) -> None:
+        """Settle compression and merge its billed usage into ``usage``.
+
+        Idempotent: the normal path settles before the run-level result hook so
+        the hook sees final usage, and ``finally`` calls it again purely as an
+        exit-path safety net. ``_close_compression`` guards on ``state.closed``;
+        the merge is guarded here so a second call cannot double-count.
+
+        Compression usage recorded here is part of the run and must survive
+        every exit path (normal completion, terminal tool, business error, max
+        iterations, cancellation).
+        """
+        if state.usage_banked:
+            return
+        await self._close_compression(spec, state, usage)
+        merge_token_usage(usage, state.usage)
+        state.usage_banked = True
+
     async def _close_compression(
         self,
         spec: AgentRunSpec,
@@ -1659,14 +1801,11 @@ class AgentRunner:
             tools=spec.tools.get_definitions(),
         )
         wants_streaming = hook.wants_streaming()
-        wants_progress_streaming = (
-            not wants_streaming
-            and spec.stream_progress_deltas
-            and spec.progress_callback is not None
-            and getattr(self.provider, "supports_progress_deltas", False) is True
-        )
 
-        progress_state: dict[str, bool] | None = None
+        async def _provider_tool_event(event: dict[str, Any]) -> None:
+            if event.get("kind") != "hosted_tool":
+                return
+            await hook.on_provider_tool_event(context, event)
 
         if wants_streaming:
 
@@ -1685,35 +1824,7 @@ class AgentRunner:
                 **kwargs,
                 on_content_delta=_stream,
                 on_thinking_delta=_thinking,
-            )
-        elif wants_progress_streaming:
-            stream_buf = ""
-            think_extractor = IncrementalThinkExtractor()
-            progress_state = {"reasoning_open": False}
-
-            async def _stream_progress(delta: str) -> None:
-                nonlocal stream_buf
-                if not delta:
-                    return
-                prev_clean = strip_think(stream_buf)
-                stream_buf += delta
-                new_clean = strip_think(stream_buf)
-                incremental = new_clean[len(prev_clean) :]
-
-                if await think_extractor.feed(stream_buf, hook.emit_reasoning):
-                    context.streamed_reasoning = True
-                    progress_state["reasoning_open"] = True
-
-                if incremental:
-                    if progress_state["reasoning_open"]:
-                        await hook.emit_reasoning_end()
-                        progress_state["reasoning_open"] = False
-                    context.streamed_content = True
-                    await spec.progress_callback(incremental)
-
-            coro = self.provider.chat_stream_with_retry(
-                **kwargs,
-                on_content_delta=_stream_progress,
+                on_tool_event=_provider_tool_event,
             )
         else:
             coro = self.provider.chat_with_retry(**kwargs)
@@ -1722,7 +1833,7 @@ class AgentRunner:
         # (NANOBOT_STREAM_IDLE_TIMEOUT_S), plus a longer wall-clock cap here as
         # a last-resort guard for providers that fail to enforce idle timeouts.
         outer_timeout_s = timeout_s
-        if (wants_streaming or wants_progress_streaming) and timeout_s is not None:
+        if wants_streaming and timeout_s is not None:
             outer_timeout_s = timeout_s * _STREAM_OUTER_TIMEOUT_MULTIPLIER
         try:
             response = (
@@ -1742,8 +1853,6 @@ class AgentRunner:
                 finish_reason="error",
                 error_kind="timeout",
             )
-        if progress_state and progress_state.get("reasoning_open"):
-            await hook.emit_reasoning_end()
         return response
 
     async def _request_finalization_retry(
@@ -1787,6 +1896,8 @@ class AgentRunner:
         tool_calls: list[ToolCallRequest],
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
+        hook: AgentHook | None = None,
+        context: AgentHookContext | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
@@ -1799,6 +1910,8 @@ class AgentRunner:
                             tool_call,
                             external_lookup_counts,
                             workspace_violation_counts,
+                            hook,
+                            context,
                         )
                         for tool_call in batch
                     )
@@ -1812,6 +1925,8 @@ class AgentRunner:
                         tool_call,
                         external_lookup_counts,
                         workspace_violation_counts,
+                        hook,
+                        context,
                     )
                     tool_results.append(result)
                     batch_results.append(result)
@@ -1845,6 +1960,8 @@ class AgentRunner:
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
+        hook: AgentHook | None = None,
+        context: AgentHookContext | None = None,
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hint = "\n\n[Analyze the error above and try a different approach.]"
         lookup_error = repeated_external_lookup_error(
@@ -1919,6 +2036,8 @@ class AgentRunner:
             )
             event = {"name": tool_call.name, "status": "denied", "detail": "permission check error"}
             return "Tool execution denied due to permission check error.", event, None
+        if hook is not None and context is not None:
+            await hook.before_execute_tool(context, tool_call, tool, params)
         try:
             if tool is not None:
                 result = await tool.execute(**params)
@@ -1939,6 +2058,8 @@ class AgentRunner:
                 "detail": exc_text.replace("\n", " ").strip()[:160],
             }
             payload = f"Error: {exc_text}"
+            if hook is not None and context is not None:
+                await hook.on_execute_tool_error(context, tool_call, tool, params, exc)
             handled = classify_violation(
                 raw_text=str(exc),
                 soft_payload=payload,
@@ -1953,6 +2074,8 @@ class AgentRunner:
             return payload, event, None
 
         if _is_tool_error_result(result):
+            if hook is not None and context is not None:
+                await hook.on_execute_tool_error(context, tool_call, tool, params, result)
             event = {
                 "name": tool_call.name,
                 "status": "error",
@@ -1970,6 +2093,9 @@ class AgentRunner:
             if self._is_fatal_tool_error(spec, tool_call.name):
                 return result + hint, event, RuntimeError(result)
             return result + hint, event, None
+
+        if hook is not None and context is not None:
+            await hook.after_execute_tool(context, tool_call, tool, params, result)
 
         detail = "" if result is None else str(result)
         raw_result = (

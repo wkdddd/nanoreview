@@ -16,6 +16,7 @@ from typing import Any
 from aiohttp import web
 from loguru import logger
 
+from nanoreview.agent.event_sink import build_callback_event_sink
 from nanoreview.config.paths import get_media_dir
 from nanoreview.review.admission import (
     ReviewAdmissionError,
@@ -306,12 +307,6 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                 emitted_content = True
             await queue.put(token)
 
-        async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
-            # Agent stream-end callbacks mark generation segment boundaries.
-            # Tool-backed requests may continue after a segment ends, so the
-            # HTTP SSE stream is closed only when process_direct returns.
-            return None
-
         async def _run() -> None:
             nonlocal stream_failed
             try:
@@ -322,8 +317,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
-                        on_stream=_on_stream,
-                        on_stream_end=_on_stream_end,
+                        # Stream-end events only mark agent segment boundaries;
+                        # tool-backed requests continue afterwards, so the HTTP
+                        # SSE stream closes when process_direct returns.
+                        events=build_callback_event_sink(on_stream=_on_stream),
                         metadata=review_metadata,
                     ),
                     timeout=timeout_s,

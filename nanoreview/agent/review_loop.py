@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanoreview.agent.context import ContextBuilder
+from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanoreview.agent.review_state import (
     REVIEW_TERMINAL_STATUSES,
     JudgeBatchState,
@@ -57,6 +58,7 @@ from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
 from nanoreview.bus.events import InboundMessage
+from nanoreview.events import NO_EVENTS, EventSink, ProgressEvent
 from nanoreview.review.admission import (
     ReviewAdmission,
     register_review_run,
@@ -204,6 +206,30 @@ def validation_repository_root(plan: ReviewPlan, fallback: Path) -> str:
     return str(fallback.resolve())
 
 
+def _review_prefetch_progress_publisher(
+    events: EventSink,
+) -> Callable[..., Awaitable[None]] | None:
+    """Adapt prefetch tool-event progress onto the turn's ``EventSink``."""
+    if events.publish is None:
+        return None
+
+    async def _publish_progress(
+        content: str,
+        *,
+        tool_hint: bool = False,
+        tool_events: list[dict[str, Any]] | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        publish = events.publish
+        if publish is None:
+            return
+        await publish(
+            ProgressEvent(content=content, tool_hint=tool_hint, tool_events=tool_events)
+        )
+
+    return _publish_progress
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewTurnRequest:
     """Minimal context the coordinator hands to :meth:`ReviewLoop.execute`.
@@ -219,7 +245,7 @@ class ReviewTurnRequest:
     session: "Session | None"
     msg: InboundMessage
     metadata: dict[str, Any]
-    progress_callback: Callable[..., Awaitable[None]] | None = None
+    events: EventSink = NO_EVENTS
     result_callback: Callable[[Any], Awaitable[None]] | None = None
 
     @property
@@ -626,7 +652,7 @@ class ReviewLoop:
         preparation = await prepare_code_review_context(
             review_messages,
             review_meta,
-            progress_callback=request.progress_callback,
+            progress_callback=_review_prefetch_progress_publisher(request.events),
         )
         if preparation.plan is None:
             raise ReviewPlanningError(
@@ -831,6 +857,12 @@ class ReviewLoop:
                 model=self._model,
                 max_iterations=_PLANNER_MAX_ITERATIONS,
                 max_tool_result_chars=self._max_tool_result_chars,
+                hook=build_agent_turn_hook(
+                    AgentTurnHookSpec(
+                        workspace=self._workspace,
+                        ephemeral=True,
+                    )
+                ),
                 tool_choice={
                     "type": "function",
                     "function": {"name": "submit_review_plan"},

@@ -103,8 +103,9 @@ class OpenAICodexProvider(LLMProvider):
         response_format: dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
-        _ = on_thinking_delta, response_format
+        _ = on_thinking_delta, response_format, on_tool_event
         return await self._call_codex(messages, tools, model, reasoning_effort, tool_choice, on_content_delta)
 
     def get_default_model(self) -> str:

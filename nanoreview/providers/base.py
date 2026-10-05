@@ -524,6 +524,7 @@ class LLMProvider(ABC):
         response_format: dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         """Stream a chat completion, calling *on_content_delta* for each text chunk.
 
@@ -532,12 +533,18 @@ class LLMProvider(ABC):
         callback for native deltas (only the optional single *on_content_delta*
         after :meth:`chat`).
 
+        *on_tool_event* is reserved for providers that host tool execution
+        server-side and report its lifecycle (``{"kind": "hosted_tool",
+        "phase": "start"|"end"|"error", "call_id": ..., ...}``); the default
+        fallback never invokes it.
+
         Returns the same ``LLMResponse`` as :meth:`chat`.  The default
         implementation falls back to a non-streaming call and delivers the
         full content as a single delta.  Providers that support native
         streaming should override this method.
         """
         _ = on_thinking_delta
+        _ = on_tool_event
         chat_kwargs: dict[str, Any] = dict(
             messages=messages, tools=tools, model=model,
             max_tokens=max_tokens, temperature=temperature,
@@ -581,6 +588,7 @@ class LLMProvider(ABC):
         response_format: dict[str, Any] | None = None,
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_thinking_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         retry_mode: str = "standard",
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
@@ -598,6 +606,7 @@ class LLMProvider(ABC):
             reasoning_effort=reasoning_effort, tool_choice=tool_choice,
             on_content_delta=on_content_delta,
             on_thinking_delta=on_thinking_delta,
+            on_tool_event=on_tool_event,
         )
         if response_format is not None:
             kw["response_format"] = response_format

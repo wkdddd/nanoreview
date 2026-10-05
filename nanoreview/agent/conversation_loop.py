@@ -34,8 +34,9 @@ from loguru import logger
 
 from nanoreview.agent.autocompact import AutoCompact
 from nanoreview.agent.context import ContextBuilder
-from nanoreview.agent.hooks.lifecycle import AgentHook, CompositeHook
-from nanoreview.agent.hooks.progress import AgentProgressHook
+from nanoreview.agent.hooks.file_edit import create_file_edit_activity_hook
+from nanoreview.agent.hooks.lifecycle import AgentHook
+from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanoreview.agent.memory import Consolidator
 from nanoreview.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
@@ -58,6 +59,7 @@ from nanoreview.agent.tools.message import MessageTool
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.events import InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
+from nanoreview.events import NO_EVENTS, EventSink, StreamDeltaEvent, StreamEndEvent
 from nanoreview.review import apply_review_metadata_from_message
 from nanoreview.utils.artifacts import generated_image_paths_from_messages
 from nanoreview.utils.document import extract_documents
@@ -121,9 +123,9 @@ class _TurnContext:
 
     pending_queue: asyncio.Queue | None = None
 
-    on_progress: Callable[..., Awaitable[None]] | None = None
-    on_stream: Callable[[str], Awaitable[None]] | None = None
-    on_stream_end: Callable[..., Awaitable[None]] | None = None
+    #: Typed event delivery for this turn. Transports build the sink; the
+    #: turn's hook chain publishes onto it and never sees raw callbacks.
+    events: EventSink = NO_EVENTS
     on_retry_wait: Callable[[str], Awaitable[None]] | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
@@ -240,9 +242,7 @@ class ConversationLoop:
         turn_id: str,
         target_root: Path,
         handoff: "ReviewHandoff | None" = None,
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        events: EventSink = NO_EVENTS,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
     ) -> OutboundMessage | None:
@@ -259,9 +259,7 @@ class ConversationLoop:
             handoff_directive=handoff.directive if handoff is not None else None,
             outbound_channel=msg.channel,
             outbound_chat_id=msg.chat_id,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
+            events=events,
             on_retry_wait=on_retry_wait,
             pending_queue=pending_queue,
         )
@@ -354,9 +352,23 @@ class ConversationLoop:
             self._usage_recorder(dict(result.usage or {}))
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self._max_iterations)
-            if ctx.on_stream and ctx.on_stream_end:
-                await ctx.on_stream(result.final_content or "")
-                await ctx.on_stream_end(resuming=False)
+            # The wrap-up body is delivered as a normal reply too (see
+            # ``_respond``), so it may only be pushed through the stream channel
+            # when a stream consumer is actually bound. Publishing it regardless
+            # duplicates a non-streaming turn's body: once as a delta/end pair
+            # nobody renders, and once as the plain reply.
+            #
+            # Delivery failures must propagate (``publish``, not ``emit``):
+            # ``_respond`` marks the reply ``_streamed=True`` on the strength of
+            # this push having happened, and ``ChannelManager`` then skips
+            # ``channel.send`` for a ``_streamed`` message. A swallowed failure
+            # would therefore mark a reply as already-rendered that never was,
+            # and the wrap-up text would reach nobody at all.
+            if ctx.events.accepts(StreamDeltaEvent):
+                await ctx.events.publish(
+                    StreamDeltaEvent(content=result.final_content or "")
+                )
+                await ctx.events.publish(StreamEndEvent(resuming=False))
         elif result.stop_reason == "error":
             logger.error(
                 "LLM returned error: {}", (result.final_content or "")[:200]
@@ -401,7 +413,7 @@ class ConversationLoop:
             ctx.stop_reason,
             ctx.had_injections,
             ctx.generated_media,
-            ctx.on_stream,
+            ctx.events.accepts(StreamDeltaEvent),
             channel=ctx.outbound_channel or ctx.msg.channel,
             chat_id=ctx.outbound_chat_id or ctx.msg.chat_id,
             turn_latency_ms=ctx.turn_latency_ms,
@@ -442,30 +454,33 @@ class ConversationLoop:
                 ctx.outbound_chat_id or ctx.msg.chat_id,
             )
 
-        loop_hook = AgentProgressHook(
-            on_progress=ctx.on_progress,
-            on_stream=ctx.on_stream,
-            on_stream_end=ctx.on_stream_end,
-            channel=ctx.outbound_channel or ctx.msg.channel,
-            chat_id=ctx.outbound_chat_id or ctx.msg.chat_id,
-            message_id=ctx.msg.metadata.get("message_id"),
-            metadata=ctx.msg.metadata,
-            session_key=ctx.session_key,
-            tool_hint_max_length=self._tool_hint_max_length,
-            set_tool_context=lambda *a, **k: self._set_registry_context(
-                ctx.tools, *a, **k
-            ),
-            on_iteration=lambda iteration: setattr(
-                self, "_current_iteration", iteration
-            ),
+        hook = build_agent_turn_hook(
+            AgentTurnHookSpec(
+                events=ctx.events,
+                streaming=ctx.events.accepts(StreamDeltaEvent),
+                channel=ctx.outbound_channel or ctx.msg.channel,
+                chat_id=ctx.outbound_chat_id or ctx.msg.chat_id,
+                message_id=ctx.msg.metadata.get("message_id"),
+                metadata=ctx.msg.metadata,
+                session_key=ctx.session_key,
+                workspace=ctx.target_root,
+                tool_hint_max_length=self._tool_hint_max_length,
+                set_tool_context=lambda *a, **k: self._set_registry_context(
+                    ctx.tools, *a, **k
+                ),
+                on_iteration=lambda iteration: setattr(
+                    self, "_current_iteration", iteration
+                ),
+                # File-edit activity is a Conversation Agent concern: review,
+                # planner and Judge paths never assemble this factory.
+                registered_hook_factories=[create_file_edit_activity_hook],
+                registered_hooks=(
+                    list(self._hooks_getter())
+                    if self._hooks_getter is not None
+                    else self._extra_hooks
+                ),
+            )
         )
-        extra_hooks = (
-            list(self._hooks_getter())
-            if self._hooks_getter is not None
-            else self._extra_hooks
-        )
-        hooks: list[AgentHook] = [loop_hook, *extra_hooks]
-        hook: AgentHook = CompositeHook(hooks) if len(hooks) > 1 else loop_hook
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
             if ctx.session is not None:
@@ -493,8 +508,6 @@ class ConversationLoop:
                     context_window_tokens=self._context_window_tokens,
                     context_block_limit=self._context_block_limit,
                     provider_retry_mode=self._provider_retry_mode,
-                    progress_callback=ctx.on_progress,
-                    stream_progress_deltas=ctx.on_stream is not None,
                     retry_wait_callback=ctx.on_retry_wait,
                     checkpoint_callback=_checkpoint,
                     injection_callback=drain,
@@ -791,7 +804,7 @@ class ConversationLoop:
         stop_reason: str,
         had_injections: bool,
         generated_media: list[str],
-        on_stream: Callable[[str], Awaitable[None]] | None,
+        streamed: bool,
         *,
         channel: str,
         chat_id: str,
@@ -822,7 +835,7 @@ class ConversationLoop:
             "compression_failed",
             "compression_limit",
         }
-        if on_stream is not None and stop_reason not in unstreamed_stop_reasons:
+        if streamed and stop_reason not in unstreamed_stop_reasons:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)

@@ -64,6 +64,7 @@ from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
     ConversationLoop,
 )
+from nanoreview.agent.event_sink import build_bus_event_sink, event_text, metadata_for_event
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.memory import Consolidator
 from nanoreview.agent.review_loop import (
@@ -89,6 +90,11 @@ from nanoreview.command import (
     register_builtin_commands,
 )
 from nanoreview.config.schema import AgentDefaults, ModelPresetConfig
+from nanoreview.events import (
+    EventSink,
+    StreamDeltaEvent,
+    StreamEndEvent,
+)
 from nanoreview.providers.base import LLMProvider
 from nanoreview.providers.factory import ProviderSnapshot
 from nanoreview.review.admission import (
@@ -674,38 +680,26 @@ class SessionCoordinator:
 
     # -- bus helpers --------------------------------------------------------
 
-    async def _build_bus_progress_callback(
-        self, msg: InboundMessage
-    ) -> Callable[..., Awaitable[None]]:
-        """Build a progress callback that publishes to the message bus."""
+    async def _build_bus_event_sink(
+        self,
+        msg: InboundMessage,
+        *,
+        stream_kind: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> EventSink:
+        """Build the turn's ``EventSink`` bound to this message's bus route.
 
-        async def _bus_progress(
-            content: str,
-            *,
-            tool_hint: bool = False,
-            tool_events: list[dict[str, Any]] | None = None,
-            reasoning: bool = False,
-            reasoning_end: bool = False,
-        ) -> None:
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            if reasoning:
-                meta["_reasoning_delta"] = True
-            if reasoning_end:
-                meta["_reasoning_end"] = True
-            if tool_events:
-                meta["_tool_events"] = tool_events
-            await self.bus.publish_outbound(
-                OutboundMessage(
-                    channel=msg.channel,
-                    chat_id=msg.chat_id,
-                    content=content,
-                    metadata=meta,
-                )
-            )
-
-        return _bus_progress
+        Owns the metadata mapping the WebSocket/CLI channels already read, so
+        hooks only publish typed events.
+        """
+        return build_bus_event_sink(
+            self.bus.publish_outbound,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            metadata=msg.metadata,
+            stream_kind=stream_kind,
+            extra=extra,
+        )
 
     async def _build_retry_wait_callback(
         self, msg: InboundMessage
@@ -1334,7 +1328,7 @@ class SessionCoordinator:
         msg: InboundMessage,
         session: Session | None,
         session_key: str,
-        on_progress: Callable[..., Awaitable[None]] | None,
+        events: EventSink,
         wants_stream: bool,
     ) -> OutboundMessage | None:
         """Hand the admitted review turn to ``ReviewLoop`` and publish its result.
@@ -1359,7 +1353,7 @@ class SessionCoordinator:
                 session=session,
                 msg=msg,
                 metadata=dict(msg.metadata or {}),
-                progress_callback=on_progress,
+                events=events,
                 result_callback=_persist_automatic_subagent_result,
             )
         )
@@ -1457,9 +1451,7 @@ class SessionCoordinator:
         session_key: str,
         *,
         pending_queue: asyncio.Queue | None,
-        on_progress: Callable[..., Awaitable[None]] | None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        events: EventSink,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Route one already-admitted, already-gated turn to the right loop.
@@ -1507,7 +1499,7 @@ class SessionCoordinator:
                 msg=msg,
                 session=session,
                 session_key=session_key,
-                on_progress=on_progress,
+                events=events,
                 wants_stream=bool(msg.metadata.get("_wants_stream")),
             )
 
@@ -1524,9 +1516,7 @@ class SessionCoordinator:
             turn_id=turn_id,
             target_root=target_root,
             handoff=handoff if handoff is not None and handoff.fits else None,
-            on_progress=on_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
+            events=events,
             on_retry_wait=on_retry_wait,
             pending_queue=pending_queue,
         )
@@ -1729,51 +1719,50 @@ class SessionCoordinator:
         try:
             async with lock, gate:
                 try:
-                    on_stream = on_stream_end = None
-                    if wants_stream:
-
-                        async def on_stream(delta: str) -> None:
-                            meta = dict(msg.metadata or {})
-                            meta["_stream_delta"] = True
-                            meta["_stream_id"] = _current_stream_id()
-                            if review_stream:
-                                meta["_stream_kind"] = "review_thinking"
-                            await self.bus.publish_outbound(
-                                OutboundMessage(
-                                    channel=msg.channel,
-                                    chat_id=msg.chat_id,
-                                    content=delta,
-                                    metadata=meta,
-                                )
+                    # One sink per turn: progress, stream segments and tool
+                    # activity all project onto this message's bus route. The
+                    # stream id is resolved per event so each segment gets a
+                    # fresh id, exactly like the previous inline callbacks.
+                    async def _publish_turn_event(event: Any) -> None:
+                        nonlocal stream_segment
+                        publish = self.bus.publish_outbound
+                        meta = metadata_for_event(
+                            msg.metadata,
+                            event,
+                            stream_kind="review_thinking" if review_stream else None,
+                        )
+                        if meta is None:
+                            return
+                        # The end event closes the segment it was opened with, so
+                        # it carries the *current* id; only then does the next
+                        # segment start. Incrementing first would point the end
+                        # at a segment the transport never opened.
+                        meta["_stream_id"] = _current_stream_id()
+                        await publish(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content=event_text(event),
+                                metadata=meta,
                             )
-
-                        async def on_stream_end(*, resuming: bool = False) -> None:
-                            nonlocal stream_segment
-                            meta = dict(msg.metadata or {})
-                            meta["_stream_end"] = True
-                            meta["_resuming"] = resuming
-                            meta["_stream_id"] = _current_stream_id()
-                            if review_stream:
-                                meta["_stream_kind"] = "review_thinking"
-                            await self.bus.publish_outbound(
-                                OutboundMessage(
-                                    channel=msg.channel,
-                                    chat_id=msg.chat_id,
-                                    content="",
-                                    metadata=meta,
-                                )
-                            )
+                        )
+                        if isinstance(event, StreamEndEvent):
                             stream_segment += 1
 
-                    on_progress = await self._build_bus_progress_callback(msg)
+                    # Without a stream consumer the turn still publishes
+                    # progress and tool activity, but skips stream events so
+                    # providers do not pay for deltas nobody renders.
+                    events = EventSink(
+                        publish=_publish_turn_event,
+                        accepts_type=lambda event_type: wants_stream
+                        or not issubclass(event_type, (StreamDeltaEvent, StreamEndEvent)),
+                    )
                     on_retry_wait = await self._build_retry_wait_callback(msg)
                     response = await self._execute_turn(
                         msg,
                         session_key,
                         pending_queue=pending,
-                        on_progress=on_progress,
-                        on_stream=on_stream,
-                        on_stream_end=on_stream_end,
+                        events=events,
                         on_retry_wait=on_retry_wait,
                     )
 
@@ -1997,9 +1986,7 @@ class SessionCoordinator:
         channel: str = "cli",
         chat_id: str = "direct",
         media: list[str] | None = None,
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end: Callable[..., Awaitable[None]] | None = None,
+        events: EventSink | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process one request directly, serialised on the session lock.
@@ -2048,6 +2035,11 @@ class SessionCoordinator:
                 CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
             )
 
+        # The sink is resolved before the lock so a request cancelled while
+        # still queued (``/stop``) can still close its stream.
+        if events is None:
+            events = await self._build_bus_event_sink(msg)
+
         task = asyncio.current_task()
         if task is not None:
             self._active_tasks.setdefault(key, []).append(task)
@@ -2063,15 +2055,11 @@ class SessionCoordinator:
                 )
                 if admission_rejection is not None:
                     return admission_rejection
-                if on_progress is None:
-                    on_progress = await self._build_bus_progress_callback(msg)
                 response = await self._execute_turn(
                     msg,
                     key,
                     pending_queue=None,
-                    on_progress=on_progress,
-                    on_stream=on_stream,
-                    on_stream_end=on_stream_end,
+                    events=events,
                 )
                 session = self.sessions.get_or_create(key)
                 self.write_context_index(session)
@@ -2083,12 +2071,7 @@ class SessionCoordinator:
             current = asyncio.current_task()
             if current is not None:
                 current.uncancel()
-            return await self._stopped_direct_reply(
-                msg,
-                key,
-                on_stream=on_stream,
-                on_stream_end=on_stream_end,
-            )
+            return await self._stopped_direct_reply(msg, key, events=events)
         finally:
             if task is not None:
                 self._remove_active_task(key, task)
@@ -2098,8 +2081,7 @@ class SessionCoordinator:
         msg: InboundMessage,
         session_key: str,
         *,
-        on_stream: Callable[[str], Awaitable[None]] | None,
-        on_stream_end: Callable[..., Awaitable[None]] | None,
+        events: EventSink,
     ) -> OutboundMessage:
         """Build the explicit reply for a request cancelled by ``/stop``.
 
@@ -2130,12 +2112,15 @@ class SessionCoordinator:
         if notes:
             content = f"{content} {'; '.join(notes)}"
 
-        if on_stream is not None:
+        # The same text is returned to every caller as the reply body, so it may
+        # only be pushed through the stream channel when a stream consumer is
+        # bound. Doing it unconditionally duplicates a non-streaming request's
+        # body: once as a delta/end pair nobody renders, once as the reply.
+        if events.accepts(StreamDeltaEvent):
             with suppress(Exception):
-                await on_stream(content)
-            if on_stream_end is not None:
-                with suppress(Exception):
-                    await on_stream_end(resuming=False)
+                await events.emit(StreamDeltaEvent(content=content))
+            with suppress(Exception):
+                await events.emit(StreamEndEvent(resuming=False))
 
         return OutboundMessage(
             channel=msg.channel,
