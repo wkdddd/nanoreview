@@ -26,6 +26,7 @@ from typing import Any
 from loguru import logger
 
 from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanoreview.agent.review_state import bound_child_error
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.registry import ToolRegistry
@@ -647,7 +648,13 @@ class ReviewJudge:
             # coordinator run.
             workspace=None,
             session_key=None,
-            hook=usage_observer,
+            # Judging is self-contained: no file-edit observer and no
+            # conversation progress, just the usage observer. The spec is
+            # not ephemeral here, otherwise the builder would drop the
+            # observer along with every other extra hook.
+            hook=build_agent_turn_hook(
+                AgentTurnHookSpec(turn_hooks=[usage_observer])
+            ),
             # Bank compression usage the instant it is billed, so a batch that
             # is cancelled by the timeout below still reports that spend.
             compression_usage_callback=usage_observer.record_compression_usage,

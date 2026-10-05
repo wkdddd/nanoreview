@@ -8,9 +8,10 @@ from typing import Any
 
 import pytest
 
+from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.event_sink import build_callback_event_sink
 from nanoreview.agent.hooks import AgentHookContext
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
-from nanoreview.agent.coordinator import SessionCoordinator
 from nanoreview.agent.review_loop import ReviewLoopOutcome, ReviewTurnRequest
 from nanoreview.agent.review_state import ReviewPhase, ReviewRunState, ReviewRunStatus
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
@@ -24,6 +25,12 @@ from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import Config, ToolsConfig, _resolve_tool_config_refs
+from nanoreview.events import (
+    NO_EVENTS,
+    EventSink,
+    StreamDeltaEvent,
+    StreamEndEvent,
+)
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.result import ReviewHandoffState, ReviewResult
@@ -1416,7 +1423,7 @@ async def test_legacy_internal_event_is_dropped_without_a_model_turn(tmp_path) -
         msg,
         "websocket:parent",
         pending_queue=None,
-        on_progress=None,
+        events=NO_EVENTS,
     )
 
     assert response is None
@@ -1663,6 +1670,72 @@ async def test_a_review_turn_records_its_result_usage(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stream segments
+# ---------------------------------------------------------------------------
+
+
+class TwoSegmentStreamRunner:
+    """Emits two stream segments so segment-to-end id pairing is observable."""
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        assert spec.hook is not None
+        context = AgentHookContext(
+            iteration=0, messages=[*spec.frozen_messages, *spec.working_messages]
+        )
+        await spec.hook.on_stream(context, "first")
+        await spec.hook.on_stream_end(context, resuming=False)
+        await spec.hook.on_stream(context, "second")
+        await spec.hook.on_stream_end(context, resuming=False)
+        return AgentRunResult(
+            final_content="firstsecond",
+            messages=[*spec.frozen_messages, *spec.working_messages],
+        )
+
+
+@pytest.mark.asyncio
+async def test_each_stream_end_carries_the_id_of_the_segment_it_closes(
+    tmp_path,
+) -> None:
+    """A stream end closes the segment it was opened with.
+
+    Regression: the coordinator bumped the segment counter *before* publishing
+    the end event, so an end carried the id of a segment no delta ever used and
+    the transport could not close the bubble it had opened.
+    """
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = TwoSegmentStreamRunner()
+    outbound: list = []
+
+    async def capture(message) -> None:
+        outbound.append(message)
+
+    bus.publish_outbound = capture  # type: ignore[method-assign]
+
+    await coordinator._dispatch(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="segments",
+            content="stream two segments",
+            metadata={"_wants_stream": True},
+            session_key_override="cli:segments",
+        )
+    )
+
+    deltas = [m for m in outbound if m.metadata.get("_stream_delta")]
+    ends = [m for m in outbound if m.metadata.get("_stream_end")]
+
+    assert [m.content for m in deltas] == ["first", "second"]
+    assert len(ends) == 2
+    # Each end reuses the id of the delta it closes, and the two segments are
+    # distinct, so the transport can pair them.
+    assert ends[0].metadata["_stream_id"] == deltas[0].metadata["_stream_id"]
+    assert ends[1].metadata["_stream_id"] == deltas[1].metadata["_stream_id"]
+    assert deltas[0].metadata["_stream_id"] != deltas[1].metadata["_stream_id"]
+
+
+# ---------------------------------------------------------------------------
 # /stop: complete stop semantics
 # ---------------------------------------------------------------------------
 
@@ -1843,8 +1916,9 @@ async def test_stopped_streaming_turn_keeps_content_and_appends_one_note(
             session_key=key,
             channel="cli",
             chat_id="streamstop",
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
+            events=build_callback_event_sink(
+                on_stream=on_stream, on_stream_end=on_stream_end
+            ),
         )
     )
     await asyncio.wait_for(runner.started.wait(), timeout=1.0)
@@ -2304,8 +2378,235 @@ async def test_internal_event_is_dropped_at_every_entry(tmp_path) -> None:
         _internal_event_msg(session_key="cli:e2"),
         "cli:e2",
         pending_queue=None,
-        on_progress=None,
+        events=NO_EVENTS,
     )
 
     assert response is None
     assert runner.specs == []
+
+
+# ---------------------------------------------------------------------------
+# Wrap-up events honour the sink's accepts() contract
+# ---------------------------------------------------------------------------
+
+
+class ExhaustingRunner:
+    """Returns a max-iterations result without touching the provider."""
+
+    def __init__(self, final_content: str) -> None:
+        self.final_content = final_content
+        self.specs: list[AgentRunSpec] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        return AgentRunResult(
+            final_content=self.final_content,
+            messages=[*spec.frozen_messages, *spec.working_messages],
+            stop_reason="max_iterations",
+        )
+
+
+class RecordingSink:
+    """Captures the typed events a producer pushes through an ``EventSink``."""
+
+    def __init__(self, *, wants_stream: bool) -> None:
+        self.events: list[Any] = []
+        self.sink = EventSink(
+            publish=self._publish,
+            accepts_type=lambda event_type: wants_stream
+            or not issubclass(event_type, (StreamDeltaEvent, StreamEndEvent)),
+        )
+
+    async def _publish(self, event: Any) -> None:
+        self.events.append(event)
+
+    @property
+    def kinds(self) -> list[str]:
+        return [type(event).__name__ for event in self.events]
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_wrap_up_skips_the_stream_channel_without_a_consumer(
+    tmp_path,
+) -> None:
+    """A non-streaming turn must not receive the wrap-up as stream events.
+
+    Regression: ``_run`` published the max-iterations body as a delta/end pair
+    regardless of ``accepts()``, so a non-streaming consumer got the body twice —
+    once through a stream channel it never renders, once as the plain reply.
+    """
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = ExhaustingRunner("hit the cap")
+    sink = RecordingSink(wants_stream=False)
+
+    response = await coordinator.conversation_loop.process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="cap", content="go"),
+        session_key="cli:cap",
+        turn_id="turn-cap",
+        target_root=tmp_path,
+        events=sink.sink,
+    )
+
+    assert sink.kinds == []
+    assert response is not None
+    assert response.content == "hit the cap"
+    assert not response.metadata.get("_stream_delta")
+    assert not response.metadata.get("_stream_end")
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_wrap_up_still_streams_when_a_consumer_is_bound(
+    tmp_path,
+) -> None:
+    """The wrap-up keeps streaming for a consumer that actually renders it."""
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = ExhaustingRunner("hit the cap")
+    sink = RecordingSink(wants_stream=True)
+
+    await coordinator.conversation_loop.process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="cap", content="go"),
+        session_key="cli:cap",
+        turn_id="turn-cap",
+        target_root=tmp_path,
+        events=sink.sink,
+    )
+
+    assert sink.kinds == ["StreamDeltaEvent", "StreamEndEvent"]
+    assert sink.events[0].content == "hit the cap"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wants_stream", [True, False])
+async def test_stop_reply_routes_through_the_stream_channel_only_for_consumers(
+    tmp_path, wants_stream: bool
+) -> None:
+    """``/stop``'s note is a reply body too, so it obeys ``accepts()``.
+
+    Regression: the stop note was published as a delta/end pair for every
+    caller, duplicating a non-streaming request's body.
+    """
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    sink = RecordingSink(wants_stream=wants_stream)
+
+    reply = await coordinator._stopped_direct_reply(
+        InboundMessage(
+            channel="cli", sender_id="user", chat_id="stop", content="/stop"
+        ),
+        "cli:stop",
+        events=sink.sink,
+    )
+
+    expected = (
+        ["StreamDeltaEvent", "StreamEndEvent"] if wants_stream else []
+    )
+    assert sink.kinds == expected
+    assert reply.content.startswith("Stopped")
+
+
+class BrokenStreamSink:
+    """A streaming sink whose transport fails on every delivery."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.sink = EventSink(publish=self._publish, accepts_type=lambda et: True)
+
+    async def _publish(self, event: Any) -> None:
+        self.attempts += 1
+        raise ConnectionError("channel closed")
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_wrap_up_propagates_a_delivery_failure(tmp_path) -> None:
+    """A failed wrap-up delivery must not be swallowed into a lost message.
+
+    ``_respond`` marks the reply ``_streamed=True`` because the wrap-up was
+    pushed through the stream channel, and ``ChannelManager`` then skips
+    ``channel.send`` for any ``_streamed`` message. So if the push fails and the
+    failure is swallowed, the reply is marked as already-rendered when nothing
+    was ever rendered and the text reaches nobody. The wrap-up is therefore the
+    turn's only delivery path and must fail loudly.
+    """
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = ExhaustingRunner("hit the cap")
+    sink = BrokenStreamSink()
+
+    with pytest.raises(ConnectionError):
+        await coordinator.conversation_loop.process_message(
+            InboundMessage(
+                channel="cli",
+                sender_id="user",
+                chat_id="cap",
+                content="go",
+                metadata={"_wants_stream": True},
+            ),
+            session_key="cli:cap",
+            turn_id="turn-cap",
+            target_root=tmp_path,
+            events=sink.sink,
+        )
+
+    assert sink.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_max_iterations_wrap_up_skips_the_push_for_a_non_streaming_turn(
+    tmp_path,
+) -> None:
+    """Without a stream consumer the failing push is never attempted at all."""
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    coordinator.conversation_loop._runner = ExhaustingRunner("hit the cap")
+    sink = BrokenStreamSink()
+    # A non-streaming turn's sink refuses stream event types outright.
+    sink.sink = EventSink(
+        publish=sink._publish,
+        accepts_type=lambda et: not issubclass(
+            et, (StreamDeltaEvent, StreamEndEvent)
+        ),
+    )
+
+    response = await coordinator.conversation_loop.process_message(
+        InboundMessage(channel="cli", sender_id="user", chat_id="cap", content="go"),
+        session_key="cli:cap",
+        turn_id="turn-cap",
+        target_root=tmp_path,
+        events=sink.sink,
+    )
+
+    assert sink.attempts == 0
+    assert response is not None
+    assert response.content == "hit the cap"
+    assert not (response.metadata or {}).get("_streamed")
+
+
+@pytest.mark.asyncio
+async def test_stop_reply_swallows_a_delivery_failure(tmp_path) -> None:
+    """``/stop``'s stream note is redundant: the reply body is the delivery path.
+
+    Its returned message carries no ``_streamed`` flag, so ``ChannelManager``
+    still routes it through ``channel.send``. A failed stream push therefore
+    costs nothing and must not turn a stopped request into an error.
+    """
+    bus = MessageBus()
+    coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
+    sink = BrokenStreamSink()
+
+    reply = await coordinator._stopped_direct_reply(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="stop",
+            content="/stop",
+            metadata={"_wants_stream": True},
+        ),
+        "cli:stop",
+        events=sink.sink,
+    )
+
+    assert sink.attempts == 2
+    assert reply.content.startswith("Stopped")
+    assert not (reply.metadata or {}).get("_streamed")

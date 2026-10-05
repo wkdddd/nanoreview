@@ -9,6 +9,13 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.events import (
+    NO_EVENTS,
+    EventSink,
+    ProgressEvent,
+    StreamDeltaEvent,
+    StreamEndEvent,
+)
 from nanoreview.utils.helpers import IncrementalThinkExtractor, strip_think
 
 if TYPE_CHECKING:
@@ -32,13 +39,13 @@ class SubagentStatus:
 
 
 class SubagentHook(AgentHook):
-    """Hook for subagent execution: log tool calls, update status, and stream
-    reasoning/output to the frontend via bus callbacks.
+    """Publish one subagent's progress onto an ``EventSink``.
 
-    Mirrors :class:`AgentProgressHook`'s streaming logic —
+    Mirrors :class:`AgentProgressHook`'s streaming logic --
     :class:`IncrementalThinkExtractor` splits ``<think>`` blocks from answer
-    text so reasoning chunks and content deltas can be emitted through
-    separate callbacks.
+    text so reasoning chunks and content deltas are published as separate
+    typed events. Progress delivery is best-effort here (this hook is an
+    observer, not the turn's delivery hook), so it stays exception-isolated.
     """
 
     def __init__(
@@ -52,9 +59,8 @@ class SubagentHook(AgentHook):
         session_key: str | None = None,
         origin_message_id: str | None = None,
         metadata: dict[str, Any] | None = None,
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-        on_stream_cb: Callable[[str], Awaitable[None]] | None = None,
-        on_stream_end_cb: Callable[..., Awaitable[None]] | None = None,
+        events: EventSink = NO_EVENTS,
+        streaming: bool = True,
         on_tool_events: Callable[[list[dict[str, str]]], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__()
@@ -67,9 +73,8 @@ class SubagentHook(AgentHook):
         self._session_key = session_key
         self._origin_message_id = origin_message_id
         self._metadata = dict(metadata or {})
-        self._on_progress = on_progress
-        self._on_stream_cb = on_stream_cb
-        self._on_stream_end_cb = on_stream_end_cb
+        self._events = events
+        self._streaming = streaming
         self._on_tool_events = on_tool_events
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
@@ -77,7 +82,13 @@ class SubagentHook(AgentHook):
     def wants_streaming(self) -> bool:
         # Force review subagents onto the provider streaming path so they avoid
         # long non-stream request timeouts while keeping the execution flow local.
-        return True
+        return self._streaming
+
+    async def _publish(self, event: Any) -> None:
+        publish = self._events.publish
+        if publish is None:
+            return
+        await publish(event)
 
     async def on_stream(self, context: AgentHookContext, delta: str) -> None:
         if not delta:
@@ -85,7 +96,7 @@ class SubagentHook(AgentHook):
         prev_clean = strip_think(self._stream_buf)
         self._stream_buf += delta
         new_clean = strip_think(self._stream_buf)
-        incremental = new_clean[len(prev_clean):]
+        incremental = new_clean[len(prev_clean) :]
 
         if await self._think_extractor.feed(self._stream_buf, self.emit_reasoning):
             context.streamed_reasoning = True
@@ -94,27 +105,27 @@ class SubagentHook(AgentHook):
             # Answer text has started; close the reasoning segment so the UI
             # can lock the bubble before the answer renders below it.
             await self.emit_reasoning_end()
-            if self._on_stream_cb:
-                await self._on_stream_cb(incremental)
+            if self._streaming and self._events.accepts(StreamDeltaEvent):
+                await self._publish(StreamDeltaEvent(content=incremental))
 
     async def on_stream_end(self, context: AgentHookContext, *, resuming: bool) -> None:
         await self.emit_reasoning_end()
-        if self._on_stream_end_cb:
-            await self._on_stream_end_cb(resuming=resuming)
+        if self._events.accepts(StreamEndEvent):
+            await self._publish(StreamEndEvent(resuming=resuming))
         self._stream_buf = ""
         self._think_extractor.reset()
 
     async def emit_reasoning(self, reasoning_content: str | None) -> None:
-        """Publish a reasoning chunk via the progress callback."""
-        if self._on_progress and reasoning_content:
+        """Publish a reasoning chunk as a typed progress event."""
+        if reasoning_content and self._events.accepts(ProgressEvent):
             self._reasoning_open = True
-            await self._on_progress(reasoning_content, reasoning=True)
+            await self._publish(ProgressEvent(reasoning=reasoning_content, reasoning_delta=True))
 
     async def emit_reasoning_end(self) -> None:
         """Close the current reasoning stream segment, if open."""
-        if self._reasoning_open and self._on_progress:
+        if self._reasoning_open and self._events.accepts(ProgressEvent):
             self._reasoning_open = False
-            await self._on_progress("", reasoning_end=True)
+            await self._publish(ProgressEvent(reasoning_end=True))
         else:
             self._reasoning_open = False
 

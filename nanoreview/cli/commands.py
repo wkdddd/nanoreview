@@ -50,6 +50,7 @@ from rich.text import Text
 
 from nanoreview import __logo__, __version__
 from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.event_sink import build_callback_event_sink
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -903,16 +904,15 @@ def review(
                 collected.append(delta)
                 await renderer.on_delta(delta)
 
-            async def _on_stream_end(**kwargs) -> None:
-                await renderer.on_end(**kwargs)
-
             await agent_loop.process_direct(
                 content=admission.content,
                 session_key=admission.session_key,
                 channel="cli",
                 chat_id="review",
-                on_stream=_on_stream,
-                on_stream_end=_on_stream_end,
+                events=build_callback_event_sink(
+                    on_stream=_on_stream,
+                    on_stream_end=renderer.on_end,
+                ),
                 metadata={
                     "_review_admitted": admission.run_id,
                     "review_target": admission.target,
@@ -1013,9 +1013,11 @@ def agent(
                     session_id,
                     channel=direct_channel,
                     chat_id=direct_chat_id,
-                    on_progress=_make_progress(renderer),
-                    on_stream=renderer.on_delta,
-                    on_stream_end=renderer.on_end,
+                    events=build_callback_event_sink(
+                        on_progress=_make_progress(renderer),
+                        on_stream=renderer.on_delta,
+                        on_stream_end=renderer.on_end,
+                    ),
                 )
                 if not renderer.streamed:
                     await renderer.close()

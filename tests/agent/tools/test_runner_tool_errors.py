@@ -4,7 +4,11 @@ from typing import Any
 
 import pytest
 
-from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
+from nanoreview.agent.hooks.lifecycle import (
+    AgentHook,
+    AgentHookContext,
+    FinalizeContentResult,
+)
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.base import Tool
 from nanoreview.agent.tools.registry import ToolRegistry
@@ -31,9 +35,12 @@ class DummyProvider(LLMProvider):
 
 
 class ReplacingHook(AgentHook):
-    def finalize_content(self, context: AgentHookContext, content: str | None) -> str | None:
-        context.content_replaced = True
-        return "REPORT"
+    def resolve_final_content(
+        self,
+        context: AgentHookContext,
+        content: str | None,
+    ) -> "FinalizeContentResult | None":
+        return FinalizeContentResult("REPORT", is_replaced=True)
 
 
 class FailingTool(Tool):

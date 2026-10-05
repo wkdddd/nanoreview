@@ -441,6 +441,10 @@ class RunCompressionState:
     stopped_error: str | None = None
     #: Guard so run cleanup runs exactly once.
     closed: bool = False
+    #: Guard so ``state.usage`` is merged into run usage exactly once, even
+    #: though the run settles accounting both before the run-level result hook
+    #: and again in ``finally`` as an exit-path safety net.
+    usage_banked: bool = False
     #: Monotonic counter bumped on every append or rewrite of the working
     #: zone (assistant/tool/injection appends and summary rebuilds). It is the
     #: single retry signal: same revision means nothing new to compress.

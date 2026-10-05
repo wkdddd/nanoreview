@@ -15,7 +15,9 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanoreview.agent.event_sink import event_text, metadata_for_event
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
+from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent_profiles import (
     SubagentCompletion,
@@ -29,6 +31,7 @@ from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.bus.events import InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import AgentDefaults, ToolsConfig
+from nanoreview.events import EventSink, ProgressEvent
 from nanoreview.providers.base import LLMProvider
 from nanoreview.utils.prompt_templates import render_template
 from nanoreview.utils.subagent_trace import append_subagent_trace, flush_subagent_trace
@@ -396,98 +399,71 @@ class SubagentManager:
             origin_channel = origin.get("channel", "cli")
             origin_chat_id = origin.get("chat_id", "direct")
 
-            # --- Streaming callbacks: publish reasoning / content deltas
-            # to the bus so the WebSocket channel can forward them to the
-            # frontend with subagent discriminator metadata. ---
-            async def _on_progress(
-                content: str,
-                *,
-                reasoning: bool = False,
-                reasoning_end: bool = False,
-                tool_hint: bool = False,
-                tool_events: list[dict[str, Any]] | None = None,
-            ) -> None:
-                meta = dict(metadata)
-                meta["_progress"] = True
-                meta["_tool_hint"] = tool_hint
-                meta["_stream_id"] = stream_id
-                meta["_subagent_id"] = task_id
-                meta["_subagent_label"] = label
-                if reasoning:
-                    meta["_reasoning_delta"] = True
+            # --- Typed event sink: the hook publishes progress / stream events
+            # and this projection gives them the subagent discriminator metadata
+            # the WebSocket channel already expects.
+            async def _publish_subagent_event(event: Any) -> None:
+                meta = metadata_for_event(
+                    metadata,
+                    event,
+                    stream_kind="subagent_content",
+                    extra={
+                        "_stream_id": stream_id,
+                        "_subagent_id": task_id,
+                        "_subagent_label": label,
+                    },
+                )
+                if meta is None:
+                    return
+                if isinstance(event, ProgressEvent) and event.reasoning_delta:
                     append_subagent_trace(
                         session_key,
                         {
                             "event": "reasoning_delta",
                             "subagent_id": task_id,
-                            "text": content,
+                            "text": event.reasoning or "",
                         },
                     )
-                if reasoning_end:
-                    meta["_reasoning_end"] = True
-                if tool_events:
-                    meta["_tool_events"] = tool_events
                 await self.bus.publish_outbound(
                     OutboundMessage(
                         channel=origin_channel,
                         chat_id=origin_chat_id,
-                        content=content,
+                        content=event_text(event),
                         metadata=meta,
                     )
                 )
 
-            async def _on_stream(delta: str) -> None:
-                meta = dict(metadata)
-                meta["_stream_delta"] = True
-                meta["_stream_id"] = stream_id
-                meta["_stream_kind"] = "subagent_content"
-                meta["_subagent_id"] = task_id
-                meta["_subagent_label"] = label
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel=origin_channel,
-                        chat_id=origin_chat_id,
-                        content=delta,
-                        metadata=meta,
-                    )
-                )
-
-            async def _on_stream_end(*, resuming: bool = False) -> None:
-                meta = dict(metadata)
-                meta["_stream_end"] = True
-                meta["_stream_id"] = stream_id
-                meta["_stream_kind"] = "subagent_content"
-                meta["_subagent_id"] = task_id
-                meta["_subagent_label"] = label
-                await self.bus.publish_outbound(
-                    OutboundMessage(
-                        channel=origin_channel,
-                        chat_id=origin_chat_id,
-                        content="",
-                        metadata=meta,
-                    )
-                )
+            events = EventSink(publish=_publish_subagent_event)
 
             # --- Lifecycle: notify frontend that this subagent is starting ---
             await self._publish_subagent_lifecycle(
                 origin_channel, origin_chat_id, task_id, label, "running"
             )
 
-            hook = SubagentHook(
-                task_id,
-                status,
-                tools=tools,
-                origin_channel=origin_channel,
-                origin_chat_id=origin_chat_id,
-                session_key=origin.get("session_key"),
-                origin_message_id=origin_message_id,
-                metadata=metadata,
-                on_progress=_on_progress,
-                on_stream_cb=_on_stream,
-                on_stream_end_cb=_on_stream_end,
-                on_tool_events=lambda events: self._record_tool_events(
-                    session_key, task_id, events
-                ),
+            # The subagent is the only progress surface for this run, so the
+            # turn's own progress hook stays unbound (``NO_EVENTS``) and the
+            # subagent hook carries delivery. Going through the builder keeps
+            # turn-local state per run instead of per process.
+            hook = build_agent_turn_hook(
+                AgentTurnHookSpec(
+                    turn_hooks=[
+                        SubagentHook(
+                            task_id,
+                            status,
+                            tools=tools,
+                            origin_channel=origin_channel,
+                            origin_chat_id=origin_chat_id,
+                            session_key=origin.get("session_key"),
+                            origin_message_id=origin_message_id,
+                            metadata=metadata,
+                            events=events,
+                            streaming=True,
+                            on_tool_events=lambda events: self._record_tool_events(
+                                session_key, task_id, events
+                            ),
+                        )
+                    ],
+                )
             )
             # Reviewer system prompt + task/evidence envelope are a frozen
             # envelope; the reviewer run starts with no inherited history.

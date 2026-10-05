@@ -122,9 +122,57 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 - 已完成：步骤 5。`report.py` 以 `collect_confirmed_findings`（按 severity 展示顺序）作为稳定 ID（`F001`…）的单一来源，写入报告 Markdown 的 ID 列与 Details；`serialize_finalizer_result` 通过 `confirmed_finding_ids_by_key` 只给 confirmed finding 附加 `id`，因此 artifact 与 `ReviewResult.findings` 与 Markdown 一致，rejected/uncertain 不生成 ID。本轮收敛：瞬时引用收集（`agent/finding_refs.py`、`_TurnContext` 的 `valid_finding_ids`/`consumed_user_texts`/`finding_refs`、`conversation.finding_refs` 日志）已全部删除，pending drain 直接构造并追加注入消息，只保留队列消费上限、metadata 传递和历史保存行为；报告中的稳定 ID 保留。
 - 已完成：handoff 收敛进 `SessionCoordinator`。`ReviewHandoff` 与 `REVIEW_CONTEXT_EVENT`/`REVIEW_HANDOFF_EVENT` 迁入 `agent/coordinator.py`，独立 `consume_handoff()` 并入 `SessionCoordinator.consume_handoff()`，`agent/handoff.py` 已删除且不留兼容入口。`ConversationLoop` 构造函数新增必需 `handoff_consumer`，由 coordinator 装配时传入绑定方法，`ReviewHandoff` 仅在 `TYPE_CHECKING` 下导入；`process_message()` 的 handoff 参数不变。执行顺序固定为「加载 session → 恢复中断历史 → AutoCompact → token Consolidator → 调用 consumer → 读取历史 → 构建模型上下文」，写入失败向上传播且不进入 Runner。测试侧删除 refs 专用文件与 ConversationLoop 的 spy/fixture/两个引用收集测试，并新增交接集成测试（报告完整进入 Runner、directive 位于 frozen system、消费标记落盘、后续 turn 与重新加载 session 不重复注入、整理先于写入、写入失败时 Runner 未执行、排队消息注入与历史保存、注入上限）。全量 `pytest` 通过（641 passed）；`ruff` 与 HEAD 基线一致（nanoreview 47 + tests 5），未新增告警。
 - 本节点步骤 1-6 均已完成；最后一个提交为步骤 5，其后的 handoff 收敛与 finding 引用删除为本轮追加调整。
+- 已完成：Hook 生命周期统一迁移（本轮追加调整）。以 nanobot hook 实现为基线补齐 run/turn/iteration/stream/逐工具全链生命周期：新增 `nanoreview/events.py`（`AgentEvent`/`EventSink`/类型化 progress、stream delta/end、file edit 事件，`publish` 保留错误语义、`emit` 为 best-effort、`accepts` 供生产者跳过无消费者事件）与 `nanoreview/agent/event_sink.py`（事件→outbound metadata 投影，`_stream_delta` 仍为布尔标记、delta 文本走 `OutboundMessage.content`，外部 wire 不变）；`hooks/lifecycle.py` 新增 `AgentRunHookContext`、`AgentTurnHookContext`/factory、`resolve_final_content` 与 Runner 私有 `FinalizeContentResult`，并从 `AgentHookContext` 移除 `content_replaced`；新增 `hooks/turn_hooks.py`（固定装配顺序 progress → registered factories → registered hooks → turn factories → turn hooks，factory 失败记录并跳过，ephemeral 短路）与 `hooks/file_edit.py`、`utils/file_edit_events.py`（仅跟踪 `write_file`/`edit_file`，复用工具自身 `_resolve` 校验）。`AgentProgressHook`/`SubagentHook` 改为直接发布类型化事件（progress hook 保持 `reraise=True`，subagent observer 异常隔离）；`AgentRunner.run()` 增加 run-level 正常/异常/取消/finally 调用顺序（`on_finally` 必执行且其失败不覆盖原异常或取消）、逐工具 before/after/error 与 provider-hosted event 通道；Coordinator、ConversationLoop、ReviewLoop、Subagent、Judge、API server、CLI 的内部 progress/stream callback 全部删除并改传 `EventSink`，四个 `AgentRunner` 调用点统一经 turn builder 装配（review/planner/Judge 不注册文件编辑 hook，SDK 经 `_extra_hooks` 注入无需改动）。DSML 清洗不视为替换，只有显式替换才阻止 pending injection drain 与 terminal tool 重试。
+- 本轮验证：全量 `pytest` 通过（701 passed，新增 `tests/agent/test_hook_lifecycle.py` 25 项、`tests/agent/test_event_sink.py` 16 项、`tests/agent/test_file_edit_hook.py` 17 项）。`ruff check nanoreview/` 为 48 项，较 HEAD 基线 47 项新增 1 条 `cli/commands.py` 的 `E402`（与该文件 Windows UTF-8 前置块后的既有 18 条同族，位置正确，未消除以免改变该块语义）；`ruff check tests/` 与基线一致（5 项）。
 - `turn_trace` 前端待适配（本节点不修改 `review-webui/`）：删除状态机后不再生成该字段，现有消费点如下，需后续节点核对保留或移除。
   - `nanoreview/channels/websocket.py`：`_turn_end` 分支读取 `metadata["turn_trace"]` 并透传给 `send_turn_end`，该键现已无生产者。
   - `review-webui/src/lib/types.ts`：`TurnTraceItem` 接口及 `turn_end.turn_trace` 字段现已恒缺省，WebUI 消费方需适配。
+
+### 复查修复：4 项 P2 后端问题（本轮追加）
+
+上游复查报告指出 4 项 P2 问题；逐项最小复现后确认全部为真实缺陷并已修复。
+
+1. **[P2] Reasoning 文本在事件投影时丢失**（`nanoreview/agent/event_sink.py`、`nanoreview/agent/subagent.py`）
+   - 复现：hook 把文本放在 `ProgressEvent.reasoning`，但 bus sink、CLI 适配器与 subagent 出口只读 `content`，结果是 `reasoning text` 被投递成空字符串 `''`。
+   - 修复：`nanoreview/events.py` 新增 `ProgressEvent.text`（`content or reasoning or ""`）作为事件正文的单一访问点；`nanoreview/agent/event_sink.py` 新增模块级 `event_text(event)`（优先读 `text`，回落 `content`）并导出，`build_bus_event_sink._publish` 与 `build_callback_event_sink` 的 `on_progress` 首参改用它；`subagent.py` 的出站 `OutboundMessage.content` 同样改用 `event_text`。prose 与 tool hint 行为不变。
+
+2. **[P2] `stream_end` 使用下一段 ID，无法正确关闭当前段**（`nanoreview/agent/coordinator.py` `_publish_turn_event`）
+   - 复现：delta 的 `_stream_id` 以 `:0` 结尾，配对的 end 却是 `:1`。
+   - 修复：把 `if isinstance(event, StreamEndEvent): stream_segment += 1` 移到 `await publish(...)` **之后**，使 end 事件携带它所关闭那一段的 id，随后才递增。
+
+3. **[P2] Run hook 的"快照"与执行状态共享引用**（`nanoreview/agent/runner.py`）
+   - 复现：`before_run` 的 `messages` 指向真实历史，结束快照的 `usage` 直接引用累计字典；observer 追加的消息进入 `result.messages`，改 `usage` 后 Runner 返回值从 `7` 变 `999`。
+   - 修复：`run()` 开头改为 `AgentRunHookContext(messages=deepcopy(messages))`；`_fill_run_context` 中 `run_context.usage = dict(usage)`（原为直接引用）。与 nanobot 的隔离方式对齐。
+
+4. **[P2] `after_run` 在压缩清理和 usage 合并前触发，拿不到最终结果**（`nanoreview/agent/runner.py`）
+   - 复现：`after_run` 看到 `40/20`，`on_finally` 与 `result.usage` 为 `140/70`。
+   - 修复：新增 `_settle_run_accounting(spec, state, usage)`，内部以 `state.usage_banked` 守卫做一次性「关闭压缩 → `merge_token_usage`」结算；`run()` 的 `CancelledError`/`Exception`/`else` 三个分支开头均先调用它，再 `_fill_run_context`，随后 `run_context.usage = dict(usage)`，最后才 `on_error`/`after_run`；`finally` 仅作幂等兜底 + `on_finally`。`nanoreview/agent/compression.py` 的 `RunCompressionState` 新增 `usage_banked: bool = False` 字段。
+
+- 本轮新增端到端回归测试：`tests/agent/test_event_sink.py`（reasoning 经 bus sink / CLI callback 投影、prose 与 tool hint 不受影响）、`tests/agent/test_hook_lifecycle.py`（`before_run` 消息隔离、run context usage/tools_used 隔离、`after_run` 观测到结算后 usage、结算只合并一次、模型报错时 `after_run` 看到最终错误态）、`tests/agent/test_loop_modes.py`（`TwoSegmentStreamRunner` + `test_each_stream_end_carries_the_id_of_the_segment_it_closes`，走 `coordinator._dispatch` 才能注入 `_stream_id`）。
+- 本轮验证：全量 `pytest` 712 passed；`ruff check nanoreview/` 48 项（与 HEAD 基线 47 的同族新增 1 条 CLI `E402`，不在本轮改动文件内），`ruff check tests/` 4 项；本轮触碰的 6 个源文件与 3 个测试文件均为 `All checks passed`。
+
+### 复查修复追加：收尾事件绕过 `EventSink.accepts()`（第 5 项 P2）
+
+- **问题**：`conversation_loop.py` 达到迭代上限时、`coordinator.py` 的 `/stop` 收尾回复都直接取 `events.publish` 并发布 `StreamDeltaEvent`/`StreamEndEvent`，绕过了 `EventSink.accepts()`。真实 Runner 复现（`_max_iterations=1` + 永远请求工具的 provider，`_wants_stream` 缺省）：非流式消费者收到 `_stream_delta` + `_stream_end`，随后又收到同正文的普通回复 —— 重复交付。`/stop` 同理。
+- **根因**：`accepts()` 是「本作用域是否有该事件的消费者」的唯一判据，hook 侧（`AgentProgressHook`/`SubagentHook`）都按类型检查；只有这两处收尾路径按「`publish` 非 None」判断，等于把「有 sink」误当「消费该类型」。
+- **修复**：
+  - `conversation_loop._run`：`if ctx.events.accepts(StreamDeltaEvent): await ctx.events.emit(StreamDeltaEvent(...)); await ctx.events.emit(StreamEndEvent(...))`。同时把 `publish` 换成 `emit` —— 收尾通知是 best-effort，投递失败不该让一个已经产出回复的 turn 抛错。
+  - `coordinator._stopped_direct_reply`：改为 `if events.accepts(StreamDeltaEvent):` 内走 `events.emit(...)`，与既有的 `suppress(Exception)` 语义一致。
+- **不加 `accepts(StreamEndEvent)` 二次判断**：delta 被接受而 end 不被接受在 `EventSink` 语义下不可能成立（`_stream_delta`/`_stream_end` 同进同出，两个 builder 的 `accepts_type` 都是布尔门），加了反而是自相矛盾的死代码。生产者侧既有写法也统一为「只查 delta」。
+- **回归测试**（`tests/agent/test_loop_modes.py`）：`ExhaustingRunner` + `RecordingSink`，四项 —— 非流式 max-iterations 不产生流事件且回复正文正确、流式 max-iterations 仍产出 `[StreamDeltaEvent, StreamEndEvent]`、`/stop` 在 wants_stream 两种取值下的事件集合。已验证把两处改回 buggy 后对应用例失败。
+- **验证**：全量 `pytest` **716 passed**（此前 712，+4）；改动文件 `ruff` 全绿，`nanoreview/` 48 项、`tests/` 4 项与基线一致。
+
+### 复查修复追加：max-iterations 收尾不得吞掉投递失败（第 6 项 P2）
+
+- **问题**：上一项修复把迭代上限收尾的 `publish` 换成了 `emit`，导致投递失败被吞。但 `_respond` 依据「这个 wrap-up 已经被推进流通道」把回复标记 `_streamed=True`，`ChannelManager._send_once`（`channels/manager.py:363`，`elif not meta.get("_streamed")`）据此跳过 `channel.send`。于是复现出：sink 抛 `ConnectionError` → 流程照常返回一条 `_streamed=True` 的回复 → 正文既没进流、也不走普通通道，**提示彻底丢失**。
+- **修复**：保留新增的 `accepts(StreamDeltaEvent)` 判断，把两处调用换回 `publish()`（传播语义）。`/stop` 保持 `emit` + `suppress(Exception)` 不变。
+- **为什么两条路径的异常语义必须不同**（`accepts()` 与 `emit`/`publish` 正交）：
+  | 路径 | 回复是否带 `_streamed` | 流通道角色 | 投递失败应当 |
+  |---|---|---|---|
+  | max-iterations 收尾 | 是（`_assemble_outbound` 打标） | **唯一交付路径** | 传播，让 turn 显式失败 |
+  | `/stop` 收尾 | 否 | 冗余通知，正文本身经 `channel.send` 交付 | 吞掉，不把已停止的请求变成错误 |
+- **回归测试**（`tests/agent/test_loop_modes.py`，`BrokenStreamSink`）：`test_max_iterations_wrap_up_propagates_a_delivery_failure`（流式 + 投递失败 → `pytest.raises(ConnectionError)`，且只尝试 1 次，证明 delta 先失败即中止）、`test_max_iterations_wrap_up_skips_the_push_for_a_non_streaming_turn`（非流式根本不尝试推送，`attempts == 0`，回复不带 `_streamed`）、`test_stop_reply_swallows_a_delivery_failure`（`/stop` 两次推送都吞掉，仍正常返回 `Stopped.`，回复不带 `_streamed`）。
+- **验证**：全量 `pytest` **719 passed**（此前 716，+3）；回归灵敏度已在同一次调用内验证（改回 `emit` → 传播异常那条失败；恢复 `publish` → 8 项全绿）。`nanoreview/` 48 项、`tests/` 4 项与基线一致，三个改动文件 `ruff` 全绿。
 
 ## 当前节点：按本机最新版 nanobot 恢复 MCP
 
