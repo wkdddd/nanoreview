@@ -16,6 +16,14 @@
 - `channels/`：协议、交付和重试；`providers/`：模型调用适配；`agent/tools/`：能力与权限。
 - `review-webui/`：展示与交互；`templates/`、`skills/`：模型行为契约。
 
+## MCP 边界
+
+- `agent/tools/mcp.py` 自本机 nanobot `432421bc` 提取适配，不产生对 nanobot 包或目录的运行依赖。恢复 stdio、SSE、Streamable HTTP 三种 transport，以及 tools/resources/prompts、图片结果和 headers 鉴权；OAuth、热重载、插件 MCP 配置与管理界面不在本轮。
+- `MCPProvider` 由 `SessionCoordinator` 独立装配，自持专用 `ToolRegistry` 与连接。**MCP 工具不注册到 `coordinator.tools`**，因此 planner、reviewer、Judge 及 `reviewer_execution_profiles()` 构造的 subagent 注册表均不可见。
+- `ConversationLoop` 每轮先完成连接准备，再向该轮独立注册表注册 `MCPToolProxy`。代理只保存工具**定义快照**，执行时经 `Provider.resolve_wrapper()` 查找活包装器，因此服务端重连后已进入的 turn 也会走新连接，不会继续使用失效 session。
+- 连接由创建它的 task 负责关闭（`_OwnedMCPConnection`，受 AnyIO cancel scope 约束）。单服务连接准备限时 `CONNECT_TIMEOUT_SECONDS`（30 秒），超时或失败只清理该服务并继续其他服务，未连接服务在下一轮重试；连接准备失败不使 conversation turn 失败。
+- `SessionCoordinator.aclose()` 是幂等关闭入口，顺序固定为：停止准入 → 取消并等待活动 turn 与子任务 → 清空 pending queue 与未决权限 future → 排空后台任务 → 关闭 MCP。Gateway、CLI 与 API cleanup 统一调用，SDK 调用方需显式关闭。`/stop` 与 API 请求取消通过 `task_is_cancelling()` 区分外部取消，不重试被取消的 MCP 调用。
+
 当前代码在 review `running` 时拒绝普通消息和非控制命令；只有清理完成且终态 metadata 已成功落盘（phase `done`）才发布 live `DONE` 并路由到 conversation。清理失败、再次取消或终态保存失败时 run 保持 `running`、门禁不开放，并向 turn 返回有界错误；已准入且停在 `PREPARE` 的 run 同样收尾为 `stopped`/`error` 及原因。失败原因与结果摘要随终态持久化，供重启后读取；无 live executor 的持久化 `running` 仍一次性规范化为 `error`。长期目标见 `.agents/plans/project-roadmap.md`。
 
 ## 本地 review 准入

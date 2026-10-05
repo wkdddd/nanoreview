@@ -40,6 +40,7 @@ NanoReview 是基于 nanobot 演进的个人多智能体代码审查系统，主
 | `constraints/gotchas.md` | 平台、编码、配置与迁移易错点。 | 不重复专题契约。 |
 | `plans/project-roadmap.md` | 长期方向、阶段、待评估与明确不做。 | 目标不等于已实现。 |
 | `plans/code-adjustment-plan.md` | 已确认的当前节点、步骤、验收与进展，可为空。 | 不加入未确认任务。 |
+| `mcp-usage.md` | MCP 配置示例与行为边界。 | 不记录产品目标。 |
 | `references/nanobot.md` | 对话、session、上下文与 Runner 参考。 | 不定义本项目架构。 |
 | `references/open-code-review.md` | 审查流程、LLM loop、预算与 resume 参考。 | 外部能力不等于本项目能力。 |
 | `references/kodus-ai.md` | review/对话分流、共享内核与压缩参考。 | 外部方案不等于本项目目标。 |

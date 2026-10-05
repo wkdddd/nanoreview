@@ -1,6 +1,6 @@
 # 当前代码调整计划
 
-更新时间：2026-10-04
+更新时间：2026-10-05
 
 ## 当前节点：roadmap 第 3 阶段 Conversation Agent
 
@@ -125,3 +125,54 @@ API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后�
 - `turn_trace` 前端待适配（本节点不修改 `review-webui/`）：删除状态机后不再生成该字段，现有消费点如下，需后续节点核对保留或移除。
   - `nanoreview/channels/websocket.py`：`_turn_end` 分支读取 `metadata["turn_trace"]` 并透传给 `send_turn_end`，该键现已无生产者。
   - `review-webui/src/lib/types.ts`：`TurnTraceItem` 接口及 `turn_end.turn_trace` 字段现已恒缺省，WebUI 消费方需适配。
+
+## 当前节点：按本机最新版 nanobot 恢复 MCP
+
+以本机 nanobot `432421bceba6e50ec435924c7b21ef341ed69e55`（2026-09-26）为源码基线，把删除于 `943d106d`（2026-06-21）的 MCP 实现与配置提取并适配回 NanoReview。Git 记录只用于追溯。**不增加对本机 nanobot 包或目录的运行依赖。**
+
+本节点已完成实施与验证；此前节点（Conversation Agent 步骤 1-6、handoff 收敛、finding 引用删除）的记录保持原样，不改写。
+
+### 已确认范围
+
+- 仅 Conversation Agent 使用 MCP。
+- 恢复 stdio、SSE、Streamable HTTP，tools/resources/prompts，图片结果与 headers 鉴权。
+- 配置修改后重启生效；进程内共享连接。OAuth、热重载、插件 MCP 配置和管理界面不纳入本轮。
+- 失败重试、断线重连与权限确认行为沿用 nanobot。
+
+### 本轮实现
+
+- 配置：补回 `tools.mcpServers` 与 `MCPServerConfig`，保留最新版 `type`、`command`、`args`、`env`、`cwd`、`url`、`headers`、`toolTimeout`、`enabledTools`。默认无服务器、调用超时 30 秒、允许全部能力。复用现有 camelCase 序列化与 `${VAR}` 解析，env/header 字典键保持原样。新增依赖 `mcp>=1.26.0,<2.0.0`。
+- 客户端：`agent/tools/mcp.py` 保留上游的 Windows 启动器处理（`npx`/`npm`/`pnpm`/`yarn`/`bunx` 与 `.cmd`/`.bat` 统一走 `COMSPEC /d /c`）、工具名清洗与长度限制、schema 规范化、tools 分页发现、错误结果处理和图片落盘。`enabledTools` 沿用上游语义：`["*"]` 开放全部能力，`[]` 禁用全部能力，指定列表时不注册 resources/prompts。
+- 接线：`SessionCoordinator` 独立装配 `MCPProvider`（自持注册表与连接），不注册到审查使用的 `self.tools`。`ConversationLoop` 每轮先完成连接准备再注册代理工具；`MCPToolProxy` 只持有定义快照，执行时经 Provider 解析活包装器，重连后既有 turn 也能使用新连接。
+- 生命周期：新增幂等 `SessionCoordinator.aclose()`，Gateway、CLI 与 API cleanup 统一调用。单服务连接准备限时 30 秒，失败清理该服务并继续其他服务，下轮重试。
+- 共享依赖：`security/network.py` 迁入 DNS 固定与代理处理并保留本项目 SSRF 白名单规则，DNS 解析移出事件循环，重定向和 SSE 后续请求均校验；`tools/base.py` 补齐 schema union 的参数转换与验证、迁入字符串兼容的 `ToolResult`；`registry.py` 与 `runner.py` 优先读取显式错误状态；新增 `utils/cancellation.py` 的 `task_is_cancelling()`；`tools/context.py` 补 `tool_log_content_allowed()`。图片复用本项目 artifact 存储，base64 不进入模型历史。
+
+### 本轮差异（相对 nanobot `432421bc`）
+
+- 仅 Conversation Agent 装配，审查侧不可见。
+- 不实现 OAuth（配置 `auth` 时明确报错）、不做热重载、不做插件 MCP 配置与管理界面。
+- `ToolResult` 消费方需兼容本项目既有工具的字符串错误约定。
+- 网络校验复用本项目 SSRF 白名单规则，而非直接沿用上游默认。
+
+### 注意事项
+
+- **MCP 不触发现有逐工具 approval 确认**，即使 `approval_enabled=true`；由 `TestApprovalIsNotTriggered` 回归。
+- 沿用上游自动重试，**可能重复执行写入操作**；不提供恰好执行一次的保证，也不回滚已发生的操作。
+- MCP 外部服务不受本地文件工具的 workspace guard 或 shell sandbox 自动约束，应在服务启动参数及其自身权限中限制访问。
+- 共享连接也共享服务端会话状态；`cwd` 来自 MCP 配置，不随 Conversation 的目标仓库自动切换。
+- 本地 HTTP MCP 需显式配置 SSRF 白名单。配置重启生效不影响运行中按上游机制恢复断开的连接。
+
+### 测试与验收
+
+- 配置（`tests/config/test_mcp_config.py`，15 项）：默认关闭、camelCase 与 snake_case、序列化与 JSON round-trip、鉴权 headers、`${VAR}` 解析、无效配置、OAuth 字段可解析但连接时报错。
+- 客户端（`tests/agent/tools/test_mcp_tool.py`，57 项）：工具名清洗与长度限制、URL 脱敏、schema 规范化（nullable union、anyOf、本地 `$ref`）、`isError`、**成功文本以 `Error:` 开头不判失败**、超时、瞬时故障重试、resource/prompt 包装器、`ToolResult` 与 Registry 交互、每轮代理、Provider 生命周期、Windows 启动器（`npx`/`.cmd`/`.exe`/shell 放行/`COMSPEC` 来源/非 Windows 不改写）。
+- 集成（`tests/agent/test_mcp_integration.py`，26 项）：Conversation 可见 MCP 而 `coordinator.tools`、planner/reviewer/Judge 均不可见；跨 session 注册表独立；重连后既有 turn 可继续调用；approval 不触发；连接中与调用中取消；`aclose()` 幂等与无残留；`enabledTools` 四种语义；分页发现；OAuth 不静默连接。
+- 生命周期：连接中和调用中 `/stop`、API 请求取消、重复关闭、各入口退出后无 MCP 子进程或 owner task 残留。
+- 真实服务器冒烟（`tests/agent/tools/test_mcp_smoke.py`，7 项）：FastMCP + uvicorn 起本地 stdio/SSE/Streamable HTTP 服务器完成三种 transport 往返、headers 鉴权、loopback 白名单守卫、重连后旧 turn 可用、关闭后无 owner task 残留。
+
+### 实施进展
+
+- 已完成代码、测试与文档。ruff 与 HEAD 基线一致（`nanoreview/` 47 + `tests/` 5），未新增告警。
+- 冒烟 fixture 曾出现端口竞态（SSE 请求打到 streamableHttp 应用导致 `/messages/` 404），已改为「分配端口 → 启动 → 读实际绑定端口并确认 started → 失败换端口重试」。
+- 修正上游一处真实缺陷：`PinnedDNSAsyncTransport._resolver_lock` 原为类级 `asyncio.Lock`（nanobot `432421bc` 同样如此），会绑定到第一个使用它的事件循环，进程内存在第二个 loop 时（测试、SDK 嵌入、多线程各一 loop）直接抛 `bound to a different event loop`，表现为 MCP HTTP 连接静默失败。现改为按 loop 弱引用取锁，`pin_resolved_url_dns` 内用线程级 `RLock` + 嵌套计数保护进程全局解析器，只有最外层恢复。
+- 修正代理与 SSRF 白名单不一致：`httpx_env_proxy_mounts` 原先无条件把所有 `http://`/`https://` 交给环境代理，白名单放行的 loopback 目标只对探测/首个请求生效，后续请求仍进代理。本地 MCP 服务器因此出现 `/sse` 可连、`/messages/?session_id=...` 被代理回 `404` 的现象（`initialize` 成功而 `notifications/initialized` 立即 404）。现被 `tools.ssrf_whitelist` 放行的 loopback host 同时豁免代理，`env_proxy_applies_to_url` 采用同一规则。以上两项回归见 `tests/security/test_network_guards.py`（12 项）。

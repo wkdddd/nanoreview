@@ -18,6 +18,10 @@
 - [project-roadmap.md](plans/project-roadmap.md)：长期产品目标、架构原则、待评估方向和明确不做；确定产品方向时先读。
 - [code-adjustment-plan.md](plans/code-adjustment-plan.md)：当前已选定的具体代码调整节点；没有确认节点时保持为空。
 
+## 使用示例
+
+- [mcp-usage.md](mcp-usage.md)：MCP 配置示例（stdio / SSE / Streamable HTTP）、`enabledTools` 语义、SSRF 放行与行为边界。
+
 
 新目标不等于当前实现。进展须核对 HEAD/工作区，候选分支单独记录；历史测试结果不得冒充本次验证。需求冲突先按已确认的新目标解释，未确认处询问用户。
 
