@@ -120,6 +120,11 @@ class _TurnContext:
     tools: ToolRegistry | None = None
     handoff_directive: str | None = None
 
+    #: Persisted Consolidator summary for this turn. Consolidation hides old
+    #: turns from the replay window, so this text is what carries them back into
+    #: the model prompt.
+    session_summary: str | None = None
+
     pending_queue: asyncio.Queue | None = None
 
     #: Typed event delivery for this turn. Transports build the sink; the
@@ -309,6 +314,11 @@ class ConversationLoop:
             ctx.session,
             replay_max_messages=self._max_messages,
         )
+        # Read what consolidation just left behind, so the turn that triggered it
+        # already sees the summary. It is also the same text the token probe
+        # counts: without this injection the replay window keeps hiding the old
+        # turns while the budget still pays for a summary nobody receives.
+        ctx.session_summary = self._consolidator.last_summary_text(ctx.session)
 
         # The handoff was prepared (and size-checked) by the coordinator, which
         # also owns the single replayable write. The loop calls it after history
@@ -579,6 +589,7 @@ class ConversationLoop:
             chat_id=self._runtime_chat_id(ctx.msg),
             current_role="user",
             sender_id=ctx.msg.sender_id,
+            session_summary=ctx.session_summary,
             session_metadata=ctx.session.metadata,
         )
 

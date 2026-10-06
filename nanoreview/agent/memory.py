@@ -191,6 +191,25 @@ class Consolidator:
             }
             self.sessions.save(session)
 
+    @staticmethod
+    def last_summary_text(session: Session) -> str | None:
+        """Read the persisted session summary, if any.
+
+        Single source of truth for ``_last_summary``: the token probe and the
+        context that reaches the model both read it here, so the budget and the
+        real prompt always account for the same summary. Consolidation hides old
+        turns from the replay window, and this text is the only carrier of them
+        back into later turns — including after a restart, when it is reloaded
+        from session metadata. Also accepts the legacy bare-string shape.
+        """
+        meta = session.metadata.get("_last_summary")
+        if isinstance(meta, dict):
+            text = meta.get("text")
+            return text if isinstance(text, str) and text else None
+        if isinstance(meta, str) and meta:
+            return meta
+        return None
+
     def estimate_session_prompt_tokens(
         self,
         session: Session,
@@ -198,8 +217,7 @@ class Consolidator:
         """Estimate prompt size from the full unconsolidated session tail."""
         history = self._full_unconsolidated_history(session, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        meta = session.metadata.get("_last_summary")
-        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else None)
+        summary = self.last_summary_text(session)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",

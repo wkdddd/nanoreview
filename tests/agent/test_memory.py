@@ -90,36 +90,82 @@ async def test_consolidation_summary_is_session_scoped_metadata(tmp_path) -> Non
     assert not (tmp_path / "memory" / "MEMORY.md").exists()
 
 
-def test_persisted_last_summary_participates_in_token_estimation(tmp_path) -> None:
-    """``_last_summary`` counts toward the consolidation token probe.
+def _consolidator(workspace, sessions: SessionManager) -> Consolidator:
+    """Real ``build_messages``: the probe must see what the prompt would."""
+    return Consolidator(
+        store=MemoryStore(workspace),
+        provider=SummaryProvider(),
+        model="summary-model",
+        sessions=sessions,
+        context_window_tokens=8192,
+        build_messages=ContextBuilder(workspace).build_messages,
+        get_tool_definitions=lambda: [],
+    )
 
-    This pins the retained Consolidator behaviour after the idle AutoCompact
-    runtime path was removed: the summary survives in session metadata (also
-    across a process restart) and still inflates the estimated prompt budget.
+
+@pytest.mark.asyncio
+async def test_last_summary_survives_a_restart(tmp_path) -> None:
+    """The summary is written to JSONL and read back by a fresh manager.
+
+    A restart must not lose it: consolidation hides old turns from the replay
+    window, so this text is the only carrier of them into later turns.
     """
-    session = Session(key="test:session")
-    session.add_message("user", "hello")
     sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    session.add_message("user", "first request")
+    session.add_message("assistant", "first answer")
 
-    def _build(session_key: str) -> Consolidator:
-        return Consolidator(
-            store=MemoryStore(tmp_path),
-            provider=SummaryProvider(),
-            model="summary-model",
-            sessions=sessions,
-            context_window_tokens=8192,
-            build_messages=ContextBuilder(tmp_path).build_messages,
-            get_tool_definitions=lambda: [],
-        )
+    consolidator = _consolidator(tmp_path, sessions)
+    summary = await consolidator.archive(session.messages)
+    consolidator._persist_last_summary(session, summary)
+    assert summary == "session-only summary"
 
-    baseline, _ = _build(session.key).estimate_session_prompt_tokens(session)
+    # Restart: a brand-new manager has an empty cache and must read the JSONL.
+    restarted = SessionManager(tmp_path)
+    reloaded = restarted.get_or_create("test:session")
 
+    assert reloaded is not session
+    assert reloaded.metadata["_last_summary"]["text"] == "session-only summary"
+    assert Consolidator.last_summary_text(reloaded) == "session-only summary"
+
+
+def test_last_summary_text_reads_both_metadata_shapes() -> None:
+    session = Session(key="test:session")
+    assert Consolidator.last_summary_text(session) is None
+
+    session.metadata["_last_summary"] = {
+        "text": "summary body",
+        "last_active": "2026-10-06T10:00:00",
+    }
+    assert Consolidator.last_summary_text(session) == "summary body"
+
+    # Legacy bare-string shape written before the dict form.
+    session.metadata["_last_summary"] = "legacy body"
+    assert Consolidator.last_summary_text(session) == "legacy body"
+
+    session.metadata["_last_summary"] = {"text": "", "last_active": "2026-10-06"}
+    assert Consolidator.last_summary_text(session) is None
+
+
+def test_reloaded_summary_participates_in_token_estimation(tmp_path) -> None:
+    """The probe counts the summary it reloaded from disk."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    session.add_message("user", "hello")
     session.metadata["_last_summary"] = {
         "text": "archived conversation context " * 200,
         "last_active": session.updated_at.isoformat(),
     }
-    # Reload through a fresh consolidator to mirror the restart path.
-    restarted, source = _build(session.key).estimate_session_prompt_tokens(session)
+    sessions.save(session)
 
+    restarted = SessionManager(tmp_path)
+    reloaded = restarted.get_or_create("test:session")
+    consolidator = _consolidator(tmp_path, restarted)
+
+    with_summary, source = consolidator.estimate_session_prompt_tokens(reloaded)
     assert source != "error"
-    assert restarted > baseline
+
+    reloaded.metadata.pop("_last_summary")
+    without_summary, _ = consolidator.estimate_session_prompt_tokens(reloaded)
+
+    assert with_summary > without_summary

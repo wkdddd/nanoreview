@@ -294,6 +294,63 @@ async def test_a_reloaded_session_does_not_repeat_the_injection(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_the_persisted_summary_reaches_the_model_after_a_restart(
+    tmp_path,
+) -> None:
+    """Consolidation hides old turns; the summary must carry them back in.
+
+    Written to disk by one process and replayed by the next, it has to land in
+    the system prompt. Otherwise the replay window keeps hiding those turns —
+    losing earlier decisions and open work — while the token probe still pays
+    for a summary the model never receives.
+    """
+    summary = "PERSISTED-SUMMARY-MARKER: earlier decisions and open work"
+
+    first = _loop(tmp_path)
+    session = first._sessions.get_or_create("cli:direct")
+    session.add_message("user", "old question")
+    session.add_message("assistant", "old answer")
+    session.metadata["_last_summary"] = {
+        "text": summary,
+        "last_active": session.updated_at.isoformat(),
+    }
+    first._sessions.save(session)
+
+    # Process restart: a fresh coordinator only sees the JSONL on disk.
+    loop = _loop(tmp_path)
+    runner = SpecCapturingRunner()
+    loop._runner = runner
+
+    await loop.process_message(
+        _msg("new question"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+    )
+
+    system = runner.specs[0].frozen_messages[0]
+    assert system["role"] == "system"
+    assert summary in system["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_session_without_a_summary_injects_none(tmp_path) -> None:
+    loop = _loop(tmp_path)
+    runner = SpecCapturingRunner()
+    loop._runner = runner
+
+    await loop.process_message(
+        _msg("hello"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+    )
+
+    system = runner.specs[0].frozen_messages[0]
+    assert "[Archived Context Summary]" not in system["content"]
+
+
+@pytest.mark.asyncio
 async def test_history_is_consolidated_before_the_handoff_is_written(
     tmp_path,
 ) -> None:
