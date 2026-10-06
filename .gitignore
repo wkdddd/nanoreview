@@ -49,6 +49,11 @@ htmlcov/
 coverage.xml
 *.cover
 
+# pytest tmp_path basetemp leftovers (created when TEMP/TMPDIR is unset
+# in subprocess test runs; safe to delete, never tracked)
+pytest-of-*/
+pytest-*/
+
 # Lock files (project policy)
 poetry.lock
 uv.lock

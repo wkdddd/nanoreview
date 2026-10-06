@@ -42,3 +42,14 @@
 - Differences: OCR 的 resume 是面向“中断后继续”的产品能力，依赖显式用户入口、持久化 manifest、逐文件 fingerprint 和输入身份校验；这类能力必须作为独立设计落地（显式入口 + 身份校验 + manifest），不能与进程内状态对象混为一谈。
 - Risks/tests: 参考入口不等于本项目支持该能力；复用 resume 方案需核对身份校验、持久化与跨运行一致性测试。
 - Last checked: 2026-09-19
+
+## open-code-review 的审查质量评测（已核查）
+
+- Root: `C:\Users\Administrator\Desktop\open-code-review`
+- Commit: `e95bdda`
+- Public benchmark: README 和 `pages/src/components/BenchmarkSection.tsx` 宣称 AACR-Bench 包含 50 个开源仓库、200 个真实 Pull Request、10 种编程语言、80+ 名资深工程师交叉验证和 1,505 个标注的 ground-truth issues；README 链接到 Hugging Face 数据集 `Alibaba-Aone/aacr-bench`。
+- Metrics: 展示 `precision`、`recall`、`F1`，以及平均耗时和平均 token；前 3 个指标用于衡量发现已知问题的准确性与覆盖率，后 2 个指标用于衡量运行成本和延迟。
+- Evidence boundary: 当前 commit 中能确认数据集说明、前端静态结果表和 benchmark 截图，但没有发现完整的数据生成、执行、评分脚本或 CI eval harness。因此这些数字是公开 benchmark 结果展示，不能视为在 NanoReview 本地复现的结果；AACR-Bench 的具体标注协议和评分细节仍需以数据集及其发布说明为准。
+- Reusable design for NanoReview: 以真实 PR/仓库快照构造 case，保存人工确认的 golden findings；运行审查 agent 后，将 candidate findings 与 golden findings 配对，计算 precision/recall/F1，并同时记录耗时、输入输出 token 和模型身份。外部 Hugging Face 数据集可以作为补充数据源，但应先转换为 NanoReview 的固定 case schema 并保留来源、版本和许可信息。
+- Limitations: 不能只复制展示表格或把 README 的总体数字当作本项目验证结果；若要声称可复现，需要补充 case manifest、运行器、finding matcher、结果落盘和固定模型/评测版本。
+- Last checked: 2026-10-06
