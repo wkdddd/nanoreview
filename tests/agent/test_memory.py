@@ -255,6 +255,24 @@ async def test_archive_folds_a_previous_summary_into_the_request(tmp_path) -> No
     assert "MARK-99" in summary
 
 
+@pytest.mark.asyncio
+async def test_archive_prompt_defines_the_nothing_replacement_sentinel(tmp_path) -> None:
+    """The destructive sentinel must be explicit in the model contract."""
+    sessions = SessionManager(tmp_path)
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(tmp_path, sessions, provider)
+
+    await consolidator.archive(
+        [{"role": "user", "content": "MARK-99 retain this decision"}],
+        previous_summary="MARK-00 earlier checkpoint",
+    )
+
+    prompt = provider.requests[0]
+    assert "'(nothing)'" in prompt
+    assert "only when neither the previous checkpoint" in prompt
+    assert "Otherwise, never return '(nothing)'" in prompt
+
+
 def test_raw_archive_keeps_the_previous_summary(tmp_path) -> None:
     """The degraded path must not drop already-archived turns either."""
     consolidator = _marker_consolidator(

@@ -435,7 +435,10 @@ class Consolidator:
             "Summarize the following older conversation turns for continuing the same session. "
             "Preserve user requests, decisions, unresolved work, tool outcomes, and code review findings. "
             "Do not create long-term facts, preferences, or cross-session memory. "
-            "Keep the summary concise and useful for the next turn."
+            "Keep the summary concise and useful for the next turn. "
+            f"Return exactly {_NOTHING_SUMMARY!r} only when neither the previous checkpoint "
+            "nor the newly archived turns contain anything useful to preserve. "
+            f"Otherwise, never return {_NOTHING_SUMMARY!r}; output a concise replacement checkpoint."
         )
         if previous_summary:
             prompt += (
