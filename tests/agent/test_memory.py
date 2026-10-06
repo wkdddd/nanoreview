@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -169,3 +171,152 @@ def test_reloaded_summary_participates_in_token_estimation(tmp_path) -> None:
     without_summary, _ = consolidator.estimate_session_prompt_tokens(reloaded)
 
     assert with_summary > without_summary
+
+
+# --- Repeated consolidation must accumulate, not overwrite, the summary -------
+
+_MARKER = re.compile(r"MARK-\d+")
+
+
+class MarkerSummaryProvider(LLMProvider):
+    """Summarize by echoing every ``MARK-nn`` marker the request carried."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[str] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        body = "\n".join(str(message.get("content", "")) for message in messages)
+        self.requests.append(body)
+        markers = sorted(set(_MARKER.findall(body)))
+        return LLMResponse(content="SUMMARY: " + " ".join(markers))
+
+    def get_default_model(self) -> str:
+        return "summary-model"
+
+
+def _marker_consolidator(
+    workspace: Path,
+    sessions: SessionManager,
+    provider: LLMProvider,
+    *,
+    context_window_tokens: int = 4000,
+) -> Consolidator:
+    return Consolidator(
+        store=MemoryStore(workspace),
+        provider=provider,
+        model="summary-model",
+        sessions=sessions,
+        context_window_tokens=context_window_tokens,
+        max_completion_tokens=256,
+        build_messages=ContextBuilder(workspace).build_messages,
+        get_tool_definitions=lambda: [],
+    )
+
+
+def _seed_turns(session: Session, start: int, count: int) -> None:
+    filler = "alpha beta gamma delta " * 6
+    for offset in range(start, start + count):
+        session.add_message("user", f"MARK-{offset:02d} {filler}")
+        session.add_message("assistant", f"reply {offset:02d} {filler}")
+
+
+@pytest.mark.asyncio
+async def test_archive_folds_a_previous_summary_into_the_request(tmp_path) -> None:
+    """The earlier summary must be an input, not something the new one replaces."""
+    sessions = SessionManager(tmp_path)
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(tmp_path, sessions, provider)
+
+    summary = await consolidator.archive(
+        [{"role": "user", "content": "MARK-99 new turn"}],
+        previous_summary="SUMMARY: MARK-00 earlier decision",
+    )
+
+    assert "MARK-00" in provider.requests[0]
+    assert "MARK-99" in provider.requests[0]
+    assert "MARK-00" in summary
+    assert "MARK-99" in summary
+
+
+def test_raw_archive_keeps_the_previous_summary(tmp_path) -> None:
+    """The degraded path must not drop already-archived turns either."""
+    consolidator = _marker_consolidator(
+        tmp_path, SessionManager(tmp_path), MarkerSummaryProvider()
+    )
+
+    raw = consolidator.raw_archive(
+        [{"role": "user", "content": "MARK-99 new turn"}],
+        previous_summary="SUMMARY: MARK-00 earlier decision",
+    )
+
+    assert raw is not None
+    assert "MARK-00" in raw
+    assert "MARK-99" in raw
+
+
+@pytest.mark.asyncio
+async def test_consolidation_rounds_accumulate_into_one_summary(tmp_path) -> None:
+    """Two rounds in one call: the second must fold the first in, not replace it.
+
+    The replay window trims an early chunk and token pressure trims the rest, so
+    a single call archives twice. Without folding, the second summary overwrites
+    the first and the earliest turns — already hidden by ``last_consolidated`` —
+    disappear from ``_last_summary`` and from every later prompt.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    _seed_turns(session, 0, 30)
+
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(tmp_path, sessions, provider)
+    rounds: list[int] = []
+    original_archive = consolidator.archive
+
+    async def _recording_archive(messages, **kwargs):
+        rounds.append(len(messages))
+        return await original_archive(messages, **kwargs)
+
+    consolidator.archive = _recording_archive  # type: ignore[method-assign]
+
+    await consolidator.maybe_consolidate_by_tokens(session, replay_max_messages=30)
+
+    assert len(rounds) >= 2
+    first_round_markers = set(_MARKER.findall(provider.requests[0]))
+    assert "MARK-00" in first_round_markers
+    summary = Consolidator.last_summary_text(session) or ""
+    assert first_round_markers <= set(_MARKER.findall(summary))
+
+
+@pytest.mark.asyncio
+async def test_a_later_consolidation_keeps_the_earlier_summary(tmp_path) -> None:
+    """Consecutive turns of consolidation must not lose the earlier summary."""
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    _seed_turns(session, 0, 30)
+
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(tmp_path, sessions, provider)
+
+    await consolidator.maybe_consolidate_by_tokens(session)
+    first = Consolidator.last_summary_text(session) or ""
+    assert "MARK-00" in first
+    consolidated_once = session.last_consolidated
+    assert consolidated_once > 0
+
+    _seed_turns(session, 30, 20)
+    await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.last_consolidated > consolidated_once
+    later = Consolidator.last_summary_text(session) or ""
+    assert set(_MARKER.findall(first)) <= set(_MARKER.findall(later))
+
