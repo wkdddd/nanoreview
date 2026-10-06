@@ -58,7 +58,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanoreview.agent import model_presets as preset_helpers
-from nanoreview.agent.autocompact import AutoCompact
 from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
@@ -261,7 +260,6 @@ class SessionCoordinator:
         session_manager: SessionManager | None = None,
         channels_config: "ChannelsConfig | None" = None,
         timezone: str | None = None,
-        session_ttl_minutes: int = 0,
         consolidation_ratio: float = 0.5,
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
@@ -420,11 +418,6 @@ class SessionCoordinator:
             max_completion_tokens=provider.generation.max_tokens,
             consolidation_ratio=consolidation_ratio,
         )
-        self.auto_compact = AutoCompact(
-            sessions=self.sessions,
-            consolidator=self.consolidator,
-            session_ttl_minutes=session_ttl_minutes,
-        )
 
         # Conversation side: ConversationLoop owns one complete conversation
         # turn; the coordinator owns the bus, queues, locks and cancellation.
@@ -436,7 +429,6 @@ class SessionCoordinator:
             context=self.context,
             runner=self.runner,
             consolidator=self.consolidator,
-            auto_compact=self.auto_compact,
             file_state_store=self._file_state_store,
             tools_config=_tc,
             model=self.model,
@@ -510,7 +502,6 @@ class SessionCoordinator:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
-            session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
@@ -1569,10 +1560,6 @@ class SessionCoordinator:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
-                self.auto_compact.check_expired(
-                    self._schedule_background,
-                    active_session_keys=self._pending_queues.keys(),
-                )
                 continue
             except asyncio.CancelledError:
                 if not self._running or asyncio.current_task().cancelling():

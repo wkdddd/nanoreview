@@ -88,3 +88,38 @@ async def test_consolidation_summary_is_session_scoped_metadata(tmp_path) -> Non
     assert session.metadata["_last_summary"]["text"] == "session-only summary"
     assert not (tmp_path / "memory" / "history.jsonl").exists()
     assert not (tmp_path / "memory" / "MEMORY.md").exists()
+
+
+def test_persisted_last_summary_participates_in_token_estimation(tmp_path) -> None:
+    """``_last_summary`` counts toward the consolidation token probe.
+
+    This pins the retained Consolidator behaviour after the idle AutoCompact
+    runtime path was removed: the summary survives in session metadata (also
+    across a process restart) and still inflates the estimated prompt budget.
+    """
+    session = Session(key="test:session")
+    session.add_message("user", "hello")
+    sessions = SessionManager(tmp_path)
+
+    def _build(session_key: str) -> Consolidator:
+        return Consolidator(
+            store=MemoryStore(tmp_path),
+            provider=SummaryProvider(),
+            model="summary-model",
+            sessions=sessions,
+            context_window_tokens=8192,
+            build_messages=ContextBuilder(tmp_path).build_messages,
+            get_tool_definitions=lambda: [],
+        )
+
+    baseline, _ = _build(session.key).estimate_session_prompt_tokens(session)
+
+    session.metadata["_last_summary"] = {
+        "text": "archived conversation context " * 200,
+        "last_active": session.updated_at.isoformat(),
+    }
+    # Reload through a fresh consolidator to mirror the restart path.
+    restarted, source = _build(session.key).estimate_session_prompt_tokens(session)
+
+    assert source != "error"
+    assert restarted > baseline
