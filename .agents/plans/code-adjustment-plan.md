@@ -202,6 +202,40 @@ rg -n "approval_enabled|permission_request|permission_response|requires_approval
 
 残留检查必须人工区分允许项与删除项：`needs_confirmation`、pairing approval、`contains_internal_url`、OAuth/provider login/logout、`web_search`/`web_fetch`、HTTP MCP transport、network guard 和 provider HTTP client 均应保留；仅 GitHub source/tool/target 分支、远程 review 参数、远程 snapshot/cache、GitHub metadata/evidence 及 approval request/response/future 不得保留有效生产入口。
 
+## 实施结果
+
+实施于 worktree `wt-stage4`（分支 `workbuddy/stage4-workspace-scope`），基于主库工作区 `5e8560e6` 的第 4 阶段基线。
+
+生产代码：
+
+- 新增 `nanoreview/agent/tools/workspace_scope.py`（`WorkspaceScope`、`resolve_workspace_scope`、`review_workspace_scope`），`agent/tools/context.py` 增加 `workspace_scope`/`current_workspace_scope()`；`filesystem.py`、`shell.py`、`message.py` 接入 scope，shell 改为 `_guard_command(command, cwd, *, restricted, boundary_root)`。
+- 删除 `agent/tools/permissions.py`、`agent/tools/github_review.py`、`review/source/github.py`；`ToolsConfig` 删除 `approval_enabled`、`github_repo`、`github_diff_enable`。
+- review 输入收敛为本地：`ReviewTargetType` 为 `{"auto","local"}`，`ReviewPlan` 删除 `target_repo`/`pr_number`/`target_ref`/`target_subpath`/`target_subpath_kind`，`ReviewMetaKey` 删除 `TARGET_REF`/`GITHUB_PREFETCH_READY`/`GITHUB_PR_HEAD_REF`，删除 `GitHubDiffEvidence`；`admission.py` 删除 `_admit_remote`，`input/targets.py` 恒返回 `local`，`planning/evidence.py`、`planner.py`、`prompt.py`、`prefetch.py`、`preprocessor.py`、`output/validator.py`、`output/finalizer.py`、`rag/review_service.py`、`channels/websocket.py`、`cli/commands.py` 同步收敛。
+- 保留：`needs_confirmation`、pairing approval、`contains_internal_url`、OAuth/provider login/logout、`web_search`/`web_fetch`、MCP 三种 transport、`nanoreview/security/network.py` 的 SSRF/重定向/私网/代理 guard、`_GITHUB_TOKEN` 日志脱敏与 `github-copilot` provider。
+
+测试：
+
+- 新增 `tests/agent/tools/test_workspace_scope.py`（20 例：优先级、别名、非法 payload 整体回退、路径解析、review 固定 restricted）与 `tests/agent/tools/test_stage4_boundaries.py`（22 例：approval 链路删除、GitHub review 输入删除、联网能力保留边界）。
+- 删除或改写 GitHub 远程 review 旧测试：删除 `tests/agent/tools/test_repo_review_github.py`；改写 `test_codereview.py`、`test_loop_modes.py`、`test_admission.py`、`test_judge.py`、`test_prefetch.py`、`test_reviewer_profiles.py`、`test_validator.py`、`test_permissions.py`、`test_mcp_integration.py`、`test_conversation_loop.py`、`test_rag_review.py`。
+- 结果：**890 passed, 1 failed**；唯一失败 `tests/review/test_admission.py::test_diff_outside_git_repo_is_rejected` 在改动前的主库 `main` 上同样失败（环境性：测试进程运行在 git 仓库内，`_find_git_root` 向上找到外层仓库），非本次引入。改动前基线为 885 passed / 同 1 项失败。
+- `ruff check nanoreview/` 45 项，全部位于未改动文件；改动文件与新增文件无新增告警。
+
+文档：已更新 `.agents/constraints/security.md`（工具权限改为 workspace scope、新增 review 输入边界）、`.agents/constraints/architecture.md`（删除权限响应/未决 future 表述、GitHub 目标改为本地）、`.agents/mcp-usage.md`、`nanoreview/skills/repo-reader/SKILL.md`、`.agents/plans/project-roadmap.md`（第 4 阶段标记已完成）。
+
+未执行项：`review-webui/` 未改动（按计划留待第 8 阶段）；前端 approval 残留与结构化错误渲染适配未处理。
+
+### 复审修复：scope 生命周期（同日）
+
+实施后的复审发现 3 处与第 39/180 行契约不符，已修复并补回归测试：
+
+- **turn scope 在第一批工具后被重置**（P1）。每批工具前会重建 request context（`AgentProgressHook.before_execute_tools` → `set_tool_context`），该调用只带 channel/chat/metadata，重建出的 `RequestContext.workspace_scope` 为 `None`，后续 filesystem/shell/message 调用回退到构造时的 `restrict_to_workspace`（默认 `full`），使用户声明的 `restricted` 在第一批工具后失效。修复：`_TurnContext` 新增 `workspace_scope`，`_set_tool_context` 解析后写入，`_run_runner` 的 `set_tool_context` lambda 每次显式补回该值。
+- **reviewer 未固定 restricted**（P1）。`review_workspace_scope()` 已定义但无生产调用：reviewer 的 `SubagentHook` 构造 `RequestContext` 时不带 scope，只依赖 `ToolsConfig.restrict_to_workspace`，会话默认 `full` 时 reviewer 可读目标仓库外路径。修复：新增 `nanoreview/agent/subagent.py::subagent_workspace_scope()`（`reviewer.*` profile 固定 restricted，其余走配置默认），`_run_subagent` 计算后传给 `SubagentHook`，hook 写入工具调用上下文。
+- **非法 payload 错误继承 session scope**（P2）。`resolve_workspace_scope` 在 payload 非法时用 `continue` 继续解析下一层，可能让 malformed message 继承 session 的 `full`。修复：非法 payload 立即返回配置默认 scope，终止整条解析链；只有该层未声明 `workspace_scope` 键时才继续向下。
+
+配套：`tests/agent/test_conversation_loop.py` 新增 `test_a_restricted_turn_scope_survives_the_pre_tool_context_refresh`（含工具批次刷新后 scope 仍为 restricted、越界读被拒），`tests/agent/test_loop_modes.py` 新增 `test_reviewer_run_binds_a_restricted_scope`（覆盖 `_run_subagent` → hook 的完整接线），`tests/agent/tools/test_stage4_boundaries.py` 新增 `TestReviewRolesArePinnedToRestricted`（3 例），`tests/agent/tools/test_workspace_scope.py` 改写非法 payload 用例为「整体回退」并补 session 层对称用例。`security.md` 同步记录 scope 刷新不变量与 reviewer 绑定要求。
+
+验证：**897 passed, 1 failed**（同一项环境性失败）；改动文件 `ruff` 全绿，全量 `nanoreview/` 45、`tests/` 4 均无新增。
+
 ## 明确不做
 
 - 不新增逐工具确认、风险分级授权、approval 兼容层或新的用户确认流程。
@@ -214,4 +248,4 @@ rg -n "approval_enabled|permission_request|permission_response|requires_approval
 
 ## 当前决策状态
 
-当前无待确认产品决策。第 4 阶段可以按本计划直接实施；实施过程中仅记录代码事实、测试结果和超出本计划范围的阻塞，不自行改变产品范围。
+第 4 阶段已实施完成（含同日复审修复），无待确认产品决策。后续阶段按 `project-roadmap.md` 推进；实施过程中仅记录代码事实、测试结果和超出本计划范围的阻塞，不自行改变产品范围。

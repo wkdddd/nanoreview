@@ -15,7 +15,6 @@ from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     SEVERITY_ORDER,
     FindingVerdict,
-    GitHubDiffEvidence,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
@@ -30,7 +29,6 @@ class ValidationContext:
     changed_files: list[str] = field(default_factory=list)
     max_line_lookup: bool = True
     local_target: str | None = None
-    remote_diff: GitHubDiffEvidence | None = None
 
 
 class ReviewValidator:
@@ -41,7 +39,6 @@ class ReviewValidator:
         self._workspace = Path(ctx.workspace).resolve()
         self._local_target = self._resolve_local_target(ctx.local_target)
         self._changed_files = {self._normalize_rel_path(path) for path in ctx.changed_files}
-        self._remote_diff = ctx.remote_diff
         self._seen_fingerprints: set[str] = set()
         self.stats = {"accepted": 0, "rejected": 0, "needs_confirmation": 0}
 
@@ -109,9 +106,6 @@ class ReviewValidator:
                 reason="invalid reviewer details: " + "; ".join(detail_errors),
             ), c
 
-        if self._remote_diff is not None:
-            return self._validate_remote_diff(c, dimension)
-
         file_path = self._resolve_candidate_path(c.file)
         if file_path is None:
             boundary = "target" if self._local_target is not None else "workspace"
@@ -171,41 +165,6 @@ class ReviewValidator:
                     c.title,
                 )
                 c = replace(c, line=actual_line)
-        return ReviewFindingVerdict(verdict=FindingVerdict.ACCEPTED), c
-
-    def _validate_remote_diff(
-        self, c: ReviewFindingCandidate, dimension: str
-    ) -> tuple[ReviewFindingVerdict, ReviewFindingCandidate]:
-        normalized = self._normalize_rel_path(c.file)
-        changed = {self._normalize_rel_path(path) for path in self._remote_diff.changed_files}
-        if normalized not in changed:
-            return ReviewFindingVerdict(
-                verdict=FindingVerdict.UNCERTAIN,
-                reason="file not in changed set",
-                missing_evidence="file is outside PR/diff scope",
-            ), c
-        patch = self._remote_diff.patches.get(normalized)
-        if not patch:
-            reason = self._remote_diff.patch_unavailable_files.get(normalized, "patch_unavailable")
-            return ReviewFindingVerdict(
-                verdict=FindingVerdict.UNCERTAIN,
-                reason=reason,
-                missing_evidence="GitHub did not provide a patch for this file",
-            ), c
-        if c.line is None or c.line not in set(self._remote_diff.touched_lines.get(normalized, [])):
-            return ReviewFindingVerdict(
-                verdict=FindingVerdict.UNCERTAIN,
-                reason="line is not an added diff line",
-                missing_evidence="diff validation only accepts added target lines",
-            ), c
-        snippets = self._evidence_snippets(c.evidence)
-        normalized_patch = " ".join(patch.split())
-        if not snippets or not any(" ".join(snippet.split()) in normalized_patch for snippet in snippets):
-            return ReviewFindingVerdict(
-                verdict=FindingVerdict.UNCERTAIN,
-                reason="evidence not found in diff patch",
-                missing_evidence="candidate evidence snippet does not match the PR patch",
-            ), c
         return ReviewFindingVerdict(verdict=FindingVerdict.ACCEPTED), c
 
     def _fingerprint(self, c: ReviewFindingCandidate) -> str:

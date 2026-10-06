@@ -122,19 +122,6 @@ class LocalReviewTool(ReviewToolBase):
             max_results,
         )
         try:
-            if self._is_github_review_turn():
-                result_text = (
-                    "Error: local_review is disabled for GitHub review targets. "
-                    "Use github_review(meta/tree/file/repo) for remote evidence; if GitHub content "
-                    "cannot be read, report the evidence limitation instead of inspecting local files."
-                )
-                logger.warning(
-                    "local_review.blocked_github_target trace_id={} action={} target={}",
-                    trace_id,
-                    action_value,
-                    target or repo_path,
-                )
-                return result_text
             if action_value not in ALL_REVIEW_TOOL_ACTIONS:
                 result_text = self._unknown_action(action_value)
                 logger.warning(
@@ -196,13 +183,6 @@ class LocalReviewTool(ReviewToolBase):
                 error=error,
                 started=started,
             )
-
-    @staticmethod
-    def _is_github_review_turn() -> bool:
-        '''disable local_review tool when github_review'''
-        ctx = current_request_context()
-        metadata = ctx.metadata if ctx is not None else {}
-        return str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower() == "github"
 
     def _get_local_scope(self) -> LocalReviewScope | None:
         ctx = current_request_context()

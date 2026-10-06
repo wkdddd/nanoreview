@@ -276,18 +276,25 @@ def test_diff_untracked_file_is_included(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Remote passthrough
+# Remote input rejection
 # ---------------------------------------------------------------------------
 
 
-def test_github_target_still_admits_without_local_validation(
+def test_github_target_type_is_rejected_with_structured_code(
+    service: ReviewAdmissionService,
+) -> None:
+    """`github` is no longer a valid review target type."""
+    with pytest.raises(ReviewAdmissionError) as excinfo:
+        service.admit(
+            _request(target="https://github.com/owner/repo", target_type="github")
+        )
+
+    assert excinfo.value.code == "invalid_target_type"
+
+
+def test_github_url_target_without_type_is_still_validated_locally(
     tmp_path: Path, service: ReviewAdmissionService
 ) -> None:
-    """Remote targets keep their existing planning path in this round."""
-    admission = service.admit(
-        _request(target="https://github.com/owner/repo", target_type="github")
-    )
-
-    assert admission.target_type == "github"
-    snapshot = _read_snapshot(tmp_path, admission.snapshot_ref)
-    assert snapshot["extra"]["repo"] == "owner/repo"
+    """A GitHub URL is not special-cased: it is treated as a (non-existent) local path."""
+    with pytest.raises(ReviewAdmissionError):
+        service.admit(_request(target="https://github.com/owner/repo"))

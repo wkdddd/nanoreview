@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from nanoreview.agent.tools.base import Tool, tool_parameters
-from nanoreview.agent.tools.context import ContextAware, RequestContext
+from nanoreview.agent.tools.context import ContextAware, RequestContext, current_workspace_scope
 from nanoreview.agent.tools.path_utils import resolve_workspace_path
 from nanoreview.agent.tools.schema import ArraySchema, StringSchema, tool_parameters_schema
 from nanoreview.bus.events import OutboundMessage
@@ -146,12 +146,18 @@ class MessageTool(Tool, ContextAware):
 
     def _resolve_media(self, media: list[str]) -> list[str]:
         """Resolve local media attachments and enforce workspace restriction when enabled."""
+        scope = current_workspace_scope()
+        if scope is not None:
+            restricted = scope.is_restricted
+            allowed_dir = scope.project_path if restricted else None
+        else:
+            restricted = self._restrict_to_workspace
+            allowed_dir = self._workspace if restricted else None
         resolved: list[str] = []
-        allowed_dir = self._workspace if self._restrict_to_workspace else None
         for p in media:
             if p.startswith(("http://", "https://")):
                 resolved.append(p)
-            elif not self._restrict_to_workspace:
+            elif not restricted:
                 path = Path(p).expanduser()
                 resolved.append(p if path.is_absolute() else str(self._workspace / path))
             else:

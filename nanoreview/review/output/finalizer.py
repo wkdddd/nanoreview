@@ -18,7 +18,6 @@ from nanoreview.review.output.validator import ReviewValidator, ValidationContex
 from nanoreview.review.types import (
     FileSkipSummary,
     FindingVerdict,
-    GitHubDiffEvidence,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
@@ -63,8 +62,6 @@ class ReviewFinalizer:
     """Parses subagent outputs, validates findings, produces final report."""
 
     _INCOMPLETE_ERROR_PATTERNS = (
-        "github api rate limited",
-        "failed to fetch github repository context",
         "unable to fetch",
         "could not fetch",
         "context unavailable",
@@ -87,7 +84,6 @@ class ReviewFinalizer:
         *,
         allowed_dimensions: list[str] | set[str] | None = None,
         local_target: str | None = None,
-        remote_diff: GitHubDiffEvidence | None = None,
         routing_mode: str = "explicit",
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
         skipped_files: list[FileSkipSummary] | tuple[FileSkipSummary, ...] = (),
@@ -99,7 +95,6 @@ class ReviewFinalizer:
             workspace=workspace,
             changed_files=self._changed_files,
             local_target=local_target,
-            remote_diff=remote_diff,
         )
         self._validator = ReviewValidator(self._ctx)
         self._dimensions: list[ReviewDimensionResult] = []

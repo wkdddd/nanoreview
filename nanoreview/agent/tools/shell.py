@@ -15,6 +15,7 @@ from loguru import logger
 from pydantic import Field
 
 from nanoreview.agent.tools.base import Tool, tool_parameters
+from nanoreview.agent.tools.context import current_workspace_scope
 from nanoreview.agent.tools.sandbox import wrap_command
 from nanoreview.agent.tools.schema import IntegerSchema, StringSchema, tool_parameters_schema
 from nanoreview.config.paths import get_media_dir
@@ -23,8 +24,7 @@ from nanoreview.config.schema import Base
 _IS_WINDOWS = sys.platform == "win32"
 _CLONE_COMMAND_ERROR = (
     "Error: Command blocked by safety guard (repository clone commands are disabled). "
-    "Use github_review for GitHub repositories; remote review snapshots are saved only "
-    "under workspace/.nanoreview/review_github."
+    "Review targets must already exist locally."
 )
 
 
@@ -34,7 +34,7 @@ _WORKSPACE_BOUNDARY_NOTE = (
     "Do NOT retry with shell tricks (symlinks, base64 piping, alternative "
     "tools, working_dir overrides). If the user genuinely needs this "
     "resource, tell them you cannot reach it under the current "
-    "restrict_to_workspace policy and ask how to proceed."
+    "workspace scope and ask how to proceed."
 )
 
 
@@ -92,9 +92,6 @@ class ExecTool(Tool):
             allow_patterns=cfg.allow_patterns,
             deny_patterns=cfg.deny_patterns,
         )
-
-    def requires_approval(self, params: dict[str, Any]) -> bool:
-        return True
 
     def __init__(
         self,
@@ -165,28 +162,40 @@ class ExecTool(Tool):
         timeout: int | None = None, **kwargs: Any,
     ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
+        scope = current_workspace_scope()
+        # The turn's scope is the single source of truth for the workspace root.
+        # When a scope is bound its project path replaces the construction-time
+        # workspace for BOTH the containment boundary and the OS sandbox mount;
+        # ``self.working_dir`` is only the fallback for unscoped tool calls.
+        # This keeps the guard and the sandbox anchored on one root: a scope
+        # pointing at another directory must not let relative writes land in the
+        # build-time workspace. In ``restricted`` mode the scope may not be left;
+        # ``full`` disables the containment check (the tool's own deny/allow
+        # patterns, internal-URL guard and OS sandbox still apply).
+        restricted = scope.is_restricted if scope is not None else self.restrict_to_workspace
+        workspace_root = str(scope.project_path) if scope is not None else self.working_dir
+        boundary_root = workspace_root if restricted else self.working_dir
 
         # Prevent an LLM-supplied working_dir from escaping the configured
-        # workspace when restrict_to_workspace is enabled (#2826). Without
-        # this, a caller can pass working_dir="/etc" and then all absolute
-        # paths under /etc would pass the _guard_command check that anchors
-        # on cwd.
-        if self.restrict_to_workspace and self.working_dir:
+        # workspace when the scope is restricted (#2826). Without this, a caller
+        # can pass working_dir="/etc" and then all absolute paths under /etc
+        # would pass the _guard_command check that anchors on cwd.
+        if restricted and boundary_root:
             try:
                 requested = Path(cwd).expanduser().resolve()
-                workspace_root = Path(self.working_dir).expanduser().resolve()
+                resolved_boundary = Path(boundary_root).expanduser().resolve()
             except Exception:
                 return (
                     "Error: working_dir could not be resolved"
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
-            if requested != workspace_root and workspace_root not in requested.parents:
+            if requested != resolved_boundary and resolved_boundary not in requested.parents:
                 return (
                     "Error: working_dir is outside the configured workspace"
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
 
-        guard_error = self._guard_command(command, cwd)
+        guard_error = self._guard_command(command, cwd, restricted=restricted, boundary_root=boundary_root)
         if guard_error:
             return guard_error
 
@@ -197,7 +206,9 @@ class ExecTool(Tool):
                     self.sandbox,
                 )
             else:
-                workspace = self.working_dir or cwd
+                # Mount the same root the guard anchored on, then pin the final
+                # cwd inside it so a relative path cannot escape the scope.
+                workspace = workspace_root or cwd
                 command = wrap_command(self.sandbox, command, workspace, cwd)
                 cwd = str(Path(workspace).resolve())
 
@@ -342,7 +353,9 @@ class ExecTool(Tool):
                 env[key] = val
         return env
 
-    def _guard_command(self, command: str, cwd: str) -> str | None:
+    def _guard_command(
+        self, command: str, cwd: str, *, restricted: bool, boundary_root: str | None,
+    ) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
         cmd = command.strip()
         lower = cmd.lower()
@@ -369,7 +382,7 @@ class ExecTool(Tool):
             # The runner turns this marker into a non-retryable security hint.
             return "Error: Command blocked by safety guard (internal/private URL detected)"
 
-        if self.restrict_to_workspace:
+        if restricted:
             if "..\\" in cmd or "../" in cmd:
                 return (
                     "Error: Command blocked by safety guard (path traversal detected)"
@@ -377,6 +390,7 @@ class ExecTool(Tool):
                 )
 
             cwd_path = Path(cwd).resolve()
+            root_path = Path(boundary_root).resolve() if boundary_root else cwd_path
 
             for raw in self._extract_absolute_paths(cmd):
                 try:
@@ -395,8 +409,8 @@ class ExecTool(Tool):
 
                 media_path = get_media_dir().resolve()
                 if (p.is_absolute()
-                    and cwd_path not in p.parents
-                    and p != cwd_path
+                    and root_path not in p.parents
+                    and p != root_path
                     and media_path not in p.parents
                     and p != media_path
                 ):

@@ -27,13 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import hashlib
-import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -323,8 +320,6 @@ class ProgrammaticEvidenceRequest:
     review_query: str
     max_results: int | None = None
     files: Iterable[Path] | None = None
-    snapshot_files: dict[str, str] | None = None
-    snapshot_name: str | None = None
     include_tests: bool | None = None
     related_tests: bool = True
     touched_lines: dict[str, list[int]] | None = None
@@ -449,22 +444,6 @@ _GRAMMARS = _GrammarRegistry()
 
 def _safe_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "repo"
-
-
-def _snapshot_scope_digest(snapshot_name: str, files: dict[str, str]) -> str:
-    hasher = hashlib.sha256()
-    hasher.update(snapshot_name.encode("utf-8"))
-    hasher.update(b"\0")
-    for rel in sorted(files):
-        hasher.update(rel.encode("utf-8", errors="surrogatepass"))
-        hasher.update(b"\0")
-        hasher.update(hashlib.sha256(files[rel].encode("utf-8")).hexdigest().encode("ascii"))
-        hasher.update(b"\0")
-    return hasher.hexdigest()[:12]
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def preview_text(text: str, *, max_lines: int = 12, max_chars: int = 600) -> str:
@@ -887,9 +866,6 @@ class ProgrammaticEvidenceService:
         # manifest and the evidence bundle share the same sampled view.
         for unit in accepted:
             self._build_preview(unit, terms=terms)
-        cache_root = None
-        if request.snapshot_files is not None and request.snapshot_name:
-            cache_root = self.write_snapshot(request.snapshot_name, request.snapshot_files)
         result = ProgrammaticEvidenceResult(
             units=accepted,
             skipped=skipped,
@@ -898,7 +874,6 @@ class ProgrammaticEvidenceService:
             inventory=inventory,
             total_tokens=total_tokens,
             accepted_tokens=sum(unit.token_count for unit in accepted),
-            cache_root=cache_root,
         )
         logger.info(
             "preprocessor.retrieve.done trace_id={} mode={} files={} units={} related={} skipped={} "
@@ -969,12 +944,6 @@ class ProgrammaticEvidenceService:
     # ------------------------------------------------------------------
 
     def _collect_files(self, request: ProgrammaticEvidenceRequest) -> dict[str, str]:
-        if request.snapshot_files is not None:
-            return {
-                str(path).replace("\\", "/"): text[: self.options.max_file_chars]
-                for path, text in request.snapshot_files.items()
-                if review_file_filter_reason(str(path), text) is None
-            }
         files: dict[str, str] = {}
         for path in request.files or self.iter_candidate_files():
             try:
@@ -1680,43 +1649,3 @@ class ProgrammaticEvidenceService:
         if len(manifest) > budget_chars:
             manifest = manifest[:budget_chars].rstrip() + "\n... (manifest truncated)"
         return manifest
-
-    # ------------------------------------------------------------------
-    # Snapshot persistence for remote sources
-    # ------------------------------------------------------------------
-
-    def write_snapshot(self, snapshot_name: str, files: dict[str, str]) -> Path:
-        """Persist accepted remote snapshot files under .nanoreview/review_github."""
-        scope_digest = _snapshot_scope_digest(snapshot_name, files)
-        cache_root = (
-            self.workspace / ".nanoreview" / "review_github" / f"{_safe_slug(snapshot_name)}_{scope_digest}"
-        )
-        cache_root.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "snapshot": snapshot_name,
-            "scope_digest": scope_digest,
-            "files_count": len(files),
-            "created_at": _now_iso(),
-            "files": sorted(files),
-        }
-        for rel, text in files.items():
-            target = (cache_root / rel).resolve()
-            try:
-                target.relative_to(cache_root)
-            except ValueError:
-                logger.warning("preprocessor.snapshot.skip unsafe_path={}", rel)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text, encoding="utf-8", newline="\n")
-        (cache_root / ".nanoreview_snapshot.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-            newline="\n",
-        )
-        logger.info(
-            "preprocessor.snapshot.done snapshot={} cache={} files={}",
-            snapshot_name,
-            cache_root,
-            len(files),
-        )
-        return cache_root

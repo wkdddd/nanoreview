@@ -18,14 +18,13 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceService,
     SkippedUnit,
 )
-from nanoreview.review.source.github import GitHubRepoReader
 from nanoreview.review.source.utils import (
     changed_lines_from_patch,
     clean_scope_paths,
     path_matches_scope,
 )
-from nanoreview.review.types import GitHubDiffEvidence, LocalReviewScope
-from nanoreview.utils.log_style import event_message, log_event
+from nanoreview.review.types import LocalReviewScope
+from nanoreview.utils.log_style import log_event
 
 _DEFAULT_DIFF_QUERY = "code review bug security performance maintainability changed lines"
 
@@ -37,21 +36,18 @@ class LocalChangedSummary:
 
 
 class ReviewEvidenceService:
-    """Compose local/git/GitHub inputs with deterministic evidence preparation."""
+    """Compose local/git inputs with deterministic evidence preparation."""
 
     def __init__(
         self,
         preprocessor: ProgrammaticEvidenceService,
-        github: GitHubRepoReader | None = None,
         *,
         workspace: Path | None = None,
     ) -> None:
         self.preprocessor = preprocessor
         self.workspace = (workspace or preprocessor.workspace).expanduser().resolve()
-        self.github = github or GitHubRepoReader(workspace=self.workspace)
         self.last_cache_root: Path | None = None
         self.last_changed_files: list[str] = []
-        self.last_diff_evidence: GitHubDiffEvidence | None = None
         # Structured preprocessing output of the most recent dispatch; the
         # prefetch layer builds the evidence bundle from it when present.
         self.last_result: ProgrammaticEvidenceResult | None = None
@@ -61,10 +57,6 @@ class ReviewEvidenceService:
         *,
         target_type: str,
         action: str,
-        repo: str = "",
-        ref: str | None = None,
-        pr_number: int = 0,
-        tree_pattern: str | None = None,
         target_subpath: str | None = None,
         target_subpath_kind: str | None = None,
         review_query: str | None = None,
@@ -74,34 +66,10 @@ class ReviewEvidenceService:
         trace_id: str = "",
         context_window_tokens: int | None = None,
     ) -> str:
-        """Unified entry point that routes to the appropriate evidence method."""
+        """Unified entry point for local review evidence retrieval."""
         self.last_cache_root = None
         self.last_changed_files = []
-        self.last_diff_evidence = None
         self.last_result = None
-        if target_type == "github":
-            if action == "diff":
-                return await self.github_diff_context(
-                    repo=repo,
-                    pr_number=pr_number,
-                    review_query=review_query,
-                    max_results=max_results,
-                    include_tests=include_tests,
-                    trace_id=trace_id,
-                    context_window_tokens=context_window_tokens,
-                )
-            return await self.github_context(
-                repo=repo,
-                ref=ref,
-                tree_pattern=tree_pattern,
-                target_subpath=target_subpath,
-                target_subpath_kind=target_subpath_kind,
-                review_query=review_query,
-                max_results=max_results,
-                include_tests=include_tests,
-                trace_id=trace_id,
-                context_window_tokens=context_window_tokens,
-            )
         if action == "diff":
             return await self.local_changed_context(
                 review_query=review_query,
@@ -450,255 +418,3 @@ class ReviewEvidenceService:
         except (OSError, UnicodeDecodeError):
             return []
         return list(range(1, len(text.replace("\r\n", "\n").replace("\r", "\n").splitlines()) + 1))
-
-    async def retrieve_snapshot_context(
-        self,
-        *,
-        snapshot_name: str,
-        files: dict[str, str],
-        review_query: str,
-        max_results: int,
-        include_tests: bool | None,
-        trace_id: str,
-        touched_lines: dict[str, list[int]] | None = None,
-        related_tests: bool = True,
-        context_window_tokens: int | None = None,
-    ) -> ProgrammaticEvidenceResult:
-        """Preprocess a remote snapshot into accepted units and skipped records."""
-        started = time.perf_counter()
-        result = await self.preprocessor.retrieve(
-            ProgrammaticEvidenceRequest(
-                source_type="github",
-                snapshot_name=snapshot_name,
-                snapshot_files=files,
-                review_query=review_query,
-                max_results=max_results,
-                include_tests=include_tests,
-                touched_lines=touched_lines,
-                related_tests=related_tests,
-                trace_id=trace_id,
-                context_window_tokens=context_window_tokens,
-            )
-        )
-        self.last_result = result
-        self.last_cache_root = result.cache_root
-        log_event(
-            logger,
-            "info",
-            "review.evidence.snapshot.done",
-            status="success",
-            trace_id=trace_id,
-            snapshot=snapshot_name,
-            files_count=len(files),
-            units_count=len(result.units),
-            skipped_count=len(result.skipped),
-            mode=result.mode,
-            context_chars=len(result.context),
-            cache=result.cache_root,
-            elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-        )
-        return result
-
-    async def github_context(
-        self,
-        *,
-        repo: str,
-        ref: str | None,
-        tree_pattern: str | None,
-        target_subpath: str | None = None,
-        target_subpath_kind: str | None = None,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        trace_id: str,
-        context_window_tokens: int | None = None,
-    ) -> str:
-        started = time.perf_counter()
-        if not review_query or not review_query.strip():
-            review_query = "code review bug security performance maintainability entry points config"
-        scoped_path = (target_subpath or "").strip().strip("/")
-        effective_pattern = tree_pattern
-        if scoped_path:
-            if (target_subpath_kind or "").lower() == "tree":
-                effective_pattern = f"{scoped_path}/**"
-            else:
-                effective_pattern = scoped_path
-            review_query = f"{review_query} {scoped_path}"
-        try:
-            snapshot, files = await self.github.fetch_text_files(
-                repo,
-                ref=ref,
-                pattern=effective_pattern,
-                max_files=self.github.config.max_index_files,
-                trace_id=trace_id,
-            )
-        except Exception as exc:
-            logger.opt(exception=True, colors=True).error(
-                event_message(
-                    "review.evidence.github_context.failed",
-                    status="failed",
-                    trace_id=trace_id,
-                )
-            )
-            return f"Error: failed to fetch GitHub repository context: {exc}"
-        self.last_changed_files = list(files)
-        if not files:
-            log_event(
-                logger,
-                "info",
-                "review.evidence.github_context.done",
-                status="empty_files",
-                trace_id=trace_id,
-                repo=repo,
-                files_count=0,
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return "No text files found for GitHub repository context retrieval."
-        result = await self.retrieve_snapshot_context(
-            snapshot_name=snapshot,
-            files=files,
-            review_query=review_query,
-            max_results=max_results,
-            include_tests=include_tests,
-            trace_id=trace_id,
-            context_window_tokens=context_window_tokens,
-        )
-        log_event(
-            logger,
-            "info",
-            "review.evidence.github_context.cache",
-            status="done",
-            trace_id=trace_id,
-            snapshot=snapshot,
-            target_subpath=scoped_path,
-            cache=result.cache_root,
-            files=len(files),
-            units=len(result.units),
-        )
-        if not result.units:
-            log_event(
-                logger,
-                "info",
-                "review.evidence.github_context.done",
-                status="no_units",
-                trace_id=trace_id,
-                repo=repo,
-                snapshot=snapshot,
-                files_count=len(files),
-                units_count=0,
-                skipped_count=len(result.skipped),
-                context_chars=len(result.context),
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return "No relevant GitHub repository review references found."
-        log_event(
-            logger,
-            "info",
-            "review.evidence.github_context.done",
-            status="success",
-            trace_id=trace_id,
-            repo=repo,
-            snapshot=snapshot,
-            files_count=len(files),
-            units_count=len(result.units),
-            skipped_count=len(result.skipped),
-            mode=result.mode,
-            context_chars=len(result.context),
-            elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-        )
-        return result.context
-
-    async def github_diff_context(
-        self,
-        *,
-        repo: str,
-        pr_number: int,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        trace_id: str,
-        context_window_tokens: int | None = None,
-    ) -> str:
-        started = time.perf_counter()
-        if pr_number <= 0:
-            log_event(
-                logger,
-                "info",
-                "review.evidence.github_diff.done",
-                status="error",
-                trace_id=trace_id,
-                reason="missing_pr_number",
-                repo=repo,
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return "Error: pr_number is required for action='diff'."
-        try:
-            evidence = await self.github.fetch_pr_files(
-                repo,
-                pr_number=pr_number,
-                trace_id=trace_id,
-            )
-        except Exception as exc:
-            logger.opt(exception=True, colors=True).error(
-                event_message(
-                    "review.evidence.github_diff.failed",
-                    status="failed",
-                    trace_id=trace_id,
-                )
-            )
-            return f"Error: failed to fetch GitHub PR diff context: {exc}"
-        self.last_diff_evidence = evidence
-        self.last_changed_files = list(evidence.changed_files)
-        if not evidence.changed_files:
-            log_event(
-                logger,
-                "info",
-                "review.evidence.github_diff.done",
-                status="empty_files",
-                trace_id=trace_id,
-                repo=repo,
-                pr=pr_number,
-                files_count=0,
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return "No text files found for GitHub PR diff retrieval."
-        skipped: dict[str, str] = dict(evidence.patch_unavailable_files)
-        usable_patches: dict[str, str] = {}
-        for path, patch in evidence.patches.items():
-            reason = review_file_filter_reason(path, patch)
-            if reason:
-                skipped[path] = reason
-            else:
-                usable_patches[path] = patch
-        result = await asyncio.to_thread(
-            self.preprocessor.diff_units,
-            usable_patches,
-            review_query=(review_query or "").strip() or _DEFAULT_DIFF_QUERY,
-            context_window_tokens=context_window_tokens,
-        )
-        # File-level filter reasons from the PR collector become skipped units.
-        result.skipped.extend(
-            SkippedUnit(path=path, reason=str(reason) or "filtered")
-            for path, reason in sorted(skipped.items())
-        )
-        self.last_result = result
-        evidence.patch_unavailable_files.update(skipped)
-        for path in skipped:
-            evidence.patches.pop(path, None)
-        log_event(
-            logger,
-            "info",
-            "review.evidence.github_diff.done",
-            status="success",
-            trace_id=trace_id,
-            repo=repo,
-            pr=pr_number,
-            snapshot=evidence.snapshot,
-            files_count=len(usable_patches),
-            units_count=len(result.units),
-            skipped_count=len(result.skipped),
-            mode=result.mode,
-            context_chars=len(result.context),
-            elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-        )
-        return result.context

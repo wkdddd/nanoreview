@@ -773,13 +773,12 @@ async def test_judge_batch_runs_through_shared_runner_with_terminal_spec() -> No
     assert spec.terminal_retry_limit == 5
     assert spec.max_iterations > spec.terminal_retry_limit
     # Only the judge terminal tool is exposed, and the batch shares no session,
-    # workspace, checkpoint, injection or permission state with the plan run.
+    # workspace, checkpoint or injection state with the plan run.
     assert spec.tools.tool_names == ["submit_verdicts"]
     assert spec.workspace is None
     assert spec.session_key is None
     assert spec.checkpoint_callback is None
     assert spec.injection_callback is None
-    assert spec.permission_policy is None
     assert [message["role"] for message in [*spec.frozen_messages, *spec.working_messages]] == ["system", "user"]
     assert "S1" in [*spec.frozen_messages, *spec.working_messages][1]["content"]
 

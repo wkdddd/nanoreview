@@ -205,11 +205,11 @@ def test_new_review_run_id_is_filesystem_safe() -> None:
 
 def test_input_fingerprint_is_stable_and_input_sensitive() -> None:
     kwargs = {
-        "target": "owner/repo",
-        "target_type": "github",
+        "target": "src/app.py",
+        "target_type": "local",
         "action": "repo",
         "roles": ["security", "tests"],
-        "scope": {"repo": "owner/repo"},
+        "scope": {"root": "/work/repo"},
         "evidence_manifest": [{"id": "ev-1", "path": "a.py", "tokens": 10}],
     }
     first = compute_input_fingerprint(**kwargs)
@@ -218,7 +218,7 @@ def test_input_fingerprint_is_stable_and_input_sensitive() -> None:
     assert first == second
     assert len(first) == 64
 
-    different_target = compute_input_fingerprint(**{**kwargs, "target": "other/repo"})
+    different_target = compute_input_fingerprint(**{**kwargs, "target": "src/other.py"})
     assert different_target != first
 
     different_evidence = compute_input_fingerprint(

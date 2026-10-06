@@ -1,6 +1,6 @@
 ---
 name: repo-reader
-description: Used when users provide GitHub/GitLab repo links or request full repository comprehension, analysis, or code review; systematically inspects repository structure, entry points, source code, tests, and call chains using local files and local_review/github_review where appropriate.
+description: Used when users request full repository comprehension, analysis, or code review of a locally available repository; systematically inspects repository structure, entry points, source code, tests, and call chains using local files and local_review.
 ---
 
 # repo-reader
@@ -8,7 +8,7 @@ description: Used when users provide GitHub/GitLab repo links or request full re
 ## When to Use
 
 Use this skill when the user wants repository-level understanding:
-- The user provides a GitHub, GitLab, or other git hosting URL, such as `https://github.com/user/repo`.
+- The repository is already available locally (cloned by the user, or the current workspace).
 - The user asks to look at, analyze, review, or understand a code repository.
 - The user asks "帮我看看这个仓库", "分析一下这个项目", or similar phrases.
 - The user wants to understand a code repository before changing it.
@@ -17,6 +17,7 @@ Do not use this skill when:
 - The user asks a narrow question about files already in the current workspace; use `local_review(review_query="...")` or read the known files directly.
 - The user only needs online documentation, API references, or external facts; use `web_search` and `web_fetch`.
 - The user only asks for a small code edit in a known area; inspect the relevant local files directly.
+- The user provides a remote repository URL that is not on disk: review input is local-only, so ask the user to clone it (or fetch specific files with `web_fetch`) before reviewing.
 
 ## Workflow
 
@@ -30,13 +31,8 @@ Do not use this skill when:
 
 ## Repository Access
 
-- For the current local workspace, inspect files directly and use `local_review(review_query="...")` to find relevant code when the important files are not obvious.
-- For GitHub repositories, start with read-only API inspection:
-  - `github_review(action="meta", target_repo="owner/repo")`
-  - `github_review(action="tree", target_repo="owner/repo", tree_pattern="*.py", tree_limit=500)`
-  - `github_review(action="file", target_repo="owner/repo", repo_path="README.md")`
-- If deep full-repository analysis is needed, use `github_review(action="repo", target_repo="owner/repo")`; it stores remote snapshots only in the fixed workspace `.nanoreview/review_github` cache.
-- GitHub mode reads metadata, tree entries, and file contents through the GitHub API; it does not perform RAG over the remote repository.
+- Inspect the repository files directly, and use `local_review(review_query="...")` to find relevant code when the important files are not obvious.
+- Review input is local-only: there is no remote repository reader. If the target is not on disk, ask the user to clone it first, or fetch individual files with `web_fetch`.
 - Do not run `git clone` or `gh repo clone` for review access unless the user explicitly asks outside the review workflow.
 
 ## Rules
@@ -48,7 +44,7 @@ Do not use this skill when:
 - Read source files that establish the directory map, entry points, and call chain.
 - Keep explanations beginner-friendly when the user is learning.
 - Mention uncertainty clearly.
-- If the repository URL has not been fetched yet, first use `github_review` to access the needed source files before applying this workflow.
+- If the repository is not available locally yet, ask the user to clone it (or fetch specific files with `web_fetch`) before applying this workflow.
 
 ## Output
 

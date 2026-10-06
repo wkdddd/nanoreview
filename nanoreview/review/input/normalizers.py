@@ -39,7 +39,7 @@ def normalize_requested_dimensions(
 
 def normalize_review_target_type(raw: str | None, target: str | None = None) -> str | None:
     value = (raw or "").strip().lower()
-    if value in {"auto", "local", "github"}:
+    if value in {"auto", "local"}:
         return value
     return infer_review_target_type(target)
 

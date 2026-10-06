@@ -15,7 +15,6 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceOptions,
     ProgrammaticEvidenceService,
 )
-from nanoreview.review.source.github import GitHubRepoConfig, GitHubRepoReader
 from nanoreview.review.source.local import LocalRepoReader
 from nanoreview.review.types import ReviewAction, ReviewMetaKey
 
@@ -45,17 +44,14 @@ class ReviewToolBase(Tool):
 
     @classmethod
     def create(cls, ctx: Any) -> Tool:
-        tools_config = ctx.config if ctx.config else None
         return cls(
             workspace=Path(ctx.workspace),
-            github_config=getattr(tools_config, "github_repo", None),
             review_config=getattr(ctx, "review_config", None),
         )
 
     def __init__(
         self,
         workspace: Path,
-        github_config: GitHubRepoConfig | None = None,
         review_config: Any | None = None,
     ) -> None:
         self.workspace = workspace.expanduser().resolve()
@@ -67,10 +63,8 @@ class ReviewToolBase(Tool):
             options=ProgrammaticEvidenceOptions.from_review_config(review_config),
         )
         self.local = LocalRepoReader(self.workspace)
-        self.github = GitHubRepoReader(github_config, workspace=workspace)
         self.evidence_service = ReviewEvidenceService(
             self.preprocessor,
-            self.github,
             workspace=self.workspace,
         )
 
@@ -105,15 +99,6 @@ class ReviewToolBase(Tool):
             return int(value) if value is not None and int(value) > 0 else None
         except (TypeError, ValueError):
             return None
-
-    @staticmethod
-    def _github_pr_head_ref() -> str | None:
-        ctx = current_request_context()
-        metadata = ctx.metadata if ctx is not None else {}
-        if str(metadata.get(ReviewMetaKey.ACTION) or "").strip().lower() != ReviewAction.DIFF.value:
-            return None
-        value = str(metadata.get(ReviewMetaKey.GITHUB_PR_HEAD_REF) or "").strip()
-        return value or None
 
     def _log_finish(
         self,

@@ -10,7 +10,7 @@ between the two agent phases a NanoReview session can be in:
   the first one carries the review handoff.
 
 It owns the process skeleton — MessageBus receive/send, per-session serial
-locks and the bounded pending queue, command dispatch and permission responses,
+locks and the bounded pending queue, command dispatch,
 cancellation scheduling, the review/conversation route and gates, the handoff
 value object with its single session write, and final result publication — and
 delegates the actual turn algorithms:
@@ -318,8 +318,6 @@ class SessionCoordinator:
             else defaults.tool_hint_max_length
         )
         self.tools_config = _tc
-        # Permission approval policy currently lives on ToolsConfig.
-        self.permissions_config = _tc
         self.review_config = review_config
         self.exec_config = _tc.exec
         self._default_reasoning_effort = default_reasoning_effort
@@ -379,7 +377,6 @@ class SessionCoordinator:
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
         self._pending_queues: dict[str, asyncio.Queue] = {}
-        self._permission_futures: dict[str, asyncio.Future[bool]] = {}
 
         # Review side: ReviewLoop owns the one-shot run state, its lifecycle,
         # its persistence, and the review turn's own context.
@@ -450,7 +447,6 @@ class SessionCoordinator:
             review_config=self.review_config,
             provider_snapshot_loader=self._provider_snapshot_loader,
             background_scheduler=self._schedule_background,
-            permission_requester=self._request_tool_permission,
             hooks=self._extra_hooks,
             hooks_getter=lambda: self._extra_hooks,
             usage_recorder=self._record_result_usage,
@@ -680,7 +676,7 @@ class SessionCoordinator:
 
     def _review_evidence_provider(self) -> Any | None:
         """Return the review tool's shared evidence service, if registered."""
-        tool = self.tools.get("local_review") or self.tools.get("github_review")
+        tool = self.tools.get("local_review")
         if tool is None:
             return None
         return getattr(tool, "evidence_provider", None)
@@ -726,31 +722,6 @@ class SessionCoordinator:
             )
 
         return _on_retry_wait
-
-    async def _request_tool_permission(
-        self,
-        request_id: str,
-        payload: dict[str, Any],
-        future: asyncio.Future[bool],
-        channel: str,
-        chat_id: str,
-    ) -> bool:
-        """Ask the transport for a per-tool approval and await its response."""
-        self._permission_futures[request_id] = future
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                channel=channel,
-                chat_id=chat_id,
-                content="",
-                metadata={"_permission_request": payload},
-            )
-        )
-        try:
-            return await asyncio.wait_for(future, timeout=300)
-        except asyncio.TimeoutError:
-            return False
-        finally:
-            self._permission_futures.pop(request_id, None)
 
     async def _dispatch_command_inline(
         self,
@@ -1592,20 +1563,6 @@ class SessionCoordinator:
                 continue
 
             raw = msg.content.strip()
-            if msg.metadata.get("_permission_response"):
-                resp = msg.metadata["_permission_response"]
-                req_id = resp.get("request_id")
-                approved = resp.get("approved", False)
-                fut = self._permission_futures.pop(req_id, None)
-                if fut and not fut.done():
-                    fut.set_result(bool(approved))
-                continue
-            if msg.metadata.get("_permission_disconnect"):
-                for req_id, fut in list(self._permission_futures.items()):
-                    if not fut.done():
-                        fut.set_result(False)
-                self._permission_futures.clear()
-                continue
             # Leftover internal events must not reach command dispatch, gating
             # or the pending queue: they are dropped here, before routing.
             if self._drop_internal_event(msg, entry="bus"):
@@ -1973,11 +1930,6 @@ class SessionCoordinator:
                 with suppress(asyncio.QueueEmpty):
                     queue.get_nowait()
         self._session_locks.clear()
-
-        for future in list(self._permission_futures.values()):
-            if not future.done():
-                future.cancel()
-        self._permission_futures.clear()
 
         await self.close_background_tasks()
         await self.mcp.aclose()

@@ -295,21 +295,13 @@ def compute_review_input_fingerprint(
 ) -> str:
     """Build the input fingerprint from a resolved review plan and evidence."""
     scope: dict[str, Any] = {}
-    if plan is not None:
-        if plan.local_scope is not None:
-            scope = {
-                "kind": plan.local_scope.kind,
-                "review_root": plan.local_scope.review_root,
-                "scope_paths": sorted(plan.local_scope.scope_paths),
-                "target_path": plan.local_scope.target_path,
-            }
-        else:
-            scope = {
-                "repo": plan.target_repo,
-                "pr_number": plan.pr_number,
-                "target_ref": plan.target_ref,
-                "subpath": plan.target_subpath,
-            }
+    if plan is not None and plan.local_scope is not None:
+        scope = {
+            "kind": plan.local_scope.kind,
+            "review_root": plan.local_scope.review_root,
+            "scope_paths": sorted(plan.local_scope.scope_paths),
+            "target_path": plan.local_scope.target_path,
+        }
     return compute_input_fingerprint(
         target=plan.target if plan is not None else None,
         target_type=plan.target_type if plan is not None else None,

@@ -6,8 +6,8 @@ Pins the boundaries the plan fixed:
   Judge registries never see them;
 * each turn gets its own registry, so sessions do not share registrations, while
   a reconnect still reaches a turn that is already running;
-* MCP tools never trigger the per-tool approval confirmation, even with
-  ``approval_enabled=True``;
+* MCP transports are a generic network capability and survive unchanged
+  (stdio here; SSE and Streamable HTTP are covered by the smoke tests);
 * connection preparation and in-flight calls both honour external cancellation,
   and repeated shutdown leaves no MCP subprocess or owner task behind.
 """
@@ -272,43 +272,24 @@ class TestPerTurnRegistryIsolation:
         assert isinstance(coordinator.mcp.registry.get("mcp_docs_search"), MCPToolWrapper)
 
 
-class TestApprovalIsNotTriggered:
+class TestMcpRemainsAvailable:
     @pytest.mark.asyncio
-    async def test_mcp_tools_bypass_approval_even_when_enabled(self, tmp_path) -> None:
+    async def test_mcp_tool_calls_still_reach_the_conversation_turn(self, tmp_path) -> None:
+        """MCP is a retained network capability: calls execute without any gate."""
         coordinator = _coordinator(
             tmp_path,
-            ToolsConfig(
-                approval_enabled=True,
-                mcp_servers={"docs": MCPServerConfig(command="x")},
-            ),
+            ToolsConfig(mcp_servers={"docs": MCPServerConfig(command="x")}),
         )
         _attach_live_tool(coordinator.mcp)
         runner = ToolCallingRunner("mcp_docs_search", {"q": "x"})
         coordinator.conversation_loop._runner = runner
-
-        asked: list[str] = []
-
-        async def _permission(
-            tool_name: str,
-            params: dict[str, Any],
-            future: asyncio.Future[bool],
-            channel: str,
-            chat_id: str,
-        ) -> bool:
-            asked.append(tool_name)
-            future.set_result(True)
-            return True
-
-        coordinator.conversation_loop._permission_requester = _permission
 
         await coordinator.conversation_loop.process_message(
             _msg(), session_key="cli:direct", turn_id="t1", target_root=tmp_path
         )
 
         assert runner.results == ["live result"]
-        # Documented behaviour: MCP capabilities do not raise the per-tool
-        # approval confirmation, even with approval_enabled=True.
-        assert asked == []
+        assert "mcp_docs_search" in runner.specs[0].tools.tool_names
 
 
 class TestCancellation:

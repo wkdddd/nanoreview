@@ -160,8 +160,6 @@ class AgentRunSpec:
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
-    permission_policy: Any | None = None
-    permission_request_callback: Any | None = None
     soft_tool_error_tools: frozenset[str] = field(default_factory=frozenset)
     terminal_tools: frozenset[str] = field(default_factory=frozenset)
     #: Tools whose untruncated result is kept in ``tool_events[*].raw_result``.
@@ -2011,38 +2009,6 @@ class AgentRunner:
             if self._is_fatal_tool_error(spec, tool_call.name):
                 error = RuntimeError(prep_error)
             return prep_error + hint, event, error
-        try:
-            if spec.permission_policy and spec.permission_request_callback:
-                from nanoreview.agent.tools.permissions import PermissionVerdict, check_permission
-
-                verdict = check_permission(tool_call.name, tool, params, spec.permission_policy)
-                if verdict == PermissionVerdict.CONFIRM:
-                    import uuid as _uuid
-
-                    request_id = str(_uuid.uuid4())
-                    payload = {
-                        "request_id": request_id,
-                        "tool_name": tool_call.name,
-                        "arguments": params,
-                        "permission": "user_approval",
-                    }
-                    future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-                    approved = await spec.permission_request_callback(request_id, payload, future)
-                    if not approved:
-                        event = {
-                            "name": tool_call.name,
-                            "status": "denied",
-                            "detail": "user denied",
-                        }
-                        return "Tool execution denied by user.", event, None
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "Permission check failed for tool {!r}, denying by default", tool_call.name
-            )
-            event = {"name": tool_call.name, "status": "denied", "detail": "permission check error"}
-            return "Tool execution denied due to permission check error.", event, None
         if hook is not None and context is not None:
             await hook.before_execute_tool(context, tool_call, tool, params)
         try:

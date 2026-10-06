@@ -14,6 +14,11 @@ class RequestContext:
     message_id: str | None = None
     session_key: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Immutable workspace access decision for the active turn. ``None`` means
+    #: the caller did not resolve a scope (e.g. review-internal tools that pass
+    #: no path guard), in which case tools fall back to their construction-time
+    #: configuration.
+    workspace_scope: Any | None = None
     #: Whether diagnostics raised while serving this request may include the
     #: request's own content. Callers handling untrusted external payloads (MCP
     #: servers) turn this off so credentials and tool output stay out of logs.
@@ -29,6 +34,12 @@ _current_request_context: ContextVar[RequestContext | None] = ContextVar(
 def current_request_context() -> RequestContext | None:
     """Return the request context for the current tool execution task."""
     return _current_request_context.get()
+
+
+def current_workspace_scope() -> Any | None:
+    """Return the workspace scope bound to the active tool request, if any."""
+    ctx = _current_request_context.get()
+    return ctx.workspace_scope if ctx is not None else None
 
 
 def tool_log_content_allowed() -> bool:

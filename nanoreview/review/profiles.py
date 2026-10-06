@@ -19,7 +19,7 @@ from nanoreview.agent.subagent_profiles import (
 )
 from nanoreview.utils.prompt_templates import render_template
 
-_SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep", "local_review", "github_review"})
+_SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep", "local_review"})
 _REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep", "review_submit"})
 
 
@@ -222,7 +222,7 @@ def _canonical_review_submit(result: Any) -> str | None:
     return None
 
 
-async def _handle_reviewer_result(*, result: Any, target_type: str) -> SubagentCompletion:
+async def _handle_reviewer_result(*, result: Any) -> SubagentCompletion:
     """Parse the final outcome of the reviewer's single AgentRun.
 
     Terminal retries (failed review_submit calls, prose answers) already
@@ -248,7 +248,7 @@ async def _handle_reviewer_result(*, result: Any, target_type: str) -> SubagentC
         )
     data = json.loads(content)
     if not data.get("findings"):
-        evidence_tools = {"github_review"} if target_type == "github" else {"read_file", "grep", "local_review"}
+        evidence_tools = {"read_file", "grep", "local_review"}
         has_evidence = any(
             event.get("name") in evidence_tools and event.get("status") == "ok"
             for event in result.tool_events or []

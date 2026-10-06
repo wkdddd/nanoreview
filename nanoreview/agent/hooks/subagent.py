@@ -20,6 +20,7 @@ from nanoreview.utils.helpers import IncrementalThinkExtractor, strip_think
 
 if TYPE_CHECKING:
     from nanoreview.agent.tools.registry import ToolRegistry
+    from nanoreview.agent.tools.workspace_scope import WorkspaceScope
 
 
 @dataclass(slots=True)
@@ -62,6 +63,7 @@ class SubagentHook(AgentHook):
         events: EventSink = NO_EVENTS,
         streaming: bool = True,
         on_tool_events: Callable[[list[dict[str, str]]], Awaitable[None]] | None = None,
+        workspace_scope: "WorkspaceScope | None" = None,
     ) -> None:
         super().__init__()
         self._task_id = task_id
@@ -76,6 +78,7 @@ class SubagentHook(AgentHook):
         self._events = events
         self._streaming = streaming
         self._on_tool_events = on_tool_events
+        self._workspace_scope = workspace_scope
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
 
@@ -131,9 +134,11 @@ class SubagentHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         # Propagate review metadata into the subagent's ContextAware tools
-        # and the current-request context var so that local_review,
-        # github_review, and read_file can make correct target-type and
-        # workspace-boundary decisions.
+        # and the current-request context var so that local_review and
+        # read_file can make correct scope and workspace-boundary decisions.
+        # The scope is bound here too: without it, tool calls would fall back
+        # to the construction-time ``restrict_to_workspace`` and a reviewer
+        # could read outside the target repository.
         from nanoreview.agent.tools.context import (
             ContextAware,
             RequestContext,
@@ -147,6 +152,7 @@ class SubagentHook(AgentHook):
                 message_id=self._origin_message_id,
                 session_key=self._session_key,
                 metadata=dict(self._metadata),
+                workspace_scope=self._workspace_scope,
             )
             for name in self._tools.tool_names:
                 tool = self._tools.get(name)

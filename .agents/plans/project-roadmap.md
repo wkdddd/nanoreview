@@ -23,7 +23,7 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 - `DONE` 表示资源清理完成，终态及最终 report 或有界失败结果已持久化；最终 status 可以是 `completed`、`error` 或 `stopped`。清理或保存失败必须向用户返回必要错误，并保持对话门禁；失败原因应持久化供重启后读取。完成 `DONE` 后，报告交接失败也必须说明错误、可用结果与覆盖缺口。
 - Conversation Agent 可以读取代码、修改文件、执行命令和运行测试，修复直接发生在原审查仓库，不自动创建 worktree。
 - 两套 Agent 使用独立 `ToolRegistry`；工具实现可以共享，但注册表实例、工具权限和执行 profile 隔离。
-- 第 4 阶段参照 nanobot 简化工具调用，移除逐工具 approval、全局与 session 确认开关及后端确认交互，不新增风险分级授权系统。角色工具隔离、路径限制、命令 guard 和已有 sandbox 保留；review 仍须由用户明确发起。当前 approval 实现直到该阶段完成前仍有效。
+- 第 4 阶段参照 nanobot 简化工具调用，已移除逐工具 approval、全局与 session 确认开关、确认请求/响应链路和 GitHub 远程 review 输入，未新增风险分级授权系统。权限只在工具调用层处理：每个 turn 解析一次 `WorkspaceScope`，review 侧固定 `restricted`。角色工具隔离、路径限制、命令 guard 和已有 sandbox 保留；通用联网能力（模型 HTTP/OAuth、`web_search`、`web_fetch`、MCP 三种 transport 与 SSRF 校验）保留。
 - 完整保留 `ReviewRunState`，供 session detail、API 和 WebUI 读取；Conversation Agent 主要使用 report 和对话 history。
 - report 以带来源标识的 `review_context` 索引消息进入 `Session.messages`，至少关联 `source=review_agent`、`run_id` 和 `report_ref`；完整 report artifact 是权威来源。
 - Conversation Agent 首次上下文注入完整 report：system directive 标注来源与只读规则，完整 report 以可重放的 handoff 消息写入历史；report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代；后续 report 参与 `Consolidator` 压缩。
@@ -63,7 +63,7 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 | 1 | 已完成 | 本地 review 准入：统一仓库与 diff 校验、单一 `target`、session 注册和双 Agent 交接契约。 |
 | 2 | 已完成 | ReviewLoop 与终态收尾：持久化 `ReviewRunState`，成功、错误和停止均完成清理与结果保存，`DONE` 后才开放对话。 |
 | 3 | 已完成 | Conversation Agent：完成 SessionCoordinator 与 ConversationLoop 迁移，删除 AgentLoop 和旧 coordinator 模块；接入 COMMON_RULES 和稳定 finding ID，不收集 finding 引用。 |
-| 4 | 下一阶段 | 工具权限简化：参照 nanobot 删除逐工具 approval、配置与 session 开关、确认请求和响应链路；收敛装配，保留角色工具隔离、路径限制、命令 guard 和已有 sandbox。 |
+| 4 | 已完成 | 工具权限与远程 review 边界收敛：删除逐工具 approval、配置与 session 开关、确认请求和响应链路及 GitHub 远程 review 接入；改为每 turn 一次 `WorkspaceScope` 解析，review 侧固定 restricted；保留角色工具隔离、路径限制、命令 guard、已有 sandbox 与全部通用联网能力。 |
 | 5 | 待实施 | 执行上下文编排：梳理规则、报告、历史、摘要和工具定义的组装与预算；收敛 Consolidator 与 run 内压缩职责，沿用 `last_consolidated`，移除 AutoCompact 产品调用路径；验证累计摘要、信息保留、历史裁剪与重启后的上下文一致性。 |
 | 6 | 待实施 | 后端闭环验收：通过 API/CLI 验证 review、报告交接、对话修复和测试验证，以及取消、部分修改、持久化、重启后读取和错误交付；核对消费者后收敛遗留代码。 |
 | 7 | 待实施 | 审查效果评测：复用 [AACR-Bench 数据集](https://huggingface.co/datasets/Alibaba-Aone/aacr-bench) 和其 [evaluation 评测框架](https://github.com/alibaba/aacr-bench/tree/main/evaluation) 作为主基线，接入 NanoReview 的结构化审查结果；以降低误报、证明审查有效性为主，代码调整带来的改善为辅助，额外模型调用总预算不超过人民币 100 元。 |

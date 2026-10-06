@@ -9,7 +9,12 @@ from nanoreview.config.schema import Config
 
 
 def _guard(tool: ExecTool, command: str, cwd: Path) -> str | None:
-    return tool._guard_command(command, str(cwd))
+    return tool._guard_command(
+        command,
+        str(cwd),
+        restricted=tool.restrict_to_workspace,
+        boundary_root=str(cwd) if tool.restrict_to_workspace else None,
+    )
 
 
 class TestExecDenyListPolicy:

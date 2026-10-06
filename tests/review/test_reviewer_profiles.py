@@ -146,7 +146,7 @@ async def test_reviewer_handler_parses_full_submission() -> None:
         ],
     )
 
-    completion = await handler(result=result, target_type="local")
+    completion = await handler(result=result)
 
     assert completion.status == "ok"
     assert json.loads(completion.content)["findings"][0]["title"] == "Issue"
@@ -175,7 +175,7 @@ async def test_reviewer_handler_truncated_tool_message_uses_raw_result() -> None
         ],
     )
 
-    completion = await handler(result=result, target_type="local")
+    completion = await handler(result=result)
 
     assert completion.status == "ok"
     parsed = json.loads(completion.content)
@@ -211,7 +211,7 @@ async def test_reviewer_handler_rejects_unprocessed_submission() -> None:
         ],
     )
 
-    completion = await handler(result=result, target_type="local")
+    completion = await handler(result=result)
 
     assert completion.status == "error"
     assert "No structured findings submitted" in completion.content
