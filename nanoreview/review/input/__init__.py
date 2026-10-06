@@ -13,7 +13,6 @@ from nanoreview.review.input.normalizers import (
 from nanoreview.review.input.targets import (
     extract_review_target,
     infer_review_target_type,
-    parse_repo_target,
 )
 
 __all__ = [
@@ -22,5 +21,4 @@ __all__ = [
     "normalize_requested_dimensions",
     "normalize_review_action",
     "normalize_review_target_type",
-    "parse_repo_target",
 ]

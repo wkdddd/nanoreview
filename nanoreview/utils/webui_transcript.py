@@ -585,43 +585,6 @@ def replay_transcript_to_ui_messages(
             buffer_parts = []
             continue
 
-        if ev == "permission_request":
-            request_id = rec.get("request_id")
-            if not isinstance(request_id, str):
-                continue
-            record = {
-                "requestId": request_id,
-                "toolName": rec.get("tool_name", ""),
-                "arguments": rec.get("arguments"),
-                "permission": rec.get("permission"),
-                "createdAt": created_at,
-            }
-            for i in range(len(messages) - 1, -1, -1):
-                m = messages[i]
-                if m.get("role") == "user":
-                    break
-                if m.get("role") == "assistant" and m.get("kind") != "trace":
-                    prev_records = list(m.get("permissionRecords") or [])
-                    prev_records.append(record)
-                    messages[i] = {**m, "permissionRecords": prev_records}
-                    break
-            continue
-
-        if ev == "permission_response":
-            request_id = rec.get("request_id")
-            approved = bool(rec.get("approved", False))
-            if not isinstance(request_id, str):
-                continue
-            for m in messages:
-                records = m.get("permissionRecords")
-                if not records:
-                    continue
-                for j, r in enumerate(records):
-                    if r.get("requestId") == request_id:
-                        records[j] = {**r, "resolved": True, "approved": approved}
-                        break
-            continue
-
     flush_review_thinking(len(lines), _ts_base + len(lines), streaming=True)
     for m in messages:
         m.pop("isStreaming", None)

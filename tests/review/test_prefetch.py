@@ -155,9 +155,9 @@ async def test_prefetch_emits_progress_events() -> None:
 
 async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
     plan = ReviewPlan(
-        target="https://github.com/test/repo",
+        target=".",
         target_name="repo",
-        target_type="github",
+        target_type="local",
         action=ReviewAction.REPO,
         roles=[],
         routing_mode="auto",
@@ -190,7 +190,8 @@ async def test_diff_prefetch_preserves_filtered_patch_body() -> None:
     assert "+token = value" in (result.summary or "")
 
 
-def test_github_blob_url_becomes_scoped_review_plan() -> None:
+def test_github_blob_url_is_treated_as_an_opaque_local_target() -> None:
+    """GitHub blob URLs are no longer parsed into a remote scope; they degrade to local."""
     plan = build_review_plan(
         target="https://github.com/wkdddd/nanobot/blob/main/review-webui/index.html",
         user_content="审查",
@@ -200,10 +201,10 @@ def test_github_blob_url_becomes_scoped_review_plan() -> None:
     )
 
     assert plan is not None
-    assert plan.target_repo == "wkdddd/nanobot"
-    assert plan.target_ref == "main"
-    assert plan.target_subpath == "review-webui/index.html"
-    assert plan.target_subpath_kind == "blob"
+    assert plan.target_type == "local"
+    assert not hasattr(plan, "target_repo")
+    assert not hasattr(plan, "target_ref")
+    assert not hasattr(plan, "target_subpath")
 
 
 def test_local_file_target_becomes_file_scope(tmp_path, monkeypatch) -> None:
@@ -227,12 +228,12 @@ def test_local_file_target_becomes_file_scope(tmp_path, monkeypatch) -> None:
     assert plan.local_scope.scope_paths == ["auth.py"]
 
 
-async def test_prefetch_passes_github_blob_scope_and_ref() -> None:
+async def test_prefetch_dispatches_without_remote_scope_fields() -> None:
     evidence_service = _EvidenceService()
     plan = build_review_plan(
-        target="https://github.com/wkdddd/nanobot/blob/main/review-webui/index.html",
+        target=".",
         user_content="审查",
-        target_type="github",
+        target_type="local",
         action="repo",
     )
 
@@ -245,11 +246,11 @@ async def test_prefetch_passes_github_blob_scope_and_ref() -> None:
     assert result.status == "ok"
     assert evidence_service.calls
     call = evidence_service.calls[0]
-    assert call["target_type"] == "github"
-    assert call["repo"] == "wkdddd/nanobot"
-    assert call["ref"] == "main"
-    assert call["target_subpath"] == "review-webui/index.html"
-    assert call["target_subpath_kind"] == "blob"
+    assert call["target_type"] == "local"
+    assert "repo" not in call
+    assert "ref" not in call
+    assert "target_subpath" not in call
+    assert "target_subpath_kind" not in call
 
 
 async def test_prefetch_builds_bundle_from_structured_units() -> None:

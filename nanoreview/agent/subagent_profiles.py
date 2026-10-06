@@ -42,7 +42,6 @@ class SubagentResultHandler(Protocol):
         self,
         *,
         result: AgentRunResult,
-        target_type: str,
     ) -> SubagentCompletion: ...
 
 

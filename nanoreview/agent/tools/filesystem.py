@@ -8,16 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from nanoreview.agent.tools.base import Tool, tool_parameters
-from nanoreview.agent.tools.context import current_request_context
+from nanoreview.agent.tools.context import current_workspace_scope
 from nanoreview.agent.tools.file_state import FileStates, _hash_file, current_file_states
-from nanoreview.agent.tools.path_utils import is_under, resolve_workspace_path
+from nanoreview.agent.tools.path_utils import resolve_workspace_path
 from nanoreview.agent.tools.schema import (
     BooleanSchema,
     IntegerSchema,
     StringSchema,
     tool_parameters_schema,
 )
-from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import build_image_content_blocks, detect_image_mime
 
 
@@ -64,10 +63,17 @@ class _FsTool(Tool):
         return current_file_states(self._fallback_file_states)
 
     def _resolve(self, path: str) -> Path:
+        scope = current_workspace_scope()
+        allowed_dir = self._allowed_dir
+        if scope is not None:
+            # The turn's scope is the single source of truth for the boundary.
+            # ``full`` lifts the containment check; ``restricted`` pins it to
+            # the scope's project path.
+            allowed_dir = scope.project_path if scope.is_restricted else None
         return resolve_workspace_path(
             path,
             self._workspace,
-            self._allowed_dir,
+            allowed_dir,
             self._extra_allowed_dirs,
         )
 
@@ -184,12 +190,6 @@ class ReadFileTool(_FsTool):
             fp = self._resolve(path)
             if _is_blocked_device(fp):
                 return f"Error: Reading {fp} is blocked (device path that could hang or produce infinite output)."
-            if self._blocks_github_review_local_read(fp):
-                return (
-                    "Error: read_file cannot read local workspace files during a GitHub review target. "
-                    "Use github_review(action='file', target_repo=..., repo_path=..., offset=..., limit=...) "
-                    "for remote content; if GitHub content is unavailable, report the evidence limitation."
-                )
             if not fp.exists():
                 return f"Error: File not found: {path}"
             if not fp.is_file():
@@ -292,15 +292,6 @@ class ReadFileTool(_FsTool):
         except Exception as e:
             return f"Error reading file: {e}"
 
-    def _blocks_github_review_local_read(self, fp: Path) -> bool:
-        ctx = current_request_context()
-        metadata = ctx.metadata if ctx is not None else {}
-        if str(metadata.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower() != "github":
-            return False
-        if self._workspace is None:
-            return False
-        return is_under(fp, self._workspace)
-
     def _read_pdf(self, fp: Path, pages: str | None) -> str:
         try:
             import fitz  # pymupdf
@@ -394,9 +385,6 @@ class WriteFileTool(_FsTool):
             "creates parent directories as needed. "
             "For partial edits, prefer edit_file instead."
         )
-
-    def requires_approval(self, params: dict[str, Any]) -> bool:
-        return True
 
     async def execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
         try:
@@ -706,9 +694,6 @@ class EditFileTool(_FsTool):
             "If old_text matches multiple times, you must provide more context "
             "or set replace_all=true. Shows a diff of the closest match on failure."
         )
-
-    def requires_approval(self, params: dict[str, Any]) -> bool:
-        return True
 
     @staticmethod
     def _strip_trailing_ws(text: str) -> str:

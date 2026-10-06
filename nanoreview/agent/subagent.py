@@ -112,7 +112,6 @@ class SubagentManager:
         return ToolsConfig(
             exec=self.tools_config.exec,
             restrict_to_workspace=self.restrict_to_workspace,
-            github_repo=self.tools_config.github_repo,
         )
 
     def _build_tool_context(
@@ -135,17 +134,9 @@ class SubagentManager:
         profile: SubagentExecutionProfile,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
-        target_type: str = "",
     ) -> ToolRegistry:
         """Build an isolated tool registry authorized by the profile scope."""
-        target_type = str(target_type or "").strip().lower()
         denied_names: set[str] = set()
-        # Review profiles declare both transport tools, but only the active
-        # target transport is exposed to the model at runtime.
-        if target_type == "github":
-            denied_names.add("local_review")
-        elif target_type == "local":
-            denied_names.add("github_review")
         registry = ToolRegistry()
         loader = ToolLoader()
         loader.load(
@@ -156,30 +147,24 @@ class SubagentManager:
         )
         loaded_names = frozenset(registry.tool_names)
         required_tools = frozenset(getattr(profile, "required_tools", frozenset()))
-        # Reviewer profiles share a base tool contract but must also expose
-        # the evidence tool for the active transport target.
+        # Reviewer profiles share a base tool contract but must also expose the
+        # local evidence tool.
         if profile.scope.startswith("reviewer."):
-            if target_type == "local":
-                required_tools |= frozenset({"local_review"})
-            elif target_type == "github":
-                required_tools |= frozenset({"github_review"})
+            required_tools |= frozenset({"local_review"})
         missing_tools = required_tools - loaded_names
         if missing_tools:
             missing = ", ".join(sorted(missing_tools))
             raise ValueError(
-                "Subagent profile {!r} (scope={!r}) is missing required tools: {} "
-                "for target_type={!r}".format(
+                "Subagent profile {!r} (scope={!r}) is missing required tools: {}".format(
                     profile.id,
                     profile.scope,
                     missing,
-                    target_type or "unknown",
                 )
             )
         logger.info(
-            "subagent.tools.loaded profile_id={} scope={} target_type={} tools={}",
+            "subagent.tools.loaded profile_id={} scope={} tools={}",
             profile.id,
             profile.scope,
-            target_type or "unknown",
             sorted(loaded_names),
         )
         return registry
@@ -231,11 +216,9 @@ class SubagentManager:
         return self._build_tool_context(workspace, tools_config)
 
     def build_tools(
-        self, profile: SubagentExecutionProfile, workspace: Path, *, target_type: str = ""
+        self, profile: SubagentExecutionProfile, workspace: Path
     ) -> ToolRegistry:
-        return self._build_tools(
-            profile, workspace=workspace, target_type=target_type
-        )
+        return self._build_tools(profile, workspace=workspace)
 
     @staticmethod
     def build_system_prompt(
@@ -391,8 +374,7 @@ class SubagentManager:
                 if profile.workspace_resolver is not None
                 else self.workspace
             )
-            target_type = str(metadata.get("review_target_type") or "").strip().lower()
-            tools = self.build_tools(profile, sub_workspace, target_type=target_type)
+            tools = self.build_tools(profile, sub_workspace)
             system_prompt = self.build_system_prompt(profile, metadata, sub_workspace)
 
             stream_id = f"subagent:{task_id}"
@@ -578,7 +560,6 @@ class SubagentManager:
                 completion = await self.handle_completed_result(
                     profile=profile,
                     result=result,
-                    target_type=target_type,
                 )
                 final_result = completion.content
                 status.stop_reason = completion.stop_reason or status.stop_reason
@@ -653,7 +634,6 @@ class SubagentManager:
         *,
         profile: SubagentExecutionProfile,
         result: AgentRunResult,
-        target_type: str,
     ) -> SubagentCompletion:
         """Normalize the final result of the single completed AgentRun.
 
@@ -667,7 +647,7 @@ class SubagentManager:
                 status="ok" if result.stop_reason != "error" else "error",
                 stop_reason=result.stop_reason,
             )
-        return await profile.result_handler(result=result, target_type=target_type)
+        return await profile.result_handler(result=result)
 
     async def _announce_result(
         self,

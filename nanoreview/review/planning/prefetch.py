@@ -286,15 +286,13 @@ async def maybe_prefetch_review_context(
     started = time.perf_counter()
     query = plan.user_requirements or "code review bug security performance maintainability entry points config"
     logger.info(
-        "review.prefetch.start trace_id={} action={} target_type={} target={} target_repo={} scope_kind={} review_root={} target_subpath={} query_chars={} max_results={}",
+        "review.prefetch.start trace_id={} action={} target_type={} target={} scope_kind={} review_root={} query_chars={} max_results={}",
         trace_id,
         plan.action.value,
         plan.target_type,
         plan.target,
-        plan.target_repo,
         plan.local_scope.kind if plan.local_scope else "",
         plan.local_scope.review_root if plan.local_scope else "",
-        plan.target_subpath or "",
         len(query),
         _DEFAULT_EVIDENCE_MAX_RESULTS,
     )
@@ -309,7 +307,6 @@ async def maybe_prefetch_review_context(
             "scope_kind": plan.local_scope.kind if plan.local_scope else None,
             "review_root": plan.local_scope.review_root if plan.local_scope else None,
             "scope_paths_count": len(plan.local_scope.scope_paths) if plan.local_scope else 0,
-            "target_subpath": plan.target_subpath,
         },
     )
     try:
@@ -317,11 +314,6 @@ async def maybe_prefetch_review_context(
         result = await evidence_service.dispatch(
             target_type=target_type,
             action=plan.action.value,
-            repo=(plan.target_repo or plan.target or "").strip(),
-            ref=plan.target_ref,
-            pr_number=plan.pr_number or 0,
-            target_subpath=plan.target_subpath,
-            target_subpath_kind=plan.target_subpath_kind,
             review_query=query,
             max_results=_DEFAULT_EVIDENCE_MAX_RESULTS,
             include_tests=True,

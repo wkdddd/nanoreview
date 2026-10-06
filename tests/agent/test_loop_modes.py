@@ -546,8 +546,7 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
     )
 
     reviewer_profile = manager.resolve_profile({"profile_id": "security"})
-    reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="local")
-    github_reviewer = manager.build_tools(reviewer_profile, tmp_path, target_type="github")
+    reviewer = manager.build_tools(reviewer_profile, tmp_path)
 
     assert reviewer.tool_names == [
         "grep",
@@ -556,15 +555,7 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
         "read_file",
         "review_submit",
     ]
-    assert github_reviewer.tool_names == [
-        "github_review",
-        "grep",
-        "list_dir",
-        "read_file",
-        "review_submit",
-    ]
     assert not reviewer.has("github_review")
-    assert not github_reviewer.has("local_review")
     assert not reviewer.has("shell")
     assert not reviewer.has("write_file")
     assert not reviewer.has("edit_file")
@@ -575,7 +566,6 @@ def test_review_subagent_inherits_subagent_tool_config(tmp_path) -> None:
     tools_config = ToolsConfig()
     tools_config.exec.timeout = 123
     tools_config.restrict_to_workspace = False
-    tools_config.github_repo.token = "gh-test-token"
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -589,7 +579,6 @@ def test_review_subagent_inherits_subagent_tool_config(tmp_path) -> None:
 
     assert ctx.config.exec.timeout == 123
     assert ctx.config.restrict_to_workspace is True
-    assert ctx.config.github_repo.token == "gh-test-token"
 
 
 @pytest.mark.asyncio
@@ -1130,15 +1119,14 @@ async def test_subagent_hook_sets_request_context(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_subagent_read_file_blocked_for_github_target(tmp_path) -> None:
-    """read_file blocks local workspace reads when target_type is github."""
+async def test_subagent_read_file_stays_inside_review_root(tmp_path) -> None:
+    """Review subagents keep reads inside the review root (restricted workspace scope)."""
     (tmp_path / "local.py").write_text("x = 1\n", encoding="utf-8")
 
     manager = _explicit_profile_manager(tmp_path)
     tools = manager.build_tools(
         manager.resolve_profile({"profile_id": _TEST_PROFILE_ID}),
         tmp_path,
-        target_type="github",
     )
 
     hook = SubagentHook(
@@ -1147,7 +1135,10 @@ async def test_subagent_read_file_blocked_for_github_target(tmp_path) -> None:
         tools=tools,
         origin_channel="websocket",
         origin_chat_id="chat",
-        metadata={ReviewMetaKey.TARGET_TYPE: "github"},
+        metadata={
+            ReviewMetaKey.TARGET_TYPE: "local",
+            ReviewMetaKey.LOCAL_ROOT: str(tmp_path),
+        },
     )
 
     context = AgentHookContext(
@@ -1163,7 +1154,7 @@ async def test_subagent_read_file_blocked_for_github_target(tmp_path) -> None:
     read_tool = tools.get("read_file")
     assert read_tool is not None
     result = await read_tool.execute(path="local.py")
-    assert "cannot read local workspace files" in str(result).lower()
+    assert "x = 1" in str(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1272,8 +1263,8 @@ async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) -> None:
-    """For GitHub targets, successful github_review counts as evidence."""
+async def test_empty_findings_with_local_review_evidence_allows_no_findings(tmp_path) -> None:
+    """A successful local_review call counts as evidence for an empty findings list."""
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -1282,13 +1273,13 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
         execution_profiles=reviewer_execution_profiles(),
     )
 
-    class GithubEvidenceRunner:
+    class LocalEvidenceRunner:
         async def run(self, spec: AgentRunSpec) -> AgentRunResult:
             return AgentRunResult(
                 final_content=None,
                 messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
-                    {"name": "github_review", "status": "ok", "detail": "repo content"},
+                    {"name": "local_review", "status": "ok", "detail": "repo content"},
                     {
                         "name": "review_submit",
                         "status": "ok",
@@ -1298,7 +1289,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
                 ],
             )
 
-    manager.runner = GithubEvidenceRunner()  # type: ignore[assignment]
+    manager.runner = LocalEvidenceRunner()  # type: ignore[assignment]
     status = SubagentStatus(
         task_id="task1",
         label="security",
@@ -1312,7 +1303,7 @@ async def test_empty_findings_with_github_evidence_allows_no_findings(tmp_path) 
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
-        origin_metadata={"profile_id": "security", ReviewMetaKey.TARGET_TYPE: "github"},
+        origin_metadata={"profile_id": "security", ReviewMetaKey.TARGET_TYPE: "local"},
     )
 
     assert status.phase == "done"
@@ -1336,8 +1327,8 @@ async def test_review_turn_delegates_review_metadata_same_turn(tmp_path) -> None
     requests = _stub_review_execution(coordinator)
     session_key = "websocket:review"
     metadata = {
-        "review_target": "https://github.com/test/repo",
-        "review_target_type": "github",
+        "review_target": str(tmp_path),
+        "review_target_type": "local",
         "review_focus": ["dependency"],
         **_admit_review_run(coordinator, session_key),
     }
@@ -1352,8 +1343,8 @@ async def test_review_turn_delegates_review_metadata_same_turn(tmp_path) -> None
 
     assert runner.initial_messages is None
     assert len(requests) == 1
-    assert requests[0].metadata["review_target"] == "https://github.com/test/repo"
-    assert requests[0].metadata["review_target_type"] == "github"
+    assert requests[0].metadata["review_target"] == str(tmp_path)
+    assert requests[0].metadata["review_target_type"] == "local"
     assert requests[0].metadata["review_focus"] == ["dependency"]
     assert requests[0].msg.content.startswith("请审查登录逻辑")
 

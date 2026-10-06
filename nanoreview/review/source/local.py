@@ -26,7 +26,7 @@ _KEY_FILES = (
 
 
 class LocalRepoReader:
-    """Read the current workspace through a GitHub-reader-like interface."""
+    """Read the current workspace as the sole review evidence source."""
 
     def __init__(self, workspace: Path, options: ProgrammaticEvidenceOptions | None = None) -> None:
         self.workspace = workspace.expanduser().resolve()

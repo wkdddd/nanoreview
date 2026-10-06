@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import hashlib
 import json
 import os
-import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -22,12 +19,6 @@ from nanoreview.rag.chunker import TreeSitterChunker
 from nanoreview.rag.config import RAGRetrievalConfig
 from nanoreview.rag.index import RAGIndex
 from nanoreview.rag.runtime import RAGRuntime
-from nanoreview.review.file_filter import (
-    DEFAULT_REVIEW_BINARY_EXTS,
-    DEFAULT_REVIEW_IGNORE_DIRS,
-    DEFAULT_REVIEW_IGNORE_GLOBS,
-    review_file_filter_reason,
-)
 from nanoreview.rag.utils import (
     IndexedChunk,
     IndexedHit,
@@ -36,10 +27,15 @@ from nanoreview.rag.utils import (
     query_terms,
     rrf_merge,
 )
+from nanoreview.review.file_filter import (
+    DEFAULT_REVIEW_BINARY_EXTS,
+    DEFAULT_REVIEW_IGNORE_DIRS,
+    DEFAULT_REVIEW_IGNORE_GLOBS,
+    review_file_filter_reason,
+)
 from nanoreview.utils.log_style import log_event
 
 SOURCE_TYPE = "code_review"
-REMOTE_SOURCE_TYPE = "code_review_github"
 
 DEFAULT_IGNORE_DIRS = set(DEFAULT_REVIEW_IGNORE_DIRS)
 DEFAULT_BINARY_EXTS = set(DEFAULT_REVIEW_BINARY_EXTS)
@@ -149,8 +145,6 @@ class RepositoryRAGRequest:
     review_query: str
     max_results: int | None = None
     files: Iterable[Path] | None = None
-    snapshot_files: dict[str, str] | None = None
-    snapshot_name: str | None = None
     touched_lines: dict[str, list[int]] | None = None
     include_tests: bool | None = None
     related_tests: bool = True
@@ -161,27 +155,6 @@ class RepositoryRAGRequest:
 class RepositoryRAGResult:
     hits: list[RepoReviewHit]
     context: str
-    cache_root: Path | None = None
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _safe_slug(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "repo"
-
-
-def _snapshot_scope_digest(snapshot_name: str, files: dict[str, str]) -> str:
-    hasher = hashlib.sha256()
-    hasher.update(snapshot_name.encode("utf-8"))
-    hasher.update(b"\0")
-    for rel in sorted(files):
-        hasher.update(rel.encode("utf-8", errors="surrogatepass"))
-        hasher.update(b"\0")
-        hasher.update(hashlib.sha256(files[rel].encode("utf-8")).hexdigest().encode("ascii"))
-        hasher.update(b"\0")
-    return hasher.hexdigest()[:12]
 
 
 def _path_role_tags(rel_path: str, text: str = "") -> list[str]:
@@ -245,10 +218,6 @@ class RepositoryRAGService:
             return RepositoryRAGResult(hits=[], context="No relevant repository review references found.")
 
         files = list(request.files or [])
-        cache_root: Path | None = None
-        if request.snapshot_files is not None:
-            cache_root = self.write_snapshot(request.snapshot_name or request.source_type, request.snapshot_files)
-            files = list(self.iter_candidate_files(cache_root))
 
         log_event(
             logger,
@@ -316,7 +285,7 @@ class RepositoryRAGService:
             context_chars=len(context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
-        return RepositoryRAGResult(hits=hits, context=context, cache_root=cache_root)
+        return RepositoryRAGResult(hits=hits, context=context)
 
     def sync_files(
         self,
@@ -739,47 +708,6 @@ class RepositoryRAGService:
             if any(term and term in name for term in stem_terms):
                 matches.append(rel)
         return sorted(dict.fromkeys(matches))[:5]
-
-    def write_snapshot(self, snapshot_name: str, files: dict[str, str]) -> Path:
-        scope_digest = _snapshot_scope_digest(snapshot_name, files)
-        cache_root = (
-            self.workspace
-            / ".nanoreview"
-            / "review_github"
-            / f"{_safe_slug(snapshot_name)}_{scope_digest}"
-        )
-        start = time.perf_counter()
-        cache_root.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "snapshot": snapshot_name,
-            "scope_digest": scope_digest,
-            "files_count": len(files),
-            "created_at": _now_iso(),
-            "files": sorted(files),
-        }
-        for rel, text in files.items():
-            target = (cache_root / rel).resolve()
-            try:
-                target.relative_to(cache_root)
-            except ValueError:
-                logger.warning("rag.review.snapshot.skip unsafe_path={}", rel)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text, encoding="utf-8", newline="\n")
-        (cache_root / ".nanoreview_snapshot.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-            newline="\n",
-        )
-        logger.info(
-            "rag.review.snapshot.done snapshot={} cache={} files={} elapsed_ms={:.1f}",
-            snapshot_name,
-            cache_root,
-            len(files),
-            (time.perf_counter() - start) * 1000,
-        )
-        return cache_root
-
 
 @dataclass(frozen=True, slots=True)
 class PureRepoPath:

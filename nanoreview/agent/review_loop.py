@@ -296,7 +296,6 @@ class _ReviewInputs:
     validation_workspace: str
     changed_files: list[str]
     local_target: str | None
-    remote_diff: Any | None
     execution_context: ReviewExecutionContext
 
 
@@ -332,8 +331,8 @@ class ReviewLoop:
         self._context_window_tokens = context_window_tokens
         self._judge_factory = judge_factory
         self._artifacts = artifact_store or ReviewArtifactStore(self._workspace)
-        #: Resolves the review tool's evidence service (``local_review`` /
-        #: ``github_review``). Resolved lazily because tools are registered
+        #: Resolves the review tool's evidence service (``local_review``).
+        #: Resolved lazily because tools are registered
         #: after the loop is constructed.
         self._evidence_provider_getter = evidence_provider_getter
         # One-shot guard for the tokenizer-unavailable warning so long runs
@@ -662,8 +661,8 @@ class ReviewLoop:
         evidence = preparation.evidence or ReviewEvidenceBundle()
         self._require_evidence(preparation.plan, evidence)
 
-        changed_files, local_target, remote_diff, validation_workspace = (
-            self._resolve_execution_inputs(review_meta, evidence_provider)
+        changed_files, local_target, validation_workspace = (
+            self._resolve_execution_inputs(review_meta)
         )
         if session is not None:
             self._sync_review_metadata(session, review_meta)
@@ -689,7 +688,6 @@ class ReviewLoop:
             validation_workspace=validation_workspace,
             changed_files=changed_files,
             local_target=local_target,
-            remote_diff=remote_diff,
             execution_context=ReviewExecutionContext(
                 channel=request.channel,
                 chat_id=request.chat_id,
@@ -729,42 +727,17 @@ class ReviewLoop:
     def _resolve_execution_inputs(
         self,
         review_meta: dict[str, Any],
-        evidence_provider: Any | None,
-    ) -> tuple[list[str], str | None, Any | None, str]:
-        """Derive validation workspace, changed files, local target, remote diff.
+    ) -> tuple[list[str], str | None, str]:
+        """Derive validation workspace, changed files, and local target.
 
-        Remote (GitHub) reviews validate against the evidence provider's cache
-        root and carry its diff so the finalizer can quote the patch; local
-        reviews validate against the resolved local review root.
+        Local reviews validate findings against the resolved local review root.
         """
         validation_workspace = str(
             review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self._workspace
         )
         changed_files: list[str] = []
         local_target = review_meta.get(ReviewMetaKey.LOCAL_TARGET)
-        remote_diff: Any | None = None
-        target_type = (
-            str(review_meta.get(ReviewMetaKey.TARGET_TYPE) or "").strip().lower()
-        )
-        if (
-            target_type == "github"
-            and evidence_provider is not None
-        ):
-            diff_evidence = getattr(evidence_provider, "last_diff_evidence", None)
-            if diff_evidence is not None:
-                remote_diff = diff_evidence
-                changed_files = list(getattr(diff_evidence, "changed_files", []))
-                review_meta[ReviewMetaKey.GITHUB_PR_HEAD_REF] = getattr(
-                    diff_evidence, "head_sha", ""
-                )
-            cache_root = getattr(evidence_provider, "last_cache_root", None)
-            if cache_root is not None:
-                validation_workspace = str(cache_root)
-                changed_files = list(
-                    getattr(evidence_provider, "last_changed_files", [])
-                )
-                local_target = None
-        return changed_files, local_target, remote_diff, validation_workspace
+        return changed_files, local_target, validation_workspace
 
     def _sync_review_metadata(
         self, session: "Session", review_meta: dict[str, Any]
@@ -777,9 +750,7 @@ class ReviewLoop:
         changed = False
         for key in (
             ReviewMetaKey.ALLOWED_DIMENSIONS,
-            ReviewMetaKey.GITHUB_PREFETCH_READY,
             ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS,
-            ReviewMetaKey.GITHUB_PR_HEAD_REF,
             ReviewMetaKey.LOCAL_ROOT,
             ReviewMetaKey.LOCAL_TARGET,
             ReviewMetaKey.LOCAL_SCOPE_KIND,
@@ -928,7 +899,6 @@ class ReviewLoop:
             routing_mode=inputs.plan.routing_mode,
             selected_dimensions=[assignment.dimension for assignment in assignments],
             local_target=inputs.local_target,
-            remote_diff=inputs.remote_diff,
             skipped_files=tuple(inputs.evidence.skipped_by_file().values()),
         )
         await self._dispatch_and_collect(
@@ -1275,9 +1245,7 @@ class ReviewLoop:
         main_text = "\n".join(main_lines) or "(none)"
         related_text = "\n".join(related_lines) or "(none)"
         source_rule = (
-            "Use only the supplied GitHub evidence or precise github_review(meta/tree/file) calls."
-            if plan.target_type == "github"
-            else "Use only the supplied evidence or precise read_file calls within the review target."
+            "Use only the supplied evidence or precise read_file calls within the review target."
         )
         return f"""Review dimension: {assignment.dimension}
 Focus: {assignment.focus}

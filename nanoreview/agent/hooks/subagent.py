@@ -131,9 +131,8 @@ class SubagentHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         # Propagate review metadata into the subagent's ContextAware tools
-        # and the current-request context var so that local_review,
-        # github_review, and read_file can make correct target-type and
-        # workspace-boundary decisions.
+        # and the current-request context var so that local_review and
+        # read_file can make correct scope and workspace-boundary decisions.
         from nanoreview.agent.tools.context import (
             ContextAware,
             RequestContext,

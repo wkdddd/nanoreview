@@ -10,7 +10,6 @@ from pydantic_settings import BaseSettings
 
 if TYPE_CHECKING:
     from nanoreview.agent.tools.shell import ExecToolConfig
-    from nanoreview.review.source.github import GitHubRepoConfig
 
 
 class Base(BaseModel):
@@ -235,12 +234,8 @@ class ToolsConfig(Base):
     """
 
     exec: ExecToolConfig = Field(default_factory=lambda: _lazy_default("nanoreview.agent.tools.shell", "ExecToolConfig"))
-    approval_enabled: bool = False  # require user approval before executing tools
-    restrict_to_workspace: bool = False  # restrict all tool access to workspace directory
+    restrict_to_workspace: bool = False  # default tool access mode: False -> full, True -> restricted
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
-    github_repo: GitHubRepoConfig = Field(
-        default_factory=lambda: _lazy_default("nanoreview.review.source.github", "GitHubRepoConfig")
-    )
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
@@ -294,7 +289,6 @@ class ReviewConfig(Base):
     preview_target_chars: int = Field(default=600, ge=1)
     preview_hard_limit: int = Field(default=3_000, ge=1)
     subagent_reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = None
-    github_diff_enable: bool = True
     judge: ReviewJudgeSettings = Field(default_factory=ReviewJudgeSettings)
 
     @model_validator(mode="after")
@@ -493,12 +487,10 @@ def _resolve_tool_config_refs() -> None:
     import sys
 
     from nanoreview.agent.tools.shell import ExecToolConfig
-    from nanoreview.review.source.github import GitHubRepoConfig
 
     # Re-export into this module's namespace
     mod = sys.modules[__name__]
     mod.ExecToolConfig = ExecToolConfig  # type: ignore[attr-defined]
-    mod.GitHubRepoConfig = GitHubRepoConfig  # type: ignore[attr-defined]
     ToolsConfig.model_rebuild()
     Config.model_rebuild()
 

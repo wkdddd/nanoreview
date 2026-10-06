@@ -56,7 +56,7 @@ def test_review_role_sets() -> None:
 def test_build_code_review_context_mentions_all_severity_levels() -> None:
     """Unified strategy: the prompt demands coverage of every severity."""
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
+        target=r"C:\work\repo",
         max_subagents=4,
     )
 
@@ -66,7 +66,7 @@ def test_build_code_review_context_mentions_all_severity_levels() -> None:
 
 def test_build_code_review_context_includes_subagent_candidate_schema() -> None:
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
+        target=r"C:\work\repo",
         max_subagents=4,
     )
     assert "Review Finding Schema" in prompt
@@ -78,7 +78,7 @@ def test_build_code_review_context_includes_subagent_candidate_schema() -> None:
 
 def test_build_code_review_context_prohibits_coordinator_review_submit() -> None:
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
+        target=r"C:\work\repo",
         max_subagents=4,
     )
     assert "must NEVER call `review_submit`" in prompt
@@ -87,7 +87,7 @@ def test_build_code_review_context_prohibits_coordinator_review_submit() -> None
 
 def test_build_code_review_context_spawn_task_requires_target_and_evidence() -> None:
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
+        target=r"C:\work\repo",
         max_subagents=4,
         focus="security",
     )
@@ -99,7 +99,7 @@ def test_build_code_review_context_spawn_task_requires_target_and_evidence() -> 
 
 def test_build_code_review_context_matches_system_finalizer_boundary() -> None:
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
+        target=r"C:\work\repo",
         max_subagents=4,
     )
 
@@ -108,14 +108,15 @@ def test_build_code_review_context_matches_system_finalizer_boundary() -> None:
     assert "respond with accept/reject/uncertain" not in prompt
 
 
-def test_build_code_review_context_extracts_github_target() -> None:
+def test_build_code_review_context_ignores_github_url_without_local_target() -> None:
+    """GitHub URLs are no longer a review input; they are treated as an opaque local target."""
     prompt = build_code_review_context(
         user_content="please review https://github.com/test/repo.",
     )
 
-    assert "- Name: test/repo" in prompt
-    assert "- URL/Path: https://github.com/test/repo" in prompt
-    assert "- Type: github" in prompt
+    assert "- Type: local" in prompt
+    assert "- Type: github" not in prompt
+    assert "github_review" not in prompt
 
 
 def test_build_code_review_context_uses_local_target_type() -> None:
@@ -138,15 +139,16 @@ def test_build_code_review_context_extracts_local_path_inside_prompt() -> None:
     assert "- Type: local" in prompt
 
 
-def test_build_code_review_context_uses_github_target_type() -> None:
+def test_build_code_review_context_rejects_github_target_type() -> None:
+    """`github` is no longer a valid target type; the builder normalizes it away."""
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
+        target=r"C:\work\repo",
         target_type="github",
     )
 
-    assert "- Type: github" in prompt
-    assert "github_review(action='repo'" in prompt
-    assert "Do NOT clone repositories" in prompt
+    assert "- Type: local" in prompt
+    assert "- Type: github" not in prompt
+    assert "github_review" not in prompt
     assert "repo_review" not in prompt
     assert "github_repo_read" not in prompt
 
@@ -165,16 +167,16 @@ def test_build_code_review_context_requires_local_review_without_prefetch() -> N
 
 
 @pytest.mark.asyncio
-async def test_resolved_github_prompt_does_not_refetch_after_empty_prefetch() -> None:
+async def test_resolved_local_prompt_does_not_refetch_after_empty_prefetch() -> None:
     class EmptyEvidence:
         async def dispatch(self, **kwargs: object) -> str:
             return ""
 
     prompt = await resolve_code_review_context(
-        [{"role": "user", "content": "review https://github.com/test/repo"}],
+        [{"role": "user", "content": r"review C:\work\repo"}],
         {
-            "review_target": "https://github.com/test/repo",
-            "review_target_type": "github",
+            "review_target": r"C:\work\repo",
+            "review_target_type": "local",
             "_review_evidence_service": EmptyEvidence(),
         },
     )
@@ -186,8 +188,8 @@ async def test_resolved_github_prompt_does_not_refetch_after_empty_prefetch() ->
 
 def test_build_code_review_context_uses_user_requirements() -> None:
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
-        target_type="github",
+        target=r"C:\work\repo",
+        target_type="local",
         user_content="重点检查鉴权和回归风险",
     )
 
@@ -196,8 +198,8 @@ def test_build_code_review_context_uses_user_requirements() -> None:
 
 def test_dimension_contract_uses_forced_focus_dimensions() -> None:
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
-        target_type="github",
+        target=r"C:\work\repo",
+        target_type="local",
         focus="security,maintainability",
     )
 
@@ -210,8 +212,8 @@ def test_dimension_contract_uses_forced_focus_dimensions() -> None:
 
 def test_forced_performance_focus_keeps_performance_dimension() -> None:
     plan = build_review_plan(
-        target="https://github.com/test/repo",
-        target_type="github",
+        target=r"C:\work\repo",
+        target_type="local",
         focus="performance",
     )
 
@@ -219,8 +221,8 @@ def test_forced_performance_focus_keeps_performance_dimension() -> None:
     assert [role.name for role in plan.roles] == ["performance"]
 
     prompt = build_code_review_context(
-        target="https://github.com/test/repo",
-        target_type="github",
+        target=r"C:\work\repo",
+        target_type="local",
         focus="performance",
     )
 
@@ -230,13 +232,14 @@ def test_forced_performance_focus_keeps_performance_dimension() -> None:
     assert "Maintainability Reviewer" not in prompt
 
 
-def test_review_plan_resolves_pr_url_to_diff() -> None:
+def test_review_plan_treats_github_url_as_local_target() -> None:
+    """A GitHub PR URL is no longer resolved to a remote diff; it degrades to a local-ish plan."""
     plan = build_review_plan(target="https://github.com/test/repo/pull/42", target_type="github")
 
     assert plan is not None
-    assert plan.action == "diff"
-    assert plan.target_repo == "test/repo"
-    assert plan.pr_number == 42
+    assert plan.target_type == "local"
+    assert not hasattr(plan, "target_repo")
+    assert not hasattr(plan, "pr_number")
 
 
 @pytest.mark.parametrize("action", ["full_repo", "pr_diff", "local_changed"])
@@ -275,4 +278,4 @@ def test_code_review_is_not_registered_as_a_tool(tmp_path) -> None:
     assert "repo_review" not in loop.tool_names
     assert "review_judge" not in loop.tool_names
     assert "local_review" in loop.tool_names
-    assert "github_review" in loop.tool_names
+    assert "github_review" not in loop.tool_names

@@ -37,7 +37,6 @@ from nanoreview.review.input.local_git import (
 from nanoreview.review.input.normalizers import (
     normalize_requested_dimensions,
     normalize_review_action,
-    normalize_review_target_type,
 )
 from nanoreview.review.input.snapshot import (
     ReviewSnapshotError,
@@ -45,7 +44,6 @@ from nanoreview.review.input.snapshot import (
     build_snapshot,
     collect_repo_content,
 )
-from nanoreview.review.input.targets import parse_repo_target
 from nanoreview.review.source.utils import clean_scope_paths
 from nanoreview.review.types import (
     LocalReviewScope,
@@ -191,31 +189,16 @@ class ReviewAdmissionService:
                 field="target",
             )
         if request.target_type and request.target_type.strip().lower() not in {
-            "auto", "local", "github", "",
+            "auto", "local", "",
         }:
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.INVALID_TARGET_TYPE,
-                f"Unknown target type '{request.target_type}'.",
+                f"Unknown target type '{request.target_type}'. Only local targets are supported.",
                 field="target_type",
             )
-        target_type = normalize_review_target_type(request.target_type, target) or "local"
         session_key = request.session_key or f"review:{uuid.uuid4().hex[:12]}"
 
         self._reject_duplicate(session_key)
-
-        if target_type == "github":
-            # Remote targets are out of scope for this round; admission only
-            # records the request so the existing planning path is unchanged.
-            return self._persist(
-                self._admit_remote(
-                    request=request,
-                    session_key=session_key,
-                    action=action,
-                    roles=roles,
-                    routing_mode=routing_mode,
-                    target=target,
-                )
-            )
 
         return self._persist(
             self._admit_local(
@@ -261,67 +244,6 @@ class ReviewAdmissionService:
         )
 
     # -- admission paths ----------------------------------------------------
-
-    def _admit_remote(
-        self,
-        *,
-        request: ReviewAdmissionRequest,
-        session_key: str,
-        action: ReviewAction,
-        roles: list[Any],
-        routing_mode: str,
-        target: str,
-    ) -> ReviewAdmission:
-        repo = parse_repo_target(target)
-        plan = ReviewPlan(
-            target=target,
-            target_name=target,
-            target_type="github",
-            action=action,
-            roles=roles,
-            routing_mode=routing_mode,  # type: ignore[arg-type]
-            user_requirements=(request.content or "").strip(),
-            target_repo=repo,
-        )
-        run_id = new_review_run_id()
-        fingerprint = compute_input_fingerprint(
-            target=target,
-            target_type="github",
-            action=action.value,
-            roles=[role.name for role in roles],
-            scope={"repo": repo, "session": session_key},
-        )
-        snapshot_ref = self._write_snapshot(
-            build_snapshot(
-                run_id=run_id,
-                session_key=session_key,
-                action=action.value,
-                target_type="github",
-                target=target,
-                input_fingerprint=fingerprint,
-                extra_metadata={"repo": repo},
-            )
-        )
-        return ReviewAdmission(
-            session_key=session_key,
-            run_id=run_id,
-            input_fingerprint=fingerprint,
-            action=action,
-            target_type="github",
-            target=target,
-            content=request.content.strip() or f"Review {target}",
-            plan=plan,
-            scope=None,
-            snapshot_ref=snapshot_ref,
-            metadata=self._metadata_payload(
-                plan=plan,
-                run_id=run_id,
-                fingerprint=fingerprint,
-                snapshot_ref=snapshot_ref,
-                focus=request.focus,
-                max_concurrent_subagents=request.max_concurrent_subagents,
-            ),
-        )
 
     def _admit_local(
         self,

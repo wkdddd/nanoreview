@@ -30,5 +30,4 @@ __all__ = [
     "tool_parameters_schema",
     "unsplash",
     "local_review",
-    "github_review",
 ]

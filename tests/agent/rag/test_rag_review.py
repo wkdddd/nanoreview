@@ -7,7 +7,6 @@ import pytest
 from loguru import logger
 
 from nanoreview.rag.review_service import (
-    REMOTE_SOURCE_TYPE,
     RepoReviewHit,
     RepositoryRAGOptions,
     RepositoryRAGRequest,
@@ -22,17 +21,8 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceResult,
     ProgrammaticEvidenceService,
 )
-from nanoreview.review.source.utils import (
-    changed_lines_from_patch,
-    parse_pr_target,
-    parse_repo,
-)
-from nanoreview.review.types import GitHubDiffEvidence, LocalReviewScope
-
-
-class _GitHub:
-    def __init__(self, *, enable: bool = True) -> None:
-        self.config = type("GitHubConfig", (), {"enable": enable, "max_index_files": 400})()
+from nanoreview.review.source.utils import changed_lines_from_patch
+from nanoreview.review.types import LocalReviewScope
 
 
 class _LogSink:
@@ -68,16 +58,6 @@ def _git(cwd: Path, *args: str) -> None:
         text=True,
         encoding="utf-8",
     )
-
-
-def test_parse_github_repo_from_url_and_owner_repo() -> None:
-    assert parse_repo("https://github.com/test/repo.") == ("test", "repo")
-    assert parse_repo("test/repo.git") == ("test", "repo")
-
-
-def test_parse_pr_target_from_url() -> None:
-    assert parse_pr_target("https://github.com/test/repo/pull/42") == ("test/repo", 42)
-    assert parse_pr_target("test/repo") == (None, None)
 
 
 def test_changed_lines_from_patch_fallback() -> None:
@@ -427,40 +407,6 @@ async def test_dispatch_local_repo_forwards_context_window(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_github_repo_forwards_context_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    captured: dict[str, object] = {}
-
-    async def fake_fetch_text_files(*_args: object, **_kwargs: object):
-        return "test/repo@main", {"src/auth.py": "token = 'x'\n"}
-
-    async def fake_retrieve(request: ProgrammaticEvidenceRequest) -> ProgrammaticEvidenceResult:
-        captured["request"] = request
-        return ProgrammaticEvidenceResult(units=[_unit()], skipped=[], context="context", mode="direct")
-
-    monkeypatch.setattr(service.github, "fetch_text_files", fake_fetch_text_files)
-    monkeypatch.setattr(service.preprocessor, "retrieve", fake_retrieve)
-
-    result = await service.dispatch(
-        target_type="github",
-        action="repo",
-        repo="test/repo",
-        review_query="auth",
-        max_results=5,
-        include_tests=True,
-        trace_id="trace-1",
-        context_window_tokens=131_072,
-    )
-
-    assert result == "context"
-    request = captured["request"]
-    assert isinstance(request, ProgrammaticEvidenceRequest)
-    assert request.context_window_tokens == 131_072
-
-
-@pytest.mark.asyncio
 async def test_dispatch_local_diff_forwards_context_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -496,96 +442,6 @@ async def test_dispatch_local_diff_forwards_context_window(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_github_diff_forwards_context_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    captured: dict[str, object] = {}
-
-    async def fake_fetch_pr_files(*_args: object, **_kwargs: object):
-        return GitHubDiffEvidence(
-            snapshot="test/repo#42",
-            head_sha="abc123",
-            patches={"src/auth.py": "@@ -1 +1 @@\n-old\n+new"},
-            changed_files=["src/auth.py"],
-            touched_lines={"src/auth.py": [1]},
-        )
-
-    def fake_diff_units(
-        patches: dict[str, str], *, review_query: str, context_window_tokens: int | None = None
-    ) -> ProgrammaticEvidenceResult:
-        captured["window"] = context_window_tokens
-        return ProgrammaticEvidenceResult(
-            units=[_unit(text="+new")], skipped=[], context="context", mode="direct"
-        )
-
-    monkeypatch.setattr(service.github, "fetch_pr_files", fake_fetch_pr_files)
-    monkeypatch.setattr(service.preprocessor, "diff_units", fake_diff_units)
-
-    result = await service.dispatch(
-        target_type="github",
-        action="diff",
-        repo="test/repo",
-        pr_number=42,
-        review_query="auth",
-        max_results=5,
-        include_tests=True,
-        trace_id="trace-1",
-        context_window_tokens=65_536,
-    )
-
-    assert result == "context"
-    assert captured["window"] == 65_536
-
-
-@pytest.mark.asyncio
-async def test_review_evidence_github_diff_uses_patches_without_rag(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    sink = _LogSink()
-    handler_id = logger.add(sink, level="INFO", format="{message}")
-
-    async def fake_fetch_pr_files(*_args: object, **_kwargs: object):
-        return GitHubDiffEvidence(
-            snapshot="test/repo#42",
-            head_sha="abc123",
-            patches={"src/auth.py": "@@ -1 +1 @@\n-old\n+def auth(): pass"},
-            changed_files=["src/auth.py", "src/big.py"],
-            touched_lines={"src/auth.py": [1]},
-            patch_unavailable_files={"src/big.py": "patch_unavailable"},
-        )
-
-    async def fail_snapshot_context(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("diff review must not create a snapshot")
-
-    monkeypatch.setattr(service.github, "fetch_pr_files", fake_fetch_pr_files)
-    monkeypatch.setattr(service, "retrieve_snapshot_context", fail_snapshot_context)
-    try:
-        result = await service.github_diff_context(
-            repo="test/repo",
-            pr_number=42,
-            review_query="auth",
-            max_results=5,
-            include_tests=True,
-            trace_id="trace-1",
-        )
-    finally:
-        logger.remove(handler_id)
-
-    assert "def auth(): pass" in result
-    assert service.last_result is not None
-    assert [unit.path for unit in service.last_result.units] == ["src/auth.py"]
-    assert [(unit.path, unit.reason) for unit in service.last_result.skipped] == [
-        ("src/big.py", "patch_unavailable")
-    ]
-    assert "review.evidence.github_diff.done" in sink.text
-    assert "status=success" in sink.text
-    assert "trace_id=trace-1" in sink.text
-
-
-@pytest.mark.asyncio
 async def test_repository_rag_logs_empty_query_and_no_terms(tmp_path: Path) -> None:
     service = RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False))
     sink = _LogSink()
@@ -609,64 +465,3 @@ async def test_repository_rag_logs_empty_query_and_no_terms(tmp_path: Path) -> N
     assert hits == []
     assert "status=empty_query" in sink.text
     assert "status=no_terms" in sink.text
-
-
-def test_repository_rag_snapshot_cache_is_scoped_by_file_set(tmp_path: Path) -> None:
-    service = RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False))
-
-    broad = service.write_snapshot(
-        "owner/repo@main",
-        {
-            "review-webui/index.html": "<html></html>",
-            "review-webui/src/App.tsx": "export function App() {}",
-        },
-    )
-    narrow = service.write_snapshot(
-        "owner/repo@main",
-        {"review-webui/index.html": "<html></html>"},
-    )
-    narrow_again = service.write_snapshot(
-        "owner/repo@main",
-        {"review-webui/index.html": "<html></html>"},
-    )
-
-    assert broad != narrow
-    assert narrow == narrow_again
-    assert [path.relative_to(narrow).as_posix() for path in service.iter_candidate_files(narrow)] == [
-        "review-webui/index.html"
-    ]
-    manifest = (narrow / ".nanoreview_snapshot.json").read_text(encoding="utf-8")
-    assert '"scope_digest"' in manifest
-    assert '"files_count": 1' in manifest
-
-
-def test_repository_rag_snapshot_sync_prunes_previous_scope(tmp_path: Path) -> None:
-    service = RepositoryRAGService(tmp_path, options=RepositoryRAGOptions(enable_chonkie=False))
-    broad = service.write_snapshot(
-        "owner/repo@main",
-        {
-            "review-webui/index.html": "<html></html>",
-            "review-webui/src/App.tsx": "export function App() {}",
-        },
-    )
-    narrow = service.write_snapshot(
-        "owner/repo@main",
-        {"review-webui/index.html": "<html></html>"},
-    )
-
-    service.sync_files(
-        source_type=REMOTE_SOURCE_TYPE,
-        files=list(service.iter_candidate_files(broad)),
-        trace_id="broad",
-    )
-    assert service.index.count(REMOTE_SOURCE_TYPE) == 2
-
-    service.sync_files(
-        source_type=REMOTE_SOURCE_TYPE,
-        files=list(service.iter_candidate_files(narrow)),
-        trace_id="narrow",
-    )
-
-    chunk_paths = [chunk.path for chunk in service.index.list_chunks(REMOTE_SOURCE_TYPE)]
-    assert len(chunk_paths) == 1
-    assert chunk_paths[0].endswith("review-webui/index.html")

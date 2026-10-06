@@ -815,14 +815,14 @@ from nanoreview.bus.queue import MessageBus
 
 @app.command()
 def review(
-    target: str | None = typer.Argument(None, help="Local file/directory path or GitHub repository URL"),
+    target: str | None = typer.Argument(None, help="Local file or directory path to review"),
     focus: str | None = typer.Option(
         None,
         "--focus",
         "-f",
         help="Comma-separated reviewer dimensions (bug,security,performance,maintainability), or auto",
     ),
-    target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto, github, or local"),
+    target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto or local"),
     action: str = typer.Option("repo", "--action", help="Review action: repo or diff"),
     max_concurrent_subagents: int | None = typer.Option(
         None,
@@ -835,7 +835,7 @@ def review(
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render output as Markdown"),
     output: str | None = typer.Option(None, "--output", "-o", help="Save report to file"),
 ):
-    """Review a local or GitHub repository with CodeReviewAgent."""
+    """Review a local target with CodeReviewAgent."""
     from nanoreview.cli.stream import StreamRenderer
     from nanoreview.review.admission import (
         ReviewAdmissionError,
@@ -844,8 +844,8 @@ def review(
     from nanoreview.review.input import normalize_review_action
     from nanoreview.review.types import ReviewMetaKey
 
-    if target_type not in ("auto", "github", "local"):
-        console.print(f"[red]Invalid --target-type '{target_type}'. Must be: auto, github, or local[/red]")
+    if target_type not in ("auto", "local"):
+        console.print(f"[red]Invalid --target-type '{target_type}'. Must be: auto or local[/red]")
         raise typer.Exit(1)
     try:
         normalize_review_action(action)
@@ -856,7 +856,7 @@ def review(
         console.print(f"[red]Invalid --fail-on '{fail_on}'. Must be: critical, high, medium, or low[/red]")
         raise typer.Exit(1)
     if not target or not target.strip():
-        target = typer.prompt("Review target (local file/directory path or GitHub URL)").strip()
+        target = typer.prompt("Review target (local file or directory path)").strip()
     if not target:
         console.print("[red]Error: review target is required[/red]")
         raise typer.Exit(1)

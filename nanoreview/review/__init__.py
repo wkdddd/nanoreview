@@ -22,20 +22,19 @@ from nanoreview.review.profiles import (
     get_reviewer_profile,
     public_reviewer_profiles,
 )
-from nanoreview.review.source.github import GitHubRepoConfig, GitHubRepoReader
 from nanoreview.review.source.local import LocalRepoReader
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     DEFAULT_REVIEW_ROLES,
     OPTIONAL_REVIEW_ROLES,
     SEVERITY_ORDER,
+    EvidenceReference,
     Finding,
     FindingVerdict,
-    EvidenceReference,
     ReviewAction,
     ReviewAssignment,
-    ReviewEvidenceBundle,
     ReviewDimensionResult,
+    ReviewEvidenceBundle,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
     ReviewJudgeDecision,
@@ -56,8 +55,6 @@ __all__ = [
     "Finding",
     "FindingVerdict",
     "EvidenceReference",
-    "GitHubRepoConfig",
-    "GitHubRepoReader",
     "LocalRepoReader",
     "ReviewAction",
     "ReviewAssignment",

@@ -21,16 +21,13 @@ class ReviewMetaKey:
     TARGET_TYPE = "review_target_type"
     ACTION = "review_action"
     REQUESTED_DIMENSIONS = "review_focus"
-    TARGET_REF = "review_target_ref"
     LOCAL_ROOT = "review_local_root"
     LOCAL_TARGET = "review_local_target"
     LOCAL_SCOPE_KIND = "review_local_scope_kind"
     MAX_CONCURRENT_SUBAGENTS = "max_concurrent_subagents"
     ALLOWED_DIMENSIONS = "allowed_review_dimensions"
     EVIDENCE_PROVIDER = "_review_evidence_service"
-    GITHUB_PREFETCH_READY = "_review_github_prefetch_ready"
     DIFF_CONTEXT_WINDOW_TOKENS = "_review_diff_context_window_tokens"
-    GITHUB_PR_HEAD_REF = "_review_github_pr_head_ref"
     # One-shot ReviewAgent run state (stable wire contract consumed by
     # WebUI/API and the report artifact API).
     RUN_ID = "review_run_id"
@@ -52,7 +49,7 @@ class ReviewMetaKey:
     #: not inject the same report twice.
     HANDOFF_RUN_ID = "review_handoff_run_id"
 
-ReviewTargetType = Literal["auto", "github", "local"]
+ReviewTargetType = Literal["auto", "local"]
 ReviewScopeKind = Literal["file", "directory", "repo"]
 ReviewRoutingMode = Literal["auto", "explicit"]
 
@@ -60,18 +57,6 @@ ReviewRoutingMode = Literal["auto", "explicit"]
 class ReviewAction(StrEnum):
     REPO = "repo"
     DIFF = "diff"
-
-
-@dataclass(slots=True)
-class GitHubDiffEvidence:
-    """Evidence collected from one GitHub pull request."""
-
-    snapshot: str
-    head_sha: str
-    patches: dict[str, str] = field(default_factory=dict)
-    changed_files: list[str] = field(default_factory=list)
-    touched_lines: dict[str, list[int]] = field(default_factory=dict)
-    patch_unavailable_files: dict[str, str] = field(default_factory=dict)
 
 
 def review_action_values() -> tuple[str, ...]:
@@ -174,11 +159,6 @@ class ReviewPlan:
     roles: list[ReviewRole]
     routing_mode: ReviewRoutingMode
     user_requirements: str = ""
-    target_repo: str | None = None
-    pr_number: int | None = None
-    target_ref: str | None = None
-    target_subpath: str | None = None
-    target_subpath_kind: str | None = None
     local_scope: LocalReviewScope | None = None
     prefetch_summary: str | None = None
 
@@ -406,40 +386,11 @@ class ReviewEvidenceProvider(Protocol):
         context_window_tokens: int | None = None,
     ) -> str: ...
 
-    async def github_context(
-        self,
-        *,
-        repo: str,
-        ref: str | None,
-        tree_pattern: str | None,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        trace_id: str,
-        context_window_tokens: int | None = None,
-    ) -> str: ...
-
-    async def github_diff_context(
-        self,
-        *,
-        repo: str,
-        pr_number: int,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        trace_id: str,
-        context_window_tokens: int | None = None,
-    ) -> str: ...
-
     async def dispatch(
         self,
         *,
         target_type: str,
         action: str,
-        repo: str = "",
-        ref: str | None = None,
-        pr_number: int = 0,
-        tree_pattern: str | None = None,
         target_subpath: str | None = None,
         target_subpath_kind: str | None = None,
         review_query: str | None = None,

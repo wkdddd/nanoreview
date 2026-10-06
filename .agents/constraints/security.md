@@ -2,8 +2,12 @@
 
 ## 工具权限
 
+权限只在工具调用层处理，不做逐工具 approval、不做用户确认回环；每个 turn 由 workspace scope 一次性决定访问范围。
+
 - 文件路径经现有 path 工具解析，启用 workspace 限制时必须检查边界；额外 root 按用途授予只读、可写或精确文件权限。
-- 审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。
+- Conversation Agent 每 turn 解析一个 `WorkspaceScope`（`agent/tools/workspace_scope.py`，`access_mode` 为 `restricted`/`full`），来源优先级 message metadata → session metadata → 全局配置，非法 payload 整体回退到配置默认值；解析后 turn 内不可变，不逐工具等待确认。
+- 默认 `ToolsConfig.restrict_to_workspace=False` 即 `full`；`True` 即 `restricted`。别名 `restrict`/`full-access` 归一化为规范值。
+- ReviewLoop、planner、reviewer、Judge 固定使用 `restricted` scope（`review_workspace_scope()`），不接受会话 metadata 放宽；审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。
 - `restrict_to_workspace` 是应用层防护，不替代操作系统或容器隔离；执行隔离复用 `agent/tools/sandbox.py`。
 
 ## 网络
@@ -14,12 +18,19 @@
 - DNS pin 改的是进程全局 `socket.getaddrinfo`，互斥必须用线程级锁并按嵌套计数，只有最外层恢复原解析器；每事件循环各持一把 `asyncio.Lock`（弱引用键），不可用单个模块级 `asyncio.Lock` —— 它会绑定到第一个 await 它的 loop，之后换 loop 直接抛 `bound to a different event loop`。回归见 `tests/security/test_network_guards.py`。
 - 环境代理（`HTTP_PROXY`/`HTTPS_PROXY`）与 SSRF 白名单必须一致：被 `tools.ssrf_whitelist` 放行的 loopback 目标要同时豁免代理，否则白名单只对「探测/首个请求」生效，后续请求仍被送进代理。症状是本地 MCP 服务器的 SSE 消息端点被代理回 `404`，只有 `/sse` 流连得上。`httpx_env_proxy_mounts` 与 `env_proxy_applies_to_url` 必须用同一套豁免规则（httpx mount 只按 host 匹配，不接受 CIDR）。
 
+## Review 输入边界
+
+- review 唯一输入是本地：admission 只接受 `auto`/`local` target type，`github` 等值按 `invalid_target_type` 拒绝；GitHub URL 不再特判，退化为普通本地路径校验。
+- 不提供 GitHub source、`github_review` 工具、远程 snapshot/cache、GitHub metadata/evidence 或远程 diff 校验入口；`ReviewPlan` 无 `target_repo`/`pr_number`/`target_ref`/`target_subpath` 字段，`ReviewMetaKey` 无 `TARGET_REF`/`GITHUB_PREFETCH_READY`/`GITHUB_PR_HEAD_REF`。
+- 通用联网能力不受影响并须保留：模型 provider HTTP/OAuth（含 `github-copilot`）、`web_search`、`web_fetch`、stdio/SSE/Streamable HTTP MCP，以及 SSRF/重定向/私网/代理校验；`_GITHUB_TOKEN` 日志脱敏、`.github/workflows` 忽略路径、`HTTP-Referer` 常量与 OAuth provider 同属非 review 能力，不随本次收敛删除。
+- 回归见 `tests/agent/tools/test_stage4_boundaries.py`。
+
 ## MCP
 
 - MCP 的 HTTP/SSE 请求逐次校验，包括重定向目标和 SSE 后续请求；`PinnedDNSAsyncTransport` 在校验与连接之间固定 DNS 结果，防止校验与使用分属不同解析。私有端点同样需要 `tools.ssrf_whitelist`，本地 HTTP MCP 服务器必须显式放行。
 - `mcpServers.headers` 常含凭据。日志与错误只输出脱敏 URL（`_redact_url` 去掉凭据、query 与 path），不记录完整 URL、header 值和工具返回内容；工具内容按 `RequestContext.log_content` 控制。
 - 配置了 OAuth（`auth: oauth`）时明确报错并拒绝连接，不静默忽略后按无鉴权连接。
-- MCP 工具**不触发逐工具 approval 确认**，即使 `approval_enabled=true`。MCP 外部服务也不受本地文件工具的 workspace guard 或 shell sandbox 约束，访问范围须在服务启动参数及其自身权限中限制。
+- MCP 外部服务不受本地文件工具的 workspace scope 或 shell sandbox 约束，访问范围须在服务启动参数及其自身权限中限制。
 - 沿用上游自动重试：瞬时故障会重试一次，**可能重复执行写入操作**。不提供恰好执行一次的保证，也不回滚已发生的操作。
 - 连接在进程内共享，因此服务端会话状态也共享；`cwd` 取自 MCP 配置，不随 Conversation 的目标仓库切换。
 

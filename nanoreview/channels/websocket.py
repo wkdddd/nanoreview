@@ -31,18 +31,17 @@ from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
 from nanoreview.agent.review_state import ReviewArtifactError, ReviewArtifactStore
-from nanoreview.bus.events import OUTBOUND_META_AGENT_UI, InboundMessage, OutboundMessage
+from nanoreview.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.channels.base import BaseChannel
 from nanoreview.command.builtin import builtin_command_palette
 from nanoreview.config.paths import get_media_dir
 from nanoreview.config.schema import Base, Config
-from nanoreview.review import normalize_review_action, normalize_review_target_type
+from nanoreview.review import normalize_review_action
 from nanoreview.review.admission import (
     ReviewAdmissionError,
     ReviewAdmissionRequest,
 )
-from nanoreview.review.input import parse_repo_target
 from nanoreview.review.profiles import public_reviewer_profiles
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import safe_filename
@@ -542,7 +541,6 @@ class WebSocketChannel(BaseChannel):
     async def _cleanup_connection(self, connection: Any) -> None:
         """Remove *connection* from every subscription set; safe to call multiple times."""
         chat_ids = self._conn_chats.pop(connection, set())
-        orphaned_chats: list[str] = []
         for cid in chat_ids:
             subs = self._subs.get(cid)
             if subs is None:
@@ -550,18 +548,7 @@ class WebSocketChannel(BaseChannel):
             subs.discard(connection)
             if not subs:
                 self._subs.pop(cid, None)
-                orphaned_chats.append(cid)
         self._conn_default.pop(connection, None)
-        for cid in orphaned_chats:
-            await self.bus.publish_inbound(
-                InboundMessage(
-                    channel="websocket",
-                    chat_id=cid,
-                    sender_id="",
-                    content="",
-                    metadata={"_permission_disconnect": True},
-                )
-            )
 
     async def _maybe_push_turn_run_wall_clock(self, chat_id: str) -> None:
         """Replay ``goal_status: running`` when a turn is still active (same-process refresh)."""
@@ -570,33 +557,9 @@ class WebSocketChannel(BaseChannel):
             return
         await self.send_goal_status(chat_id, "running", started_at=t0)
 
-    async def _maybe_push_session_approval_state(self, chat_id: str) -> None:
-        """Replay session approval toggle after subscribe so refreshes restore it."""
-        if self._session_manager is None:
-            return
-        row = self._session_manager.read_session_file(f"websocket:{chat_id}")
-        meta = row.get("metadata", {}) if isinstance(row, dict) else {}
-        if not isinstance(meta, dict):
-            meta = {}
-        perms = meta.get("permissions", {})
-        if not isinstance(perms, dict):
-            return
-        approval_enabled = bool(perms.get("approval_enabled", False))
-        if not approval_enabled:
-            return
-        conns = list(self._subs.get(chat_id, ()))
-        for conn in conns:
-            await self._send_event(
-                conn,
-                "session_permission_updated",
-                chat_id=chat_id,
-                approval_enabled=approval_enabled,
-            )
-
     async def _hydrate_after_subscribe(self, chat_id: str) -> None:
         """Replay goal/run strip state after subscribe (same-process refresh)."""
         await self._maybe_push_turn_run_wall_clock(chat_id)
-        await self._maybe_push_session_approval_state(chat_id)
 
     async def _send_event(self, connection: Any, event: str, **fields: Any) -> None:
         """Send a control event (attached, error, ...) to a single connection."""
@@ -1310,40 +1273,6 @@ class WebSocketChannel(BaseChannel):
 
         raise CodeContextError(404, "file not found")
 
-    def _resolve_github_snapshot_file(self, metadata: dict[str, Any], rel_path: str) -> Path:
-        workspace = self._workspace_root()
-        cache_root = workspace / ".nanoreview" / "review_github"
-        if not cache_root.is_dir():
-            raise CodeContextError(404, "review snapshot not found")
-        raw_target = str(metadata.get("review_target") or "").strip()
-        target = parse_repo_target(raw_target) or raw_target
-        candidates: list[Path] = []
-        for manifest in cache_root.glob("*/.nanoreview_snapshot.json"):
-            snapshot_dir = manifest.parent
-            try:
-                data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            files = data.get("files")
-            snapshot_name = str(data.get("snapshot") or "")
-            manifest_files = {str(item).replace("\\", "/") for item in files} if isinstance(files, list) else set()
-            if manifest_files and rel_path not in manifest_files:
-                continue
-            if target and target not in snapshot_name and snapshot_name not in target:
-                continue
-            candidates.insert(0, snapshot_dir)
-        for snapshot_dir in candidates:
-            try:
-                root = snapshot_dir.resolve()
-                root.relative_to(cache_root.resolve())
-                candidate = (root / rel_path).resolve()
-                candidate.relative_to(root)
-            except (OSError, ValueError):
-                continue
-            if candidate.is_file():
-                return candidate
-        raise CodeContextError(404, "file not found in review snapshot")
-
     def _code_context_payload(
         self,
         key: str,
@@ -1390,16 +1319,8 @@ class WebSocketChannel(BaseChannel):
                         except (ValueError, OSError):
                             pass
         rel_path = self._normal_code_rel_path(_raw)
-        target_type = normalize_review_target_type(
-            str(metadata.get("review_target_type") or ""),
-            str(metadata.get("review_target") or "") or None,
-        )
-        if target_type == "github":
-            target = self._resolve_github_snapshot_file(metadata, rel_path)
-            source = "github_snapshot"
-        else:
-            target = self._resolve_local_code_file(metadata, rel_path)
-            source = "local"
+        target = self._resolve_local_code_file(metadata, rel_path)
+        source = "local"
         payload = self._read_utf8_context(
             target,
             file_label=rel_path,
@@ -2412,49 +2333,6 @@ class WebSocketChannel(BaseChannel):
                 is_dm=False,
             )
             return
-        if t == "permission_response":
-            request_id = envelope.get("request_id")
-            approved = envelope.get("approved", False)
-            cid = envelope.get("chat_id")
-            if not isinstance(request_id, str) or not request_id:
-                await self._send_event(connection, "error", detail="missing request_id")
-                return
-            if not _is_valid_chat_id(cid):
-                await self._send_event(connection, "error", detail="invalid chat_id")
-                return
-            self._try_append_webui_transcript(
-                cid, {"event": "permission_response", "request_id": request_id, "approved": bool(approved)}
-            )
-            await self.bus.publish_inbound(
-                InboundMessage(
-                    channel="websocket",
-                    chat_id=cid,
-                    sender_id=client_id,
-                    content="",
-                    metadata={"_permission_response": {"request_id": request_id, "approved": bool(approved)}},
-                )
-            )
-            return
-        if t == "set_session_permission":
-            cid = envelope.get("chat_id")
-            approval_enabled = bool(envelope.get("approval_enabled", False))
-            if not _is_valid_chat_id(cid):
-                await self._send_event(connection, "error", detail="invalid chat_id")
-                return
-            logger.info("session websocket:{} tool approval: {}", cid, "enabled" if approval_enabled else "disabled")
-            if self._session_manager is not None:
-                session_key = f"websocket:{cid}"
-                session = self._session_manager.get_or_create(session_key)
-                perms = session.metadata.setdefault("permissions", {})
-                perms["approval_enabled"] = approval_enabled
-                self._session_manager.save(session)
-            await self._send_event(
-                connection,
-                "session_permission_updated",
-                chat_id=cid,
-                approval_enabled=approval_enabled,
-            )
-            return
         await self._send_event(connection, "error", detail=f"unknown type: {t!r}")
 
     async def stop(self) -> None:
@@ -2492,19 +2370,6 @@ class WebSocketChannel(BaseChannel):
                 model_name=msg.metadata.get("model"),
                 model_preset=msg.metadata.get("model_preset"),
             )
-            return
-
-        if msg.metadata.get("_permission_request"):
-            payload = msg.metadata["_permission_request"]
-            self._try_append_webui_transcript(msg.chat_id, {"event": "permission_request", **payload})
-            conns = list(self._subs.get(msg.chat_id, ()))
-            for conn in conns:
-                await self._send_event(
-                    conn,
-                    "permission_request",
-                    chat_id=msg.chat_id,
-                    **payload,
-                )
             return
 
         # Snapshot the subscriber set so ConnectionClosed cleanups mid-iteration are safe.

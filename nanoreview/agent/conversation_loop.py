@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 from loguru import logger
 
@@ -57,10 +58,15 @@ from nanoreview.agent.tools.file_state import (
 from nanoreview.agent.tools.loader import ToolLoader
 from nanoreview.agent.tools.message import MessageTool
 from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.agent.tools.workspace_scope import (
+    WorkspaceScope,
+    resolve_workspace_scope,
+)
 from nanoreview.bus.events import InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.events import NO_EVENTS, EventSink, StreamDeltaEvent, StreamEndEvent
 from nanoreview.review import apply_review_metadata_from_message
+from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.artifacts import generated_image_paths_from_messages
 from nanoreview.utils.document import extract_documents
 from nanoreview.utils.helpers import image_placeholder_text
@@ -81,7 +87,7 @@ if TYPE_CHECKING:
 MAX_PENDING_CONVERSATION_MESSAGES = 20
 
 #: Tools that stay review-only: the conversation agent never sees them.
-_CONVERSATION_DENIED_TOOLS = frozenset({"local_review", "github_review"})
+_CONVERSATION_DENIED_TOOLS = frozenset({"local_review"})
 
 _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 _PENDING_USER_TURN_KEY = "pending_user_turn"
@@ -161,13 +167,6 @@ class ConversationLoop:
         review_config: Any = None,
         provider_snapshot_loader: Callable[..., Any] | None = None,
         background_scheduler: Callable[[Awaitable[Any]], None] | None = None,
-        permission_requester: (
-            Callable[
-                [str, dict[str, Any], "asyncio.Future[bool]", str, str],
-                Awaitable[bool],
-            ]
-            | None
-        ) = None,
         hooks: list[AgentHook] | None = None,
         hooks_getter: Callable[[], list[AgentHook]] | None = None,
         usage_recorder: Callable[[dict[str, int]], None] | None = None,
@@ -194,7 +193,6 @@ class ConversationLoop:
         self._review_config = review_config
         self._provider_snapshot_loader = provider_snapshot_loader
         self._background_scheduler = background_scheduler
-        self._permission_requester = permission_requester
         self._extra_hooks: list[AgentHook] = hooks if hooks is not None else []
         # Dynamic accessor so the owner (coordinator/SDK) can swap its hook
         # list between turns; falls back to the static list when absent.
@@ -439,28 +437,6 @@ class ConversationLoop:
     # -- runner -------------------------------------------------------------
 
     async def _run_runner(self, ctx: _TurnContext) -> AgentRunResult:
-        from nanoreview.agent.tools.permissions import resolve_policy
-
-        permission_policy = resolve_policy(
-            self._tools_config,
-            ctx.session.metadata if ctx.session is not None else {},
-        )
-
-        async def _permission_request_cb(
-            request_id: str,
-            payload: dict[str, Any],
-            future: asyncio.Future[bool],
-        ) -> bool:
-            if self._permission_requester is None:
-                return False
-            return await self._permission_requester(
-                request_id,
-                payload,
-                future,
-                ctx.outbound_channel or ctx.msg.channel,
-                ctx.outbound_chat_id or ctx.msg.chat_id,
-            )
-
         hook = build_agent_turn_hook(
             AgentTurnHookSpec(
                 events=ctx.events,
@@ -519,8 +495,6 @@ class ConversationLoop:
                     checkpoint_callback=_checkpoint,
                     injection_callback=drain,
                     llm_timeout_s=None,
-                    permission_policy=permission_policy,
-                    permission_request_callback=_permission_request_cb,
                 )
             )
         finally:
@@ -678,14 +652,40 @@ class ConversationLoop:
         return str(msg.metadata.get("context_chat_id") or msg.chat_id)
 
     def _set_tool_context(self, ctx: _TurnContext) -> None:
+        metadata = dict(ctx.msg.metadata or {})
+        session_metadata = dict(ctx.session.metadata) if ctx.session is not None else {}
+        scope = resolve_workspace_scope(
+            default_project_path=self._resolve_scope_root(session_metadata),
+            restrict_to_workspace=self._tools_config.restrict_to_workspace,
+            message_metadata=metadata,
+            session_metadata=session_metadata,
+        )
         self._set_registry_context(
             ctx.tools,
             ctx.outbound_channel or ctx.msg.channel,
             ctx.outbound_chat_id or ctx.msg.chat_id,
             ctx.msg.metadata.get("message_id"),
-            ctx.msg.metadata,
+            metadata,
             session_key=ctx.session_key,
+            workspace_scope=scope,
         )
+
+    def _resolve_scope_root(self, session_metadata: Mapping[str, Any]) -> Path:
+        """Target repository root for the conversation turn's scope.
+
+        The session's persisted review root wins; an invalid value falls back to
+        the application workspace, which is only used for session/report/artifact
+        persistence and never substitutes for the target repository root.
+        """
+        raw = session_metadata.get(ReviewMetaKey.LOCAL_ROOT)
+        if isinstance(raw, (str, os.PathLike)) and str(raw).strip():
+            try:
+                candidate = Path(raw).expanduser()
+                if candidate.is_absolute() and candidate.is_dir():
+                    return candidate.resolve()
+            except OSError:
+                pass
+        return self._workspace
 
     def _set_registry_context(
         self,
@@ -695,6 +695,7 @@ class ConversationLoop:
         message_id: str | None = None,
         metadata: dict | None = None,
         session_key: str | None = None,
+        workspace_scope: WorkspaceScope | None = None,
     ) -> None:
         if registry is None:
             return
@@ -705,6 +706,7 @@ class ConversationLoop:
             message_id=message_id,
             session_key=effective_key,
             metadata=dict(metadata or {}),
+            workspace_scope=workspace_scope,
         )
         for name in registry.tool_names:
             tool = registry.get(name)

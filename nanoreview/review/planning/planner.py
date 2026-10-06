@@ -15,11 +15,6 @@ from nanoreview.review.input import (
     normalize_requested_dimensions,
     normalize_review_action,
     normalize_review_target_type,
-    parse_repo_target,
-)
-from nanoreview.review.source.utils import (
-    parse_github_scoped_target,
-    parse_pr_target,
 )
 from nanoreview.review.types import (
     LocalReviewScope,
@@ -100,9 +95,6 @@ def _resolve_action(
     target_type: ReviewTargetType,
     user_content: str,
 ) -> ReviewAction:
-    pr_repo, _ = parse_pr_target(target)
-    if pr_repo and requested == ReviewAction.REPO:
-        return ReviewAction.DIFF
     return requested
 
 
@@ -114,7 +106,6 @@ def build_review_plan(
     max_subagents: Any = 4,
     target_type: str | None = None,
     action: str | None = None,
-    target_ref: str | None = None,
     prefetch_summary: str | None = None,
 ) -> ReviewPlan | None:
     trace_id = uuid.uuid4().hex[:8]
@@ -136,7 +127,7 @@ def build_review_plan(
 
     roles, routing_mode = normalize_requested_dimensions(focus)
     normalized_type = normalize_review_target_type(target_type, target)
-    if normalized_type not in {"github", "local"}:
+    if normalized_type not in {"local", "auto"}:
         normalized_type = normalize_review_target_type(None, target) or "auto"
     target_type_value: ReviewTargetType = normalized_type  # type: ignore[assignment]
     requested_action = normalize_review_action(action)
@@ -146,18 +137,6 @@ def build_review_plan(
         target_type=target_type_value,
         user_content=user_content,
     )
-    target_repo, pr_number = parse_pr_target(target)
-    normalized_ref: str | None = target_ref.strip() if isinstance(target_ref, str) and target_ref.strip() else None
-    target_subpath: str | None = None
-    target_subpath_kind: str | None = None
-    scoped_target = parse_github_scoped_target(target)
-    if scoped_target is not None and target_type_value == "github":
-        target_repo = scoped_target.repo
-        normalized_ref = scoped_target.ref
-        target_subpath = scoped_target.path
-        target_subpath_kind = scoped_target.kind
-    if target_repo is None and target_type_value == "github":
-        target_repo = parse_repo_target(target)
 
     local_scope: LocalReviewScope | None = None
     scope_reason = ""
@@ -172,23 +151,18 @@ def build_review_plan(
         roles=roles,
         routing_mode=routing_mode,
         user_requirements=user_content.strip(),
-        target_repo=target_repo,
-        pr_number=pr_number,
-        target_ref=normalized_ref,
-        target_subpath=target_subpath,
-        target_subpath_kind=target_subpath_kind,
         local_scope=local_scope,
         prefetch_summary=prefetch_summary,
     )
     logger.info(
-        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} target_subpath={} routing_mode={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
+        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} scope_paths={} routing_mode={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
         trace_id,
         plan.action.value,
         plan.target_type,
         plan.local_scope.kind if plan.local_scope else "",
         scope_reason,
         plan.local_scope.review_root if plan.local_scope else "",
-        plan.target_subpath or "",
+        len(plan.local_scope.scope_paths) if plan.local_scope else 0,
         plan.routing_mode == "explicit",
         focus,
         [role.name for role in plan.roles],
@@ -257,7 +231,6 @@ async def prepare_code_review_context(
         max_subagents=session_meta.get(ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS) or 4,
         target_type=session_meta.get(ReviewMetaKey.TARGET_TYPE) if isinstance(session_meta.get(ReviewMetaKey.TARGET_TYPE), str) else None,
         action=session_meta.get(ReviewMetaKey.ACTION) if isinstance(session_meta.get(ReviewMetaKey.ACTION), str) else None,
-        target_ref=session_meta.get(ReviewMetaKey.TARGET_REF) if isinstance(session_meta.get(ReviewMetaKey.TARGET_REF), str) else None,
     )
     if plan is None:
         return ReviewPreparation(None, build_review_fallback_prompt())
@@ -282,21 +255,15 @@ async def prepare_code_review_context(
     )
     if prefetch_summary.summary:
         plan = replace(plan, prefetch_summary=prefetch_summary.summary)
-        if plan.target_type == "github":
-            session_meta[ReviewMetaKey.GITHUB_PREFETCH_READY] = True
     elif prefetch_summary.attempted:
-        target_label = "GitHub" if plan.target_type == "github" else "repository"
-        if plan.target_type == "github":
-            session_meta[ReviewMetaKey.GITHUB_PREFETCH_READY] = True
         detail = f": {prefetch_summary.reason}" if prefetch_summary.reason else ""
         plan = replace(
             plan,
             prefetch_summary=(
-                f"{target_label} evidence prefetch was already attempted for this review "
+                "Repository evidence prefetch was already attempted for this review "
                 f"and returned {prefetch_summary.status}{detail}. Do not call "
-                f"{'github_review' if plan.target_type == 'github' else 'local_review'} again "
-                "for the same target in this turn; continue with the available context and "
-                "state any evidence limitations in the review."
+                "local_review again for the same target in this turn; continue with the "
+                "available context and state any evidence limitations in the review."
             ),
         )
     session_meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = [role.name for role in plan.roles]
@@ -316,7 +283,6 @@ def build_code_review_context(
     max_subagents: int = 4,
     target_type: str | None = None,
     action: str | None = None,
-    target_ref: str | None = None,
 ) -> str:
     from nanoreview.review.planning.prompt import build_review_fallback_prompt, render_review_prompt
 
@@ -327,7 +293,6 @@ def build_code_review_context(
         max_subagents=max_subagents,
         target_type=target_type,
         action=action,
-        target_ref=target_ref,
     )
     if plan is None:
         return build_review_fallback_prompt()
@@ -350,7 +315,6 @@ def apply_review_metadata_from_message(
         ReviewMetaKey.TARGET_TYPE,
         ReviewMetaKey.ACTION,
         ReviewMetaKey.REQUESTED_DIMENSIONS,
-        ReviewMetaKey.TARGET_REF,
     )
     if not any(key in metadata for key in keys):
         return False
@@ -387,12 +351,6 @@ def apply_review_metadata_from_message(
     raw_focus = metadata.get(ReviewMetaKey.REQUESTED_DIMENSIONS)
     if isinstance(raw_focus, (str, list)):
         _set_meta(ReviewMetaKey.REQUESTED_DIMENSIONS, raw_focus)
-
-    raw_ref = metadata.get(ReviewMetaKey.TARGET_REF)
-    if isinstance(raw_ref, str) and raw_ref.strip():
-        _set_meta(ReviewMetaKey.TARGET_REF, raw_ref.strip())
-    elif ReviewMetaKey.TARGET_REF in metadata:
-        _pop_meta(ReviewMetaKey.TARGET_REF)
 
     target_type = normalize_review_target_type(
         metadata.get(ReviewMetaKey.TARGET_TYPE) if isinstance(metadata.get(ReviewMetaKey.TARGET_TYPE), str) else None,
