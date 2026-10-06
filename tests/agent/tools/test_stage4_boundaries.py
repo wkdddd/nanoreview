@@ -230,3 +230,91 @@ class TestReviewRolesArePinnedToRestricted:
         assert observed is not None
         assert observed.access_mode == ACCESS_RESTRICTED
         assert observed.project_path == target.resolve()
+
+
+class TestSandboxMountsTheScopeRoot:
+    """The OS sandbox must mount the same root the command guard anchored on.
+
+    A bound turn scope replaces the construction-time workspace for the sandbox
+    too. When it did not, a restricted turn whose scope pointed at another
+    directory could pass the ``working_dir`` check and then have relative writes
+    land in the tool's build-time workspace, outside the scope.
+    """
+
+    @staticmethod
+    def _install_capture(monkeypatch, shell_mod, captured: dict, build_ws: Path):
+        def fake_wrap(sandbox, command, workspace, cwd):
+            captured["sandbox"] = sandbox
+            captured["workspace"] = workspace
+            captured["cwd"] = cwd
+            return command
+
+        async def fake_spawn(command, cwd, env):
+            captured["spawn_cwd"] = cwd
+
+            class _Process:
+                returncode = 0
+
+                async def communicate(self):
+                    return b"", b""
+
+            return _Process()
+
+        monkeypatch.setattr(shell_mod, "_IS_WINDOWS", False)
+        monkeypatch.setattr(shell_mod, "wrap_command", fake_wrap)
+        tool = ExecTool(
+            working_dir=str(build_ws),
+            sandbox="bwrap",
+            restrict_to_workspace=True,
+        )
+        monkeypatch.setattr(tool, "_spawn", fake_spawn)
+        return tool
+
+    @pytest.mark.asyncio
+    async def test_relative_write_cannot_escape_the_scope(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from nanoreview.agent.tools import shell as shell_mod
+        from nanoreview.agent.tools.context import (
+            RequestContext,
+            reset_current_request_context,
+            set_current_request_context,
+        )
+        from nanoreview.agent.tools.workspace_scope import WorkspaceScope
+
+        build_ws = tmp_path / "build"
+        build_ws.mkdir()
+        scope_root = tmp_path / "repo"
+        scope_root.mkdir()
+
+        captured: dict = {}
+        tool = self._install_capture(monkeypatch, shell_mod, captured, build_ws)
+
+        scope = WorkspaceScope(project_path=scope_root, access_mode=ACCESS_RESTRICTED)
+        token = set_current_request_context(
+            RequestContext(channel="cli", chat_id="c", workspace_scope=scope)
+        )
+        try:
+            await tool.execute("echo hi > out.txt", working_dir=str(scope_root))
+        finally:
+            reset_current_request_context(token)
+
+        assert Path(captured["workspace"]).resolve() == scope_root.resolve()
+        assert Path(captured["spawn_cwd"]).resolve() == scope_root.resolve()
+
+    @pytest.mark.asyncio
+    async def test_unscoped_call_falls_back_to_the_build_workspace(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from nanoreview.agent.tools import shell as shell_mod
+
+        build_ws = tmp_path / "build"
+        build_ws.mkdir()
+
+        captured: dict = {}
+        tool = self._install_capture(monkeypatch, shell_mod, captured, build_ws)
+
+        await tool.execute("echo hi")
+
+        assert Path(captured["workspace"]).resolve() == build_ws.resolve()
+

@@ -163,12 +163,18 @@ class ExecTool(Tool):
     ) -> str:
         cwd = working_dir or self.working_dir or os.getcwd()
         scope = current_workspace_scope()
-        # The turn's scope is the single source of truth for the boundary. In
-        # ``restricted`` mode the project path replaces the construction-time
-        # workspace; ``full`` disables the containment check (the tool's own
-        # deny/allow patterns, internal-URL guard and OS sandbox still apply).
+        # The turn's scope is the single source of truth for the workspace root.
+        # When a scope is bound its project path replaces the construction-time
+        # workspace for BOTH the containment boundary and the OS sandbox mount;
+        # ``self.working_dir`` is only the fallback for unscoped tool calls.
+        # This keeps the guard and the sandbox anchored on one root: a scope
+        # pointing at another directory must not let relative writes land in the
+        # build-time workspace. In ``restricted`` mode the scope may not be left;
+        # ``full`` disables the containment check (the tool's own deny/allow
+        # patterns, internal-URL guard and OS sandbox still apply).
         restricted = scope.is_restricted if scope is not None else self.restrict_to_workspace
-        boundary_root = scope.project_path if scope is not None and scope.is_restricted else self.working_dir
+        workspace_root = str(scope.project_path) if scope is not None else self.working_dir
+        boundary_root = workspace_root if restricted else self.working_dir
 
         # Prevent an LLM-supplied working_dir from escaping the configured
         # workspace when the scope is restricted (#2826). Without this, a caller
@@ -177,13 +183,13 @@ class ExecTool(Tool):
         if restricted and boundary_root:
             try:
                 requested = Path(cwd).expanduser().resolve()
-                workspace_root = Path(boundary_root).expanduser().resolve()
+                resolved_boundary = Path(boundary_root).expanduser().resolve()
             except Exception:
                 return (
                     "Error: working_dir could not be resolved"
                     + _WORKSPACE_BOUNDARY_NOTE
                 )
-            if requested != workspace_root and workspace_root not in requested.parents:
+            if requested != resolved_boundary and resolved_boundary not in requested.parents:
                 return (
                     "Error: working_dir is outside the configured workspace"
                     + _WORKSPACE_BOUNDARY_NOTE
@@ -200,7 +206,9 @@ class ExecTool(Tool):
                     self.sandbox,
                 )
             else:
-                workspace = self.working_dir or cwd
+                # Mount the same root the guard anchored on, then pin the final
+                # cwd inside it so a relative path cannot escape the scope.
+                workspace = workspace_root or cwd
                 command = wrap_command(self.sandbox, command, workspace, cwd)
                 cwd = str(Path(workspace).resolve())
 
