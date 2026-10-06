@@ -1,226 +1,217 @@
 # 当前代码调整计划
 
-更新时间：2026-10-05
+更新时间：2026-10-06
 
-## 当前节点：roadmap 第 3 阶段 Conversation Agent
+## 当前节点：roadmap 第 4 阶段工具权限与远程 review 边界收敛
 
-实施 Conversation Agent 的完整对话 turn，将 session 调度与双 Agent 协调收敛到 `SessionCoordinator`，完整迁移并删除 `AgentLoop`。本节点按已确认方案实施；当前代码状态仍以工作区为准。
+状态：待实施。本轮只调整计划文档，生产代码与 WebUI 不在本轮修改范围内。
 
-### 已确认职责与边界
+本计划是第 4 阶段的实施基线。下列目标、字段、优先级、默认值、删除范围和验收条件均已确定，实施时不再引入新的产品决策或兼容行为。
 
-- 将 `SessionCoordinator` 从 `nanoreview/session/coordinator.py` 移至 `nanoreview/agent/coordinator.py`，保留类名并删除旧模块及其导入路径；不再单独建立 `SessionRuntime`。
-- `SessionCoordinator` 作为 session 核心入口，承接 MessageBus 收发、session 锁与最多 20 条的待处理队列、命令与权限响应、取消调度、review/conversation 路由与门禁、handoff 准备及最终结果发布。进入 review turn 后，它不构造或保存 review 上下文，只接收并发布 `ReviewLoop` 结果（包括报告分块推流）；它可读取 session metadata、维护 review 索引，但不承担普通对话 turn 的历史构造、追加和保存。按职责拆分私有 helper。
-- Coordinator 调用 `ReviewLoop` 或 `ConversationLoop`，不把 Agent 执行算法并入自身。`ReviewLoop` 负责完整的 review turn：从 session 构造 `ContextBuilder` + `COMMON_RULES` 上下文，保存用户消息和报告，管理 review 生命周期、run 状态和 report artifact，并返回结果；`AgentRunner` 继续执行单个模型/工具 run。
-- `ConversationLoop` 拥有完整对话 turn：读取 session/history、调用 handoff consumer 完成交接写入、构造上下文与工具、调用 `AgentRunner`、错误与取消收尾、保存历史及组装回复。它使用现有 `SessionManager`，不建立第二套存储。交接值对象 `ReviewHandoff` 与唯一一次 session 写入由 `SessionCoordinator` 拥有（`handoff_consumer` 为 Loop 构造函数必需参数，装配时传入绑定方法）。
-- review 未完成清理、终态及结果持久化前继续拒绝普通消息；完成 `DONE` 后才路由到 conversation。首次 handoff 注入完整 report 或既有的有界失败上下文，报告只读且超出上下文预算时拒绝该 turn。
-- Review Agent 与 Conversation Agent 保持独立 prompt、上下文、`ToolRegistry` 和权限执行 profile；Conversation Agent 沿用通用 core（含 `message`、`spawn` 和已注册插件），排除 review 专属工具，权限行为沿用现有 `approval_enabled`。工作区解析与路径限制复用 nanobot，目标仓库 root 作为文件路径基准和默认命令 cwd。
-- 以现有继承 nanobot 的 `AgentLoop` 为迁移起点，复用其消息注入、流式输出、保存和交付策略；本次删除 `nanoreview/agent/loop.py`、`AgentLoop` 类及其导出、导入，不保留兼容门面，不引入正式 conversation 状态机。
-- `/stop` 取消当前 turn 和队列，不回滚已发生修改；进程重启后不恢复或重跑未完成 turn。
+## 已确认目标
 
-### ConversationLoop 具体实现契约
+- 权限只处理工具调用层，复用 nanobot 的 `restricted` / `full` workspace access 模型。
+- Conversation Agent 在每个 turn 开始解析 workspace scope；在 scope 允许的范围内读取、写入文件、执行命令和运行测试，不再逐工具等待确认。
+- ReviewLoop、planner、reviewer、Judge 固定使用 `restricted` scope。它们对目标仓库内容只读；已有的 report、session、artifact 内部持久化写入继续保留，并且不通过通用文件或 shell 工具扩大目标仓库权限。
+- 删除逐工具 approval、全局和 session approval 开关、permission request/response、permission future 与 approval transcript。Judge 业务结果中的 `needs_confirmation` 保留，它不是工具授权状态。
+- 已弃用的配置字段、CLI/API 参数、事件和入口直接删除，不做兼容转换或旧字段回填。
+- 删除 GitHub 作为 review 输入及其专属能力：GitHub review/source/target/normalizer/admission 分支、GitHub metadata/evidence、远程 snapshot/cache 和 GitHub review 配置。保留全部通用联网能力：模型 provider 的 HTTP/OAuth 调用、`web_search`、`web_fetch`、stdio/SSE/Streamable HTTP MCP，以及 SSRF、重定向、私网地址和代理校验。
+- 第 4–7 阶段只调整后端；WebUI approval 入口和展示残留统一在第 8 阶段清理。第 4–7 阶段后端不再生成或接受 approval 协议事件。
 
-采用 nanobot 式单轮处理接口。Coordinator 先串行准入，再调用 ConversationLoop；一个 session 可执行多个 turn，每个 turn 调用一次 Runner，每个 run 内可多次调用模型和工具。核心接口如下，执行配置及现有回调按需显式传入，名称可按现有实现微调：
 
-```python
-async def process_message(
-    self,
-    msg: InboundMessage,
-    *,
-    session_key: str,
-    turn_id: str,
-    target_root: Path,
-    handoff: ReviewHandoff | None = None,
-) -> OutboundMessage | None:
-    ...
-```
+## 固定的 workspace access 契约
 
-- 删除占位的 `ConversationTurnRequest`、`ConversationTurnResult`，不新增外部 `ConversationTurnContext` 或回调包装类。输入复用 `InboundMessage`，Runner 输出复用 `AgentRunResult`，最终回复复用 `OutboundMessage`。
-- 内部使用私有 `_TurnContext`，保存本轮 Session、history、消息分区、工具注册表、Runner 结果和回复状态。每次调用独立创建；不把本轮可变状态保存在共享 Loop 实例中，不持久化该对象。
-- Coordinator 在 session 锁内完成路由、门禁及 handoff 准备，传入已确定的 session/turn 标识、目标 root 和一致的模型/预算配置。它负责读取权威 report、准备只读 handoff 并拥有其唯一一次 session 写入；ConversationLoop 不决定是否开放 conversation，也不再次读取 report artifact。
-- ConversationLoop 通过 `SessionManager` 取得 Session。turn 顺序固定为「加载 session → 恢复中断历史 → AutoCompact 准备 → token Consolidator → 调用 handoff consumer → 读取历史 → 构建模型上下文」：完整报告预算检查通过后才写入可重放的历史消息和已消费标记并保存，写入失败向上传播且不进入 Runner；超窗拒绝不得消费 handoff。后续 turn 与重新加载 session 后均不重复注入。
-- 使用 `ContextBuilder.build_partitioned_messages()`：system prompt、共同规则、技能和当前 user/media 位于 frozen 区，history 位于 working 区；handoff directive 追加到 frozen system message。不得注入完整 reviewer/Judge transcript，保留既有历史整理接线，长对话治理调整仍留待后续节点。
-- 为本轮创建独立 `ToolRegistry`，通过现有 `ToolLoader` 加载 core，仅排除 `local_review`、`github_review`。`submit_review_plan`、`submit_verdicts` 的实际名称均为 `_plugin_discoverable=False`，本来不会自动加载；`review_submit` 只在 reviewer scope 中，不进入 core。绑定 request context、工作区及 `FileStateStore.for_session(session_key)`；`message`/`spawn` 的发送和子任务依赖由统一装配接入，不新增 MessageBus 消费循环。
-- 组装 `AgentRunSpec` 调用共享 Runner。模型/工具迭代、运行内压缩、usage 和逐工具 permission callback 保留在 Runner；权限响应、进度/流式发布和 pending injection 通过现有回调接入 Coordinator。
-- 复用 nanobot 的 pending 注入策略：执行中消费的追加消息进入当前 run，未消费消息继续由 Coordinator 调度。历史增量包含这些用户消息及新增 assistant/tool 消息，不重复保存当前首条用户消息、frozen 内容或旧 history；增量边界留在 Loop 内部。
-- Loop 保存本轮 user 消息、增量及必要的错误/停止内容，执行既有裁剪、清洗、file cap 和 `SessionManager.save()`，然后组装回复。保留 message 工具已发送时的重复回复抑制、媒体交付和流式内容替换行为。
-- 正文实时流式发送，stream segment 结束不等于 turn 成功。保存失败须明确报错并阻止成功终态；正常返回 `None` 可表示工具已发送、无需再发正文，不得据此推断失败。usage、stop reason 等通过内存回调或现有 turn 生命周期事件交给 Coordinator，Coordinator 发布最终回复和 turn_end。
-- 取消时复用现有 runtime checkpoint：由 ConversationLoop 保存可用历史，并在下一个 turn 补齐中断 turn 的占位历史，不重跑该 turn；在 `finally` 中清理本轮绑定后传播取消。Coordinator 负责取消队列、关闭交付和释放调度资源。收尾保存失败须可见，不能吞掉取消；这不新增恢复 checkpoint，也不回滚修改。
-- 私有 helper 按读取、构造、执行、保存、回复和清理组织流程，不引入状态转移表、通用 `BaseLoop` 或 `ConversationRunState`。拒绝一次工具权限只产生 denied 结果供模型继续，`/stop` 才停止整轮。
+### Scope 数据结构
 
-因此一次普通对话 turn 的实际顺序固定为：
+每个 Agent turn 使用一个不可变的 scope 值对象：
 
 ```text
-Coordinator.receive
-  -> route/gate/lock/queue
-  -> prepare read-only handoff + resolve turn configuration
-  -> ConversationLoop.process_message(InboundMessage)
-       -> load Session + consolidate + call handoff consumer + read history
-       -> build ContextBuilder partition
-       -> create core-only tools + bind FileStates/permissions
-       -> AgentRunner.run(AgentRunSpec)
-       -> collect turn output + persist history + SessionManager.save
-       -> assemble OutboundMessage or None
-       -> finally cleanup
-  -> publish outbound/turn_end
+workspace_scope = {
+    project_path: <绝对且已存在的目录>,
+    access_mode: "restricted" | "full",
+}
 ```
 
-API/CLI 的 `process_direct()` 归 Coordinator：转换为 `InboundMessage` 后等待 session 锁串行执行，返回自己的回复，不注入正在运行的 turn，再调用两个 Loop；ConversationLoop 不提供绕过调度的直接入口。
+- metadata 键名固定为 `workspace_scope`。
+- `project_path` 必须是绝对路径并且在解析时已经存在且为目录。
+- `access_mode` 的规范值为 `restricted` 和 `full`；兼容 nanobot 的输入别名 `restrict` 与 `full-access`，解析后统一为规范值。
+- message metadata 优先于 session metadata，session metadata 优先于全局配置默认值。
+- metadata payload、mode、path 任一非法时，整份 scope 回退到全局配置计算出的默认 scope；不得部分采用非法 payload 中的字段，也不得等待用户确认。
+- `ToolsConfig.restrict_to_workspace=False` 是当前配置默认值，因此默认 `access_mode` 固定为 `full`；显式设置为 `True` 时默认 `access_mode` 为 `restricted`。
+- scope 在 turn 开始解析并绑定到本轮 `ToolContext` / `RequestContext`；同一 turn 的内部迭代使用同一快照，不能被工具调用改变。
 
-- Coordinator 将 system/subagent 消息作为内部事件放过门禁；conversation 阶段交给 `ConversationLoop.process_message`，按 nanobot 方式以 assistant 角色运行一个 turn；review 阶段继续走 `result_callback` 和队列。
+### Root 来源
 
-### 共享规则文件
+- Conversation Agent：先读取 session metadata 的 `ReviewMetaKey.LOCAL_ROOT`（持久化键 `review_local_root`）；该值无效时使用 `agents.defaults.workspace`。应用 workspace 仅用于 session、report、artifact 等持久化，不作为目标仓库 root 的替代值。
+- ReviewLoop、planner、reviewer、Judge：优先读取 review metadata 的 `repository_root` 或 `review_local_root`；该值无效时使用已通过本地准入的目标仓库 root。
+- Review Agent 的 restricted scope 只保护目标仓库工具访问；写入 report、session、artifact 的现有领域持久化路径继续有效，不能借此写入目标仓库任意文件。
 
-- 将 workspace 根目录的 `SOUL.md` 和模板 `templates/SOUL.md` 改为 `COMMON_RULES.md`，通过 `ContextBuilder.BOOTSTRAP_FILES` 读取；不再回退读取旧 `SOUL.md`。`MemoryStore.read_soul` 当前没有调用方，不作为 SOUL 接入点；是否清理无调用 API 需随调用方核对。
-- 重写模板内容，使其约束 Review Agent 与 Conversation Agent 共同遵守的代码规范、证据要求和审查原则；去掉“只能分析、不能修改代码”及“收到 review target 立即开始 review”等角色专属规则。未来可另增 `REVIEW_RULES.md` 与 `CONVERSATION_RULES.md`。
-- Conversation 和 planner 每次通过 `ContextBuilder.BOOTSTRAP_FILES` 在 turn/run 开始读取一次 `COMMON_RULES.md`；reviewer 的 `prompt_builder` 和 Judge 的 `_system_prompt` 也分别在每个 run/batch 新增读取接线。内部模型迭代保持该快照；后启动的执行读取最新文件。缺失或读取失败时跳过附加规则并记录警告。固定系统指令及安全、权限、报告只读边界优先；不记录规则 hash。Consolidator 等历史维护调用不注入该规则。
-- 已有 workspace 中改过的 `SOUL.md` 内容不自动迁移到 `COMMON_RULES.md`；迁移或重写需显式处理。保留 `MemoryStore` 作为可扩展的 memory 文件抽象，更新 memory skill 文档及相关测试，移除对 `SOUL.md` 的说明。
+### 两种模式的边界
 
-### Conversation 历史与观测
+- `restricted`：filesystem、shell、message 等通用工具的路径和 cwd 必须位于 `project_path` 内；越界读、写和命令执行都拒绝。
+- `full`：允许工具访问 `project_path` 外的路径和 cwd，但仍执行工具自身的路径校验、shell deny/allow pattern、内部/私有 URL guard 和操作系统 sandbox；`full` 不绕过这些限制，也不恢复 approval。
+- Review Agent 的工具注册表继续与 Conversation Agent 分离。共享工具实现不改变上述角色边界。
 
-- Session history 是对话回放来源，不维护独立 conversation sidecar，不新增文件修改或 shell 命令的持久化审计。
-- 不为审计增加 Git 前后快照、FileStates turn 写路径收集或 shell 退出码解析；保留现有工具事件、进度、错误日志及历史中的工具交互。
-- turn/session/run 标识用于日志和事件关联；usage、停止原因沿用既有观测契约，不新增持久化审计字段。
-- 本决定不删除既有 WebUI transcript、subagent trace 等存储；其消费者和清理仍沿用现有机制。不持久化 task、future、lock 或可恢复执行的 runtime 状态；现有 runtime checkpoint 仅保存历史补全信息，不用于恢复执行。
-- 删除状态机后默认不再生成 `turn_trace` 字段；`websocket.py` 和 WebUI `types.ts` 的现有消费者记录为前端待适配项，本节点不修改 `review-webui/`。
+## 实施步骤
 
-### Finding 引用
+### 1. 建立影响面清单（只读）
 
-- 为最终 report 中的 confirmed findings 按最终展示顺序生成稳定的 report-local ID（如 `F001`），写入 Markdown、report artifact 和 `ReviewResult.findings`；内部 rejected/uncertain candidates 不生成面向用户的 ID。
-- 这些 ID 保留在报告与结果中，供用户和模型讨论具体问题；Conversation Agent 不再提取、临时记录或消费用户消息中的 finding 引用（`agent/finding_refs.py` 及其日志、字段和测试已删除），pending drain 也不再为本目的记录用户文本。
-- 不建立 finding 修复状态机，不自动关闭 finding，不改写原 report，也不表示修复已验证或重新审查通过；用户原文中的 ID 仍作为普通历史内容保留。
+先核对下列生产入口、消费者、事件和测试，形成实施前清单；此步骤不修改代码：
 
-### 实施顺序
+- 权限链路：`nanoreview/config/schema.py`、`nanoreview/agent/tools/permissions.py`、`nanoreview/agent/tools/filesystem.py`、`nanoreview/agent/tools/shell.py`、`nanoreview/agent/tools/message.py`、`nanoreview/agent/runner.py`、`nanoreview/agent/conversation_loop.py`、`nanoreview/agent/coordinator.py`、`nanoreview/agent/subagent.py`、`nanoreview/channels/websocket.py`。
+- 本地权限 root：`nanoreview/agent/context.py`、`nanoreview/agent/tools/*`、`nanoreview/review/types.py`、`nanoreview/review/admission.py`、`nanoreview/agent/review_loop.py`、`nanoreview/review/planning/planner.py`、`nanoreview/review/profiles.py`。
+- GitHub/远程 review：`nanoreview/agent/tools/github_review.py`、`nanoreview/agent/tools/review_base.py`、`nanoreview/review/source/github.py`、`nanoreview/review/source/utils.py`、`nanoreview/review/input/targets.py`、`nanoreview/review/input/normalizers.py`、`nanoreview/review/admission.py`、`nanoreview/review/planning/prompt.py`、`nanoreview/review/planning/evidence.py`、`nanoreview/review/planning/preprocessor.py`、`nanoreview/review/profiles.py`、`nanoreview/rag/review_service.py`。
+- OAuth/provider（保留并验证）：`nanoreview/providers/openai_codex_provider.py`、`nanoreview/providers/factory.py`、`nanoreview/providers/registry.py`、`nanoreview/cli/commands.py` 及 provider 配置 schema。
+- 网络与 MCP（保留并验证）：`nanoreview/security/network.py`、`nanoreview/config/loader.py`、`nanoreview/agent/tools/mcp.py`、MCP 配置 schema、MCP 装配和 CLI/API schema；同时核对 `web_search`/`web_fetch` 的实际注册、提示和测试入口。
+- 测试：`tests/agent/tools/test_permissions.py`、`tests/agent/tools/test_repo_review_github.py`、`tests/agent/test_mcp_integration.py`、`tests/agent/tools/test_mcp_smoke.py`、`tests/agent/tools/test_mcp_tool.py`、`tests/config/test_mcp_config.py`、`tests/agent/test_loop_modes.py`、`tests/agent/test_review_gate.py`、`tests/security/test_network_guards.py` 以及 OAuth、WebSocket/API 相关测试。
 
-1. 迁移 coordinator 模块及其测试和导入方；删除 `nanoreview/session/coordinator.py` 旧路径，并确认所有 API、CLI、channel 与服务装配入口均使用 `nanoreview.agent.coordinator.SessionCoordinator`。
-2. 将 `AgentLoop` 的装配、MessageBus 主循环、session 串行和队列、命令、取消调度、权限响应、双 Agent 路由迁入 Coordinator；把 review turn 的 `ContextBuilder`/`COMMON_RULES` 上下文构造、用户消息和报告保存、结果返回收敛到 `ReviewLoop`，Coordinator 只发布结果（包括报告分块推流），不引入第二个 runtime 类。
-3. 将完整对话 turn 迁入 ConversationLoop：InboundMessage 输入、内部 `_TurnContext`、handoff 历史写入、上下文与工具、Runner 调用、历史保存、取消收尾及 OutboundMessage 输出。删除占位 Request/Result 类，复用 nanobot 的注入、工作区、流式和交付策略。
-4. 通过 `ContextBuilder.BOOTSTRAP_FILES` 将 SOUL 文件和模板接入 `COMMON_RULES.md`，显式接入 reviewer `prompt_builder` 与 Judge `_system_prompt`；不假定旧 workspace 的 `SOUL.md` 内容自动迁移，验证内部迭代不刷新。
-5. 为最终 report findings 增加稳定 ID（`report.py` + artifact/`ReviewResult`），不增加独立 sidecar 或文件/shell 审计。
-6. 迁移 API、CLI、channel、包导出及测试，完整删除 `nanoreview/agent/loop.py`、`AgentLoop` 及旧 coordinator 导入路径，不保留兼容门面；记录 `turn_trace` 消失对应的前端待适配项。本节点不修改 `review-webui/`。
+### 2. 实现 workspace access
 
-当前核查的迁移影响面为 9 个源文件和 8 个测试文件，重点核对 `test_review_gate`（21 处引用）与 `test_loop_modes`（19 处引用）。每个实施步骤单独提交；步骤完成后运行受影响测试并保持 pytest 通过，最后运行全量 pytest。
+- 在安全/工具上下文层实现上述 `workspace_scope` 解析、优先级、别名、默认值和非法输入回退。
+- 在 Conversation turn 开始绑定 scope；filesystem、shell、message 和测试执行工具读取当前 scope。
+- ReviewLoop、planner、reviewer、Judge 创建 scope 时直接固定为目标仓库 root + `restricted`，不得接受 conversation metadata 对其放宽。
+- 保留现有路径 guard、命令 guard、内部 URL guard 和 OS sandbox；只替换原先以 `restrict_to_workspace` 为中心的统一判定入口。
+- 删除或改写仅依赖旧布尔值的调用方，避免同一 turn 同时存在旧布尔值和新 scope 两套权限事实。
 
-### 测试与验收
+### 3. 移除 approval 执行链路
 
-- Coordinator 路由只在 review `DONE` 后开放 conversation；review handoff 只注入一次，普通消息门禁、队列上限、命令、权限响应、取消与 outbound 行为保持一致。
-- `AgentLoop` 类、模块、导出及旧 coordinator 导入路径全部移除；API/CLI 和总线入口共用 Coordinator 调度。ConversationLoop 独立完成对话历史读取、保存和回复组装，Coordinator 不重复追加历史；交接写入由 Coordinator 拥有，Loop 在固定位置回调调用。
-- 多轮对话回放连续；注入消息只保存一次，未消费消息继续调度；`None` 返回和 message 工具发送不会导致重复回复或误判失败。system/subagent 消息在 conversation 阶段按 assistant turn 执行，在 review 阶段按 `result_callback` 和队列交付。
-- Conversation Agent 只收到自己的工具注册表、目标工作区和权限配置；仅 `local_review`/`github_review` 从 core 排除，`submit_review_plan`/`submit_verdicts` 不因 discoverability 被自动加载，`review_submit` 不进入 core；core 的 message/spawn 行为保持一致，拒绝单次权限不强制结束 turn。
-- `COMMON_RULES.md` 按 ContextBuilder、reviewer `prompt_builder` 和 Judge `_system_prompt` 在指定 turn/run/batch 开始读取，内部迭代不刷新，下一次执行读取最新文件；缺失/不可读不会中断调用，旧 `SOUL.md` 不自动迁移或读取。
-- 流式输出可先于保存，成功终态必须在保存后；保存失败明确可见，取消通过现有 runtime checkpoint 保留部分历史，并在下一个 turn 补齐中断 turn 的占位历史且不重跑；已发生修改保留并清理绑定后传播取消。
-- 不生成 conversation sidecar 或新增文件/shell 审计；Finding ID 在 report Markdown、artifact、ReviewResult 和 Web/API 状态中一致；不收集或持久化 finding 引用关联，report 内容及 finding 状态不被 Conversation Agent 修改。
-- 删除状态机后默认不输出 `turn_trace`，记录 `websocket.py` 与 WebUI `types.ts` 的前端待适配项；session 删除沿用既有关联数据清理，重启只回读已保存历史和结果，不恢复未完成执行或队列。运行最近的 coordinator/conversation、Runner 取消、report/result、session 和入口相关 pytest，并执行全量 pytest。ruff 验收以不新增错误为准；当前已有 47 个错误均不在本节点涉及文件内，不要求本次清零。
+- 从 `AgentRunSpec`、Runner、ConversationLoop、Coordinator 和 subagent 装配中删除 permission policy、requester、callback、future、响应等待和 approval transcript。
+- 删除 `nanoreview/agent/tools/permissions.py` 的运行时调用方以及工具上的 `requires_approval()`；清理 `ToolsConfig.approval_enabled`、session approval 状态和相关 CLI/API 参数。
+- 删除 WebSocket 后端的 permission request/response、session approval 读写和 approval transcript 生产。第 4–7 阶段不改 `review-webui/`；前端旧入口在此期间没有有效后端协议，统一到第 8 阶段删除。
+- 保留 pairing、普通业务确认、控制命令和 Judge 的 `needs_confirmation`；这些语义不转换为工具 approval。
 
-### 本节点之外
+### 4. 删除 GitHub 远程 review 接入，保留联网能力
 
-`REVIEW_RULES.md`、`CONVERSATION_RULES.md` 的角色专用规则拆分；更细的工具权限与 approval 策略；finding 修复状态、自动关闭或重新审查；多次 review/多报告、自动 worktree、scope 用户入口；长对话 Consolidator/AutoCompact 收敛及 WebUI 交互改造均不在本节点实现。
+- 删除 `github_review` 工具及其注册、提示、技能说明、denied list、trace/evidence 记录和测试。
+- 删除 GitHub 专属 source、target 类型、normalizer 分支、admission 分支、metadata/evidence、远程 snapshot/cache 和 GitHub 配置字段。保留本地 admission 的仓库存在性、路径校验、归一化、快照、session 注册和错误处理流程；本地 target 仍是唯一审查输入。
+- 保留 `openai_codex_provider`、token/login/logout 入口、provider 注册、OAuth 依赖及所有已支持 provider 的 HTTP API 调用；仅删除实际绑定 GitHub 远程 review 的 OAuth/config 字段（如代码核对确认存在）。
+- 保留 `web_search`、`web_fetch` 的工具实现、注册、运行时提示、技能说明、compactable/hint 注册和测试；它们可读取普通网页和代码托管文档，但不得把 URL 转换为 review target 或恢复远程仓库 review。
+- `MCPServerConfig` 与 MCP provider 继续支持 `type="stdio"`、`type="sse"`、`type="streamableHttp"`，以及现有 `url`、`headers`、`auth` 等网络鉴权字段和实现；继续应用 SSRF、重定向、私网地址和代理校验。无 MCP 配置时保持关闭。
+- 删除 `ToolsConfig.github_repo` 等 GitHub 专属配置字段；保留 `ToolsConfig.ssrf_whitelist` 及其 loader 接线。保留 `nanoreview/security/network.py` 中所有联网场景使用的 URL guard；普通模型 provider 的 HTTP 连接不经过 Agent 网络工具注册表。
+- 同步收敛工具 loader、registry、CLI/API schema、服务装配、日志事件、skills 和生产文档；不保留失效兼容门面。
 
-### 实施进展与前端待适配项
+### 5. 同步测试、约束和文档
 
-- 已完成：步骤 1（`0902ef09`），步骤 2、3 与 6 的代码迁移（`728e47f9`）。`SessionCoordinator` 已合并 `AgentLoop` 运行时，`ConversationLoop` 完成完整对话 turn，`nanoreview/agent/loop.py` 与 `AgentLoop` 已删除，API/CLI/channel/包导出与相关测试均已迁移；全量 `pytest` 通过。
-- 已完成：步骤 4。`BOOTSTRAP_FILES` 改为读取 `COMMON_RULES.md`，模板由 `templates/SOUL.md` 重命名并重写；reviewer `prompt_builder`（经 `metadata["common_rules_workspace"]`）与 Judge `_system_prompt`（构造参数 `common_rules_workspace`）在每次 run/batch 读取一次，缺失或不可读时跳过并告警，运行内不刷新；`MemoryStore` 移除无调用方的 SOUL API，memory skill 文档与相关测试同步。不再回退旧 `SOUL.md`。
-- 已完成：步骤 5。`report.py` 以 `collect_confirmed_findings`（按 severity 展示顺序）作为稳定 ID（`F001`…）的单一来源，写入报告 Markdown 的 ID 列与 Details；`serialize_finalizer_result` 通过 `confirmed_finding_ids_by_key` 只给 confirmed finding 附加 `id`，因此 artifact 与 `ReviewResult.findings` 与 Markdown 一致，rejected/uncertain 不生成 ID。本轮收敛：瞬时引用收集（`agent/finding_refs.py`、`_TurnContext` 的 `valid_finding_ids`/`consumed_user_texts`/`finding_refs`、`conversation.finding_refs` 日志）已全部删除，pending drain 直接构造并追加注入消息，只保留队列消费上限、metadata 传递和历史保存行为；报告中的稳定 ID 保留。
-- 已完成：handoff 收敛进 `SessionCoordinator`。`ReviewHandoff` 与 `REVIEW_CONTEXT_EVENT`/`REVIEW_HANDOFF_EVENT` 迁入 `agent/coordinator.py`，独立 `consume_handoff()` 并入 `SessionCoordinator.consume_handoff()`，`agent/handoff.py` 已删除且不留兼容入口。`ConversationLoop` 构造函数新增必需 `handoff_consumer`，由 coordinator 装配时传入绑定方法，`ReviewHandoff` 仅在 `TYPE_CHECKING` 下导入；`process_message()` 的 handoff 参数不变。执行顺序固定为「加载 session → 恢复中断历史 → AutoCompact → token Consolidator → 调用 consumer → 读取历史 → 构建模型上下文」，写入失败向上传播且不进入 Runner。测试侧删除 refs 专用文件与 ConversationLoop 的 spy/fixture/两个引用收集测试，并新增交接集成测试（报告完整进入 Runner、directive 位于 frozen system、消费标记落盘、后续 turn 与重新加载 session 不重复注入、整理先于写入、写入失败时 Runner 未执行、排队消息注入与历史保存、注入上限）。全量 `pytest` 通过（641 passed）；`ruff` 与 HEAD 基线一致（nanoreview 47 + tests 5），未新增告警。
-- 本节点步骤 1-6 均已完成；最后一个提交为步骤 5，其后的 handoff 收敛与 finding 引用删除为本轮追加调整。
-- 已完成：Hook 生命周期统一迁移（本轮追加调整）。以 nanobot hook 实现为基线补齐 run/turn/iteration/stream/逐工具全链生命周期：新增 `nanoreview/events.py`（`AgentEvent`/`EventSink`/类型化 progress、stream delta/end、file edit 事件，`publish` 保留错误语义、`emit` 为 best-effort、`accepts` 供生产者跳过无消费者事件）与 `nanoreview/agent/event_sink.py`（事件→outbound metadata 投影，`_stream_delta` 仍为布尔标记、delta 文本走 `OutboundMessage.content`，外部 wire 不变）；`hooks/lifecycle.py` 新增 `AgentRunHookContext`、`AgentTurnHookContext`/factory、`resolve_final_content` 与 Runner 私有 `FinalizeContentResult`，并从 `AgentHookContext` 移除 `content_replaced`；新增 `hooks/turn_hooks.py`（固定装配顺序 progress → registered factories → registered hooks → turn factories → turn hooks，factory 失败记录并跳过，ephemeral 短路）与 `hooks/file_edit.py`、`utils/file_edit_events.py`（仅跟踪 `write_file`/`edit_file`，复用工具自身 `_resolve` 校验）。`AgentProgressHook`/`SubagentHook` 改为直接发布类型化事件（progress hook 保持 `reraise=True`，subagent observer 异常隔离）；`AgentRunner.run()` 增加 run-level 正常/异常/取消/finally 调用顺序（`on_finally` 必执行且其失败不覆盖原异常或取消）、逐工具 before/after/error 与 provider-hosted event 通道；Coordinator、ConversationLoop、ReviewLoop、Subagent、Judge、API server、CLI 的内部 progress/stream callback 全部删除并改传 `EventSink`，四个 `AgentRunner` 调用点统一经 turn builder 装配（review/planner/Judge 不注册文件编辑 hook，SDK 经 `_extra_hooks` 注入无需改动）。DSML 清洗不视为替换，只有显式替换才阻止 pending injection drain 与 terminal tool 重试。
-- 本轮验证：全量 `pytest` 通过（701 passed，新增 `tests/agent/test_hook_lifecycle.py` 25 项、`tests/agent/test_event_sink.py` 16 项、`tests/agent/test_file_edit_hook.py` 17 项）。`ruff check nanoreview/` 为 48 项，较 HEAD 基线 47 项新增 1 条 `cli/commands.py` 的 `E402`（与该文件 Windows UTF-8 前置块后的既有 18 条同族，位置正确，未消除以免改变该块语义）；`ruff check tests/` 与基线一致（5 项）。
-- `turn_trace` 前端待适配（本节点不修改 `review-webui/`）：删除状态机后不再生成该字段，现有消费点如下，需后续节点核对保留或移除。
-  - `nanoreview/channels/websocket.py`：`_turn_end` 分支读取 `metadata["turn_trace"]` 并透传给 `send_turn_end`，该键现已无生产者。
-  - `review-webui/src/lib/types.ts`：`TurnTraceItem` 接口及 `turn_end.turn_trace` 字段现已恒缺省，WebUI 消费方需适配。
+- 删除或改写仅涉及 GitHub 远程 review 的旧测试，不保留已删除入口的兼容断言；保留并增强 OAuth/provider、`web_search`/`web_fetch`、stdio/SSE/Streamable HTTP MCP 及 network guard 测试。
+- 新增或保留 workspace access 契约测试：默认 full、显式 restricted、message/session/config 优先级、别名、非法 payload 回退、restricted 越界拒绝、full 受既有 guard 约束、Review 固定 restricted、内部 report/session/artifact 写入继续有效。
+- 新增 approval 删除测试：工具执行不创建或等待 future，不发送 permission request/response；Judge 仍返回业务 `needs_confirmation`。
+- 新增本地-only review 与联网能力边界测试；验证 GitHub target/source/tool/cache/metadata/evidence 无有效入口，同时 OAuth/provider、web 工具及三种 MCP transport 继续可用并受 network guard 约束。
+- 更新 `.agents/constraints/security.md`、`.agents/constraints/architecture.md`、`.agents/mcp-usage.md`、`nanoreview/skills/github/SKILL.md`、`nanoreview/skills/repo-reader/SKILL.md`、`nanoreview/skills/rag/SKILL.md` 及相关生产文档，明确普通联网资料可访问但不能成为远程 review target；本计划记录实施结果和验收结果。
 
-### 复查修复：4 项 P2 后端问题（本轮追加）
+## 受影响文件清单
 
-上游复查报告指出 4 项 P2 问题；逐项最小复现后确认全部为真实缺陷并已修复。
+### 生产代码
 
-1. **[P2] Reasoning 文本在事件投影时丢失**（`nanoreview/agent/event_sink.py`、`nanoreview/agent/subagent.py`）
-   - 复现：hook 把文本放在 `ProgressEvent.reasoning`，但 bus sink、CLI 适配器与 subagent 出口只读 `content`，结果是 `reasoning text` 被投递成空字符串 `''`。
-   - 修复：`nanoreview/events.py` 新增 `ProgressEvent.text`（`content or reasoning or ""`）作为事件正文的单一访问点；`nanoreview/agent/event_sink.py` 新增模块级 `event_text(event)`（优先读 `text`，回落 `content`）并导出，`build_bus_event_sink._publish` 与 `build_callback_event_sink` 的 `on_progress` 首参改用它；`subagent.py` 的出站 `OutboundMessage.content` 同样改用 `event_text`。prose 与 tool hint 行为不变。
+```text
+nanoreview/config/schema.py
+nanoreview/config/loader.py
+nanoreview/agent/context.py
+nanoreview/agent/runner.py
+nanoreview/agent/conversation_loop.py
+nanoreview/agent/coordinator.py
+nanoreview/agent/subagent.py
+nanoreview/agent/review_loop.py
+nanoreview/agent/tools/permissions.py
+nanoreview/agent/tools/filesystem.py
+nanoreview/agent/tools/shell.py
+nanoreview/agent/tools/message.py
+nanoreview/agent/tools/mcp.py
+nanoreview/agent/tools/github_review.py
+nanoreview/agent/tools/review_base.py
+nanoreview/review/types.py
+nanoreview/review/admission.py
+nanoreview/review/source/github.py
+nanoreview/review/source/utils.py
+nanoreview/review/input/targets.py
+nanoreview/review/input/normalizers.py
+nanoreview/review/planning/prompt.py
+nanoreview/review/planning/evidence.py
+nanoreview/review/planning/preprocessor.py
+nanoreview/review/profiles.py
+nanoreview/rag/review_service.py
+nanoreview/providers/openai_codex_provider.py   # 保留 provider/OAuth，仅核对 GitHub review 绑定
+nanoreview/providers/factory.py                 # 保留并验证
+nanoreview/providers/registry.py                # 保留并验证
+nanoreview/channels/websocket.py
+nanoreview/cli/commands.py
+nanoreview/security/network.py                  # 保留并验证所有 network guard
+```
 
-2. **[P2] `stream_end` 使用下一段 ID，无法正确关闭当前段**（`nanoreview/agent/coordinator.py` `_publish_turn_event`）
-   - 复现：delta 的 `_stream_id` 以 `:0` 结尾，配对的 end 却是 `:1`。
-   - 修复：把 `if isinstance(event, StreamEndEvent): stream_segment += 1` 移到 `await publish(...)` **之后**，使 end 事件携带它所关闭那一段的 id，随后才递增。
+### 测试与文档
 
-3. **[P2] Run hook 的"快照"与执行状态共享引用**（`nanoreview/agent/runner.py`）
-   - 复现：`before_run` 的 `messages` 指向真实历史，结束快照的 `usage` 直接引用累计字典；observer 追加的消息进入 `result.messages`，改 `usage` 后 Runner 返回值从 `7` 变 `999`。
-   - 修复：`run()` 开头改为 `AgentRunHookContext(messages=deepcopy(messages))`；`_fill_run_context` 中 `run_context.usage = dict(usage)`（原为直接引用）。与 nanobot 的隔离方式对齐。
+```text
+tests/agent/tools/test_permissions.py
+tests/agent/tools/test_repo_review_github.py
+tests/agent/test_mcp_integration.py
+tests/agent/tools/test_mcp_smoke.py
+tests/agent/tools/test_mcp_tool.py
+tests/config/test_mcp_config.py
+tests/agent/test_loop_modes.py
+tests/agent/test_review_gate.py
+tests/security/test_network_guards.py
+tests/agent/test_coordinator.py
+tests/agent/test_conversation_loop.py
+tests/agent/test_review_loop.py
+tests/review/test_admission.py
+tests/review/test_policy.py
+.agents/constraints/security.md
+.agents/constraints/architecture.md
+.agents/mcp-usage.md
+nanoreview/skills/github/SKILL.md
+nanoreview/skills/repo-reader/SKILL.md
+nanoreview/skills/rag/SKILL.md
+```
 
-4. **[P2] `after_run` 在压缩清理和 usage 合并前触发，拿不到最终结果**（`nanoreview/agent/runner.py`）
-   - 复现：`after_run` 看到 `40/20`，`on_finally` 与 `result.usage` 为 `140/70`。
-   - 修复：新增 `_settle_run_accounting(spec, state, usage)`，内部以 `state.usage_banked` 守卫做一次性「关闭压缩 → `merge_token_usage`」结算；`run()` 的 `CancelledError`/`Exception`/`else` 三个分支开头均先调用它，再 `_fill_run_context`，随后 `run_context.usage = dict(usage)`，最后才 `on_error`/`after_run`；`finally` 仅作幂等兜底 + `on_finally`。`nanoreview/agent/compression.py` 的 `RunCompressionState` 新增 `usage_banked: bool = False` 字段。
+### WebUI（第 8 阶段，仅记录，不在本阶段修改）
 
-- 本轮新增端到端回归测试：`tests/agent/test_event_sink.py`（reasoning 经 bus sink / CLI callback 投影、prose 与 tool hint 不受影响）、`tests/agent/test_hook_lifecycle.py`（`before_run` 消息隔离、run context usage/tools_used 隔离、`after_run` 观测到结算后 usage、结算只合并一次、模型报错时 `after_run` 看到最终错误态）、`tests/agent/test_loop_modes.py`（`TwoSegmentStreamRunner` + `test_each_stream_end_carries_the_id_of_the_segment_it_closes`，走 `coordinator._dispatch` 才能注入 `_stream_id`）。
-- 本轮验证：全量 `pytest` 712 passed；`ruff check nanoreview/` 48 项（与 HEAD 基线 47 的同族新增 1 条 CLI `E402`，不在本轮改动文件内），`ruff check tests/` 4 项；本轮触碰的 6 个源文件与 3 个测试文件均为 `All checks passed`。
+```text
+review-webui/
+```
 
-### 复查修复追加：收尾事件绕过 `EventSink.accepts()`（第 5 项 P2）
+以上清单是本阶段的固定范围；实施时不得新增范围外文件。若核对后某个列出的文件没有对应入口，只能从清单中删除该文件并在实施记录中说明原因，不得扩展到未列出的功能。
 
-- **问题**：`conversation_loop.py` 达到迭代上限时、`coordinator.py` 的 `/stop` 收尾回复都直接取 `events.publish` 并发布 `StreamDeltaEvent`/`StreamEndEvent`，绕过了 `EventSink.accepts()`。真实 Runner 复现（`_max_iterations=1` + 永远请求工具的 provider，`_wants_stream` 缺省）：非流式消费者收到 `_stream_delta` + `_stream_end`，随后又收到同正文的普通回复 —— 重复交付。`/stop` 同理。
-- **根因**：`accepts()` 是「本作用域是否有该事件的消费者」的唯一判据，hook 侧（`AgentProgressHook`/`SubagentHook`）都按类型检查；只有这两处收尾路径按「`publish` 非 None」判断，等于把「有 sink」误当「消费该类型」。
-- **修复**：
-  - `conversation_loop._run`：`if ctx.events.accepts(StreamDeltaEvent): await ctx.events.emit(StreamDeltaEvent(...)); await ctx.events.emit(StreamEndEvent(...))`。同时把 `publish` 换成 `emit` —— 收尾通知是 best-effort，投递失败不该让一个已经产出回复的 turn 抛错。
-  - `coordinator._stopped_direct_reply`：改为 `if events.accepts(StreamDeltaEvent):` 内走 `events.emit(...)`，与既有的 `suppress(Exception)` 语义一致。
-- **不加 `accepts(StreamEndEvent)` 二次判断**：delta 被接受而 end 不被接受在 `EventSink` 语义下不可能成立（`_stream_delta`/`_stream_end` 同进同出，两个 builder 的 `accepts_type` 都是布尔门），加了反而是自相矛盾的死代码。生产者侧既有写法也统一为「只查 delta」。
-- **回归测试**（`tests/agent/test_loop_modes.py`）：`ExhaustingRunner` + `RecordingSink`，四项 —— 非流式 max-iterations 不产生流事件且回复正文正确、流式 max-iterations 仍产出 `[StreamDeltaEvent, StreamEndEvent]`、`/stop` 在 wants_stream 两种取值下的事件集合。已验证把两处改回 buggy 后对应用例失败。
-- **验证**：全量 `pytest` **716 passed**（此前 712，+4）；改动文件 `ruff` 全绿，`nanoreview/` 48 项、`tests/` 4 项与基线一致。
+## 验收矩阵
 
-### 复查修复追加：max-iterations 收尾不得吞掉投递失败（第 6 项 P2）
+| 场景 | 固定输入 | 必须结果 |
+|---|---|---|
+| 默认 Conversation scope | `restrict_to_workspace=False`，无 message/session override | `access_mode=full`，root 为有效 `review_local_root`，无效时为 `agents.defaults.workspace` |
+| 显式 restricted | message metadata 提供合法 `workspace_scope` | 只能访问 `project_path` 内路径；越界读、写、cwd 和测试命令拒绝 |
+| 显式 full | message/session metadata 提供 `full` 或别名 `full-access` | 可访问 workspace 外路径，但仍受路径 guard、shell guard、内部 URL guard 和 OS sandbox 约束 |
+| 非法 scope | 缺字段、非法 mode、相对路径、非目录或不存在路径 | 整体回退到配置默认 scope，不等待确认、不部分采用 payload |
+| Review Agent | `repository_root`/`review_local_root` 有效或回退到本地 target root | 目标仓库工具访问固定 restricted；目标仓库写入/修改命令拒绝；report/session/artifact 内部持久化成功 |
+| Approval | 任意 Conversation 工具调用 | 不创建、不等待 approval future，不产生 permission request/response；工具直接按 scope 执行 |
+| Judge 业务确认 | Judge 返回 `needs_confirmation` | 字段和值语义保留，不触发工具 approval |
+| Review 输入 | 本地仓库 target | admission、归一化、快照、注册和 review 流程成功 |
+| 远程输入 | GitHub URL、GitHub target 或远程 review 参数 | 作为 review 输入被拒绝；无 GitHub source/tool/cache/metadata/evidence 有效入口；普通网页或代码托管文档 URL 可由 `web_fetch` 读取，但不转为 review target |
+| MCP | `type="stdio"`、`type="sse"`、`type="streamableHttp"` 配置 | 三种 transport 均按既有字段连接；`url`、`headers`、`auth` 继续解析并受 SSRF、重定向、私网和代理 guard 约束 |
+| 模型调用 | 任一已支持 provider（含 OAuth） | provider 所需 HTTP API 调用继续工作，不注册为 Agent 网络工具 |
+| 通用联网工具 | `web_search`、`web_fetch` | 工具入口、提示和测试继续有效；可访问普通网页资料，不创建远程 review target |
+| WebUI 范围 | 第 4–7 阶段 | `review-webui/` 不修改；后端不生成或接受 approval 协议事件；第 8 阶段再删除前端残留并做闭环验收 |
 
-- **问题**：上一项修复把迭代上限收尾的 `publish` 换成了 `emit`，导致投递失败被吞。但 `_respond` 依据「这个 wrap-up 已经被推进流通道」把回复标记 `_streamed=True`，`ChannelManager._send_once`（`channels/manager.py:363`，`elif not meta.get("_streamed")`）据此跳过 `channel.send`。于是复现出：sink 抛 `ConnectionError` → 流程照常返回一条 `_streamed=True` 的回复 → 正文既没进流、也不走普通通道，**提示彻底丢失**。
-- **修复**：保留新增的 `accepts(StreamDeltaEvent)` 判断，把两处调用换回 `publish()`（传播语义）。`/stop` 保持 `emit` + `suppress(Exception)` 不变。
-- **为什么两条路径的异常语义必须不同**（`accepts()` 与 `emit`/`publish` 正交）：
-  | 路径 | 回复是否带 `_streamed` | 流通道角色 | 投递失败应当 |
-  |---|---|---|---|
-  | max-iterations 收尾 | 是（`_assemble_outbound` 打标） | **唯一交付路径** | 传播，让 turn 显式失败 |
-  | `/stop` 收尾 | 否 | 冗余通知，正文本身经 `channel.send` 交付 | 吞掉，不把已停止的请求变成错误 |
-- **回归测试**（`tests/agent/test_loop_modes.py`，`BrokenStreamSink`）：`test_max_iterations_wrap_up_propagates_a_delivery_failure`（流式 + 投递失败 → `pytest.raises(ConnectionError)`，且只尝试 1 次，证明 delta 先失败即中止）、`test_max_iterations_wrap_up_skips_the_push_for_a_non_streaming_turn`（非流式根本不尝试推送，`attempts == 0`，回复不带 `_streamed`）、`test_stop_reply_swallows_a_delivery_failure`（`/stop` 两次推送都吞掉，仍正常返回 `Stopped.`，回复不带 `_streamed`）。
-- **验证**：全量 `pytest` **719 passed**（此前 716，+3）；回归灵敏度已在同一次调用内验证（改回 `emit` → 传播异常那条失败；恢复 `publish` → 8 项全绿）。`nanoreview/` 48 项、`tests/` 4 项与基线一致，三个改动文件 `ruff` 全绿。
+## 验证命令
 
-## 当前节点：按本机最新版 nanobot 恢复 MCP
+实施完成后按以下顺序执行：
 
-以本机 nanobot `432421bceba6e50ec435924c7b21ef341ed69e55`（2026-09-26）为源码基线，把删除于 `943d106d`（2026-06-21）的 MCP 实现与配置提取并适配回 NanoReview。Git 记录只用于追溯。**不增加对本机 nanobot 包或目录的运行依赖。**
+```powershell
+git diff --check
+pytest <受影响测试文件>
+pytest
+ruff check nanoreview/
+rg -n "approval_enabled|permission_request|permission_response|requires_approval|github_review|github_repo|review_github|target_type.*github|remote.*review" nanoreview tests
+```
 
-本节点已完成实施与验证；此前节点（Conversation Agent 步骤 1-6、handoff 收敛、finding 引用删除）的记录保持原样，不改写。
+残留检查必须人工区分允许项与删除项：`needs_confirmation`、pairing approval、`contains_internal_url`、OAuth/provider login/logout、`web_search`/`web_fetch`、HTTP MCP transport、network guard 和 provider HTTP client 均应保留；仅 GitHub source/tool/target 分支、远程 review 参数、远程 snapshot/cache、GitHub metadata/evidence 及 approval request/response/future 不得保留有效生产入口。
 
-### 已确认范围
+## 明确不做
 
-- 仅 Conversation Agent 使用 MCP。
-- 恢复 stdio、SSE、Streamable HTTP，tools/resources/prompts，图片结果与 headers 鉴权。
-- 配置修改后重启生效；进程内共享连接。OAuth、热重载、插件 MCP 配置和管理界面不纳入本轮。
-- 失败重试、断线重连与权限确认行为沿用 nanobot。
+- 不新增逐工具确认、风险分级授权、approval 兼容层或新的用户确认流程。
+- 不把普通模型 provider 的 HTTP API 当作 Agent 可调用的通用网络工具，也不删除模型调用所需的 HTTP/OAuth 能力。
+- 不删除 `web_search`、`web_fetch` 或任何已支持的 MCP transport；继续保留 `nanoreview/security/network.py`、SSRF whitelist、重定向、私网和代理 guard。
+- 不把普通网页或代码托管文档访问扩展为远程仓库 review；GitHub URL 只可作为普通网页资料输入（如适用），不能成为 review target。
+- 不修改 `review-webui/`，不在第 4–7 阶段修复前端 approval 残留。
+- 不修改审查策略、上下文压缩、报告交接契约、finding 语义或 `/stop` 回滚行为。
+- 不自动创建 worktree，不恢复远程 review，不保留已删除入口的兼容门面。
 
-### 本轮实现
+## 当前决策状态
 
-- 配置：补回 `tools.mcpServers` 与 `MCPServerConfig`，保留最新版 `type`、`command`、`args`、`env`、`cwd`、`url`、`headers`、`toolTimeout`、`enabledTools`。默认无服务器、调用超时 30 秒、允许全部能力。复用现有 camelCase 序列化与 `${VAR}` 解析，env/header 字典键保持原样。新增依赖 `mcp>=1.26.0,<2.0.0`。
-- 客户端：`agent/tools/mcp.py` 保留上游的 Windows 启动器处理（`npx`/`npm`/`pnpm`/`yarn`/`bunx` 与 `.cmd`/`.bat` 统一走 `COMSPEC /d /c`）、工具名清洗与长度限制、schema 规范化、tools 分页发现、错误结果处理和图片落盘。`enabledTools` 沿用上游语义：`["*"]` 开放全部能力，`[]` 禁用全部能力，指定列表时不注册 resources/prompts。
-- 接线：`SessionCoordinator` 独立装配 `MCPProvider`（自持注册表与连接），不注册到审查使用的 `self.tools`。`ConversationLoop` 每轮先完成连接准备再注册代理工具；`MCPToolProxy` 只持有定义快照，执行时经 Provider 解析活包装器，重连后既有 turn 也能使用新连接。
-- 生命周期：新增幂等 `SessionCoordinator.aclose()`，Gateway、CLI 与 API cleanup 统一调用。单服务连接准备限时 30 秒，失败清理该服务并继续其他服务，下轮重试。
-- 共享依赖：`security/network.py` 迁入 DNS 固定与代理处理并保留本项目 SSRF 白名单规则，DNS 解析移出事件循环，重定向和 SSE 后续请求均校验；`tools/base.py` 补齐 schema union 的参数转换与验证、迁入字符串兼容的 `ToolResult`；`registry.py` 与 `runner.py` 优先读取显式错误状态；新增 `utils/cancellation.py` 的 `task_is_cancelling()`；`tools/context.py` 补 `tool_log_content_allowed()`。图片复用本项目 artifact 存储，base64 不进入模型历史。
-
-### 本轮差异（相对 nanobot `432421bc`）
-
-- 仅 Conversation Agent 装配，审查侧不可见。
-- 不实现 OAuth（配置 `auth` 时明确报错）、不做热重载、不做插件 MCP 配置与管理界面。
-- `ToolResult` 消费方需兼容本项目既有工具的字符串错误约定。
-- 网络校验复用本项目 SSRF 白名单规则，而非直接沿用上游默认。
-
-### 注意事项
-
-- **MCP 不触发现有逐工具 approval 确认**，即使 `approval_enabled=true`；由 `TestApprovalIsNotTriggered` 回归。
-- 沿用上游自动重试，**可能重复执行写入操作**；不提供恰好执行一次的保证，也不回滚已发生的操作。
-- MCP 外部服务不受本地文件工具的 workspace guard 或 shell sandbox 自动约束，应在服务启动参数及其自身权限中限制访问。
-- 共享连接也共享服务端会话状态；`cwd` 来自 MCP 配置，不随 Conversation 的目标仓库自动切换。
-- 本地 HTTP MCP 需显式配置 SSRF 白名单。配置重启生效不影响运行中按上游机制恢复断开的连接。
-
-### 测试与验收
-
-- 配置（`tests/config/test_mcp_config.py`，15 项）：默认关闭、camelCase 与 snake_case、序列化与 JSON round-trip、鉴权 headers、`${VAR}` 解析、无效配置、OAuth 字段可解析但连接时报错。
-- 客户端（`tests/agent/tools/test_mcp_tool.py`，57 项）：工具名清洗与长度限制、URL 脱敏、schema 规范化（nullable union、anyOf、本地 `$ref`）、`isError`、**成功文本以 `Error:` 开头不判失败**、超时、瞬时故障重试、resource/prompt 包装器、`ToolResult` 与 Registry 交互、每轮代理、Provider 生命周期、Windows 启动器（`npx`/`.cmd`/`.exe`/shell 放行/`COMSPEC` 来源/非 Windows 不改写）。
-- 集成（`tests/agent/test_mcp_integration.py`，26 项）：Conversation 可见 MCP 而 `coordinator.tools`、planner/reviewer/Judge 均不可见；跨 session 注册表独立；重连后既有 turn 可继续调用；approval 不触发；连接中与调用中取消；`aclose()` 幂等与无残留；`enabledTools` 四种语义；分页发现；OAuth 不静默连接。
-- 生命周期：连接中和调用中 `/stop`、API 请求取消、重复关闭、各入口退出后无 MCP 子进程或 owner task 残留。
-- 真实服务器冒烟（`tests/agent/tools/test_mcp_smoke.py`，7 项）：FastMCP + uvicorn 起本地 stdio/SSE/Streamable HTTP 服务器完成三种 transport 往返、headers 鉴权、loopback 白名单守卫、重连后旧 turn 可用、关闭后无 owner task 残留。
-
-### 实施进展
-
-- 已完成代码、测试与文档。ruff 与 HEAD 基线一致（`nanoreview/` 47 + `tests/` 5），未新增告警。
-- 冒烟 fixture 曾出现端口竞态（SSE 请求打到 streamableHttp 应用导致 `/messages/` 404），已改为「分配端口 → 启动 → 读实际绑定端口并确认 started → 失败换端口重试」。
-- 修正上游一处真实缺陷：`PinnedDNSAsyncTransport._resolver_lock` 原为类级 `asyncio.Lock`（nanobot `432421bc` 同样如此），会绑定到第一个使用它的事件循环，进程内存在第二个 loop 时（测试、SDK 嵌入、多线程各一 loop）直接抛 `bound to a different event loop`，表现为 MCP HTTP 连接静默失败。现改为按 loop 弱引用取锁，`pin_resolved_url_dns` 内用线程级 `RLock` + 嵌套计数保护进程全局解析器，只有最外层恢复。
-- 修正代理与 SSRF 白名单不一致：`httpx_env_proxy_mounts` 原先无条件把所有 `http://`/`https://` 交给环境代理，白名单放行的 loopback 目标只对探测/首个请求生效，后续请求仍进代理。本地 MCP 服务器因此出现 `/sse` 可连、`/messages/?session_id=...` 被代理回 `404` 的现象（`initialize` 成功而 `notifications/initialized` 立即 404）。现被 `tools.ssrf_whitelist` 放行的 loopback host 同时豁免代理，`env_proxy_applies_to_url` 采用同一规则。以上两项回归见 `tests/security/test_network_guards.py`（12 项）。
+当前无待确认产品决策。第 4 阶段可以按本计划直接实施；实施过程中仅记录代码事实、测试结果和超出本计划范围的阻塞，不自行改变产品范围。
