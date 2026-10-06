@@ -18,6 +18,7 @@ from nanoreview.agent.tools.safety_boundary import (
     ssrf_soft_payload,
 )
 from nanoreview.agent.tools.shell import ExecTool
+from nanoreview.agent.tools.workspace_scope import ACCESS_FULL, ACCESS_RESTRICTED
 from nanoreview.review.input.normalizers import normalize_review_target_type
 from nanoreview.review.input.targets import infer_review_target_type
 
@@ -165,3 +166,67 @@ class TestNetworkCapabilitiesAreRetained:
         registry = ToolRegistry()
 
         assert registry.tool_names == []
+
+
+class TestReviewRolesArePinnedToRestricted:
+    """Review roles stay ``restricted`` even though the conversation default is
+    ``full``; the pinning must reach the actual tool-call context, not just the
+    helper that builds the value."""
+
+    @staticmethod
+    def _reviewer_profile():
+        from nanoreview.review.profiles import reviewer_execution_profiles
+
+        return reviewer_execution_profiles()["security"]
+
+    def test_reviewer_profile_resolves_to_restricted(self, tmp_path: Path):
+        from nanoreview.agent.subagent import subagent_workspace_scope
+
+        target = tmp_path / "repo"
+        target.mkdir()
+
+        scope = subagent_workspace_scope(
+            self._reviewer_profile(), target, restrict_to_workspace=False
+        )
+
+        assert scope.access_mode == ACCESS_RESTRICTED
+        assert scope.project_path == target.resolve()
+
+    def test_non_review_profile_keeps_the_config_default(self, tmp_path: Path):
+        from dataclasses import replace
+
+        from nanoreview.agent.subagent import subagent_workspace_scope
+
+        generic = replace(
+            self._reviewer_profile(), id="generic", scope="generic.read"
+        )
+
+        scope = subagent_workspace_scope(generic, tmp_path, restrict_to_workspace=False)
+
+        assert scope.access_mode == ACCESS_FULL
+
+    @pytest.mark.asyncio
+    async def test_subagent_hook_binds_the_scope_for_tool_calls(self, tmp_path: Path):
+        from nanoreview.agent.hooks.lifecycle import AgentHookContext
+        from nanoreview.agent.hooks.subagent import SubagentHook
+        from nanoreview.agent.subagent import subagent_workspace_scope
+        from nanoreview.agent.tools.context import current_workspace_scope
+
+        target = tmp_path / "repo"
+        target.mkdir()
+        scope = subagent_workspace_scope(
+            self._reviewer_profile(), target, restrict_to_workspace=False
+        )
+        hook = SubagentHook(
+            "task1",
+            None,
+            tools=ToolRegistry(),
+            workspace_scope=scope,
+        )
+
+        await hook.before_execute_tools(AgentHookContext(iteration=0, messages=[]))
+
+        observed = current_workspace_scope()
+        assert observed is not None
+        assert observed.access_mode == ACCESS_RESTRICTED
+        assert observed.project_path == target.resolve()

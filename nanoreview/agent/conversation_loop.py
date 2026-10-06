@@ -128,6 +128,12 @@ class _TurnContext:
     pending_summary: str | None = None
     handoff_directive: str | None = None
 
+    #: Turn-level workspace access decision. Resolved once before the runner
+    #: starts and reused by every later request-context refresh: rebuilding the
+    #: context without it would silently drop ``restricted`` after the first
+    #: tool batch and let later calls reach outside the project root.
+    workspace_scope: WorkspaceScope | None = None
+
     pending_queue: asyncio.Queue | None = None
 
     #: Typed event delivery for this turn. Transports build the sink; the
@@ -448,8 +454,13 @@ class ConversationLoop:
                 session_key=ctx.session_key,
                 workspace=ctx.target_root,
                 tool_hint_max_length=self._tool_hint_max_length,
+                # The progress hook refreshes the request context before every
+                # tool batch (so tools registered mid-turn, e.g. reconnected MCP
+                # capabilities, receive it). The turn scope is injected here
+                # because the hook only knows channel/chat/metadata — without
+                # it the refresh would reset ``workspace_scope`` to ``None``.
                 set_tool_context=lambda *a, **k: self._set_registry_context(
-                    ctx.tools, *a, **k
+                    ctx.tools, *a, **{**k, "workspace_scope": ctx.workspace_scope}
                 ),
                 on_iteration=lambda iteration: setattr(
                     self, "_current_iteration", iteration
@@ -660,6 +671,7 @@ class ConversationLoop:
             message_metadata=metadata,
             session_metadata=session_metadata,
         )
+        ctx.workspace_scope = scope
         self._set_registry_context(
             ctx.tools,
             ctx.outbound_channel or ctx.msg.channel,

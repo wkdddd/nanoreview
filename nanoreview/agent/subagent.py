@@ -28,6 +28,11 @@ from nanoreview.agent.tools.context import ToolContext
 from nanoreview.agent.tools.file_state import FileStates
 from nanoreview.agent.tools.loader import ToolLoader
 from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.agent.tools.workspace_scope import (
+    WorkspaceScope,
+    resolve_workspace_scope,
+    review_workspace_scope,
+)
 from nanoreview.bus.events import InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import AgentDefaults, ToolsConfig
@@ -38,6 +43,26 @@ from nanoreview.utils.subagent_trace import append_subagent_trace, flush_subagen
 
 _TASK_RUNNING = "running"
 _TASK_COMPLETED = "completed"
+
+
+def subagent_workspace_scope(
+    profile: SubagentExecutionProfile,
+    workspace: Path,
+    restrict_to_workspace: bool,
+) -> WorkspaceScope:
+    """Resolve the workspace scope one subagent run is bound to.
+
+    Review profiles are pinned to ``restricted`` against their target
+    repository root, so a reviewer can neither read nor execute outside it
+    regardless of the conversation-side configuration. Any non-review profile
+    falls back to the config-derived default.
+    """
+    if profile.scope.startswith("reviewer."):
+        return review_workspace_scope(workspace)
+    return resolve_workspace_scope(
+        default_project_path=workspace,
+        restrict_to_workspace=restrict_to_workspace,
+    )
 _TASK_FAILED = "failed"
 
 
@@ -376,6 +401,9 @@ class SubagentManager:
             )
             tools = self.build_tools(profile, sub_workspace)
             system_prompt = self.build_system_prompt(profile, metadata, sub_workspace)
+            workspace_scope = subagent_workspace_scope(
+                profile, sub_workspace, self.restrict_to_workspace
+            )
 
             stream_id = f"subagent:{task_id}"
             origin_channel = origin.get("channel", "cli")
@@ -440,6 +468,7 @@ class SubagentManager:
                             metadata=metadata,
                             events=events,
                             streaming=True,
+                            workspace_scope=workspace_scope,
                             on_tool_events=lambda events: self._record_tool_events(
                                 session_key, task_id, events
                             ),

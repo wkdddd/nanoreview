@@ -6,8 +6,10 @@
 
 - 文件路径经现有 path 工具解析，启用 workspace 限制时必须检查边界；额外 root 按用途授予只读、可写或精确文件权限。
 - Conversation Agent 每 turn 解析一个 `WorkspaceScope`（`agent/tools/workspace_scope.py`，`access_mode` 为 `restricted`/`full`），来源优先级 message metadata → session metadata → 全局配置，非法 payload 整体回退到配置默认值；解析后 turn 内不可变，不逐工具等待确认。
+- turn 内每次重建工具调用上下文都必须沿用同一 scope。每批工具前会刷新 request context（让中途注册的工具，如重连的 MCP，拿到上下文），刷新只带 channel/chat/metadata，**scope 必须由调用方显式补回**；漏传会把 scope 重置为 `None`，后续 filesystem/shell/message 调用随即回退到构造时的 `restrict_to_workspace`（默认 `full`），使 `restricted` 在第一批工具后失效。
+- 带 `workspace_scope` 键但 payload 非法的层级会使整条解析链终止并回退配置默认，不再向下一层取用；只有该层**未声明**该键时才继续向下。非法声明不得继承更低层的更宽 scope。
 - 默认 `ToolsConfig.restrict_to_workspace=False` 即 `full`；`True` 即 `restricted`。别名 `restrict`/`full-access` 归一化为规范值。
-- ReviewLoop、planner、reviewer、Judge 固定使用 `restricted` scope（`review_workspace_scope()`），不接受会话 metadata 放宽；审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。
+- ReviewLoop、planner、reviewer、Judge 固定使用 `restricted` scope（`review_workspace_scope()`），不接受会话 metadata 放宽；审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。reviewer 的 scope 由 subagent hook 写入工具调用上下文，不能只依赖 `ToolsConfig.restrict_to_workspace`（会话默认 `full` 时 reviewer 仍须只读目标仓库）。
 - `restrict_to_workspace` 是应用层防护，不替代操作系统或容器隔离；执行隔离复用 `agent/tools/sandbox.py`。
 
 ## 网络

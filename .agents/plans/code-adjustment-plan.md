@@ -224,6 +224,18 @@ rg -n "approval_enabled|permission_request|permission_response|requires_approval
 
 未执行项：`review-webui/` 未改动（按计划留待第 8 阶段）；前端 approval 残留与结构化错误渲染适配未处理。
 
+### 复审修复：scope 生命周期（同日）
+
+实施后的复审发现 3 处与第 39/180 行契约不符，已修复并补回归测试：
+
+- **turn scope 在第一批工具后被重置**（P1）。每批工具前会重建 request context（`AgentProgressHook.before_execute_tools` → `set_tool_context`），该调用只带 channel/chat/metadata，重建出的 `RequestContext.workspace_scope` 为 `None`，后续 filesystem/shell/message 调用回退到构造时的 `restrict_to_workspace`（默认 `full`），使用户声明的 `restricted` 在第一批工具后失效。修复：`_TurnContext` 新增 `workspace_scope`，`_set_tool_context` 解析后写入，`_run_runner` 的 `set_tool_context` lambda 每次显式补回该值。
+- **reviewer 未固定 restricted**（P1）。`review_workspace_scope()` 已定义但无生产调用：reviewer 的 `SubagentHook` 构造 `RequestContext` 时不带 scope，只依赖 `ToolsConfig.restrict_to_workspace`，会话默认 `full` 时 reviewer 可读目标仓库外路径。修复：新增 `nanoreview/agent/subagent.py::subagent_workspace_scope()`（`reviewer.*` profile 固定 restricted，其余走配置默认），`_run_subagent` 计算后传给 `SubagentHook`，hook 写入工具调用上下文。
+- **非法 payload 错误继承 session scope**（P2）。`resolve_workspace_scope` 在 payload 非法时用 `continue` 继续解析下一层，可能让 malformed message 继承 session 的 `full`。修复：非法 payload 立即返回配置默认 scope，终止整条解析链；只有该层未声明 `workspace_scope` 键时才继续向下。
+
+配套：`tests/agent/test_conversation_loop.py` 新增 `test_a_restricted_turn_scope_survives_the_pre_tool_context_refresh`（含工具批次刷新后 scope 仍为 restricted、越界读被拒），`tests/agent/test_loop_modes.py` 新增 `test_reviewer_run_binds_a_restricted_scope`（覆盖 `_run_subagent` → hook 的完整接线），`tests/agent/tools/test_stage4_boundaries.py` 新增 `TestReviewRolesArePinnedToRestricted`（3 例），`tests/agent/tools/test_workspace_scope.py` 改写非法 payload 用例为「整体回退」并补 session 层对称用例。`security.md` 同步记录 scope 刷新不变量与 reviewer 绑定要求。
+
+验证：**897 passed, 1 failed**（同一项环境性失败）；改动文件 `ruff` 全绿，全量 `nanoreview/` 45、`tests/` 4 均无新增。
+
 ## 明确不做
 
 - 不新增逐工具确认、风险分级授权、approval 兼容层或新的用户确认流程。
@@ -236,4 +248,4 @@ rg -n "approval_enabled|permission_request|permission_response|requires_approval
 
 ## 当前决策状态
 
-当前无待确认产品决策。第 4 阶段可以按本计划直接实施；实施过程中仅记录代码事实、测试结果和超出本计划范围的阻塞，不自行改变产品范围。
+第 4 阶段已实施完成（含同日复审修复），无待确认产品决策。后续阶段按 `project-roadmap.md` 推进；实施过程中仅记录代码事实、测试结果和超出本计划范围的阻塞，不自行改变产品范围。

@@ -109,8 +109,10 @@ def resolve_workspace_scope(
     """Resolve the turn's scope from metadata, falling back to config.
 
     Message metadata wins over session metadata; session metadata wins over the
-    global config default. An invalid payload at either level is skipped and the
-    next level is consulted, so the result is always a valid scope.
+    global config default. A level that omits the key is simply not a source and
+    resolution continues. A level that *carries* an invalid payload aborts the
+    whole chain and returns the config-derived default: no field of the illegal
+    payload is adopted, and no lower level is consulted either.
     """
     default_scope = _default_scope(default_project_path, restrict_to_workspace)
 
@@ -125,10 +127,12 @@ def resolve_workspace_scope(
         payload = metadata.get(WORKSPACE_SCOPE_KEY)
         parsed = _parse_payload(payload)
         if parsed is None:
+            # The payload is rejected as a whole: an illegal scope declaration
+            # must not silently inherit a wider scope from a lower level.
             logger.warning(
                 "workspace_scope.invalid source={} fallback=config", source_name
             )
-            continue
+            return default_scope
         return parsed
 
     return default_scope

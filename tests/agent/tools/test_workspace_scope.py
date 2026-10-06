@@ -119,22 +119,49 @@ class TestInvalidPayloadFallback:
 
         assert scope.access_mode == ACCESS_FULL
 
-    def test_invalid_message_payload_does_not_fall_through_to_valid_session(
+    def test_invalid_message_payload_aborts_resolution_to_config_default(
         self, tmp_path: Path
     ):
-        """A malformed payload is skipped, so resolution continues to the next level."""
+        """An illegal declaration is rejected whole; no lower level is consulted."""
         other = tmp_path / "other"
         other.mkdir()
 
         scope = resolve_workspace_scope(
             default_project_path=tmp_path,
-            restrict_to_workspace=False,
+            restrict_to_workspace=True,
             message_metadata={"workspace_scope": {"access_mode": "full"}},
-            session_metadata=_payload(other, "restricted"),
+            session_metadata=_payload(other, "full"),
+        )
+
+        assert scope.project_path == tmp_path
+        assert scope.access_mode == ACCESS_RESTRICTED
+
+    def test_invalid_session_payload_aborts_resolution_to_config_default(
+        self, tmp_path: Path
+    ):
+        scope = resolve_workspace_scope(
+            default_project_path=tmp_path,
+            restrict_to_workspace=True,
+            session_metadata={"workspace_scope": {"access_mode": "full"}},
+        )
+
+        assert scope.project_path == tmp_path
+        assert scope.access_mode == ACCESS_RESTRICTED
+
+    def test_absent_message_key_still_consults_session(self, tmp_path: Path):
+        """A level that omits the key is not a declaration; the chain continues."""
+        other = tmp_path / "other"
+        other.mkdir()
+
+        scope = resolve_workspace_scope(
+            default_project_path=tmp_path,
+            restrict_to_workspace=True,
+            message_metadata={"something_else": 1},
+            session_metadata=_payload(other, "full"),
         )
 
         assert scope.project_path == other.resolve()
-        assert scope.access_mode == ACCESS_RESTRICTED
+        assert scope.access_mode == ACCESS_FULL
 
     def test_absent_key_does_not_override(self, tmp_path: Path):
         scope = resolve_workspace_scope(
@@ -146,7 +173,10 @@ class TestInvalidPayloadFallback:
 
         assert scope.access_mode == ACCESS_RESTRICTED
 
-    def test_dot_path_is_resolved_to_absolute(self, tmp_path: Path, monkeypatch):
+    def test_relative_path_payload_is_rejected_and_falls_back(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A relative ``project_path`` is an illegal payload, not a resolvable one."""
         monkeypatch.chdir(tmp_path)
 
         scope = resolve_workspace_scope(
@@ -155,8 +185,8 @@ class TestInvalidPayloadFallback:
             message_metadata=_payload(Path("."), "restricted"),
         )
 
-        assert scope.project_path.is_absolute()
         assert scope.project_path == tmp_path.resolve()
+        assert scope.access_mode == ACCESS_FULL
 
 
 class TestReviewScope:

@@ -33,13 +33,19 @@ from nanoreview.agent.coordinator import (
     ReviewHandoff,
     SessionCoordinator,
 )
+from nanoreview.agent.hooks.lifecycle import AgentHookContext
 from nanoreview.agent.review_state import ReviewRunStatus
 from nanoreview.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
     AgentRunResult,
     AgentRunSpec,
 )
+from nanoreview.agent.tools.context import current_workspace_scope
 from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.agent.tools.workspace_scope import (
+    ACCESS_RESTRICTED,
+    WORKSPACE_SCOPE_KEY,
+)
 from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.providers.base import LLMProvider, LLMResponse
@@ -102,6 +108,33 @@ class InjectingRunner(SpecCapturingRunner):
                 {"role": "assistant", "content": "ok"},
             ],
             had_injections=bool(self.injected),
+        )
+
+
+class ContextRefreshRunner(SpecCapturingRunner):
+    """Runner that refreshes the tool context the way the real runner does.
+
+    ``AgentRunner`` calls ``hook.before_execute_tools`` before each batch so
+    tools registered mid-turn (reconnected MCP capabilities) receive the
+    request context. Recording the scope observed right after that refresh is
+    what pins the turn scope against being dropped.
+    """
+
+    def __init__(self, batches: int = 2) -> None:
+        super().__init__()
+        self._batches = batches
+        self.observed_scopes: list[Any] = []
+
+    async def run(self, spec: AgentRunSpec) -> AgentRunResult:
+        self.specs.append(spec)
+        for _ in range(self._batches):
+            await spec.hook.before_execute_tools(
+                AgentHookContext(iteration=0, messages=[])
+            )
+            self.observed_scopes.append(current_workspace_scope())
+        return AgentRunResult(
+            final_content="ok",
+            messages=[*spec.frozen_messages, *spec.working_messages],
         )
 
 
@@ -402,3 +435,54 @@ async def test_the_drain_respects_the_injection_cap(tmp_path) -> None:
     # The cap still holds and the surplus stays queued for a later turn.
     assert len(runner.injected) == _MAX_INJECTIONS_PER_TURN
     assert queue.qsize() == 3
+
+
+@pytest.mark.asyncio
+async def test_a_restricted_turn_scope_survives_the_pre_tool_context_refresh(
+    tmp_path,
+) -> None:
+    """A ``restricted`` turn must not widen once tools start running.
+
+    Regression: the progress hook rebuilds the request context before every
+    tool batch and only knows channel/chat/metadata. Rebuilding without the
+    turn scope reset it to ``None``, so later filesystem/shell calls fell back
+    to the construction-time ``restrict_to_workspace`` (``full`` by default) and
+    could reach outside the project root.
+    """
+    scope_root = tmp_path / "repo"
+    scope_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("SECRET", encoding="utf-8")
+
+    loop = _loop(tmp_path)
+    runner = ContextRefreshRunner()
+    loop._runner = runner
+
+    await loop.process_message(
+        InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content="hello",
+            metadata={
+                WORKSPACE_SCOPE_KEY: {
+                    "project_path": str(scope_root),
+                    "access_mode": "restricted",
+                }
+            },
+        ),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+    )
+
+    assert len(runner.observed_scopes) == 2
+    for observed in runner.observed_scopes:
+        assert observed is not None
+        assert observed.access_mode == ACCESS_RESTRICTED
+        assert observed.project_path == scope_root.resolve()
+
+    # And the boundary is enforced, not merely recorded.
+    read_tool = runner.specs[0].tools.get("read_file")
+    result = await read_tool.execute(path=str(outside))
+    assert "SECRET" not in str(result)
