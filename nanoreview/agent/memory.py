@@ -47,6 +47,9 @@ class MemoryStore:
 _RAW_ARCHIVE_MAX_CHARS = 16_000
 _ARCHIVE_SUMMARY_MAX_CHARS = 8_000
 
+_PREVIOUS_SUMMARY_HEADER = "Earlier summary of already-archived turns:"
+_NEW_TURNS_HEADER = "Newly archived conversation turns:"
+
 
 class Consolidator:
     """Summarize old session turns into session metadata only."""
@@ -188,18 +191,22 @@ class Consolidator:
             previous_summary=self.last_summary_text(session),
         )
         session.last_consolidated = end_idx
-        if summary:
-            self._persist_last_summary(session, summary)
-        else:
-            self.sessions.save(session)
+        self._persist_last_summary(session, summary)
 
     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
+        """Store a meaningful summary and persist the session either way.
+
+        ``last_consolidated`` has usually already moved by the time this runs, so
+        the save must happen even when the summary is missing or the LLM sentinel
+        ``"(nothing)"``: skipping it leaves the progress only in memory and a
+        restart re-reads turns that were already hidden from the replay window.
+        """
         if summary and summary != "(nothing)":
             session.metadata["_last_summary"] = {
                 "text": summary,
                 "last_active": session.updated_at.isoformat(),
             }
-            self.sessions.save(session)
+        self.sessions.save(session)
 
     @staticmethod
     def last_summary_text(session: Session) -> str | None:
@@ -248,8 +255,9 @@ class Consolidator:
     def _input_token_budget(self) -> int:
         return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
 
-    def _truncate_to_token_budget(self, text: str) -> str:
-        budget = self._input_token_budget
+    def _truncate_to_token_budget(self, text: str, budget: int | None = None) -> str:
+        if budget is None:
+            budget = self._input_token_budget
         if budget <= 0:
             return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
         try:
@@ -283,21 +291,21 @@ class Consolidator:
     ) -> str | None:
         """Fallback summary for session metadata when the LLM is unavailable.
 
-        ``previous_summary``, when present, is kept at the head of the truncated
-        body: the degraded path must preserve already-archived turns too.
+        ``previous_summary`` is kept ahead of the new turns, each capped to half
+        the character budget: the degraded path must preserve already-archived
+        turns without letting a large running summary push the newly archived
+        ones out of the text.
         """
         if not messages:
             return None
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
-        body = self._format_messages(messages)
+        turns = self._format_messages(messages)
         if previous_summary:
-            body = (
-                "Earlier summary of already-archived turns:\n"
-                f"{previous_summary}\n\n"
-                "Newly archived turns:\n"
-                f"{body}"
-            )
-        formatted = truncate_text(body, limit)
+            notes = truncate_text(previous_summary, max(1, limit // 2))
+            body = f"{_PREVIOUS_SUMMARY_HEADER}\n{notes}\n\n{_NEW_TURNS_HEADER}\n{turns}"
+            formatted = truncate_text(body, limit)
+        else:
+            formatted = truncate_text(turns, limit)
         logger.warning(
             "Session consolidation degraded: raw-summarized {} messages", len(messages)
         )
@@ -323,12 +331,22 @@ class Consolidator:
         if not body:
             # Nothing new to summarize; keep what the session already carried.
             return previous_summary
-        sections = [body]
         if previous_summary:
-            sections.insert(
-                0, f"Earlier summary of already-archived turns:\n{previous_summary}"
+            # Cap the running summary to half the budget and only then head-trim
+            # the whole prompt. The new turns are what the caller is about to
+            # hide behind `last_consolidated`, so they must always keep a share:
+            # a summary that fills the budget would push them out of the model
+            # input entirely while the caller still advanced past them, losing
+            # them for good.
+            notes = self._truncate_to_token_budget(
+                f"{_PREVIOUS_SUMMARY_HEADER}\n{previous_summary}",
+                max(1, self._input_token_budget // 2),
             )
-        formatted = self._truncate_to_token_budget("\n\n".join(sections))
+            formatted = self._truncate_to_token_budget(
+                f"{notes}\n\n{_NEW_TURNS_HEADER}\n{body}"
+            )
+        else:
+            formatted = self._truncate_to_token_budget(body)
         if not formatted:
             return None
         prompt = (
@@ -433,10 +451,8 @@ class Consolidator:
                     previous_summary=self.last_summary_text(session),
                 )
                 session.last_consolidated = end_idx
-                if summary:
-                    self._persist_last_summary(session, summary)
-                else:
-                    self.sessions.save(session)
+                self._persist_last_summary(session, summary)
+                if not summary:
                     break
 
                 with suppress(Exception):

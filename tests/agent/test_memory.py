@@ -179,11 +179,16 @@ _MARKER = re.compile(r"MARK-\d+")
 
 
 class MarkerSummaryProvider(LLMProvider):
-    """Summarize by echoing every ``MARK-nn`` marker the request carried."""
+    """Summarize by echoing every ``MARK-nn`` marker the request carried.
 
-    def __init__(self) -> None:
+    ``reply`` overrides that with a fixed answer, e.g. the ``"(nothing)"``
+    sentinel the real provider sometimes returns.
+    """
+
+    def __init__(self, reply: str | None = None) -> None:
         super().__init__()
         self.requests: list[str] = []
+        self.reply = reply
 
     async def chat(
         self,
@@ -197,6 +202,8 @@ class MarkerSummaryProvider(LLMProvider):
     ) -> LLMResponse:
         body = "\n".join(str(message.get("content", "")) for message in messages)
         self.requests.append(body)
+        if self.reply is not None:
+            return LLMResponse(content=self.reply)
         markers = sorted(set(_MARKER.findall(body)))
         return LLMResponse(content="SUMMARY: " + " ".join(markers))
 
@@ -319,4 +326,63 @@ async def test_a_later_consolidation_keeps_the_earlier_summary(tmp_path) -> None
     assert session.last_consolidated > consolidated_once
     later = Consolidator.last_summary_text(session) or ""
     assert set(_MARKER.findall(first)) <= set(_MARKER.findall(later))
+
+
+@pytest.mark.asyncio
+async def test_a_previous_summary_cannot_crowd_out_the_new_turns(tmp_path) -> None:
+    """A running summary larger than the budget must still leave room for the chunk.
+
+    The chunk is about to be hidden behind ``last_consolidated``; if the previous
+    summary fills the whole prompt the new turns never reach the model and are
+    lost for good, even though the caller already advanced past them.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(
+        tmp_path, sessions, provider, context_window_tokens=1500
+    )
+    old_summary = "OLD-SUMMARY " + ("ancient decision detail " * 120)
+    session.metadata["_last_summary"] = {
+        "text": old_summary,
+        "last_active": session.updated_at.isoformat(),
+    }
+    _seed_turns(session, 0, 20)
+
+    await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert provider.requests
+    sent = provider.requests[0]
+    assert "MARK-00" in sent  # the new turns reached the model
+    assert "OLD-SUMMARY" in sent  # without dropping the running summary
+    assert "MARK-00" in (Consolidator.last_summary_text(session) or "")
+
+
+@pytest.mark.asyncio
+async def test_a_nothing_summary_still_persists_progress(tmp_path) -> None:
+    """The ``"(nothing)"`` sentinel must not swallow the session save.
+
+    ``_persist_last_summary`` still updates ``last_consolidated`` before it runs,
+    so skipping the save would keep the progress only in memory and a restart
+    would re-read turns that were already hidden from the replay window.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    _seed_turns(session, 0, 20)
+    sessions.save(session)
+
+    consolidator = _marker_consolidator(
+        tmp_path,
+        sessions,
+        MarkerSummaryProvider(reply="(nothing)"),
+        context_window_tokens=4000,
+    )
+
+    await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.last_consolidated > 0
+    reloaded = SessionManager(tmp_path).get_or_create("test:session")
+    assert reloaded.last_consolidated == session.last_consolidated
+    # The sentinel must not become the stored summary.
+    assert Consolidator.last_summary_text(reloaded) is None
 
