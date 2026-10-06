@@ -16,7 +16,12 @@
 - 压缩只改变模型工作上下文，不改变 `AgentRunResult.messages` 原始历史；重建保留 summary、最近完整交互单元与压缩期间追加的 suffix。
 - assistant tool-call 及其 tool results 不可拆分；未完成交互保留在活动区。异步结果必须校验 snapshot，过期结果不得覆盖新上下文。
 - 同步压缩失败重试一次，仍失败为 `compression_failed`；成功后仍超限为 `compression_limit`。错误非空，必须向调用方和用户可见。
-- run 内压缩不负责跨轮历史管理；当前 `Consolidator`/`AutoCompact` 提供会话整理，后续调整需分别核对回放预算与 run 预算。
+- run 内压缩不负责跨轮历史管理；当前 `Consolidator` 按 token 提供会话整理，后续调整需分别核对回放预算与 run 预算。
+- 会话整理隐藏的历史只经由持久化 `_last_summary` 回到后续上下文（含重启后）；它同时是 token 探针与真实 prompt 的摘要来源，两者必须一致，不得只计入预算而不注入。
+- 新的整理摘要必须先纳入当前 `_last_summary` 再落盘，不得整体覆盖；同一次调用的多个 chunk 与跨轮连续整理都累积到同一份，否则更早被隐藏的决策和未完成事项会从上下文消失。
+- 整理请求必须为新 chunk 保留预算份额，且超预算时两端都保留、只省略中间：新 chunk 即将被 `last_consolidated` 隐藏，丢了就永久丢失，其尾部又紧邻回放窗口边界。降级为 raw 摘要时同样处理（本项目没有 raw history sidecar 可兜底）。
+- 推进 `last_consolidated` 后必须落盘；摘要缺失（`None`）保留旧检查点，模型返回 `"(nothing)"` 则是**替换**检查点——删除 `_last_summary`，不得留存旧值继续注入它已不再覆盖的上下文。
+- `"(nothing)"` 会删除检查点，必须在 Consolidator prompt 中明确定义为仅当旧检查点和新 chunk 都没有可保留信息时使用；不可把未声明的模型文本解释为控制信号。
 
 ## Usage
 

@@ -47,6 +47,26 @@ class MemoryStore:
 _RAW_ARCHIVE_MAX_CHARS = 16_000
 _ARCHIVE_SUMMARY_MAX_CHARS = 8_000
 
+_PREVIOUS_SUMMARY_HEADER = "Earlier summary of already-archived turns:"
+_NEW_TURNS_HEADER = "Newly archived conversation turns:"
+_NOTHING_SUMMARY = "(nothing)"
+_ELISION = "\n... (truncated) ...\n"
+
+
+def _truncate_keeping_ends(text: str, limit: int) -> str:
+    """Trim ``text`` to ``limit`` characters, eliding the middle.
+
+    Trimming only the tail drops the newest turns, and trimming only the head
+    drops the original task; a chunk that does not fit keeps both ends and marks
+    the gap. Callers use this for the newly archived turns, never for a stored
+    summary (whose opening facts are the ones worth keeping).
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = max(0, (limit - len(_ELISION)) // 2)
+    tail = max(0, limit - len(_ELISION) - head)
+    return text[:head] + _ELISION + text[len(text) - tail:]
+
 
 class Consolidator:
     """Summarize old session turns into session metadata only."""
@@ -164,32 +184,78 @@ class Consolidator:
         self,
         session: Session,
         replay_max_messages: int | None,
-    ) -> str | None:
-        """Summarize messages that would be hidden by the replay window."""
+    ) -> None:
+        """Summarize messages hidden by the replay window and persist the result.
+
+        The new summary folds in the session's current ``_last_summary``, so the
+        turns hidden by the replay window join the ones hidden by earlier
+        consolidation instead of replacing them.
+        """
         end_idx = self._replay_overflow_boundary(session, replay_max_messages)
         if end_idx is None:
-            return None
+            return
         chunk = session.messages[session.last_consolidated:end_idx]
         if not chunk:
-            return None
+            return
         logger.info(
             "Replay-window consolidation for {}: chunk={} msgs, replay_max={}",
             session.key,
             len(chunk),
             replay_max_messages,
         )
-        summary = await self.archive(chunk)
+        summary = await self.archive(
+            chunk,
+            previous_summary=self.last_summary_text(session),
+        )
         session.last_consolidated = end_idx
-        self.sessions.save(session)
-        return summary
+        self._persist_last_summary(session, summary)
 
     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        if summary and summary != "(nothing)":
+        """Replace the session checkpoint and persist the session either way.
+
+        ``last_consolidated`` has usually already moved by the time this runs, so
+        the save must happen even when the summary is missing or the model sent
+        the ``"(nothing)"`` sentinel: skipping it leaves the progress only in
+        memory and a restart re-reads turns that were already hidden.
+
+        ``"(nothing)"`` is a *replacement* checkpoint, not a missing one: the
+        model asserted that neither the previous checkpoint nor the newly
+        archived turns hold anything worth carrying forward. The stored summary
+        is therefore dropped — keeping it would leave a stale checkpoint that
+        claims to describe turns it no longer covers. NanoReview represents "no
+        checkpoint" by the absence of the key, so no reader has to know the
+        sentinel.
+
+        A ``None`` summary means the opposite — nothing could be produced — and
+        keeps the existing checkpoint in place.
+        """
+        if summary == _NOTHING_SUMMARY:
+            session.metadata.pop("_last_summary", None)
+        elif summary:
             session.metadata["_last_summary"] = {
                 "text": summary,
                 "last_active": session.updated_at.isoformat(),
             }
-            self.sessions.save(session)
+        self.sessions.save(session)
+
+    @staticmethod
+    def last_summary_text(session: Session) -> str | None:
+        """Read the persisted session summary, if any.
+
+        Single source of truth for ``_last_summary``: the token probe and the
+        context that reaches the model both read it here, so the budget and the
+        real prompt always account for the same summary. Consolidation hides old
+        turns from the replay window, and this text is the only carrier of them
+        back into later turns — including after a restart, when it is reloaded
+        from session metadata. Also accepts the legacy bare-string shape.
+        """
+        meta = session.metadata.get("_last_summary")
+        if isinstance(meta, dict):
+            text = meta.get("text")
+            return text if isinstance(text, str) and text else None
+        if isinstance(meta, str) and meta:
+            return meta
+        return None
 
     def estimate_session_prompt_tokens(
         self,
@@ -198,8 +264,7 @@ class Consolidator:
         """Estimate prompt size from the full unconsolidated session tail."""
         history = self._full_unconsolidated_history(session, include_timestamps=True)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        meta = session.metadata.get("_last_summary")
-        summary = meta.get("text") if isinstance(meta, dict) else (meta if isinstance(meta, str) else None)
+        summary = self.last_summary_text(session)
         probe_messages = self._build_messages(
             history=history,
             current_message="[token-probe]",
@@ -220,8 +285,9 @@ class Consolidator:
     def _input_token_budget(self) -> int:
         return self.context_window_tokens - self.max_completion_tokens - self._SAFETY_BUFFER
 
-    def _truncate_to_token_budget(self, text: str) -> str:
-        budget = self._input_token_budget
+    def _truncate_to_token_budget(self, text: str, budget: int | None = None) -> str:
+        if budget is None:
+            budget = self._input_token_budget
         if budget <= 0:
             return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
         try:
@@ -232,6 +298,35 @@ class Consolidator:
             return enc.decode(tokens[:budget]) + "\n... (truncated)"
         except Exception:
             return truncate_text(text, budget * 4)
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        if not text:
+            return 0
+        try:
+            return len(tiktoken.get_encoding("cl100k_base").encode(text))
+        except Exception:
+            return max(1, len(text) // 4)
+
+    def _truncate_to_token_budget_keeping_ends(self, text: str, budget: int) -> str:
+        """Trim ``text`` to ``budget`` tokens, eliding the middle."""
+        if budget <= 0:
+            return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            tokens = enc.encode(text)
+            if len(tokens) <= budget:
+                return text
+            room = max(0, budget - len(enc.encode(_ELISION)))
+            head = room // 2
+            tail = room - head
+            return (
+                enc.decode(tokens[:head])
+                + _ELISION
+                + enc.decode(tokens[len(tokens) - tail:])
+            )
+        except Exception:
+            return _truncate_keeping_ends(text, budget * 4)
 
     @staticmethod
     def _format_messages(messages: list[dict[str, Any]]) -> str:
@@ -246,30 +341,110 @@ class Consolidator:
             )
         return "\n".join(lines)
 
-    def raw_archive(self, messages: list[dict[str, Any]], *, max_chars: int | None = None) -> str | None:
-        """Fallback summary for session metadata when the LLM is unavailable."""
+    def raw_archive(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_chars: int | None = None,
+        previous_summary: str | None = None,
+    ) -> str | None:
+        """Fallback summary for session metadata when the LLM is unavailable.
+
+        Bounded text is the only copy that survives here — NanoReview keeps no
+        raw-history sidecar — so neither end of the archive may be dropped
+        silently: the running summary keeps its head (its opening facts are the
+        ones that matter) and the new turns keep both ends (the newest turns sit
+        at the tail, the original task at the head).
+        """
         if not messages:
             return None
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
-        formatted = truncate_text(self._format_messages(messages), limit)
+        turns = self._format_messages(messages)
+        prefix = f"[RAW] {len(messages)} messages\n"
+        if previous_summary:
+            notes = truncate_text(previous_summary, max(1, limit // 2))
+            header = f"{prefix}{_PREVIOUS_SUMMARY_HEADER}\n{notes}\n\n{_NEW_TURNS_HEADER}\n"
+            body = _truncate_keeping_ends(turns, max(1, limit - len(header)))
+            result = header + body
+        else:
+            body = _truncate_keeping_ends(turns, max(1, limit - len(prefix)))
+            result = prefix + body
         logger.warning(
             "Session consolidation degraded: raw-summarized {} messages", len(messages)
         )
-        return f"[RAW] {len(messages)} messages\n{formatted}"
+        return result
 
-    async def archive(self, messages: list[dict[str, Any]]) -> str | None:
-        """Summarize messages and return text for current-session metadata."""
+    def _merge_archive_prompt(self, body: str, previous_summary: str) -> str:
+        """Fit the running summary and the newly archived turns into the budget.
+
+        The running summary keeps its head; the new turns keep both ends. Both
+        matter: the new turns are about to be hidden behind ``last_consolidated``
+        (so losing them here loses them for good) and the newest of them sit
+        right at the replay-window boundary, where a silent gap breaks
+        continuity.
+        """
+        budget = self._input_token_budget
+        if budget <= 0:
+            # No token budget at all: fall back to the character cap, half/half.
+            notes = truncate_text(previous_summary, max(1, _RAW_ARCHIVE_MAX_CHARS // 2))
+            header = (
+                f"{_PREVIOUS_SUMMARY_HEADER}\n{notes}\n\n{_NEW_TURNS_HEADER}\n"
+            )
+            return header + _truncate_keeping_ends(
+                body, max(1, _RAW_ARCHIVE_MAX_CHARS - len(header))
+            )
+        notes = self._truncate_to_token_budget(
+            f"{_PREVIOUS_SUMMARY_HEADER}\n{previous_summary}",
+            max(1, budget // 2),
+        )
+        remaining = max(1, budget - self._count_tokens(notes))
+        turns = self._truncate_to_token_budget_keeping_ends(
+            f"{_NEW_TURNS_HEADER}\n{body}", remaining
+        )
+        return f"{notes}\n\n{turns}"
+
+    async def archive(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        previous_summary: str | None = None,
+    ) -> str | None:
+        """Summarize messages and return text for current-session metadata.
+
+        ``previous_summary`` is the summary of turns consolidated earlier — by an
+        earlier round of the same call or an earlier turn of the session. It is
+        folded into the new summary rather than overwritten, so repeated
+        consolidation never drops the older decisions and open work that earlier
+        rounds already hid from the replay window.
+        """
         if not messages:
             return None
-        formatted = self._truncate_to_token_budget(self._format_messages(messages))
+        body = self._format_messages(messages)
+        if not body:
+            # Nothing new to summarize; keep what the session already carried.
+            return previous_summary
+        if previous_summary:
+            formatted = self._merge_archive_prompt(body, previous_summary)
+        else:
+            formatted = self._truncate_to_token_budget_keeping_ends(
+                body, self._input_token_budget
+            )
         if not formatted:
             return None
         prompt = (
             "Summarize the following older conversation turns for continuing the same session. "
             "Preserve user requests, decisions, unresolved work, tool outcomes, and code review findings. "
             "Do not create long-term facts, preferences, or cross-session memory. "
-            "Keep the summary concise and useful for the next turn."
+            "Keep the summary concise and useful for the next turn. "
+            f"Return exactly {_NOTHING_SUMMARY!r} only when neither the previous checkpoint "
+            "nor the newly archived turns contain anything useful to preserve. "
+            f"Otherwise, never return {_NOTHING_SUMMARY!r}; output a concise replacement checkpoint."
         )
+        if previous_summary:
+            prompt += (
+                " An earlier summary of even older turns is included; merge it with the new"
+                " turns so nothing already recorded is dropped."
+            )
         try:
             response = await self.provider.chat_with_retry(
                 model=self.model,
@@ -286,7 +461,7 @@ class Consolidator:
             return summary
         except Exception:
             logger.warning("Consolidation LLM call failed, using raw session summary")
-            return self.raw_archive(messages)
+            return self.raw_archive(messages, previous_summary=previous_summary)
 
     async def maybe_consolidate_by_tokens(
         self,
@@ -302,7 +477,7 @@ class Consolidator:
         async with lock:
             budget = self._input_token_budget
             target = int(budget * self.consolidation_ratio)
-            last_summary = await self._consolidate_replay_overflow(
+            await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
             )
@@ -312,7 +487,6 @@ class Consolidator:
                 logger.exception("Token estimation failed for {}", session.key)
                 estimated, source = 0, "error"
             if estimated <= 0:
-                self._persist_last_summary(session, last_summary)
                 return
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
@@ -324,7 +498,6 @@ class Consolidator:
                     source,
                     unconsolidated_count,
                 )
-                self._persist_last_summary(session, last_summary)
                 return
 
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
@@ -354,11 +527,16 @@ class Consolidator:
                     source,
                     len(chunk),
                 )
-                summary = await self.archive(chunk)
-                if summary:
-                    last_summary = summary
+                # Feed the running summary back in so each round folds the new
+                # chunk into what earlier rounds already hid, then persist it:
+                # `_last_summary` stays the single source both the next round's
+                # prompt and the token probe read.
+                summary = await self.archive(
+                    chunk,
+                    previous_summary=self.last_summary_text(session),
+                )
                 session.last_consolidated = end_idx
-                self.sessions.save(session)
+                self._persist_last_summary(session, summary)
                 if not summary:
                     break
 
@@ -366,5 +544,3 @@ class Consolidator:
                     estimated, source = self.estimate_session_prompt_tokens(session)
                 if estimated <= 0:
                     break
-
-            self._persist_last_summary(session, last_summary)

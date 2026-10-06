@@ -12,7 +12,7 @@
 - `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
 - `agent/subagent.py`：子代理任务生命周期；`agent/review_state.py`：run 状态、fingerprint 与报告 artifact。
 - `review/`：`admission.py` 准入边界，`result.py` 终态结果与交接渲染，`input/`、`planning/`、`source/`、`output/` 输入、证据、源码、finding 校验、Judge 与报告领域逻辑。
-- `session/`：历史持久化与回放；`agent/context.py`、`memory.py`、`autocompact.py`：提示上下文与会话整理。
+- `session/`：历史持久化与回放；`agent/context.py`、`memory.py`：提示上下文与会话整理（会话整理只由 `Consolidator` 按 token 触发）。
 - `channels/`：协议、交付和重试；`providers/`：模型调用适配；`agent/tools/`：能力与 workspace scope。
 - `review-webui/`：展示与交互；`templates/`、`skills/`：模型行为契约。
 
@@ -47,7 +47,7 @@
 - 阶段判断从 live `ReviewRunState`、session metadata、report artifact 和交接索引推导，不新增 session phase 字段。终态 metadata 先落盘、后发布 live `DONE`，因此“可路由”等价于“已持久化”。无 live executor 的持久化 `running` 会被一次性规范化为终态 `error`，并持久化有界中断原因，不 resume、不重跑。规范化在 `pending_handoff()` 里先于 `_review_settled()` 执行（`result()` 提前调用），保证重启后第一条普通消息就修复 orphan，而非永远卡在 `running`。规范化的 `save()` 失败必须回滚 metadata（缓存不提前发布 `error/done`），保持磁盘与缓存一致，留待下次读重试。
 - 终态 metadata 除 run id/status/phase/fingerprint/report ref 外，还持久化有界 `review_summary`（report 摘要或失败原因）与 `review_error`（非 `completed` 终态的原因），供重启后读取；不持久化 child transcript 或其他中间状态。
 - 交接三态：`complete`（artifact 已落盘且无缺口）、`partial`（artifact 已落盘但存在缺口）、`failed`（无可用 artifact，绝不渲染为完整成功）。交接不重试、不自动补齐、不重跑；已落盘 report 仍可查看。
-- 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。写入由 `SessionCoordinator.consume_handoff` 执行，turn 顺序固定为「加载 session → 恢复中断历史 → AutoCompact 准备 → token Consolidator → 调用 handoff consumer → 读取历史 → 构建模型上下文」；写入失败向上传播且不进入 Runner。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。review 完成 `DONE` 后，交接失败仍可进入对话，但必须说明失败、可用结果与覆盖缺口。
+- 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。写入由 `SessionCoordinator.consume_handoff` 执行，turn 顺序固定为「加载 session → 恢复中断历史 → 执行 token Consolidator → 调用 handoff consumer（处理 review handoff）→ 读取历史 → 构建模型上下文」；写入失败向上传播且不进入 Runner。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。review 完成 `DONE` 后，交接失败仍可进入对话，但必须说明失败、可用结果与覆盖缺口。
 - report artifact 与 `ReviewRunState` 是权威来源，Conversation Agent 不得改写；`review_context` 只是索引。
 - conversation 按 session 串行、最多 20 条待处理消息；`/stop` 取消当前与排队 turn 且保留已发生的修改不自动回滚；重启后不执行未完成队列。
 - 不新增第三个 Agent、通用 `BaseLoop` 或完整独立的 session 状态机。

@@ -16,7 +16,7 @@ review report artifact or rewrites the review run state.
 
 Turn shape (linear helper calls, no state machine, no transition table):
 
-    load session -> restore checkpoint -> compact -> consume handoff
+    load session -> restore checkpoint -> consume handoff
       -> build context/tools -> run -> persist history -> assemble reply
       -> cleanup
 """
@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 from loguru import logger
 
-from nanoreview.agent.autocompact import AutoCompact
 from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.hooks.file_edit import create_file_edit_activity_hook
 from nanoreview.agent.hooks.lifecycle import AgentHook
@@ -125,7 +124,6 @@ class _TurnContext:
     generated_media: list[str] = field(default_factory=list)
 
     tools: ToolRegistry | None = None
-    pending_summary: str | None = None
     handoff_directive: str | None = None
 
     #: Turn-level workspace access decision. Resolved once before the runner
@@ -133,6 +131,11 @@ class _TurnContext:
     #: context without it would silently drop ``restricted`` after the first
     #: tool batch and let later calls reach outside the project root.
     workspace_scope: WorkspaceScope | None = None
+
+    #: Persisted Consolidator summary for this turn. Consolidation hides old
+    #: turns from the replay window, so this text is what carries them back into
+    #: the model prompt.
+    session_summary: str | None = None
 
     pending_queue: asyncio.Queue | None = None
 
@@ -159,7 +162,6 @@ class ConversationLoop:
         context: ContextBuilder,
         runner: AgentRunner,
         consolidator: Consolidator,
-        auto_compact: AutoCompact,
         file_state_store: FileStateStore,
         tools_config: "ToolsConfig",
         model: str,
@@ -185,7 +187,6 @@ class ConversationLoop:
         self._context = context
         self._runner = runner
         self._consolidator = consolidator
-        self._auto_compact = auto_compact
         self._file_state_store = file_state_store
         self._tools_config = tools_config
         self._model = model
@@ -276,7 +277,6 @@ class ConversationLoop:
         )
         try:
             await self._load_session(ctx)
-            self._compact(ctx)
             await self._build(ctx, handoff)
             await self._run(ctx)
             self._save(ctx)
@@ -310,13 +310,6 @@ class ConversationLoop:
             self._sessions.save(session)
         ctx.session = session
 
-    def _compact(self, ctx: _TurnContext) -> None:
-        session, pending = self._auto_compact.prepare_session(
-            ctx.session, ctx.session_key
-        )
-        ctx.session = session
-        ctx.pending_summary = pending
-
     async def _build(
         self, ctx: _TurnContext, handoff: "ReviewHandoff | None"
     ) -> None:
@@ -325,6 +318,11 @@ class ConversationLoop:
             ctx.session,
             replay_max_messages=self._max_messages,
         )
+        # Read what consolidation just left behind, so the turn that triggered it
+        # already sees the summary. It is also the same text the token probe
+        # counts: without this injection the replay window keeps hiding the old
+        # turns while the budget still pays for a summary nobody receives.
+        ctx.session_summary = self._consolidator.last_summary_text(ctx.session)
 
         # The handoff was prepared (and size-checked) by the coordinator, which
         # also owns the single replayable write. The loop calls it after history
@@ -576,7 +574,7 @@ class ConversationLoop:
             chat_id=self._runtime_chat_id(ctx.msg),
             current_role="user",
             sender_id=ctx.msg.sender_id,
-            session_summary=ctx.pending_summary,
+            session_summary=ctx.session_summary,
             session_metadata=ctx.session.metadata,
         )
 
