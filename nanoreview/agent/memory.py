@@ -49,6 +49,23 @@ _ARCHIVE_SUMMARY_MAX_CHARS = 8_000
 
 _PREVIOUS_SUMMARY_HEADER = "Earlier summary of already-archived turns:"
 _NEW_TURNS_HEADER = "Newly archived conversation turns:"
+_NOTHING_SUMMARY = "(nothing)"
+_ELISION = "\n... (truncated) ...\n"
+
+
+def _truncate_keeping_ends(text: str, limit: int) -> str:
+    """Trim ``text`` to ``limit`` characters, eliding the middle.
+
+    Trimming only the tail drops the newest turns, and trimming only the head
+    drops the original task; a chunk that does not fit keeps both ends and marks
+    the gap. Callers use this for the newly archived turns, never for a stored
+    summary (whose opening facts are the ones worth keeping).
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = max(0, (limit - len(_ELISION)) // 2)
+    tail = max(0, limit - len(_ELISION) - head)
+    return text[:head] + _ELISION + text[len(text) - tail:]
 
 
 class Consolidator:
@@ -194,14 +211,27 @@ class Consolidator:
         self._persist_last_summary(session, summary)
 
     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        """Store a meaningful summary and persist the session either way.
+        """Replace the session checkpoint and persist the session either way.
 
         ``last_consolidated`` has usually already moved by the time this runs, so
-        the save must happen even when the summary is missing or the LLM sentinel
-        ``"(nothing)"``: skipping it leaves the progress only in memory and a
-        restart re-reads turns that were already hidden from the replay window.
+        the save must happen even when the summary is missing or the model sent
+        the ``"(nothing)"`` sentinel: skipping it leaves the progress only in
+        memory and a restart re-reads turns that were already hidden.
+
+        ``"(nothing)"`` is a *replacement* checkpoint, not a missing one: the
+        model asserted that neither the previous checkpoint nor the newly
+        archived turns hold anything worth carrying forward. The stored summary
+        is therefore dropped — keeping it would leave a stale checkpoint that
+        claims to describe turns it no longer covers. NanoReview represents "no
+        checkpoint" by the absence of the key, so no reader has to know the
+        sentinel.
+
+        A ``None`` summary means the opposite — nothing could be produced — and
+        keeps the existing checkpoint in place.
         """
-        if summary and summary != "(nothing)":
+        if summary == _NOTHING_SUMMARY:
+            session.metadata.pop("_last_summary", None)
+        elif summary:
             session.metadata["_last_summary"] = {
                 "text": summary,
                 "last_active": session.updated_at.isoformat(),
@@ -270,6 +300,35 @@ class Consolidator:
             return truncate_text(text, budget * 4)
 
     @staticmethod
+    def _count_tokens(text: str) -> int:
+        if not text:
+            return 0
+        try:
+            return len(tiktoken.get_encoding("cl100k_base").encode(text))
+        except Exception:
+            return max(1, len(text) // 4)
+
+    def _truncate_to_token_budget_keeping_ends(self, text: str, budget: int) -> str:
+        """Trim ``text`` to ``budget`` tokens, eliding the middle."""
+        if budget <= 0:
+            return truncate_text(text, _RAW_ARCHIVE_MAX_CHARS)
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            tokens = enc.encode(text)
+            if len(tokens) <= budget:
+                return text
+            room = max(0, budget - len(enc.encode(_ELISION)))
+            head = room // 2
+            tail = room - head
+            return (
+                enc.decode(tokens[:head])
+                + _ELISION
+                + enc.decode(tokens[len(tokens) - tail:])
+            )
+        except Exception:
+            return _truncate_keeping_ends(text, budget * 4)
+
+    @staticmethod
     def _format_messages(messages: list[dict[str, Any]]) -> str:
         lines: list[str] = []
         for message in messages:
@@ -291,25 +350,58 @@ class Consolidator:
     ) -> str | None:
         """Fallback summary for session metadata when the LLM is unavailable.
 
-        ``previous_summary`` is kept ahead of the new turns, each capped to half
-        the character budget: the degraded path must preserve already-archived
-        turns without letting a large running summary push the newly archived
-        ones out of the text.
+        Bounded text is the only copy that survives here — NanoReview keeps no
+        raw-history sidecar — so neither end of the archive may be dropped
+        silently: the running summary keeps its head (its opening facts are the
+        ones that matter) and the new turns keep both ends (the newest turns sit
+        at the tail, the original task at the head).
         """
         if not messages:
             return None
         limit = max_chars if max_chars is not None else _RAW_ARCHIVE_MAX_CHARS
         turns = self._format_messages(messages)
+        prefix = f"[RAW] {len(messages)} messages\n"
         if previous_summary:
             notes = truncate_text(previous_summary, max(1, limit // 2))
-            body = f"{_PREVIOUS_SUMMARY_HEADER}\n{notes}\n\n{_NEW_TURNS_HEADER}\n{turns}"
-            formatted = truncate_text(body, limit)
+            header = f"{prefix}{_PREVIOUS_SUMMARY_HEADER}\n{notes}\n\n{_NEW_TURNS_HEADER}\n"
+            body = _truncate_keeping_ends(turns, max(1, limit - len(header)))
+            result = header + body
         else:
-            formatted = truncate_text(turns, limit)
+            body = _truncate_keeping_ends(turns, max(1, limit - len(prefix)))
+            result = prefix + body
         logger.warning(
             "Session consolidation degraded: raw-summarized {} messages", len(messages)
         )
-        return f"[RAW] {len(messages)} messages\n{formatted}"
+        return result
+
+    def _merge_archive_prompt(self, body: str, previous_summary: str) -> str:
+        """Fit the running summary and the newly archived turns into the budget.
+
+        The running summary keeps its head; the new turns keep both ends. Both
+        matter: the new turns are about to be hidden behind ``last_consolidated``
+        (so losing them here loses them for good) and the newest of them sit
+        right at the replay-window boundary, where a silent gap breaks
+        continuity.
+        """
+        budget = self._input_token_budget
+        if budget <= 0:
+            # No token budget at all: fall back to the character cap, half/half.
+            notes = truncate_text(previous_summary, max(1, _RAW_ARCHIVE_MAX_CHARS // 2))
+            header = (
+                f"{_PREVIOUS_SUMMARY_HEADER}\n{notes}\n\n{_NEW_TURNS_HEADER}\n"
+            )
+            return header + _truncate_keeping_ends(
+                body, max(1, _RAW_ARCHIVE_MAX_CHARS - len(header))
+            )
+        notes = self._truncate_to_token_budget(
+            f"{_PREVIOUS_SUMMARY_HEADER}\n{previous_summary}",
+            max(1, budget // 2),
+        )
+        remaining = max(1, budget - self._count_tokens(notes))
+        turns = self._truncate_to_token_budget_keeping_ends(
+            f"{_NEW_TURNS_HEADER}\n{body}", remaining
+        )
+        return f"{notes}\n\n{turns}"
 
     async def archive(
         self,
@@ -332,21 +424,11 @@ class Consolidator:
             # Nothing new to summarize; keep what the session already carried.
             return previous_summary
         if previous_summary:
-            # Cap the running summary to half the budget and only then head-trim
-            # the whole prompt. The new turns are what the caller is about to
-            # hide behind `last_consolidated`, so they must always keep a share:
-            # a summary that fills the budget would push them out of the model
-            # input entirely while the caller still advanced past them, losing
-            # them for good.
-            notes = self._truncate_to_token_budget(
-                f"{_PREVIOUS_SUMMARY_HEADER}\n{previous_summary}",
-                max(1, self._input_token_budget // 2),
-            )
-            formatted = self._truncate_to_token_budget(
-                f"{notes}\n\n{_NEW_TURNS_HEADER}\n{body}"
-            )
+            formatted = self._merge_archive_prompt(body, previous_summary)
         else:
-            formatted = self._truncate_to_token_budget(body)
+            formatted = self._truncate_to_token_budget_keeping_ends(
+                body, self._input_token_budget
+            )
         if not formatted:
             return None
         prompt = (

@@ -386,3 +386,89 @@ async def test_a_nothing_summary_still_persists_progress(tmp_path) -> None:
     # The sentinel must not become the stored summary.
     assert Consolidator.last_summary_text(reloaded) is None
 
+
+@pytest.mark.asyncio
+async def test_a_nothing_summary_replaces_an_earlier_checkpoint(tmp_path) -> None:
+    """The sentinel is a replacement checkpoint, not a missing one.
+
+    Once the round advanced ``last_consolidated``, keeping the previous summary
+    would leave a stale checkpoint describing turns it no longer covers, and that
+    text would keep being injected into every later prompt.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    session.metadata["_last_summary"] = {
+        "text": "STALE-SUMMARY of already hidden turns",
+        "last_active": session.updated_at.isoformat(),
+    }
+    _seed_turns(session, 0, 20)
+    sessions.save(session)
+
+    consolidator = _marker_consolidator(
+        tmp_path,
+        sessions,
+        MarkerSummaryProvider(reply="(nothing)"),
+        context_window_tokens=4000,
+    )
+
+    await consolidator.maybe_consolidate_by_tokens(session)
+
+    assert session.last_consolidated > 0
+    assert Consolidator.last_summary_text(session) is None
+    reloaded = SessionManager(tmp_path).get_or_create("test:session")
+    assert reloaded.last_consolidated == session.last_consolidated
+    assert Consolidator.last_summary_text(reloaded) is None
+
+
+def test_the_raw_fallback_keeps_both_ends_of_the_new_turns(tmp_path) -> None:
+    """A long degraded dump must not lose its newest turns.
+
+    NanoReview keeps no raw-history sidecar, so this bounded text is the only
+    copy that survives. The tail sits right at the replay-window boundary and the
+    head holds the original task, so an over-budget archive elides the middle
+    instead of trimming one end.
+    """
+    consolidator = _marker_consolidator(
+        tmp_path,
+        SessionManager(tmp_path),
+        MarkerSummaryProvider(),
+        context_window_tokens=2000,
+    )
+    filler = "x" * 300
+    messages: list[dict[str, Any]] = [{"role": "user", "content": f"HEAD-MARK {filler}"}]
+    messages += [{"role": "assistant", "content": filler} for _ in range(98)]
+    messages.append({"role": "assistant", "content": f"{filler} TAIL-MARK"})
+
+    raw = consolidator.raw_archive(
+        messages, max_chars=16_000, previous_summary="OLD-SUMMARY"
+    )
+
+    assert raw is not None
+    assert len(raw) <= 16_000
+    assert "HEAD-MARK" in raw
+    assert "TAIL-MARK" in raw
+    assert "OLD-SUMMARY" in raw
+    assert "(truncated)" in raw  # the middle was elided, not an end dropped
+
+
+@pytest.mark.asyncio
+async def test_the_token_path_keeps_both_ends_of_the_new_turns(tmp_path) -> None:
+    """The same guarantee for the model prompt, not just the degraded fallback."""
+    sessions = SessionManager(tmp_path)
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(
+        tmp_path, sessions, provider, context_window_tokens=1500
+    )
+    filler = "alpha beta gamma delta " * 6
+    messages: list[dict[str, Any]] = [{"role": "user", "content": f"HEAD-MARK {filler}"}]
+    messages += [{"role": "assistant", "content": filler} for _ in range(38)]
+    messages.append({"role": "assistant", "content": f"{filler} TAIL-MARK"})
+
+    await consolidator.archive(messages, previous_summary="OLD-SUMMARY")
+
+    assert provider.requests
+    sent = provider.requests[0]
+    assert "HEAD-MARK" in sent
+    assert "TAIL-MARK" in sent
+    assert "(truncated)" in sent
+
