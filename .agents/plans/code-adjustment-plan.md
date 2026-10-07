@@ -1,251 +1,191 @@
 # 当前代码调整计划
 
-更新时间：2026-10-06
+更新时间：2026-10-07
 
-## 当前节点：roadmap 第 4 阶段工具权限与远程 review 边界收敛
+## 当前节点：ReviewLoop 预算与 diff-only 审查
 
-状态：待实施。本轮只调整计划文档，生产代码与 WebUI 不在本轮修改范围内。
+状态：已确认，待实施。本计划覆盖此前的第 4 阶段计划；实施前只允许按源码核对修正文件清单，不改变已确认目标和预算。
 
-本计划是第 4 阶段的实施基线。下列目标、字段、优先级、默认值、删除范围和验收条件均已确定，实施时不再引入新的产品决策或兼容行为。
+## 前置状态
+
+- 工具 workspace scope 与远程 review 边界第 4 阶段已完成，具体历史实施流水不在本计划重复保留。
+- `nanoreview review` 已支持审查后在同一 CLI session 继续对话；`pytest tests/cli` 已验证该入口。
+- 本计划只调整后端与相关测试/约束/roadmap，不修改 `review-webui/`。
 
 ## 已确认目标
 
-- 权限只处理工具调用层，复用 nanobot 的 `restricted` / `full` workspace access 模型。
-- Conversation Agent 在每个 turn 开始解析 workspace scope；在 scope 允许的范围内读取、写入文件、执行命令和运行测试，不再逐工具等待确认。
-- ReviewLoop、planner、reviewer、Judge 固定使用 `restricted` scope。它们对目标仓库内容只读；已有的 report、session、artifact 内部持久化写入继续保留，并且不通过通用文件或 shell 工具扩大目标仓库权限。
-- 删除逐工具 approval、全局和 session approval 开关、permission request/response、permission future 与 approval transcript。Judge 业务结果中的 `needs_confirmation` 保留，它不是工具授权状态。
-- 已弃用的配置字段、CLI/API 参数、事件和入口直接删除，不做兼容转换或旧字段回填。
-- 删除 GitHub 作为 review 输入及其专属能力：GitHub review/source/target/normalizer/admission 分支、GitHub metadata/evidence、远程 snapshot/cache 和 GitHub review 配置。保留全部通用联网能力：模型 provider 的 HTTP/OAuth 调用、`web_search`、`web_fetch`、stdio/SSE/Streamable HTTP MCP，以及 SSRF、重定向、私网地址和代理校验。
-- 第 4–7 阶段只调整后端；WebUI approval 入口和展示残留统一在第 8 阶段清理。第 4–7 阶段后端不再生成或接受 approval 协议事件。
+- ReviewLoop 的 Planner、reviewer、Judge 固定使用 `200_000` tokens 上下文窗口；通用 Conversation Agent 保持独立配置。
+- reviewer 每次模型输出最多 `8_192` tokens，最多 `30` 次模型请求（最后一次用于 `review_submit`，计入 30 次），单 reviewer 超时 `180s`。不新增累计 token、金额或日/月配额。
+- Reviewer 通过 frozen task 中已分配的 evidence excerpts 审查；四类 reviewer subagent 的工具注册表不含 `local_review`。主 review coordinator/core 仍可使用该工具，其 `ReviewEvidenceService` 继续负责 prefetch 和 evidence dispatch。
+- review 产品入口只保留本地 diff review，移除 repo review 的有效入口、配置和兼容分支。
+- diff 包含 staged、unstaged 和 untracked 变更。无 Git 仓库、无法读取 diff 或 diff 为空时，准入失败并返回明确原因，不启动 Planner/reviewer/Judge。
+- Planner/evidence 的授权范围只来自 diff。reviewer 可以用定向 `read_file`/`grep` 读取 diff 外文件作为上下文；reviewer 工具集不暴露 `local_review`。`local_review` 保留给 core/RAG 等其他场景，内部 `ReviewEvidenceService` 继续负责预处理和 evidence dispatch。
+- accepted finding 必须位于 changed file；行号允许在同一文件的邻近未修改上下文，但需说明与变更的关联。
+- diff evidence 以 changed hunk 为主，按现有优先级排序；必要时补充有限 related context。
+- 单个 changed file 小于 `8_000` tokens 时保留为一个完整 evidence unit；达到或超过阈值时沿用现有语义/diff hunk 切分规则。按单文件判定，不因整个目标进入 chunked 模式而拆分所有小文件。
+- 主 evidence 总预算为 `150_000` tokens；related evidence 保持总预算的四分之一，默认约 `37_500` tokens，维持单层补充规则。
+- Planner 只使用一个结构化 evidence manifest。manifest references 和 skipped/omitted 说明预算固定为上下文窗口的 40%，即 `80_000` tokens。优先保留高优先级 previews；超限时省略低优先级 references 并记录覆盖缺口。
+- manifest 是从同一份结构化 `EvidenceReference` 数据生成的 Planner 唯一输入，不再并行维护 summary manifest 和 coordinator reference manifest。
+- 最终经过预算筛选的 Planner manifest 持久化到 review snapshot，并由 report/ReviewRunState 引用其版本、覆盖和省略统计。
+- 可借鉴 Kodus 的优先级排序、adaptive fit、有界工具输出和 overflow recovery；保留 NanoReview 的 evidence ID、Planner 路由和多维 reviewer，不移植按文件分配 agent 的模式。
 
-
-## 固定的 workspace access 契约
-
-### Scope 数据结构
-
-每个 Agent turn 使用一个不可变的 scope 值对象：
+## 预算契约
 
 ```text
-workspace_scope = {
-    project_path: <绝对且已存在的目录>,
-    access_mode: "restricted" | "full",
-}
+context_window_tokens = 200_000
+reserved_overhead_tokens = 9_000
+safety_margin = 10% of context_window_tokens
+usable_context_tokens = 171_000
+evidence_token_budget = 150_000
+related_evidence_budget = evidence_token_budget / 4 = 37_500
+planner_manifest_budget = context_window_tokens * 40% = 80_000
+reviewer_max_output_tokens = 8_192
+reviewer_model_request_limit = 30
+reviewer_timeout_seconds = 180
 ```
 
-- metadata 键名固定为 `workspace_scope`。
-- `project_path` 必须是绝对路径并且在解析时已经存在且为目录。
-- `access_mode` 的规范值为 `restricted` 和 `full`；兼容 nanobot 的输入别名 `restrict` 与 `full-access`，解析后统一为规范值。
-- message metadata 优先于 session metadata，session metadata 优先于全局配置默认值。
-- metadata payload、mode、path 任一非法时，整份 scope 回退到全局配置计算出的默认 scope；不得部分采用非法 payload 中的字段，也不得等待用户确认。
-- `ToolsConfig.restrict_to_workspace=False` 是当前配置默认值，因此默认 `access_mode` 固定为 `full`；显式设置为 `True` 时默认 `access_mode` 为 `restricted`。
-- scope 在 turn 开始解析并绑定到本轮 `ToolContext` / `RequestContext`；同一 turn 的内部迭代使用同一快照，不能被工具调用改变。
+上述数值是 ReviewLoop 的固定运行预算，不表示所有模型都能使用 200k；本项目本节点按已确认决定统一设置，不做 provider 动态识别。Planner 的 80k 约束只针对 manifest references 与 coverage 说明；Planner system/task/tool 定义和输出仍计入完整 200k 请求窗口。
 
-### Root 来源
+`subagent_evidence_budget_chars` 若保留，必须说明其实际用途是派生 chunk cap，而不是 reviewer 请求的独立总预算。无生产消费者的 `EvidenceBudget.task_cap_tokens` 可以清理，但需核对并同步测试、构造与序列化消费者；不得误删仍影响 `chunk_cap_tokens` 的配置语义。
 
-- Conversation Agent：先读取 session metadata 的 `ReviewMetaKey.LOCAL_ROOT`（持久化键 `review_local_root`）；该值无效时使用 `agents.defaults.workspace`。应用 workspace 仅用于 session、report、artifact 等持久化，不作为目标仓库 root 的替代值。
-- ReviewLoop、planner、reviewer、Judge：优先读取 review metadata 的 `repository_root` 或 `review_local_root`；该值无效时使用已通过本地准入的目标仓库 root。
-- Review Agent 的 restricted scope 只保护目标仓库工具访问；写入 report、session、artifact 的现有领域持久化路径继续有效，不能借此写入目标仓库任意文件。
-
-### 两种模式的边界
-
-- `restricted`：filesystem、shell、message 等通用工具的路径和 cwd 必须位于 `project_path` 内；越界读、写和命令执行都拒绝。
-- `full`：允许工具访问 `project_path` 外的路径和 cwd，但仍执行工具自身的路径校验、shell deny/allow pattern、内部/私有 URL guard 和操作系统 sandbox；`full` 不绕过这些限制，也不恢复 approval。
-- Review Agent 的工具注册表继续与 Conversation Agent 分离。共享工具实现不改变上述角色边界。
+Planner 和 reviewer 收到的输入不同：Planner 看到 manifest 元数据与 previews；reviewer 看到被分配的 evidence excerpts 及关联 related evidence。相同窗口不代表 reviewer 输入一定不超限。实施时必须核对并保护 reviewer frozen task 的请求窗口；不得静默丢弃授权 evidence，也不得假定 working-history compression 能裁剪 frozen task。若容量不足，失败或省略行为必须明确记录到 coverage 和 run 状态。
 
 ## 实施步骤
 
-### 1. 建立影响面清单（只读）
+### 1. 收敛 diff-only 准入
 
-先核对下列生产入口、消费者、事件和测试，形成实施前清单；此步骤不修改代码：
+- 梳理 `ReviewAdmissionService`、CLI/API、tool、配置和 prompt 的 action 消费者，删除 repo review 的可达入口及仅服务于该入口的分支。
+- 保留 staged、unstaged、untracked 收集；明确新增、删除、重命名、不可读和被过滤文件的输入/coverage 语义。
+- 将非 Git 仓库、diff 读取异常、空 diff 统一映射为准入错误；失败不得创建 running review 或调用 agent。
+- snapshot 记录 action、HEAD SHA（可得时）、changed files、skipped files、scope 和 input fingerprint。
 
-- 权限链路：`nanoreview/config/schema.py`、`nanoreview/agent/tools/permissions.py`、`nanoreview/agent/tools/filesystem.py`、`nanoreview/agent/tools/shell.py`、`nanoreview/agent/tools/message.py`、`nanoreview/agent/runner.py`、`nanoreview/agent/conversation_loop.py`、`nanoreview/agent/coordinator.py`、`nanoreview/agent/subagent.py`、`nanoreview/channels/websocket.py`。
-- 本地权限 root：`nanoreview/agent/context.py`、`nanoreview/agent/tools/*`、`nanoreview/review/types.py`、`nanoreview/review/admission.py`、`nanoreview/agent/review_loop.py`、`nanoreview/review/planning/planner.py`、`nanoreview/review/profiles.py`。
-- GitHub/远程 review：`nanoreview/agent/tools/github_review.py`、`nanoreview/agent/tools/review_base.py`、`nanoreview/review/source/github.py`、`nanoreview/review/source/utils.py`、`nanoreview/review/input/targets.py`、`nanoreview/review/input/normalizers.py`、`nanoreview/review/admission.py`、`nanoreview/review/planning/prompt.py`、`nanoreview/review/planning/evidence.py`、`nanoreview/review/planning/preprocessor.py`、`nanoreview/review/profiles.py`、`nanoreview/rag/review_service.py`。
-- OAuth/provider（保留并验证）：`nanoreview/providers/openai_codex_provider.py`、`nanoreview/providers/factory.py`、`nanoreview/providers/registry.py`、`nanoreview/cli/commands.py` 及 provider 配置 schema。
-- 网络与 MCP（保留并验证）：`nanoreview/security/network.py`、`nanoreview/config/loader.py`、`nanoreview/agent/tools/mcp.py`、MCP 配置 schema、MCP 装配和 CLI/API schema；同时核对 `web_search`/`web_fetch` 的实际注册、提示和测试入口。
-- 测试：`tests/agent/tools/test_permissions.py`、`tests/agent/tools/test_repo_review_github.py`、`tests/agent/test_mcp_integration.py`、`tests/agent/tools/test_mcp_smoke.py`、`tests/agent/tools/test_mcp_tool.py`、`tests/config/test_mcp_config.py`、`tests/agent/test_loop_modes.py`、`tests/agent/test_review_gate.py`、`tests/security/test_network_guards.py` 以及 OAuth、WebSocket/API 相关测试。
+### 2. 调整 diff evidence 预处理
 
-### 2. 实现 workspace access
+- 让本地 diff evidence 成为 Planner 唯一授权证据来源；diff 外文件只能由 reviewer 定向读取作上下文。
+- 以单文件 token 数应用 `8_000` 阈值：低于阈值保留一个完整 unit；达到阈值后使用现有解析、hunk、递归拆分和合并策略。
+- 设置主 evidence `150_000` tokens 与 related 四分之一比例；按现有优先级选择主 evidence，related 只作一层补充。
+- 核查文件读取字符上限，确保截断文件被明确标记，不能将截断内容描述成完整文件 evidence。
+- 检查 direct/chunked/oversized 模式、changed-line 定位和 skipped reason，保证大仓库不会因新增单文件规则丢失覆盖信息。
 
-- 在安全/工具上下文层实现上述 `workspace_scope` 解析、优先级、别名、默认值和非法输入回退。
-- 在 Conversation turn 开始绑定 scope；filesystem、shell、message 和测试执行工具读取当前 scope。
-- ReviewLoop、planner、reviewer、Judge 创建 scope 时直接固定为目标仓库 root + `restricted`，不得接受 conversation metadata 对其放宽。
-- 保留现有路径 guard、命令 guard、内部 URL guard 和 OS sandbox；只替换原先以 `restrict_to_workspace` 为中心的统一判定入口。
-- 删除或改写仅依赖旧布尔值的调用方，避免同一 turn 同时存在旧布尔值和新 scope 两套权限事实。
+### 3. 统一并预算 Planner manifest
 
-### 3. 移除 approval 执行链路
+- 以 `EvidenceReference` 为唯一结构化来源，统一 id、path/range、kind、role、token count、matched/risk hints、preview coverage、preview 和 skipped/omitted 记录。
+- 删除 Planner 对旧 summary/context 文本的依赖，所有展示由同一 manifest renderer 生成；Planner 的 assignment 只能引用 manifest 中可用的 evidence IDs。
+- 对 Planner 实际收到的 references 与 coverage 执行 `80_000` token 预算。按优先级保留必要元数据和 previews；预算不足时省略低优先级 references，并记录文件、数量、原因和预算统计。
+- 预算计算需包含 token counter 的来源/估算方式及 manifest 版本；manifest 本身不得超过预算，Planner 全请求不得超过 200k 窗口。
+- reviewer assignment 使用同一 evidence ID 集合，并按现有 parent 关系附加 related evidence。
 
-- 从 `AgentRunSpec`、Runner、ConversationLoop、Coordinator 和 subagent 装配中删除 permission policy、requester、callback、future、响应等待和 approval transcript。
-- 删除 `nanoreview/agent/tools/permissions.py` 的运行时调用方以及工具上的 `requires_approval()`；清理 `ToolsConfig.approval_enabled`、session approval 状态和相关 CLI/API 参数。
-- 删除 WebSocket 后端的 permission request/response、session approval 读写和 approval transcript 生产。第 4–7 阶段不改 `review-webui/`；前端旧入口在此期间没有有效后端协议，统一到第 8 阶段删除。
-- 保留 pairing、普通业务确认、控制命令和 Judge 的 `needs_confirmation`；这些语义不转换为工具 approval。
+### 4. 接线 ReviewLoop 预算与范围
 
-### 4. 删除 GitHub 远程 review 接入，保留联网能力
+- Planner、reviewer、Judge 的 `AgentRunSpec` 显式绑定 `context_window_tokens=200_000`；不得改变 Conversation Agent 的独立上下文配置。
+- reviewer 固定 `max_tokens=8_192`、最多 30 次模型请求、timeout 180 秒；最后一次请求用于最终结构化提交并计入 30 次。一次模型请求可返回多个并行工具调用，模型请求数不等于工具调用数。
+- 维持 Runner frozen/working 分区语义。manifest 和 reviewer task 是 frozen 输入，不得被工作历史压缩静默改写。
+- 从四类 reviewer subagent 的工具注册表移除 `local_review`，保留 `read_file`/`list_dir`/`grep`/`review_submit` 和受限 scope。主 review coordinator 的工具注册及 `local_review` evidence provider 保持可用。
+- 将 changed-file 集合贯穿 reviewer、Judge、validator、finalizer；非 changed-file finding 不得进入 accepted report。
 
-- 删除 `github_review` 工具及其注册、提示、技能说明、denied list、trace/evidence 记录和测试。
-- 删除 GitHub 专属 source、target 类型、normalizer 分支、admission 分支、metadata/evidence、远程 snapshot/cache 和 GitHub 配置字段。保留本地 admission 的仓库存在性、路径校验、归一化、快照、session 注册和错误处理流程；本地 target 仍是唯一审查输入。
-- 保留 `openai_codex_provider`、token/login/logout 入口、provider 注册、OAuth 依赖及所有已支持 provider 的 HTTP API 调用；仅删除实际绑定 GitHub 远程 review 的 OAuth/config 字段（如代码核对确认存在）。
-- 保留 `web_search`、`web_fetch` 的工具实现、注册、运行时提示、技能说明、compactable/hint 注册和测试；它们可读取普通网页和代码托管文档，但不得把 URL 转换为 review target 或恢复远程仓库 review。
-- `MCPServerConfig` 与 MCP provider 继续支持 `type="stdio"`、`type="sse"`、`type="streamableHttp"`，以及现有 `url`、`headers`、`auth` 等网络鉴权字段和实现；继续应用 SSRF、重定向、私网地址和代理校验。无 MCP 配置时保持关闭。
-- 删除 `ToolsConfig.github_repo` 等 GitHub 专属配置字段；保留 `ToolsConfig.ssrf_whitelist` 及其 loader 接线。保留 `nanoreview/security/network.py` 中所有联网场景使用的 URL guard；普通模型 provider 的 HTTP 连接不经过 Agent 网络工具注册表。
-- 同步收敛工具 loader、registry、CLI/API schema、服务装配、日志事件、skills 和生产文档；不保留失效兼容门面。
+### 5. Reviewer 收尾与错误语义
 
-### 5. 同步测试、约束和文档
+- 在 30 轮耗尽前保留最后一轮用于 `review_submit`；成功提交结构化 findings 或空 findings 后正常完成。
+- 最终提交仍失败、reviewer 超时或执行异常时，将该维度标为 incomplete/error；不得把未提交结果解释为空 findings 或完整审查。
+- CLI 对 reviewer/证据不完整或 review 失败返回非零；完整完成且无 findings 返回 0。`--fail-on` 继续只按 finding 严重级别判定。
 
-- 删除或改写仅涉及 GitHub 远程 review 的旧测试，不保留已删除入口的兼容断言；保留并增强 OAuth/provider、`web_search`/`web_fetch`、stdio/SSE/Streamable HTTP MCP 及 network guard 测试。
-- 新增或保留 workspace access 契约测试：默认 full、显式 restricted、message/session/config 优先级、别名、非法 payload 回退、restricted 越界拒绝、full 受既有 guard 约束、Review 固定 restricted、内部 report/session/artifact 写入继续有效。
-- 新增 approval 删除测试：工具执行不创建或等待 future，不发送 permission request/response；Judge 仍返回业务 `needs_confirmation`。
-- 新增本地-only review 与联网能力边界测试；验证 GitHub target/source/tool/cache/metadata/evidence 无有效入口，同时 OAuth/provider、web 工具及三种 MCP transport 继续可用并受 network guard 约束。
-- 更新 `.agents/constraints/security.md`、`.agents/constraints/architecture.md`、`.agents/mcp-usage.md`、`nanoreview/skills/github/SKILL.md`、`nanoreview/skills/repo-reader/SKILL.md`、`nanoreview/skills/rag/SKILL.md` 及相关生产文档，明确普通联网资料可访问但不能成为远程 review target；本计划记录实施结果和验收结果。
+### 6. 修复证据与工具接口缺陷
 
-## 受影响文件清单
+- GitPython 不可用时，CLI diff fallback 将 Git worktree-relative 路径转换为目录 target-relative 路径；子目录 target 的 staged、unstaged 和 untracked 变更应进入 evidence。
+- 修正 core/RAG `local_review` 非 reader action 调用 `ReviewEvidenceService.dispatch()` 时传入不支持的 `tree_pattern` 参数；保留其 `meta/tree/file` reader 和仍允许的 evidence 行为，不恢复 repo review 入口。
+- 为目录 target + GitPython fallback、仍可达的 core/RAG `local_review` evidence dispatch 和 CLI 不完整/完整空 findings 退出码补回归测试。
 
-### 生产代码
+### 7. 重复工作诊断与质量评测
+
+- 按 run/reviewer 记录 evidence 分配、重复文件读取、工具调用数、token usage、耗时和 coverage；用于定位重复探索，不新增累计 token 硬上限。
+- 在 reviewer run 内按解析后的绝对路径和规范化行范围识别 `read_file` 重复读取；文件内容未变且同一范围已成功返回时，阻止再次返回全文，向模型返回简短提示，要求复用已有上下文或请求不同范围。
+- 对 `grep` 等可定位范围的读取工具使用相同原则：仅抑制相同查询/相同范围且内容未变的重复结果；允许读取不同范围和文件变化后的内容，不按“同一文件”粗略禁止全部后续读取。Reviewer 不暴露 `local_review`，因此不为其设计 reviewer 内去重路径。
+- Reviewer 的重复读取拦截不可由 `force` 参数绕过；其他 Agent 的既有行为不因此改变。去重状态限定在单个 reviewer run，不跨 reviewer 或 review run 共享。
+- 建立固定 golden diff case 与 deterministic tool replay，输出 finding 匹配明细、precision/recall/F1、incomplete rate、token usage、工具调用数和耗时。
+- A/B 比较必须固定 case、Planner/reviewer 配置、模型与 reasoning effort；工具回放覆盖不足的 case 标为不可判定，不计作模型漏报。
+
+### 8. 持久化与报告覆盖
+
+- review snapshot 持久化最终给 Planner 的结构化 manifest、budget/renderer 版本、保留和省略 evidence、changed-file 边界及统计。
+- report/ReviewRunState 持有 snapshot/manifest 引用，并呈现 omitted/skipped、reviewer timeout/overflow 和未覆盖原因；不复制完整源码或完整会话。
+- 日志关联 `run_id`/`trace_id`，记录窗口、预算、保留/省略数量、重复读取、usage 和停止原因，不记录完整源码、密钥或完整会话。
+- 同步更新架构、预算、安全约束和 roadmap 中与本节点冲突的阶段边界；WebUI 展示适配留待后续阶段。
+
+### 9. 测试与验证
+
+- 准入测试覆盖 staged、unstaged、untracked、空 diff、非 Git、读取失败、受限 scope、重复路径及新增/删除文件。
+- reviewer 测试覆盖最后一轮结构化提交、提交失败/超时的 incomplete 状态，以及失败不能被规范化为空 findings。
+- reviewer 空 findings 校验覆盖 frozen task 已带 evidence excerpts 的情况；无需 reviewer 调用 `local_review` 才能证明已读取证据。无分配 evidence 且没有成功 `read_file`/`grep` 时仍标记 incomplete。
+- evidence/tool/CLI 回归测试覆盖子目录 target 的 GitPython fallback、coordinator/core/RAG `local_review` dispatch 参数契约、四类 reviewer registry 均不注册 `local_review`、incomplete 非零退出码和完整空 findings 零退出码。
+- Preprocessor 测试覆盖 `<8k` 整文件、`>=8k` 切分、主/related 预算、优先级淘汰、截断标记和大仓库 coverage。
+- Manifest 测试覆盖单一路径、80k token 上限、优先级保留、低优先级省略、稳定 ID、assignment 校验、统计和持久化回放。
+- ReviewLoop 测试覆盖 200k 传递、reviewer 8192/30 次模型请求/180 秒、Conversation 隔离、diff-only 工具权限、changed-file finding 边界及 frozen task 超窗可见失败。
+- 去重测试覆盖路径别名与等价范围归一化、相同范围/未变化内容返回提示、`force` 不绕过 reviewer 去重、不同范围和文件变化允许读取、不同 reviewer 状态隔离，以及 reviewer 可用的 `read_file`/`grep` 路径。
+- Golden replay 验证固定 case 的 finding 匹配、coverage、incomplete rate、usage、工具调用和耗时；质量不能只以 wiring smoke 或 LLM judge 单独判定。
+- 清理 reviewer 的 `local_review` 工具暴露：从 reviewer scope 注册结果中排除该工具，移除 reviewer 的必需工具约束，并更新 reviewer task/system prompt 中要求或建议 reviewer 调用它的内容。只调整面向 subagent 的工具说明；保留主 review coordinator 的 prompt 指引、工具注册及内部 `ReviewEvidenceService`。
+- 核对工具错误软处理和空 findings evidence 校验。Planner 分配并注入 reviewer frozen task 的 evidence excerpts 应计为已提供证据；reviewer 也可通过 `read_file`/`grep` 补充上下文。没有分配 evidence 且没有成功读取证据时，空 findings 仍应标为 incomplete。
+- 运行最贴近测试、完整 pytest、`ruff check nanoreview/`、`git diff --check`；残留扫描区分 reviewer 不可见的要求与 core/RAG 保留的 `local_review` 能力。
+
+## 主要影响面
+
+实施前按实际调用关系确认并收敛下列模块，不做无关重构：
 
 ```text
 nanoreview/config/schema.py
 nanoreview/config/loader.py
-nanoreview/agent/context.py
-nanoreview/agent/runner.py
-nanoreview/agent/conversation_loop.py
-nanoreview/agent/coordinator.py
-nanoreview/agent/subagent.py
 nanoreview/agent/review_loop.py
-nanoreview/agent/tools/permissions.py
-nanoreview/agent/tools/filesystem.py
-nanoreview/agent/tools/shell.py
-nanoreview/agent/tools/message.py
-nanoreview/agent/tools/mcp.py
-nanoreview/agent/tools/github_review.py
+nanoreview/agent/runner.py
+nanoreview/agent/subagent.py
 nanoreview/agent/tools/review_base.py
 nanoreview/review/types.py
 nanoreview/review/admission.py
-nanoreview/review/source/github.py
-nanoreview/review/source/utils.py
-nanoreview/review/input/targets.py
-nanoreview/review/input/normalizers.py
-nanoreview/review/planning/prompt.py
+nanoreview/review/input/snapshot.py
 nanoreview/review/planning/evidence.py
 nanoreview/review/planning/preprocessor.py
+nanoreview/review/planning/prefetch.py
+nanoreview/review/planning/planner.py
+nanoreview/review/planning/prompt.py
 nanoreview/review/profiles.py
-nanoreview/rag/review_service.py
-nanoreview/providers/openai_codex_provider.py   # 保留 provider/OAuth，仅核对 GitHub review 绑定
-nanoreview/providers/factory.py                 # 保留并验证
-nanoreview/providers/registry.py                # 保留并验证
-nanoreview/channels/websocket.py
+ nanoreview/agent/tools/local_review.py
+nanoreview/review/output/judge.py
+nanoreview/review/output/validator.py
+nanoreview/review/output/finalizer.py
 nanoreview/cli/commands.py
-nanoreview/security/network.py                  # 保留并验证所有 network guard
+nanoreview/api/server.py
 ```
 
-### 测试与文档
+主要测试位于 `tests/review/`、`tests/agent/`、`tests/cli/` 和 `tests/api/`。至少核对 admission、preprocessor、prefetch、prompt、review loop、runner compression、local_review dispatch、CLI/API schema 与 report serialization 的对应测试。
 
-```text
-tests/agent/tools/test_permissions.py
-tests/agent/tools/test_repo_review_github.py
-tests/agent/test_mcp_integration.py
-tests/agent/tools/test_mcp_smoke.py
-tests/agent/tools/test_mcp_tool.py
-tests/config/test_mcp_config.py
-tests/agent/test_loop_modes.py
-tests/agent/test_review_gate.py
-tests/security/test_network_guards.py
-tests/agent/test_coordinator.py
-tests/agent/test_conversation_loop.py
-tests/agent/test_review_loop.py
-tests/review/test_admission.py
-tests/review/test_policy.py
-.agents/constraints/security.md
-.agents/constraints/architecture.md
-.agents/mcp-usage.md
-nanoreview/skills/github/SKILL.md
-nanoreview/skills/repo-reader/SKILL.md
-nanoreview/skills/rag/SKILL.md
-```
+## 验收标准
 
-### WebUI（第 8 阶段，仅记录，不在本阶段修改）
+| 场景 | 必须结果 |
+|---|---|
+| ReviewLoop context | Planner/reviewer/Judge 均为 200k；Conversation Agent 独立配置不变 |
+| Reviewer limits | max output 8192、最多 30 次模型请求且最后一次用于提交、180 秒超时；工具调用数单独观测 |
+| Duplicate reads | reviewer 对相同规范化文件范围和未变化内容不重复接收全文；返回复用提示，不阻止不同范围或更新后的内容 |
+| Reviewer completion | 所有成功维度有结构化提交；耗尽/超时/异常显式 incomplete，不伪装为空 findings |
+| CLI result | incomplete/failed 返回非零；完整且无 findings 返回 0；`--fail-on` 只按严重级别判定 |
+| Diff input | staged/unstaged/untracked 纳入；无 Git、读取失败、空 diff 在准入阶段明确失败 |
+| Directory diff fallback | GitPython 不可用时，子目录 target 的 diff evidence 路径正确且变更可审查 |
+| Reviewer tool surface | 四类 reviewer registry 均不含 `local_review`，仍提供 `read_file`/`list_dir`/`grep`/`review_submit`；已分配 evidence 可直接用于审查 |
+| Coordinator evidence service | 主 review coordinator 的 `local_review` provider 仍可生成 diff prefetch；Planner manifest 和 reviewer task 收到同一授权 evidence |
+| Other local_review callers | coordinator/core/RAG 场景仍按既有范围可用；reader 与 evidence dispatch 契约正确，不恢复 repo review 入口 |
+| Diff-only boundary | Planner 只收到 diff evidence；reviewer 可定向读取上下文但不能 broad repo review |
+| Finding boundary | accepted finding 文件必须 changed；同一文件邻近未修改行允许并需关联变更 |
+| Evidence granularity | 单文件 `<8k` 一个完整 unit；`>=8k` 沿用现有切分策略 |
+| Evidence budgets | 主预算 150k；related 为其四分之一；省略和跳过原因可见 |
+| Planner manifest | 唯一结构化输入路径；实际 manifest 不超过 80k token budget；超限优先保留高优先级并记录遗漏 |
+| Persistence | snapshot 有最终 manifest 与预算版本；report/RunState 可读其引用和 coverage |
+| Review efficiency | run/reviewer 可观测重复读取、tool calls、usage、耗时与 coverage；固定 golden replay 可比较质量和成本 |
+| Overflow | frozen 输入超窗时不静默截断；明确恢复结果或 failure/coverage gap 被持久化 |
+| Network capabilities | 不因 diff-only 删除 provider HTTP/OAuth、`web_search`、`web_fetch` 或 MCP 网络能力 |
+| WebUI boundary | 本节点不修改 `review-webui/`；后端不恢复 approval 协议 |
 
-```text
-review-webui/
-```
+## 本节点不做
 
-以上清单是本阶段的固定范围；实施时不得新增范围外文件。若核对后某个列出的文件没有对应入口，只能从清单中删除该文件并在实施记录中说明原因，不得扩展到未列出的功能。
-
-## 验收矩阵
-
-| 场景 | 固定输入 | 必须结果 |
-|---|---|---|
-| 默认 Conversation scope | `restrict_to_workspace=False`，无 message/session override | `access_mode=full`，root 为有效 `review_local_root`，无效时为 `agents.defaults.workspace` |
-| 显式 restricted | message metadata 提供合法 `workspace_scope` | 只能访问 `project_path` 内路径；越界读、写、cwd 和测试命令拒绝 |
-| 显式 full | message/session metadata 提供 `full` 或别名 `full-access` | 可访问 workspace 外路径，但仍受路径 guard、shell guard、内部 URL guard 和 OS sandbox 约束 |
-| 非法 scope | 缺字段、非法 mode、相对路径、非目录或不存在路径 | 整体回退到配置默认 scope，不等待确认、不部分采用 payload |
-| Review Agent | `repository_root`/`review_local_root` 有效或回退到本地 target root | 目标仓库工具访问固定 restricted；目标仓库写入/修改命令拒绝；report/session/artifact 内部持久化成功 |
-| Approval | 任意 Conversation 工具调用 | 不创建、不等待 approval future，不产生 permission request/response；工具直接按 scope 执行 |
-| Judge 业务确认 | Judge 返回 `needs_confirmation` | 字段和值语义保留，不触发工具 approval |
-| Review 输入 | 本地仓库 target | admission、归一化、快照、注册和 review 流程成功 |
-| 远程输入 | GitHub URL、GitHub target 或远程 review 参数 | 作为 review 输入被拒绝；无 GitHub source/tool/cache/metadata/evidence 有效入口；普通网页或代码托管文档 URL 可由 `web_fetch` 读取，但不转为 review target |
-| MCP | `type="stdio"`、`type="sse"`、`type="streamableHttp"` 配置 | 三种 transport 均按既有字段连接；`url`、`headers`、`auth` 继续解析并受 SSRF、重定向、私网和代理 guard 约束 |
-| 模型调用 | 任一已支持 provider（含 OAuth） | provider 所需 HTTP API 调用继续工作，不注册为 Agent 网络工具 |
-| 通用联网工具 | `web_search`、`web_fetch` | 工具入口、提示和测试继续有效；可访问普通网页资料，不创建远程 review target |
-| WebUI 范围 | 第 4–7 阶段 | `review-webui/` 不修改；后端不生成或接受 approval 协议事件；第 8 阶段再删除前端残留并做闭环验收 |
-
-## 验证命令
-
-实施完成后按以下顺序执行：
-
-```powershell
-git diff --check
-pytest <受影响测试文件>
-pytest
-ruff check nanoreview/
-rg -n "approval_enabled|permission_request|permission_response|requires_approval|github_review|github_repo|review_github|target_type.*github|remote.*review" nanoreview tests
-```
-
-残留检查必须人工区分允许项与删除项：`needs_confirmation`、pairing approval、`contains_internal_url`、OAuth/provider login/logout、`web_search`/`web_fetch`、HTTP MCP transport、network guard 和 provider HTTP client 均应保留；仅 GitHub source/tool/target 分支、远程 review 参数、远程 snapshot/cache、GitHub metadata/evidence 及 approval request/response/future 不得保留有效生产入口。
-
-## 实施结果
-
-实施于 worktree `wt-stage4`（分支 `workbuddy/stage4-workspace-scope`），基于主库工作区 `5e8560e6` 的第 4 阶段基线。
-
-生产代码：
-
-- 新增 `nanoreview/agent/tools/workspace_scope.py`（`WorkspaceScope`、`resolve_workspace_scope`、`review_workspace_scope`），`agent/tools/context.py` 增加 `workspace_scope`/`current_workspace_scope()`；`filesystem.py`、`shell.py`、`message.py` 接入 scope，shell 改为 `_guard_command(command, cwd, *, restricted, boundary_root)`。
-- 删除 `agent/tools/permissions.py`、`agent/tools/github_review.py`、`review/source/github.py`；`ToolsConfig` 删除 `approval_enabled`、`github_repo`、`github_diff_enable`。
-- review 输入收敛为本地：`ReviewTargetType` 为 `{"auto","local"}`，`ReviewPlan` 删除 `target_repo`/`pr_number`/`target_ref`/`target_subpath`/`target_subpath_kind`，`ReviewMetaKey` 删除 `TARGET_REF`/`GITHUB_PREFETCH_READY`/`GITHUB_PR_HEAD_REF`，删除 `GitHubDiffEvidence`；`admission.py` 删除 `_admit_remote`，`input/targets.py` 恒返回 `local`，`planning/evidence.py`、`planner.py`、`prompt.py`、`prefetch.py`、`preprocessor.py`、`output/validator.py`、`output/finalizer.py`、`rag/review_service.py`、`channels/websocket.py`、`cli/commands.py` 同步收敛。
-- 保留：`needs_confirmation`、pairing approval、`contains_internal_url`、OAuth/provider login/logout、`web_search`/`web_fetch`、MCP 三种 transport、`nanoreview/security/network.py` 的 SSRF/重定向/私网/代理 guard、`_GITHUB_TOKEN` 日志脱敏与 `github-copilot` provider。
-
-测试：
-
-- 新增 `tests/agent/tools/test_workspace_scope.py`（20 例：优先级、别名、非法 payload 整体回退、路径解析、review 固定 restricted）与 `tests/agent/tools/test_stage4_boundaries.py`（22 例：approval 链路删除、GitHub review 输入删除、联网能力保留边界）。
-- 删除或改写 GitHub 远程 review 旧测试：删除 `tests/agent/tools/test_repo_review_github.py`；改写 `test_codereview.py`、`test_loop_modes.py`、`test_admission.py`、`test_judge.py`、`test_prefetch.py`、`test_reviewer_profiles.py`、`test_validator.py`、`test_permissions.py`、`test_mcp_integration.py`、`test_conversation_loop.py`、`test_rag_review.py`。
-- 结果：**890 passed, 1 failed**；唯一失败 `tests/review/test_admission.py::test_diff_outside_git_repo_is_rejected` 在改动前的主库 `main` 上同样失败（环境性：测试进程运行在 git 仓库内，`_find_git_root` 向上找到外层仓库），非本次引入。改动前基线为 885 passed / 同 1 项失败。
-- `ruff check nanoreview/` 45 项，全部位于未改动文件；改动文件与新增文件无新增告警。
-
-文档：已更新 `.agents/constraints/security.md`（工具权限改为 workspace scope、新增 review 输入边界）、`.agents/constraints/architecture.md`（删除权限响应/未决 future 表述、GitHub 目标改为本地）、`.agents/mcp-usage.md`、`nanoreview/skills/repo-reader/SKILL.md`、`.agents/plans/project-roadmap.md`（第 4 阶段标记已完成）。
-
-未执行项：`review-webui/` 未改动（按计划留待第 8 阶段）；前端 approval 残留与结构化错误渲染适配未处理。
-
-### 复审修复：scope 生命周期（同日）
-
-实施后的复审发现 3 处与第 39/180 行契约不符，已修复并补回归测试：
-
-- **turn scope 在第一批工具后被重置**（P1）。每批工具前会重建 request context（`AgentProgressHook.before_execute_tools` → `set_tool_context`），该调用只带 channel/chat/metadata，重建出的 `RequestContext.workspace_scope` 为 `None`，后续 filesystem/shell/message 调用回退到构造时的 `restrict_to_workspace`（默认 `full`），使用户声明的 `restricted` 在第一批工具后失效。修复：`_TurnContext` 新增 `workspace_scope`，`_set_tool_context` 解析后写入，`_run_runner` 的 `set_tool_context` lambda 每次显式补回该值。
-- **reviewer 未固定 restricted**（P1）。`review_workspace_scope()` 已定义但无生产调用：reviewer 的 `SubagentHook` 构造 `RequestContext` 时不带 scope，只依赖 `ToolsConfig.restrict_to_workspace`，会话默认 `full` 时 reviewer 可读目标仓库外路径。修复：新增 `nanoreview/agent/subagent.py::subagent_workspace_scope()`（`reviewer.*` profile 固定 restricted，其余走配置默认），`_run_subagent` 计算后传给 `SubagentHook`，hook 写入工具调用上下文。
-- **非法 payload 错误继承 session scope**（P2）。`resolve_workspace_scope` 在 payload 非法时用 `continue` 继续解析下一层，可能让 malformed message 继承 session 的 `full`。修复：非法 payload 立即返回配置默认 scope，终止整条解析链；只有该层未声明 `workspace_scope` 键时才继续向下。
-
-配套：`tests/agent/test_conversation_loop.py` 新增 `test_a_restricted_turn_scope_survives_the_pre_tool_context_refresh`（含工具批次刷新后 scope 仍为 restricted、越界读被拒），`tests/agent/test_loop_modes.py` 新增 `test_reviewer_run_binds_a_restricted_scope`（覆盖 `_run_subagent` → hook 的完整接线），`tests/agent/tools/test_stage4_boundaries.py` 新增 `TestReviewRolesArePinnedToRestricted`（3 例），`tests/agent/tools/test_workspace_scope.py` 改写非法 payload 用例为「整体回退」并补 session 层对称用例。`security.md` 同步记录 scope 刷新不变量与 reviewer 绑定要求。
-
-验证：**897 passed, 1 failed**（同一项环境性失败）；改动文件 `ruff` 全绿，全量 `nanoreview/` 45、`tests/` 4 均无新增。
-
-## 明确不做
-
-- 不新增逐工具确认、风险分级授权、approval 兼容层或新的用户确认流程。
-- 不把普通模型 provider 的 HTTP API 当作 Agent 可调用的通用网络工具，也不删除模型调用所需的 HTTP/OAuth 能力。
-- 不删除 `web_search`、`web_fetch` 或任何已支持的 MCP transport；继续保留 `nanoreview/security/network.py`、SSRF whitelist、重定向、私网和代理 guard。
-- 不把普通网页或代码托管文档访问扩展为远程仓库 review；GitHub URL 只可作为普通网页资料输入（如适用），不能成为 review target。
-- 不修改 `review-webui/`，不在第 4–7 阶段修复前端 approval 残留。
-- 不修改审查策略、上下文压缩、报告交接契约、finding 语义或 `/stop` 回滚行为。
-- 不自动创建 worktree，不恢复远程 review，不保留已删除入口的兼容门面。
-
-## 当前决策状态
-
-第 4 阶段已实施完成（含同日复审修复），无待确认产品决策。后续阶段按 `project-roadmap.md` 推进；实施过程中仅记录代码事实、测试结果和超出本计划范围的阻塞，不自行改变产品范围。
+- 不支持 repo-wide review、远端仓库或远端 PR review。
+- 不新增累计 token/金额/周期配额，不动态识别模型窗口；本节点固定 ReviewLoop 200k。
+- 不将 reviewer 改成按文件分配，不整体移植 Kodus 实现。
+- 不允许 Conversation Agent 自主发起 review，不修改 WebUI。
+- 不让 reviewer 的上下文读取扩大 finding 审查范围；accepted findings 仍受 changed-file 边界约束。
+- 不自动恢复中断的 review/tool run，不引入第二套 runner、压缩器或 review 状态机。

@@ -6,7 +6,7 @@ import select
 import signal
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
@@ -321,6 +321,212 @@ async def _read_interactive_input_async() -> str:
             )
     except EOFError as exc:
         raise KeyboardInterrupt from exc
+
+
+def _install_cli_signal_handlers() -> None:
+    """Handle SIGINT/SIGTERM while an interactive CLI session is running."""
+
+    def _handle_signal(signum, frame):
+        sig_name = signal.Signals(signum).name
+        _restore_terminal()
+        console.print(f"\nReceived {sig_name}, goodbye!")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    # SIGHUP is not available on Windows
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, _handle_signal)
+    # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
+    # SIGPIPE is not available on Windows
+    if hasattr(signal, 'SIGPIPE'):
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+
+async def _run_cli_session(
+    agent_loop: SessionCoordinator,
+    *,
+    config: Config,
+    session_key: str,
+    render_markdown: bool = True,
+    session_key_override: str | None = None,
+    read_input: Callable[[], Awaitable[str]] | None = None,
+) -> None:
+    """Run one interactive CLI session until the user exits.
+
+    Shared by ``nanoreview agent`` (free-form chat) and the interactive phase of
+    ``nanoreview review`` (report discussion, fixes and verification). Every line
+    is published as an inbound turn through the bus, so the coordinator's
+    command router, review gate and report handoff apply exactly as they do for
+    other channels.
+
+    ``session_key`` decides delivery (``channel:chat_id``).
+    ``session_key_override`` pins the turns to an explicit session: the review
+    phase must address the session the review run was admitted into, while plain
+    chat keeps the derived key so ``agents.defaults.unified_session`` can still
+    fold it into the shared session.
+
+    The caller owns ``agent_loop.aclose()``; this function owns the outbound
+    consumer and the coordinator's ``run()`` task it starts.
+    """
+    from nanoreview.bus.events import InboundMessage
+
+    if ":" in session_key:
+        cli_channel, cli_chat_id = session_key.split(":", 1)
+    else:
+        cli_channel, cli_chat_id = "cli", session_key
+
+    if read_input is None:
+        try:
+            _init_prompt_session()
+        except Exception as exc:
+            # prompt_toolkit needs a real console. The review (and its report)
+            # is already finished at this point, so degrade to the one-shot
+            # result instead of failing the whole command.
+            console.print(f"[red]Interactive session unavailable: {exc}[/red]")
+            console.print(
+                "[dim]Run from an interactive terminal, or pass --no-chat.[/dim]"
+            )
+            return
+        read_input = _read_interactive_input_async
+
+    bot_name = config.agents.defaults.bot_name
+    bot_icon = config.agents.defaults.bot_icon
+
+    # A review turn leaves its subagents' progress and lifecycle events on the
+    # outbound queue (the CLI renders the review through its own sink), and this
+    # session shares the channel route with that phase. Take the route over cleanly:
+    # a stale message would otherwise be read as this session's first reply.
+    dropped = agent_loop.bus.drain_outbound()
+    if dropped:
+        logger.debug("cli.session.dropped_stale_outbound count={}", dropped)
+
+    bus_task = asyncio.create_task(agent_loop.run())
+    turn_done = asyncio.Event()
+    turn_done.set()
+    turn_response: list[tuple[str, dict]] = []
+    renderer: StreamRenderer | None = None
+
+    async def _consume_outbound():
+        while True:
+            try:
+                msg = await asyncio.wait_for(agent_loop.bus.consume_outbound(), timeout=1.0)
+
+                if msg.metadata.get("_stream_delta"):
+                    if renderer:
+                        await renderer.on_delta(msg.content)
+                    continue
+                if msg.metadata.get("_stream_end"):
+                    if renderer:
+                        await renderer.on_end(
+                            resuming=msg.metadata.get("_resuming", False),
+                        )
+                    continue
+                if msg.metadata.get("_streamed"):
+                    # ``_streamed`` only says the transport accepts stream
+                    # deltas, so a turn that answered without any delta (a
+                    # non-streaming provider or an error reply) would otherwise
+                    # count as delivered and never be shown. Keep that reply for
+                    # the waiting turn to print. A stream marker that arrives
+                    # while no turn is in flight is stale and must not end one.
+                    if not turn_done.is_set():
+                        if msg.content and renderer is not None and not renderer.streamed:
+                            meta = dict(msg.metadata or {})
+                            meta.pop("_streamed", None)
+                            turn_response.append((msg.content, meta))
+                        turn_done.set()
+                    continue
+
+                if await _maybe_print_interactive_progress(
+                    msg,
+                    renderer,
+                    agent_loop.channels_config,
+                    renderer,
+                ):
+                    continue
+
+                if not turn_done.is_set():
+                    if msg.content:
+                        turn_response.append((msg.content, dict(msg.metadata or {})))
+                    turn_done.set()
+                elif msg.content:
+                    await _print_interactive_response(
+                        msg.content,
+                        render_markdown=render_markdown,
+                        metadata=msg.metadata,
+                    )
+
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+    outbound_task = asyncio.create_task(_consume_outbound())
+
+    try:
+        while True:
+            try:
+                _flush_pending_tty_input()
+                # Stop spinner before user input to avoid prompt_toolkit conflicts
+                if renderer:
+                    renderer.stop_for_input()
+                user_input = _sanitize_surrogates(await read_input())
+                command = user_input.strip()
+                if not command:
+                    continue
+
+                if _is_exit_command(command):
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+
+                turn_done.clear()
+                turn_response.clear()
+                renderer = StreamRenderer(
+                    render_markdown=render_markdown,
+                    bot_name=bot_name,
+                    bot_icon=bot_icon,
+                )
+
+                await agent_loop.bus.publish_inbound(InboundMessage(
+                    channel=cli_channel,
+                    sender_id="user",
+                    chat_id=cli_chat_id,
+                    content=user_input,
+                    metadata={"_wants_stream": True},
+                    session_key_override=session_key_override,
+                ))
+
+                await turn_done.wait()
+
+                if turn_response:
+                    content, meta = turn_response[0]
+                    if content and not meta.get("_streamed"):
+                        if renderer:
+                            await renderer.close()
+                        print_kwargs: dict[str, Any] = {}
+                        if renderer and renderer.header_printed:
+                            print_kwargs["show_header"] = False
+                        _print_agent_response(
+                            content,
+                            render_markdown=render_markdown,
+                            metadata=meta,
+                            **print_kwargs,
+                        )
+                elif renderer and not renderer.streamed:
+                    await renderer.close()
+            except KeyboardInterrupt:
+                _restore_terminal()
+                console.print("\nGoodbye!")
+                break
+            except EOFError:
+                _restore_terminal()
+                console.print("\nGoodbye!")
+                break
+    finally:
+        agent_loop.stop()
+        outbound_task.cancel()
+        await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
 
 
 def version_callback(value: bool):
@@ -813,6 +1019,26 @@ def _run_gateway(
 from nanoreview.bus.queue import MessageBus
 
 
+def _resolve_cli_chat_mode(chat: bool | None, *, fail_on: str | None) -> bool:
+    """Decide whether ``review`` continues in an interactive session.
+
+    ``--chat``/``--no-chat`` wins whenever it is given. The default keeps a
+    terminal session open after the review, while a piped or scripted
+    invocation (``--fail-on`` included) stays one-shot and exits with the gate
+    status instead of waiting on input nobody will type. Both streams must be a
+    terminal: prompt_toolkit reads stdin but needs a console for stdout, so
+    redirecting the report to a file must not drop into a prompt.
+    """
+    if chat is not None:
+        return chat
+    if fail_on:
+        return False
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
 @app.command()
 def review(
     target: str | None = typer.Argument(None, help="Local file or directory path to review"),
@@ -834,8 +1060,19 @@ def review(
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render output as Markdown"),
     output: str | None = typer.Option(None, "--output", "-o", help="Save report to file"),
+    chat: bool | None = typer.Option(
+        None,
+        "--chat/--no-chat",
+        help="Continue the session after the review (default: on for a terminal)",
+    ),
 ):
-    """Review a local target with CodeReviewAgent."""
+    """Review a local target with CodeReviewAgent, then keep the session open.
+
+    The review always runs in its own session. On a terminal the command
+    continues in that session, so the report can be discussed and the code
+    fixed; use --no-chat for a one-shot run (piped and scripted calls do that
+    automatically).
+    """
     from nanoreview.cli.stream import StreamRenderer
     from nanoreview.review.admission import (
         ReviewAdmissionError,
@@ -865,6 +1102,13 @@ def review(
     sync_workspace_templates(loaded.workspace_path)
     logger.enable("nanoreview")
 
+    # The review run owns this session for its whole lifetime. The interactive
+    # phase below continues on the same key, which is what makes the completed
+    # report available as the conversation handoff (and keeps the review gate
+    # closed until the run reaches a terminal state).
+    session_key = f"cli:review:{uuid.uuid4().hex[:8]}"
+    interactive = _resolve_cli_chat_mode(chat, fail_on=fail_on)
+
     bus = MessageBus()
     agent_loop = SessionCoordinator.from_config(loaded, bus)
 
@@ -874,6 +1118,7 @@ def review(
     )
 
     async def run_once() -> None:
+        exit_code = 0
         try:
             effective_max_subagents = (
                 max_concurrent_subagents
@@ -889,7 +1134,7 @@ def review(
                         target_type=target_type,
                         action=action,
                         focus=focus,
-                        session_key=f"cli:review:{uuid.uuid4().hex[:8]}",
+                        session_key=session_key,
                         cwd=os.getcwd(),
                         max_concurrent_subagents=effective_max_subagents,
                     )
@@ -904,7 +1149,7 @@ def review(
                 collected.append(delta)
                 await renderer.on_delta(delta)
 
-            await agent_loop.process_direct(
+            response = await agent_loop.process_direct(
                 content=admission.content,
                 session_key=admission.session_key,
                 channel="cli",
@@ -922,19 +1167,46 @@ def review(
                 },
             )
 
-            full_output = "".join(collected)
+            streamed_output = "".join(collected)
+            if response is not None and response.content and not streamed_output.strip():
+                # The CLI never asks for the bus-streamed report, so a review
+                # turn hands its report back as the direct response. Rendering
+                # it here is the only place it reaches the terminal.
+                await renderer.on_delta(response.content)
+                await renderer.on_end()
+            full_output = (
+                response.content
+                if response is not None and response.content
+                else streamed_output
+            )
 
             if output:
                 _save_review_report(output, full_output)
 
             if fail_on:
                 exit_code = _check_fail_on(full_output, fail_on)
-                if exit_code != 0:
-                    raise typer.Exit(exit_code)
 
+            if interactive:
+                console.print(
+                    f"\n[dim]Review session [bold]{admission.session_key}[/bold] is open: "
+                    "ask about the report, request fixes, or use /status, /history and "
+                    "/stop. Type exit to quit.[/dim]\n"
+                )
+                await _run_cli_session(
+                    agent_loop,
+                    config=loaded,
+                    session_key=admission.session_key,
+                    render_markdown=markdown,
+                    session_key_override=admission.session_key,
+                )
         finally:
             await agent_loop.aclose()
 
+        if exit_code:
+            raise typer.Exit(exit_code)
+
+    if interactive:
+        _install_cli_signal_handlers()
     asyncio.run(run_once())
 
 
@@ -1036,147 +1308,19 @@ def agent(
         asyncio.run(run_once())
     else:
         # Interactive mode — route through bus like other channels
-        from nanoreview.bus.events import InboundMessage
-        _init_prompt_session()
         _model, _preset_tag = _model_display(config)
         console.print(f"{__logo__} Interactive mode [bold blue]({_model})[/bold blue]{_preset_tag} — type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit\n")
-
-        if ":" in session_id:
-            cli_channel, cli_chat_id = session_id.split(":", 1)
-        else:
-            cli_channel, cli_chat_id = "cli", session_id
-
-        def _handle_signal(signum, frame):
-            sig_name = signal.Signals(signum).name
-            _restore_terminal()
-            console.print(f"\nReceived {sig_name}, goodbye!")
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-        # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
-            signal.signal(signal.SIGHUP, _handle_signal)
-        # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
-        # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        _install_cli_signal_handlers()
 
         async def run_interactive():
-            bus_task = asyncio.create_task(agent_loop.run())
-            turn_done = asyncio.Event()
-            turn_done.set()
-            turn_response: list[tuple[str, dict]] = []
-            renderer: StreamRenderer | None = None
-
-            async def _consume_outbound():
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-
-                        if msg.metadata.get("_stream_delta"):
-                            if renderer:
-                                await renderer.on_delta(msg.content)
-                            continue
-                        if msg.metadata.get("_stream_end"):
-                            if renderer:
-                                await renderer.on_end(
-                                    resuming=msg.metadata.get("_resuming", False),
-                                )
-                            continue
-                        if msg.metadata.get("_streamed"):
-                            turn_done.set()
-                            continue
-
-                        if await _maybe_print_interactive_progress(
-                            msg,
-                            renderer,
-                            agent_loop.channels_config,
-                            renderer,
-                        ):
-                            continue
-
-                        if not turn_done.is_set():
-                            if msg.content:
-                                turn_response.append((msg.content, dict(msg.metadata or {})))
-                            turn_done.set()
-                        elif msg.content:
-                            await _print_interactive_response(
-                                msg.content,
-                                render_markdown=markdown,
-                                metadata=msg.metadata,
-                            )
-
-                    except asyncio.TimeoutError:
-                        continue
-                    except asyncio.CancelledError:
-                        break
-
-            outbound_task = asyncio.create_task(_consume_outbound())
-
             try:
-                while True:
-                    try:
-                        _flush_pending_tty_input()
-                        # Stop spinner before user input to avoid prompt_toolkit conflicts
-                        if renderer:
-                            renderer.stop_for_input()
-                        user_input = _sanitize_surrogates(await _read_interactive_input_async())
-                        command = user_input.strip()
-                        if not command:
-                            continue
-
-                        if _is_exit_command(command):
-                            _restore_terminal()
-                            console.print("\nGoodbye!")
-                            break
-
-                        turn_done.clear()
-                        turn_response.clear()
-                        renderer = StreamRenderer(
-                            render_markdown=markdown,
-                            bot_name=config.agents.defaults.bot_name,
-                            bot_icon=config.agents.defaults.bot_icon,
-                        )
-
-                        await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
-                            sender_id="user",
-                            chat_id=cli_chat_id,
-                            content=user_input,
-                            metadata={"_wants_stream": True},
-                        ))
-
-                        await turn_done.wait()
-
-                        if turn_response:
-                            content, meta = turn_response[0]
-                            if content and not meta.get("_streamed"):
-                                if renderer:
-                                    await renderer.close()
-                                print_kwargs: dict[str, Any] = {}
-                                if renderer and renderer.header_printed:
-                                    print_kwargs["show_header"] = False
-                                _print_agent_response(
-                                    content,
-                                    render_markdown=markdown,
-                                    metadata=meta,
-                                    **print_kwargs,
-                                )
-                        elif renderer and not renderer.streamed:
-                            await renderer.close()
-                    except KeyboardInterrupt:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
-                    except EOFError:
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
+                await _run_cli_session(
+                    agent_loop,
+                    config=config,
+                    session_key=session_id,
+                    render_markdown=markdown,
+                )
             finally:
-                agent_loop.stop()
-                outbound_task.cancel()
-                await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.aclose()
 
         asyncio.run(run_interactive())
@@ -1206,7 +1350,9 @@ def _check_fail_on(report_content: str, threshold: str) -> int:
 
     content_lower = report_content.lower()
     for sev in target_severities:
-        if re.search(rf"(#{2,4}\s.*{sev}|severity:\s*{sev})", content_lower):
+        # ``{{2,4}}`` is an f-string escape: ``{2,4}`` would be formatted as a
+        # Python tuple and the heading arm would never match a report.
+        if re.search(rf"(#{{2,4}}\s.*{sev}|severity:\s*{sev})", content_lower):
             return 1
     return 0
 # ============================================================================

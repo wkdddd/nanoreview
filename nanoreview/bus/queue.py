@@ -33,6 +33,20 @@ class MessageBus:
         """Consume the next outbound message (blocks until available)."""
         return await self.outbound.get()
 
+    def drain_outbound(self) -> int:
+        """Discard queued outbound messages and report how many were dropped.
+
+        Used by an entry point that takes ownership of a channel route and must
+        not mistake an earlier phase's delivery for its own reply.
+        """
+        dropped = 0
+        while True:
+            try:
+                self.outbound.get_nowait()
+            except asyncio.QueueEmpty:
+                return dropped
+            dropped += 1
+
     @property
     def inbound_size(self) -> int:
         """Number of pending inbound messages."""

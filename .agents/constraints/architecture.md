@@ -50,6 +50,7 @@
 - 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。写入由 `SessionCoordinator.consume_handoff` 执行，turn 顺序固定为「加载 session → 恢复中断历史 → 执行 token Consolidator → 调用 handoff consumer（处理 review handoff）→ 读取历史 → 构建模型上下文」；写入失败向上传播且不进入 Runner。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。review 完成 `DONE` 后，交接失败仍可进入对话，但必须说明失败、可用结果与覆盖缺口。
 - report artifact 与 `ReviewRunState` 是权威来源，Conversation Agent 不得改写；`review_context` 只是索引。
 - conversation 按 session 串行、最多 20 条待处理消息；`/stop` 取消当前与排队 turn 且保留已发生的修改不自动回滚；重启后不执行未完成队列。
+- CLI 交互入口：`cli/commands.py` 的 `review` 在准入成功后于同一 `cli:review:<id>` session 执行 review，终态后默认进入交互对话（`agent` 的交互模式复用同一 `_run_cli_session`）；交互阶段以 `session_key_override` 固定到该 session，因此命令路由、review 门禁和 report handoff 与其他 channel 一致。`--no-chat`、stdin/stdout 非终端或无控制台时的 `--fail-on` 调用保持一次性执行。review 报告经 `process_direct` 返回值交给 CLI 渲染（CLI 不请求 bus 报告流）。
 - 不新增第三个 Agent、通用 `BaseLoop` 或完整独立的 session 状态机。
 
 ## 模块边界
