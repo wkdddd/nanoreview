@@ -8,7 +8,7 @@
 
 - `agent/coordinator.py`：进程运行时与唯一决策点——MessageBus 接收/发送、per-session 串行与有界 pending 队列、命令分发、取消调度、review/conversation 路由与门禁、handoff 值对象（`ReviewHandoff`）与其唯一一次 session 写入（`SessionCoordinator.consume_handoff`）、结果发布。自身不调用模型、不执行工具、不写普通对话历史：review turn 整体交给 `ReviewLoop`，conversation turn 交给 `ConversationLoop`。
 - `agent/review_loop.py`：一次 review run 的唯一 supervisor——准备、计划、reviewer/Judge 执行、用户消息与报告持久化、资源清理与终态写入，内部按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序执行；同时拥有状态迁移和结构化结果。
-- `agent/conversation_loop.py`：一个完整 conversation turn——读取 session/历史、调用注入的 handoff consumer 完成交接写入、构建 frozen/working 上下文与 per-turn 核心 `ToolRegistry`、单次 `AgentRunner` 运行、历史持久化与回复组装；不含 `local_review`。构造时必需 `handoff_consumer`，`ReviewHandoff` 只在 `TYPE_CHECKING` 下导入。连接 MCP 后把代理工具注册进该轮注册表。
+- `agent/conversation_loop.py`：一个完整 conversation turn——读取 session/历史、调用注入的 handoff consumer 完成交接写入、构建 frozen/working 上下文与 per-turn 核心 `ToolRegistry`、单次 `AgentRunner` 运行、历史持久化与回复组装；只注册通用 workspace 工具，不存在仓库级 reader 工具（`local_review` 已整体删除）。构造时必需 `handoff_consumer`，`ReviewHandoff` 只在 `TYPE_CHECKING` 下导入。连接 MCP 后把代理工具注册进该轮注册表。
 - `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
 - `agent/subagent.py`：子代理任务生命周期；`agent/review_state.py`：run 状态、fingerprint 与报告 artifact。
 - `review/`：`admission.py` 准入边界，`result.py` 终态结果与交接渲染，`input/`、`planning/`、`source/`、`output/` 输入、证据、源码、finding 校验、Judge 与报告领域逻辑。
@@ -29,10 +29,15 @@
 ## 本地 review 准入
 
 - `review/admission.py` 是 WebUI、结构化 API、CLI 共用的准入边界，transport 只做协议解析、交付和状态读取；`SessionCoordinator.admit_review` 是各入口调用的唯一入口。
-- 准入按「校验 → 快照 → 注册」一次完成：`ReviewAdmissionService.admit` 校验本地目标与 scope、采集相对 `HEAD` 的净 diff（`review/input/local_git.py`）、写入输入快照（`review/input/snapshot.py`），并持久化 session 导航 metadata；`SessionCoordinator` 随后注册 `ReviewRunState`。
+- 准入按「校验 → 快照 → 注册」一次完成：`ReviewAdmissionService.admit` 校验本地目标与 scope、采集相对 `HEAD` 的净 diff（`review/input/local_git.py`，含 staged/unstaged/untracked）、写入输入快照（`review/input/snapshot.py`），并持久化 session 导航 metadata；`SessionCoordinator` 随后注册 `ReviewRunState`。
+- review action 只有 `diff`：`normalize_review_action` 默认 `diff`，显式 `repo` 按 `invalid_action` 拒绝；无 Git 仓库、无法读取 diff、空 diff 分别在准入阶段映射为稳定错误码（`not_a_git_repo` / `diff_unavailable` / `empty_diff`），不启动 Planner/reviewer/Judge。CLI `review` 的 `--action` 默认值同步为 `diff`。
 - 拒绝是原子的：抛出 `ReviewAdmissionError`（稳定 `code` + HTTP `status`），不写 session、不建 run、不落快照、不留历史。重复提交同一 session 返回 `duplicate_review`。
 - 执行只读 `review_run_id` 对应的 run；准入 turn 以 `_review_admitted` 标记放行。
 - review 输入只有本地一种：`ReviewTargetType` 为 `{"auto", "local"}`，无 GitHub source/tool/cache/metadata/evidence 入口；远端 GitHub URL 不特判，退化为普通本地路径参与校验。
+- 准入快照是审查的**权威输入**，不只是审计记录：PREPARE 读回该 run 的 snapshot（`ReviewSnapshotStore.read`），把其中的净 diff 作为 `ReviewMetaKey.FROZEN_DIFF`（私有的进程内键，`{"patches", "skipped"}`）交给 prefetch，`ReviewEvidenceService.dispatch` 据此**不再读取当前工作树**——准入后用户改动/提交/回滚都不会改变被审内容；快照缺失时降级为读活工作树并记 warning，不失败 run。
+- **changed-file 边界同样取自快照**：`_resolve_execution_inputs` 把 snapshot 的 `changed_files` 送入 `_ReviewInputs.changed_files`，最终进入 `validator` 的 diff 边界校验（未修改文件中的 finding 判 `uncertain` 而非 accepted），并由 `ReviewRunState.changed_files` 进入 report coverage。该键从不进入 reviewer metadata。
+- 净 diff 的统一形态是 **`HEAD -> worktree`**：`collect_net_diff` 与 `ReviewEvidenceService.local_changed_patches` 都用 `git diff HEAD`，staged 的中间态（`HEAD -> index`）不再与 `index -> worktree` 拼接，reviewer 不会同时看到中间态与最终态。
+- PLAN 完成后，`ReviewLoop` 把最终 Planner manifest（budget/version/retained/omitted）与预算契约回写同一 run 的 snapshot（`ReviewSnapshotStore.augment`）；report artifact 另带 `snapshot_ref` 与 `coverage`（changed/skipped files、per-reviewer 状态/usage/重复读取、incomplete dimensions），不复制源码或完整会话。snapshot 回写失败只记日志，不改变 run 终态。
 - 前端适配未完成：WebSocket 准入拒绝复用既有 `error` 事件并附带 `code`/`field`，WebUI 表单渲染结构化错误与输入回填留待前端节点。
 
 ## Review / Conversation 运行时边界
@@ -44,6 +49,9 @@
 - `ReviewLoop` 是 run 状态、report artifact 与终态 metadata 的唯一写入者；`SessionCoordinator` 只读结果、写 `review_context` 索引、切换路由；`AgentRunner` 不写 review 状态。
 - review 固定按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序推进，每步只更新 `ReviewRunState.phase`，不引入状态转移表或通用 `BaseLoop`。成功、错误和 `/stop` 三种出口都先经过 `CLEANUP` 再在 `DONE` 写终态：正常为 `completed`、致命失败为 `error`、取消为 `stopped`。清理未确认完成或终态保存失败时不发布 `DONE`：run 保持 `running`、门禁保持关闭，并把有界错误交给 turn（`finalize()` 此时返回 `None`）。report stream 等 transport 事件由上层交付，不属于 review phase。
 - `REVIEW` 阶段内部固定为「并发 dispatch reviewer → 全部收齐 → 校验 finding → 按 context window 切候选批 → 逐批判定」：reviewer 受并发上限约束并行执行；Judge 只在所有 reviewer 终态、候选集完整后才运行。Judge 的“批”是对已收齐候选池按 token 预算的切分，不是 reviewer 到达流；各批串行执行，批间 verdicts 合并与顺序无关。
+- **仓库级 reader 工具（`local_review`）已从代码库整体删除**：工具本身、`ReviewToolBase`、`review/source/local.py::LocalRepoReader` 与 `skills/rag` 一并移除，`_CONVERSATION_DENIED_TOOLS` 随之取消。Review 流程的模型工具集因此天然不含它：Planner 只注册 `submit_review_plan`，四类 reviewer subagent 只有 `grep`/`list_dir`/`read_file`/`review_submit`，Judge 只注册 verdict 工具；证据由 `ReviewEvidenceService` 作为 ReviewLoop 的内部依赖直接提供（prefetch 与 Planner manifest 用同一份授权 evidence），不依赖任何工具 wrapper 注册。ReviewLoop 的 coordinator/reviewer prompt 与 task 也不建议模型调用任何仓库 reader 工具。
+- reviewer 模型请求上限（30）中的**最后一次为保留的提交轮**：`AgentRunner` 在 `iteration == max_iterations - 1` 时只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，因此即使前面的请求都在探索，reviewer 仍会得到一次 `review_submit` 机会，不会以 `max_iterations` 收场（`AgentRunSpec.reserve_terminal_iteration`，默认开启；Planner/Judge 本就每轮强制，行为不变）。
+- reviewer run 自带去重 ledger（每个 subagent 一个独立 `FileStates`）：相同规范化文件范围/检索签名且内容未变时返回短提示而非全文，`force` 不可绕过，状态不跨 reviewer 或 review run 共享；用于定位重复探索，不新增累计 token 上限。
 - 阶段判断从 live `ReviewRunState`、session metadata、report artifact 和交接索引推导，不新增 session phase 字段。终态 metadata 先落盘、后发布 live `DONE`，因此“可路由”等价于“已持久化”。无 live executor 的持久化 `running` 会被一次性规范化为终态 `error`，并持久化有界中断原因，不 resume、不重跑。规范化在 `pending_handoff()` 里先于 `_review_settled()` 执行（`result()` 提前调用），保证重启后第一条普通消息就修复 orphan，而非永远卡在 `running`。规范化的 `save()` 失败必须回滚 metadata（缓存不提前发布 `error/done`），保持磁盘与缓存一致，留待下次读重试。
 - 终态 metadata 除 run id/status/phase/fingerprint/report ref 外，还持久化有界 `review_summary`（report 摘要或失败原因）与 `review_error`（非 `completed` 终态的原因），供重启后读取；不持久化 child transcript 或其他中间状态。
 - 交接三态：`complete`（artifact 已落盘且无缺口）、`partial`（artifact 已落盘但存在缺口）、`failed`（无可用 artifact，绝不渲染为完整成功）。交接不重试、不自动补齐、不重跑；已落盘 report 仍可查看。

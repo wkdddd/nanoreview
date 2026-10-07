@@ -22,10 +22,14 @@
 
 ## Review 输入边界
 
-- review 唯一输入是本地：admission 只接受 `auto`/`local` target type，`github` 等值按 `invalid_target_type` 拒绝；GitHub URL 不再特判，退化为普通本地路径校验。
+- review 唯一输入是本地 diff：admission 只接受 `auto`/`local` target type，`github` 等值按 `invalid_target_type` 拒绝；GitHub URL 不再特判，退化为普通本地路径校验。action 只保留 `diff`，显式 `repo` 按 `invalid_action` 拒绝；无 Git 仓库 / diff 读取失败 / 空 diff 分别映射为 `not_a_git_repo` / `diff_unavailable` / `empty_diff`，在准入阶段失败且不启动任何模型角色。
+- **`local_review`（仓库级 reader/evidence wrapper）已整体删除**：工具、`ReviewToolBase`、`LocalRepoReader`、`skills/rag` 及其专属测试全部移除，`ConversationLoop._CONVERSATION_DENIED_TOOLS` 随之取消。Review 流程的模型角色因此天然不含它：Planner/coordinator 只注册 `submit_review_plan`，四类 reviewer 只有 `grep`/`list_dir`/`read_file`/`review_submit`，Judge 只注册 verdict 工具；授权证据由 ReviewLoop 内部依赖 `ReviewEvidenceService` 直接注入 frozen task，不依赖工具 wrapper 注册。residual 扫描须确认 review coordinator/reviewer prompt 与 task 不再建议模型调用任何仓库 reader 工具。
+- `ReviewAction.REPO` 仅作为被拒 action 的规范名保留（错误信息与历史 metadata 识别），任何入口都不再产生它；本节点不恢复 repo review 入口。
 - 不提供 GitHub source、`github_review` 工具、远程 snapshot/cache、GitHub metadata/evidence 或远程 diff 校验入口；`ReviewPlan` 无 `target_repo`/`pr_number`/`target_ref`/`target_subpath` 字段，`ReviewMetaKey` 无 `TARGET_REF`/`GITHUB_PREFETCH_READY`/`GITHUB_PR_HEAD_REF`。
 - 通用联网能力不受影响并须保留：模型 provider HTTP/OAuth（含 `github-copilot`）、`web_search`、`web_fetch`、stdio/SSE/Streamable HTTP MCP，以及 SSRF/重定向/私网/代理校验；`_GITHUB_TOKEN` 日志脱敏、`.github/workflows` 忽略路径、`HTTP-Referer` 常量与 OAuth provider 同属非 review 能力，不随本次收敛删除。
-- 回归见 `tests/agent/tools/test_stage4_boundaries.py`。
+- reviewer 的重复读取抑制是上下文效率控制，不改变只读权限；reviewer 仍可在 `restricted` scope 内用定向 `read_file`/`grep` 读取 diff 外文件作上下文，但不得据此扩大 accepted finding 的 changed-file 边界。
+- **审查内容冻结在准入快照**：prefetch 用准入时采集的净 diff（snapshot 的 `net_diff`），不重读活工作树；changed-file 边界也取自 snapshot（未修改文件的 finding 判 `uncertain`）。因此准入后对工作树的任意修改/提交/回滚都不能改变被审内容或放宽边界。净 diff 统一为 `HEAD -> worktree`，不暴露 staged 中间态。
+- 回归见 `tests/agent/tools/test_stage4_boundaries.py`、`tests/agent/tools/test_reviewer_read_dedup.py`、`tests/agent/test_review_loop.py::test_changed_file_boundary_comes_from_the_admitted_snapshot`、`tests/agent/rag/test_rag_review.py::test_local_changed_patches_uses_net_head_diff_not_staged_concat`。
 
 ## MCP
 

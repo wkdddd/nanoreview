@@ -211,6 +211,31 @@ class ReadFileTool(_FsTool):
             if mime and mime.startswith("image/"):
                 return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
 
+            # Reviewer-run duplicate suppression. Reviewer subagents get their
+            # own FileStates (and thus their own ledger); a repeated read of the
+            # same normalized range with unchanged content is answered with a
+            # short hint instead of the full text. This check runs *before* the
+            # general dedup block and ignores ``force`` on purpose: a reviewer
+            # cannot re-inflate its context by forcing a re-read.
+            review_ledger = self._file_states.review_ledger
+            if review_ledger is not None:
+                review_hash = _hash_file(str(fp))
+                repeated = review_ledger.read_repeat(
+                    fp,
+                    offset=offset,
+                    limit=limit,
+                    content_hash=review_hash,
+                    default_limit=self._DEFAULT_LIMIT,
+                )
+                if repeated is not None:
+                    start, count = repeated
+                    review_ledger.duplicate_reads += 1
+                    return (
+                        f"[Duplicate read suppressed: {path} lines {start}-{start + count - 1} "
+                        "are unchanged since this reviewer already read them. Reuse the "
+                        "content you already have, or read a different range.]"
+                    )
+
             # Read dedup: same path + offset + limit + unchanged mtime → stub
             # Always check for external modifications before dedup
             entry = self._file_states.get(fp)
@@ -286,6 +311,16 @@ class ReadFileTool(_FsTool):
             else:
                 result += f"\n\n(End of file — {total} lines total)"
             self._file_states.record_read(fp, offset=offset, limit=limit)
+            if review_ledger is not None:
+                # Record the range we actually returned so a later identical
+                # read of the same reviewer run is suppressed.
+                review_ledger.note_read(
+                    fp,
+                    offset=offset,
+                    limit=limit,
+                    content_hash=review_hash,
+                    default_limit=self._DEFAULT_LIMIT,
+                )
             return result
         except PermissionError as e:
             return f"Error: {e}"

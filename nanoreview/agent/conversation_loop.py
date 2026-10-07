@@ -85,9 +85,6 @@ if TYPE_CHECKING:
 #: Maximum number of messages a session may queue while a turn is running.
 MAX_PENDING_CONVERSATION_MESSAGES = 20
 
-#: Tools that stay review-only: the conversation agent never sees them.
-_CONVERSATION_DENIED_TOOLS = frozenset({"local_review"})
-
 _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
 _PENDING_USER_TURN_KEY = "pending_user_turn"
 
@@ -598,7 +595,6 @@ class ConversationLoop:
             tool_ctx,
             registry,
             scope="core",
-            denied_names=_CONVERSATION_DENIED_TOOLS,
         )
         mcp_count = await self._register_mcp_proxies(ctx, registry)
         logger.debug(

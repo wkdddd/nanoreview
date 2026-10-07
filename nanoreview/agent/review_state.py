@@ -111,6 +111,12 @@ class ReviewerRunState:
     status: str = "pending"
     error: str = ""
     usage: dict[str, int] = field(default_factory=dict)
+    #: Number of authorized evidence references injected into this reviewer's
+    #: frozen task (evidence assignment, for duplicate-work diagnosis).
+    evidence_assigned: int = 0
+    #: Reviewer-run duplicate read/search suppression counters.
+    duplicate_reads: int = 0
+    duplicate_searches: int = 0
 
     def add_usage(self, usage: Mapping[str, Any] | None) -> None:
         """Accumulate this reviewer's token usage for the run audit trail."""
@@ -159,6 +165,12 @@ class ReviewRunState:
     summary: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: Changed-file boundary enforced for accepted findings (diff review).
+    changed_files: list[str] = field(default_factory=list)
+    #: Files excluded from the diff evidence at admission time.
+    skipped_files: list[str] = field(default_factory=list)
+    #: Budgeted planner manifest statistics (version/budget/retained/omitted).
+    manifest_stats: dict[str, Any] = field(default_factory=dict)
 
     def enter_phase(self, phase: ReviewPhase) -> None:
         if self.status is not ReviewRunStatus.RUNNING:
@@ -276,7 +288,7 @@ def compute_input_fingerprint(
     payload: dict[str, Any] = {
         "target": (target or "").strip() or None,
         "target_type": (target_type or "auto").strip().lower(),
-        "action": (action or "repo").strip().lower(),
+        "action": (action or "diff").strip().lower(),
         "roles": sorted({str(role) for role in roles or []}),
         "scope": scope or {},
         "evidence_manifest": evidence_manifest or [],
@@ -402,18 +414,55 @@ def build_report_artifact(
     still be ``running`` while the artifact is being written, and baking
     that in would leave a permanently "running" report on disk. Pass
     ``status`` explicitly; the state's own value is only a fallback.
+
+    The ``coverage`` block carries the run's review boundary and per-reviewer
+    execution/cost summary (manifest budget, changed/skipped files, duplicate
+    reads, incomplete dimensions) without copying any source or full session.
     """
     return {
         "run_id": state.run_id,
         "session_key": state.session_key,
         "status": (status or state.status).value,
         "input_fingerprint": state.input_fingerprint,
+        "snapshot_ref": state.snapshot_ref,
         "report_markdown": report_markdown,
         "findings": state.findings,
         "verdicts": list(verdicts or []),
         "usage": dict(state.usage),
         "warnings": list(state.warnings),
+        "coverage": _coverage_payload(state),
         "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _coverage_payload(state: ReviewRunState) -> dict[str, Any]:
+    """Compact review-boundary and per-reviewer summary for the report."""
+    reviewers = {
+        dimension: {
+            "status": reviewer.status,
+            "evidence_assigned": reviewer.evidence_assigned,
+            "duplicate_reads": reviewer.duplicate_reads,
+            "duplicate_searches": reviewer.duplicate_searches,
+            "usage": dict(reviewer.usage),
+        }
+        for dimension, reviewer in state.reviewers.items()
+    }
+    incomplete = sorted(
+        dimension
+        for dimension, reviewer in state.reviewers.items()
+        if reviewer.status != "completed"
+    )
+    judge_batches = {
+        batch_id: {"status": batch.status, "error": batch.error}
+        for batch_id, batch in state.judge_batches.items()
+    }
+    return {
+        "changed_files": list(state.changed_files),
+        "skipped_files": list(state.skipped_files),
+        "manifest": dict(state.manifest_stats),
+        "reviewers": reviewers,
+        "incomplete_dimensions": incomplete,
+        "judge_batches": judge_batches,
     }
 
 

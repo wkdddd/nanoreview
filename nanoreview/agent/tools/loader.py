@@ -14,7 +14,6 @@ from nanoreview.agent.tools.registry import ToolRegistry
 _SKIP_MODULES = frozenset({
     "base", "schema", "registry", "context", "loader", "config",
     "file_state", "sandbox", "__init__",
-    "review_base",
 })
 
 

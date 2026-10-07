@@ -45,10 +45,20 @@ def normalize_review_target_type(raw: str | None, target: str | None = None) -> 
 
 
 def normalize_review_action(raw: str | None) -> ReviewAction:
-    value = (raw or ReviewAction.REPO.value).strip().lower()
-    try:
-        return ReviewAction(value)
-    except ValueError:
-        pass
+    """Resolve the review action; only local ``diff`` review is supported.
+
+    Repo-wide review has been removed as a product entry point: a missing
+    action defaults to ``diff`` and an explicit ``repo`` request is rejected so
+    no transport can reach the removed entry. ``ReviewAction.REPO`` stays as the
+    canonical name of that rejected action (error message and recognition of
+    previously persisted metadata) even though nothing produces it any more.
+    """
+    value = (raw or ReviewAction.DIFF.value).strip().lower()
+    if value == ReviewAction.DIFF.value:
+        return ReviewAction.DIFF
+    if value == ReviewAction.REPO.value:
+        raise ValueError(
+            "Repo-wide review is not supported; only action 'diff' review is available."
+        )
     allowed = ", ".join(review_action_values())
     raise ValueError(f"Unknown review action '{value}'. Available action values: {allowed}")

@@ -11,6 +11,7 @@ gated forever.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -441,11 +442,29 @@ async def test_unstarted_run_is_released_instead_of_finalized(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
 def _admission_loop(tmp_path: Path) -> tuple[SessionCoordinator, Path]:
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
     target = tmp_path / "admitted-pkg"
     target.mkdir()
     (target / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # Diff review needs a Git worktree with a reviewable change.
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "init")
+    (target / "mod.py").write_text("VALUE = 2\n", encoding="utf-8")
     return loop, target
 
 
@@ -455,6 +474,7 @@ def _admit(loop: SessionCoordinator, target: Path, session_key: str = REVIEW_SES
             target=str(target),
             session_key=session_key,
             cwd=str(target.parent),
+            action="diff",
         )
     )
 

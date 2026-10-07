@@ -170,6 +170,14 @@ class AgentRunSpec:
     # Max terminal-tool submission attempts (failed submissions and prose
     # answers both count) before the run fails with terminal_tool_failed.
     terminal_retry_limit: int = 5
+    #: Reserve the final allowed iteration for the required terminal tool. On
+    #: that iteration only the terminal tool(s) stay exposed and a single
+    #: terminal tool is forced via ``tool_choice``, so a run that spent every
+    #: other request exploring still submits instead of ending as
+    #: ``max_iterations`` with no result. No effect when ``terminal_tools`` is
+    #: empty. Runs whose final iteration is not reached (early submission) are
+    #: unaffected.
+    reserve_terminal_iteration: bool = True
     #: Overrides the default ``agent/memory_compression.md`` prompt template.
     compression_prompt: str | None = None
     #: Wall-clock timeout applied to each compression-layer logical request.
@@ -444,8 +452,28 @@ class AgentRunner:
                 context = AgentHookContext(iteration=iteration, messages=messages)
                 context.session_key = spec.session_key
                 await hook.before_iteration(context)
+                # The final allowed iteration of a terminal-tool run is
+                # reserved for the submission: only the terminal tool(s) are
+                # offered (and a single one is forced), so a run that burned
+                # every other request on exploratory reads still gets one
+                # guaranteed review_submit/plan/verdict turn instead of
+                # collapsing into ``max_iterations`` without a result.
+                reserved_terminal = self._reserved_terminal_tools(spec, iteration)
+                if reserved_terminal:
+                    logger.info(
+                        "terminal_tool.reserved_iteration iteration={}/{} tools={}",
+                        iteration + 1,
+                        spec.max_iterations,
+                        sorted(reserved_terminal),
+                    )
                 ##请求模型
-                response = await self._request_model(spec, messages_for_model, hook, context)
+                response = await self._request_model(
+                    spec,
+                    messages_for_model,
+                    hook,
+                    context,
+                    reserved_terminal=reserved_terminal,
+                )
                 raw_usage = self._usage_dict(response.usage)
                 context.response = response
                 context.usage = dict(raw_usage)
@@ -1759,6 +1787,7 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
+        tool_choice: dict[str, Any] | str | None = None,
     ) -> dict[str, Any]:
 
         kwargs: dict[str, Any] = {
@@ -1774,11 +1803,52 @@ class AgentRunner:
             kwargs["max_tokens"] = spec.max_tokens
         if spec.reasoning_effort is not None:
             kwargs["reasoning_effort"] = spec.reasoning_effort
-        if spec.tool_choice is not None:
-            kwargs["tool_choice"] = spec.tool_choice
+        # A per-request override (the reserved terminal submission turn) wins
+        # over the run-level ``tool_choice``.
+        choice = tool_choice if tool_choice is not None else spec.tool_choice
+        if choice is not None:
+            kwargs["tool_choice"] = choice
         if spec.response_format is not None:
             kwargs["response_format"] = spec.response_format
         return kwargs
+
+    @staticmethod
+    def _terminal_tool_definitions(
+        spec: AgentRunSpec, names: frozenset[str]
+    ) -> list[dict[str, Any]]:
+        """Return only the definitions of ``names`` from the tool registry."""
+        selected: list[dict[str, Any]] = []
+        for schema in spec.tools.get_definitions():
+            function = schema.get("function")
+            name = (
+                function.get("name")
+                if isinstance(function, dict)
+                else schema.get("name")
+            )
+            if isinstance(name, str) and name in names:
+                selected.append(schema)
+        return selected
+
+    def _reserved_terminal_tools(
+        self,
+        spec: AgentRunSpec,
+        iteration: int,
+    ) -> frozenset[str]:
+        """The terminal tools the final allowed iteration is restricted to.
+
+        Empty unless this is the last permitted iteration of a run that
+        declares terminal tools and opted into the reservation. A non-empty
+        result tells the request builder to expose only those tools (and force
+        a single one), turning the would-be ``max_iterations`` exit into a
+        guaranteed submission turn.
+        """
+        if (
+            not spec.reserve_terminal_iteration
+            or not spec.terminal_tools
+            or iteration != spec.max_iterations - 1
+        ):
+            return frozenset()
+        return spec.terminal_tools
 
     async def _request_model(
         self,
@@ -1786,6 +1856,8 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         hook: AgentHook,
         context: AgentHookContext,
+        *,
+        reserved_terminal: frozenset[str] = frozenset(),
     ):
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
@@ -1800,10 +1872,27 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        # On the reserved submission turn the model only sees the terminal
+        # tool(s); a single terminal tool is additionally forced so the turn
+        # cannot end in prose.
+        if reserved_terminal:
+            tools = self._terminal_tool_definitions(spec, reserved_terminal)
+            forced_choice = (
+                {
+                    "type": "function",
+                    "function": {"name": next(iter(reserved_terminal))},
+                }
+                if len(reserved_terminal) == 1
+                else None
+            )
+        else:
+            tools = spec.tools.get_definitions()
+            forced_choice = None
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=tools,
+            tool_choice=forced_choice,
         )
         wants_streaming = hook.wants_streaming()
 

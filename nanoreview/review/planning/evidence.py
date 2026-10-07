@@ -8,6 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -65,8 +66,15 @@ class ReviewEvidenceService:
         local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
         context_window_tokens: int | None = None,
+        frozen_diff: dict[str, Any] | None = None,
     ) -> str:
-        """Unified entry point for local review evidence retrieval."""
+        """Unified entry point for local review evidence retrieval.
+
+        ``frozen_diff`` carries the net diff captured at admission
+        (``{"patches": {...}, "skipped": {...}}``). When present, the diff is
+        read from the admitted snapshot rather than the live worktree so a
+        post-admission edit/commit/rollback cannot change what is reviewed.
+        """
         self.last_cache_root = None
         self.last_changed_files = []
         self.last_result = None
@@ -77,6 +85,7 @@ class ReviewEvidenceService:
                 include_tests=include_tests,
                 local_scope=local_scope,
                 context_window_tokens=context_window_tokens,
+                frozen_diff=frozen_diff,
             )
         return await self.local_context(
             review_query=review_query,
@@ -192,10 +201,21 @@ class ReviewEvidenceService:
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
         context_window_tokens: int | None = None,
+        frozen_diff: dict[str, Any] | None = None,
     ) -> str:
         started = time.perf_counter()
         preprocessor = self._preprocessor_for_scope(local_scope)
-        patches, skipped = await asyncio.to_thread(self.local_changed_patches, preprocessor.workspace)
+        if frozen_diff is not None:
+            # Review the change captured at admission, not the live worktree:
+            # the snapshot's net diff is the authoritative review input.
+            raw_patches = frozen_diff.get("patches")
+            raw_skipped = frozen_diff.get("skipped")
+            patches = dict(raw_patches) if isinstance(raw_patches, dict) else {}
+            skipped = dict(raw_skipped) if isinstance(raw_skipped, dict) else {}
+            frozen = True
+        else:
+            patches, skipped = await asyncio.to_thread(self.local_changed_patches, preprocessor.workspace)
+            frozen = False
         scopes = clean_scope_paths(local_scope.scope_paths if local_scope else [])
         if scopes:
             patches = {path: patch for path, patch in patches.items() if path_matches_scope(path, scopes)}
@@ -224,6 +244,7 @@ class ReviewEvidenceService:
             units_count=len(result.units),
             skipped_count=len(result.skipped),
             mode=result.mode,
+            frozen=frozen,
             context_chars=len(result.context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
         )
@@ -261,13 +282,18 @@ class ReviewEvidenceService:
                     )
                 )
             else:
+                # Net change relative to HEAD, matching admission's net diff.
+                # Concatenating ``HEAD -> index`` with ``index -> worktree``
+                # would expose the intermediate staged snapshot alongside the
+                # final worktree state, so the reviewer would see the same
+                # change twice (once per staging state).
                 try:
-                    unstaged = self._git_cli("diff", "--no-ext-diff", "--unified=3", "--", path, cwd=root)
-                    staged = self._git_cli("diff", "--no-ext-diff", "--cached", "--unified=3", "--", path, cwd=root)
+                    patch = self._git_cli(
+                        "diff", "--no-ext-diff", "--unified=3", "HEAD", "--", path, cwd=root
+                    )
                 except Exception:
                     skipped[path] = "patch_unavailable"
                     continue
-                patch = "\n".join(part for part in (staged, unstaged) if part.strip())
             if not patch.strip():
                 skipped[path] = "patch_unavailable"
             elif review_file_filter_reason(path, patch) is not None:
@@ -326,26 +352,48 @@ class ReviewEvidenceService:
     def _local_changed_summary_cli(self, workspace: Path | None = None) -> LocalChangedSummary:
         root = (workspace or self.workspace).expanduser().resolve()
         try:
-            paths = set(self._git_cli("diff", "--name-only", cwd=root).splitlines())
-            paths.update(self._git_cli("diff", "--name-only", "--cached", cwd=root).splitlines())
-            paths.update(self._git_cli("ls-files", "--others", "--exclude-standard", cwd=root).splitlines())
-            text_paths = sorted(
-                path for path in paths if review_file_filter_reason(path) is None
+            worktree = Path(
+                self._git_cli("rev-parse", "--show-toplevel", cwd=root).strip()
+            ).resolve()
+        except Exception as exc:
+            logger.warning("repo_review local git cli unavailable reason={}", exc)
+            return LocalChangedSummary()
+        try:
+            # Git reports paths relative to the worktree root (``diff``) while
+            # ``ls-files --others`` reports them relative to the cwd. Query
+            # everything from the worktree root and convert to review-root
+            # coordinates so a subdirectory target still collects its changes.
+            tracked = set(self._git_cli("diff", "--name-only", cwd=worktree).splitlines())
+            tracked.update(
+                self._git_cli("diff", "--name-only", "--cached", cwd=worktree).splitlines()
             )
-            untracked = set(self._git_cli("ls-files", "--others", "--exclude-standard", cwd=root).splitlines())
+            untracked = set(
+                self._git_cli("ls-files", "--others", "--exclude-standard", cwd=worktree).splitlines()
+            )
+            rel_by_raw: dict[str, str] = {}
+            for raw in sorted(tracked | untracked):
+                rel_path = self._path_relative_to_root(raw, worktree=worktree, root=root)
+                if rel_path is None or review_file_filter_reason(rel_path) is not None:
+                    continue
+                rel_by_raw[raw] = rel_path
+            text_paths = sorted(rel_by_raw.values())
             touched: dict[str, list[int]] = {}
-            for path in text_paths:
+            for raw, rel_path in rel_by_raw.items():
                 lines: set[int] = set()
                 lines.update(
-                    changed_lines_from_patch(path, self._local_diff_patch_cli(path, cached=False, cwd=root))
+                    changed_lines_from_patch(
+                        rel_path, self._local_diff_patch_cli(raw, cached=False, cwd=worktree)
+                    )
                 )
                 lines.update(
-                    changed_lines_from_patch(path, self._local_diff_patch_cli(path, cached=True, cwd=root))
+                    changed_lines_from_patch(
+                        rel_path, self._local_diff_patch_cli(raw, cached=True, cwd=worktree)
+                    )
                 )
-                if path in untracked:
-                    lines.update(self._untracked_workspace_file_lines(path, workspace=root))
+                if raw in untracked:
+                    lines.update(self._untracked_workspace_file_lines(rel_path, workspace=root))
                 if lines:
-                    touched[path] = sorted(lines)
+                    touched[rel_path] = sorted(lines)
             return LocalChangedSummary(files=text_paths, touched_lines=touched)
         except Exception as exc:
             logger.warning("repo_review local git cli diff unavailable reason={}", exc)

@@ -1,22 +1,23 @@
 ---
 name: repo-reader
-description: Used when users request full repository comprehension, analysis, or code review of a locally available repository; systematically inspects repository structure, entry points, source code, tests, and call chains using local files and local_review.
+description: Used when users request repository comprehension or code navigation for a locally available repository; systematically inspects structure, entry points, source code, tests, and call chains with bounded local file tools.
 ---
 
 # repo-reader
 
 ## When to Use
 
-Use this skill when the user wants repository-level understanding:
+Use this skill when the user wants repository-level understanding or code navigation:
 - The repository is already available locally (cloned by the user, or the current workspace).
-- The user asks to look at, analyze, review, or understand a code repository.
+- The user asks to look at, analyze, navigate, or understand a code repository.
 - The user asks "帮我看看这个仓库", "分析一下这个项目", or similar phrases.
 - The user wants to understand a code repository before changing it.
 
 Do not use this skill when:
-- The user asks a narrow question about files already in the current workspace; use `local_review(review_query="...")` or read the known files directly.
+- The user asks a narrow question about files already in the current workspace; read the known files directly.
 - The user only needs online documentation, API references, or external facts; use `web_search` and `web_fetch`.
 - The user only asks for a small code edit in a known area; inspect the relevant local files directly.
+- The user requests a structured code review; use the `nanoreview review --action diff` workflow instead of this skill.
 - The user provides a remote repository URL that is not on disk: review input is local-only, so ask the user to clone it (or fetch specific files with `web_fetch`) before reviewing.
 
 ## Workflow
@@ -31,19 +32,21 @@ Do not use this skill when:
 
 ## Repository Access
 
-- Inspect the repository files directly, and use `local_review(review_query="...")` to find relevant code when the important files are not obvious.
-- Review input is local-only: there is no remote repository reader. If the target is not on disk, ask the user to clone it first, or fetch individual files with `web_fetch`.
-- Do not run `git clone` or `gh repo clone` for review access unless the user explicitly asks outside the review workflow.
+- Inspect the repository with `list_dir`, focused `grep`, and bounded `read_file` calls. Start with the directory tree and key project files, then follow imports, call sites, and tests.
+- Keep reads narrow and avoid repeatedly scanning the same file or the whole repository. Reuse content already in context and request a different range only when needed.
+- Repository understanding is local-only. If the target is not on disk, ask the user to provide a local checkout or use `web_fetch` for specific remote files.
+- Do not run `git clone` or `gh repo clone` as part of this skill.
 
 ## Rules
 
 - Do not modify code unless the user explicitly asks.
 - Prefer facts from files over assumptions.
 - Do not summarize a repository from README alone.
-- Do not summarize a repository from review snippets alone.
+- Do not summarize a repository from search results or isolated snippets alone.
 - Read source files that establish the directory map, entry points, and call chain.
 - Keep explanations beginner-friendly when the user is learning.
 - Mention uncertainty clearly.
+- Keep this skill exploratory and read-only. Do not create a structured finding report or claim that a diff review was completed.
 - If the repository is not available locally yet, ask the user to clone it (or fetch specific files with `web_fetch`) before applying this workflow.
 
 ## Output

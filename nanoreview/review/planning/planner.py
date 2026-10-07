@@ -5,7 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -26,6 +26,9 @@ from nanoreview.review.types import (
 )
 from nanoreview.session.manager import Session
 
+if TYPE_CHECKING:
+    from nanoreview.review.planning.manifest import EvidenceManifest
+
 
 @dataclass(frozen=True, slots=True)
 class ReviewPreparation:
@@ -34,6 +37,8 @@ class ReviewPreparation:
     plan: ReviewPlan | None
     prompt: str
     evidence: ReviewEvidenceBundle | None = None
+    #: The single budgeted planner manifest the prompt was rendered from.
+    manifest: "EvidenceManifest | None" = None
 
 
 def _find_git_root(path: Path) -> Path | None:
@@ -217,6 +222,7 @@ async def prepare_code_review_context(
     progress_callback: Any | None = None,
 ) -> ReviewPreparation:
     """Resolve policy, evidence, and the coordinator-only prompt for one review."""
+    from nanoreview.review.planning.manifest import build_evidence_manifest
     from nanoreview.review.planning.prefetch import maybe_prefetch_review_context
     from nanoreview.review.planning.prompt import (
         build_review_fallback_prompt,
@@ -261,17 +267,21 @@ async def prepare_code_review_context(
             plan,
             prefetch_summary=(
                 "Repository evidence prefetch was already attempted for this review "
-                f"and returned {prefetch_summary.status}{detail}. Do not call "
-                "local_review again for the same target in this turn; continue with the "
+                f"and returned {prefetch_summary.status}{detail}. Do not repeat broad "
+                "evidence retrieval for the same target in this turn; continue with the "
                 "available context and state any evidence limitations in the review."
             ),
         )
     session_meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = [role.name for role in plan.roles]
     evidence = prefetch_summary.evidence
+    # The planner sees exactly one structured manifest, built from the same
+    # references the reviewer assignments use and budgeted for the review window.
+    manifest = build_evidence_manifest(evidence)
     return ReviewPreparation(
         plan=plan,
-        prompt=render_review_coordinator_prompt(plan, evidence),
+        prompt=render_review_coordinator_prompt(plan, evidence, manifest=manifest),
         evidence=evidence,
+        manifest=manifest,
     )
 
 

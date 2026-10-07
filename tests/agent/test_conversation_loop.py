@@ -5,8 +5,9 @@ frozen/working context, a core-only ``ToolRegistry``, one ``AgentRunner`` run,
 history persistence and reply assembly. These tests pin the boundary the
 coordinator and the review side rely on:
 
-* the conversation core owns ``local_review`` but never sees the review-only
-  coordinator tools (``review_judge`` / ``review_submit``);
+* the conversation core owns its ordinary tools (``read_file`` / ``grep``) but
+  never sees the review-only coordinator tools (``review_judge`` /
+  ``review_submit``), and there is no repository-reader tool at all;
 * one turn runs exactly one runner and persists the user/assistant history;
 * the review handoff reaches the first turn through the coordinator's own
   writer — the report artifact is never copied into session metadata, and the

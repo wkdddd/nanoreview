@@ -56,7 +56,7 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 
 截至本次核查，第 1–3 阶段已完成，生命周期 hooks 与 MCP 也已落地，不再作为后续待开发节点。此处的完成记录不替代本次或后续实施的验证。权限简化与上下文编排分为两个独立阶段，先权限、后上下文。
 
-第 4 阶段的具体实施方案、受影响文件和验收条件见 `code-adjustment-plan.md`；本文件只记录长期阶段目标，不重复短期实施清单。后续阶段在选定实施节点后，沿用同一计划文件补充对应方案。
+第 4 阶段的具体实施方案、受影响文件和验收条件见 `code-adjustment-plan.md`；本文件只记录长期阶段目标，不重复短期实施清单。后续阶段在选定实施节点后，沿用同一计划文件补充对应方案。**（2026-10-07 同步）** 当前短期节点为「ReviewLoop 预算与 diff-only 审查」，同样记录在 `code-adjustment-plan.md`，其范围明确越过了第 5 阶段的边界（见下表后说明）。
 
 | 顺序 | 状态 | 阶段与预期结果 |
 |---|---|---|
@@ -69,11 +69,22 @@ Review Agent 与 Conversation Agent 是两套 Agent，共用分层 Harness，但
 | 7 | 待实施 | 审查效果评测：复用 [AACR-Bench 数据集](https://huggingface.co/datasets/Alibaba-Aone/aacr-bench) 和其 [evaluation 评测框架](https://github.com/alibaba/aacr-bench/tree/main/evaluation) 作为主基线，接入 NanoReview 的结构化审查结果；以降低误报、证明审查有效性为主，代码调整带来的改善为辅助，额外模型调用总预算不超过人民币 100 元。 |
 | 8 | 最后实施 | 前端适配与演示闭环：统一 WebUI 的状态、报告、流式对话、控制和错误展示，移除 approval 残留入口，完成刷新、重连与完整工作流验收。 |
 
-第 5 阶段限定为执行上下文编排，不同时调整仓库检索、代码分块或 reviewer 证据分配策略；这些效果优化在评测暴露问题后另行讨论。第 7 阶段的数据集适用性、案例规模和对照方案在实施前核查确定，不预设多智能体优于单 Agent，也不把已知问题检出率等同于整个仓库的完整召回率。
+第 5 阶段限定为执行上下文编排，不同时调整仓库检索、代码分块或 reviewer 证据分配策略；这些效果优化在评测暴露问题后另行讨论。
+
+**（2026-10-07 同步，位置与理由）** 该阶段边界已被后续确认的短期节点「ReviewLoop 预算与 diff-only 审查」越过，按「短期计划优先」原则以 `code-adjustment-plan.md` 为准，此处同步 roadmap：
+
+- 审查输入收敛为**本地 diff only**：移除 repo review 的有效入口、CLI/API/配置与兼容分支（`ReviewAction` 仅 `diff`），无 Git/读取失败/空 diff 在准入阶段失败。
+- diff evidence 分块改为**按单文件 token 阈值**（`<8_000` 一个完整 unit，`>=8_000` 沿用语义/hunk 切分），主 evidence 预算 `150_000`、related `37_500`。
+- Planner 收敛为**单一结构化 manifest**（原 summary/context 文本路径删除），`80_000` token 预算，超限按优先级省略并记录覆盖缺口。
+- Review 流程的模型工具集**统一移除 `local_review`**，evidence service 改为 ReviewLoop 内部依赖注入。**（2026-10-07 收尾）** `local_review` 工具本身、`ReviewToolBase`、`LocalRepoReader` 与 `skills/rag` 已从代码库整体删除，`ConversationLoop` 的 deny 列表随之取消；非 review 场景不再提供仓库级 reader 工具（改用 `read_file`/`grep`/`list_dir` 与 `repo-reader` skill）。
+- 新增 reviewer 预算（`8_192` 输出 / `30` 次模型请求 / `180s`）与 run 内重复读取抑制，以及 golden diff replay 质量评测。30 次请求中的**最后一次由 `AgentRunner` 强制保留为 `review_submit` 提交轮**（`reserve_terminal_iteration`），避免探索耗尽预算后被判未提交。
+
+这些改动改变了第 5 阶段所排除的「仓库检索、代码分块、reviewer 证据分配」边界，因此评测（第 7 阶段）需要按 diff-only 重做基线假设，见下节。第 7 阶段的数据集适用性、案例规模和对照方案在实施前核查确定，不预设多智能体优于单 Agent，也不把已知问题检出率等同于整个仓库的完整召回率。
 
 ### 第 7 阶段评测方案
 
 - **评测基线**：固定 AACR-Bench 数据集版本、数据快照校验值、评测框架 commit、NanoReview commit、模型版本、提示词、工具权限和运行参数。AACR-Bench 的 PR 样本保留完整仓库上下文，可作为 NanoReview repository-level review 的第一批可复现基线；不直接采用 OpenCodeReview 页面中的静态结果表。
+  - **（2026-10-07 同步）** NanoReview 产品入口已收敛为**本地 diff review**，不再支持 repository-level review；该基线假设失效。AACR-Bench 样本只能取 PR 的 diff 作为审查输入；无 diff 的完整仓库审查案例全部移到下方「补充验证」的原生 whole-repository cases 轨道，且该轨道只作为评测侧离线构造，不接入产品入口。评测指标的口径应改为「给定 diff 的问题检出」，不宣称整个仓库的完整召回率。
 - **复用方式**：保留 AACR-Bench 的 `data -> review -> result -> evaluate` 流程和标准 JSONL schema，新增 NanoReview reviewer adapter/result converter，将 NanoReview finding 统一为文件路径、行区间、diff side、描述和严重性等字段。必要的 NanoReview 全仓库审查案例另建独立 manifest，不修改 AACR-Bench 原始数据。
 - **主要指标**：正式报告语义 Precision、Recall、F1，以及行号 Precision、Recall、F1；同时报告生成评论数、参考问题数、匹配数、成功/缺失/超时/失败样本数、耗时和 token。主结论优先看 Precision、误报率和人工确认的有效问题比例，Recall 只解释为对数据集已标注问题的检出率。
 - **裁判与人工核验**：Mock Judge 只用于验证流水线；正式结果使用固定的真实 Judge 配置，并保存逐条匹配明细。对关键样本和 Judge 边界样本进行人工复核，记录 Judge 误判、位置偏差和标注覆盖不足，不把 LLM Judge 单独当作真值。

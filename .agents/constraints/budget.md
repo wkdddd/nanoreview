@@ -30,6 +30,26 @@
 - Judge 通过 Runner 执行，失败 batch 仍保留已消耗 usage；超时使用已观察到的批内快照。
 - 当前 `AgentLoop._total_usage`/WebSocket `/usage` 是进程观测，未完整包含 review 与会话整理用量，不代表账单。
 
+## Review run 预算契约
+
+Review 管线（Planner / reviewer / Judge）使用固定 `200_000` tokens 上下文窗口，不随 Conversation Agent 配置或 provider 探测变化（`agent/review_loop.py::REVIEW_CONTEXT_WINDOW_TOKENS`）：
+
+```text
+context_window_tokens = 200_000
+planner_manifest_budget = 80_000（上下文窗口 40%）
+evidence_token_budget = 150_000（主）/ related = 37_500（四分之一，单层补充）
+diff evidence 单文件阈值 = 8_000（`<threshold` 一个完整 unit；`>=threshold` 沿用语义/hunk 切分）
+reviewer_max_output_tokens = 8_192
+reviewer_model_request_limit = 30（最后一次请求用于 review_submit）
+reviewer_timeout_seconds = 180
+```
+
+- review 输入只有本地 diff：evidence 以 changed hunk 为主，related 只作一层补充。文件读取超 `max_file_chars` 时追加截断标记，不得把截断内容当作完整文件 evidence。
+- Planner 只读一个结构化 manifest（`review/planning/manifest.py`），其 references 与 skipped/omitted 说明共享 80k 预算；超限优先保留高优先级 references，并记录被省略的 id/数量/原因。manifest 的 version 与 token counter 随 `EvidenceManifest.snapshot_payload()` 持久化到 review snapshot。
+- reviewer frozen task（授权 evidence + related evidence）是固定输入，不参与工作历史压缩；容量不足必须显式失败或记录 coverage 缺口，不得静默丢弃授权 evidence，也不得假定压缩能裁剪 frozen task。
+- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Planner（`submit_review_plan`）与 Judge（`submit_verdicts`）本就每轮强制，故行为不变；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
+- reviewer 内重复 `read_file`/`grep` 按单 run ledger 抑制（相同规范化范围 + 内容未变时返回短提示），`force` 不可绕过；这是上下文效率控制，不是累计 token 硬上限，也不跨 reviewer/review run 共享。
+
 ## 变更检查
 
 预算改动核对配置映射、evidence 策略、Runner/Subagent 限制、压缩分区与停止原因、Provider usage、WebUI 展示及对应测试。新增总配额须定义作用域、计量来源、并发扣减与超限行为。

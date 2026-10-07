@@ -191,6 +191,16 @@ MIN_CHUNK_TOKENS = 400
 MAX_CHUNK_TOKENS = 4_000
 MIN_USABLE_TOKENS = 1_000
 
+#: Per-file diff unit threshold. A changed file whose patch is below this many
+#: tokens is kept as one complete diff unit; at or above it the existing
+#: hunk-splitting strategy applies. Judged per file, so a large target does not
+#: force every small changed file into hunks.
+DIFF_UNIT_TOKEN_THRESHOLD = 8_000
+
+#: Appended to a file clipped at ``ProgrammaticEvidenceOptions.max_file_chars``
+#: so its evidence can never be described as the complete file.
+TRUNCATION_MARKER = "\n... (file truncated at max_file_chars) ..."
+
 #: Fixed context lines prepended/appended to semantic chunk text. Overlap is
 #: comprehension context only; canonical start/end lines (and therefore the
 #: authorized review scope) never widen because of it.
@@ -918,7 +928,7 @@ class ProgrammaticEvidenceService:
                     )
                 )
                 continue
-            units.extend(self._patch_units(path, patch, budgets, skipped))
+            units.extend(self._patch_units(path, patch, skipped))
         terms = self._query_terms(review_query)
         for unit in units:
             self._score_unit(unit, terms, [])
@@ -948,9 +958,15 @@ class ProgrammaticEvidenceService:
         for path in request.files or self.iter_candidate_files():
             try:
                 rel = path.relative_to(self.workspace).as_posix()
-                text = path.read_text(encoding="utf-8")[: self.options.max_file_chars]
+                raw = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError, ValueError):
                 continue
+            # A file clipped at ``max_file_chars`` carries an explicit marker so
+            # its preview and coverage can never be read as a complete file.
+            if len(raw) > self.options.max_file_chars:
+                text = raw[: self.options.max_file_chars] + TRUNCATION_MARKER
+            else:
+                text = raw
             if review_file_filter_reason(rel, text) is None:
                 files[rel] = text
         return files
@@ -1302,11 +1318,10 @@ class ProgrammaticEvidenceService:
     def _patch_units(
         path: str,
         patch: str,
-        budgets: EvidenceBudget,
         skipped: list[SkippedUnit],
     ) -> list[CodeUnit]:
         tokens = estimate_tokens(patch)
-        if tokens <= budgets.chunk_cap_tokens:
+        if tokens < DIFF_UNIT_TOKEN_THRESHOLD:
             start, end = ProgrammaticEvidenceService._patch_range(patch)
             return [
                 CodeUnit(
@@ -1319,7 +1334,7 @@ class ProgrammaticEvidenceService:
                     token_count=tokens,
                 )
             ]
-        # Split oversized patches by hunks.
+        # At or above the per-file threshold, split oversized patches by hunks.
         pieces = re.split(r"(?=^@@ )", patch, flags=re.MULTILINE)
         units: list[CodeUnit] = []
         for piece in pieces:
@@ -1330,7 +1345,7 @@ class ProgrammaticEvidenceService:
             start = int(match.group(1)) if match else 1
             count = int(match.group(2) or 1) if match else 1
             end = start + max(count - 1, 0)
-            if piece_tokens > budgets.chunk_cap_tokens:
+            if piece_tokens > DIFF_UNIT_TOKEN_THRESHOLD:
                 skipped.append(
                     SkippedUnit(path, "token_limit_exceeded", start, end, detail="oversized hunk")
                 )

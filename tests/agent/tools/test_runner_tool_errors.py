@@ -538,3 +538,135 @@ async def test_terminal_tool_prose_answer_counts_as_attempt_and_fails_at_limit()
     assert result.stop_reason == "terminal_tool_failed"
     assert result.terminal_attempts == 2
     assert provider.calls == 2
+
+
+class ExploreTool(Tool):
+    """Non-terminal tool used to spend iterations without submitting."""
+
+    @property
+    def name(self) -> str:
+        return "explore_tool"
+
+    @property
+    def description(self) -> str:
+        return "Explore the workspace."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, **kwargs: Any) -> Any:
+        return "nothing here"
+
+
+class ToolChoiceAwareProvider(LLMProvider):
+    """Explores every turn, but honours a forced ``tool_choice``.
+
+    Models what a real provider does on the reserved final turn: a forced
+    function choice produces that call instead of another exploratory one.
+    """
+
+    def __init__(self, terminal_name: str = "terminal_tool") -> None:
+        super().__init__()
+        self.terminal_name = terminal_name
+        self.requests: list[dict[str, Any]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        self.requests.append({"tools": tools or [], "tool_choice": tool_choice})
+        forced: str | None = None
+        if isinstance(tool_choice, dict):
+            function = tool_choice.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+                forced = name if isinstance(name, str) else None
+        name = forced or "explore_tool"
+        return LLMResponse(
+            content=None,
+            tool_calls=[
+                ToolCallRequest(
+                    id=f"call_{len(self.requests)}",
+                    name=name,
+                    arguments={},
+                )
+            ],
+        )
+
+    def get_default_model(self) -> str:
+        return "dummy"
+
+
+def _exposed_tool_names(tools: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        schema["function"]["name"]
+        for schema in tools
+        if isinstance(schema.get("function"), dict)
+    )
+
+
+@pytest.mark.asyncio
+async def test_reserved_final_iteration_forces_the_terminal_submission() -> None:
+    """A run that explores every turn still submits on its last iteration."""
+    tools = ToolRegistry()
+    tools.register(TerminalTool())
+    tools.register(ExploreTool())
+    provider = ToolChoiceAwareProvider()
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            max_iterations=3,
+        )
+    )
+
+    assert result.stop_reason == "completed"
+    assert result.terminal_attempts == 1
+    assert len(provider.requests) == 3
+
+    # Exploratory turns see the whole surface and no forced choice.
+    first = provider.requests[0]
+    assert _exposed_tool_names(first["tools"]) == ["explore_tool", "terminal_tool"]
+    assert first["tool_choice"] is None
+
+    # The reserved final turn exposes only the terminal tool and forces it.
+    last = provider.requests[-1]
+    assert _exposed_tool_names(last["tools"]) == ["terminal_tool"]
+    assert last["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "terminal_tool"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_reserved_terminal_iteration_can_be_disabled() -> None:
+    """Without the reservation the run still collapses into max_iterations."""
+    tools = ToolRegistry()
+    tools.register(TerminalTool())
+    tools.register(ExploreTool())
+    provider = ToolChoiceAwareProvider()
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            max_iterations=3,
+            reserve_terminal_iteration=False,
+        )
+    )
+
+    assert result.stop_reason == "max_iterations"
+    assert result.terminal_attempts == 0
+    assert len(provider.requests) == 3
+    assert all(request["tool_choice"] is None for request in provider.requests)

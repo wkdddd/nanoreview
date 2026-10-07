@@ -27,10 +27,15 @@ from typing import Any, cast
 import pytest
 
 from nanoreview.agent.review_loop import (
+    REVIEW_CONTEXT_WINDOW_TOKENS,
+    REVIEWER_MAX_OUTPUT_TOKENS,
+    REVIEWER_MODEL_REQUEST_LIMIT,
+    REVIEWER_TIMEOUT_SECONDS,
     ReviewLoop,
     ReviewLoopOutcome,
     ReviewPlanningError,
     ReviewTurnRequest,
+    review_budget_contract,
 )
 from nanoreview.agent.review_state import (
     ReviewArtifactStore,
@@ -38,10 +43,12 @@ from nanoreview.agent.review_state import (
     ReviewRunState,
     ReviewRunStatus,
 )
-from nanoreview.agent.runner import AgentRunResult, AgentRunner
+from nanoreview.agent.runner import AgentRunner, AgentRunResult
 from nanoreview.bus.events import InboundMessage
 from nanoreview.providers.base import LLMResponse, ToolCallRequest
+from nanoreview.review.input.snapshot import build_snapshot
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
+from nanoreview.review.planning.manifest import build_evidence_manifest
 from nanoreview.review.planning.planner import ReviewPreparation
 from nanoreview.review.result import ReviewHandoffState
 from nanoreview.review.types import (
@@ -51,6 +58,7 @@ from nanoreview.review.types import (
     ReviewEvidenceBundle,
     ReviewMetaKey,
     ReviewPlan,
+    SkippedReviewUnit,
 )
 from nanoreview.session.manager import SessionManager
 
@@ -62,7 +70,7 @@ def _plan(*roles: str) -> ReviewPlan:
         target="repo",
         target_name="repo",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
         routing_mode="explicit",
     )
@@ -351,9 +359,10 @@ def prepared(monkeypatch):
         evidence: ReviewEvidenceBundle,
         *,
         prompt: str = "plan",
+        manifest: object | None = None,
     ) -> None:
         async def _prepare(_messages, _meta, progress_callback=None):
-            return ReviewPreparation(plan, prompt, evidence)
+            return ReviewPreparation(plan, prompt, evidence, manifest=manifest)
 
         monkeypatch.setattr(
             "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
@@ -571,21 +580,28 @@ async def test_local_diff_without_evidence_explains_how_to_continue(
 
     outcome = await loop.execute(_request())
 
-    assert "Switch Scope to Repo" in (outcome.error or "")
+    assert "Stage or modify a file inside the target" in (outcome.error or "")
     assert state.status is ReviewRunStatus.ERROR
 
 
 @pytest.mark.asyncio
-async def test_evidence_unavailable_without_changes_explains_skipped_units(
+async def test_diff_without_evidence_reports_skipped_units(
     tmp_path, prepared
 ) -> None:
-    prepared(_plan("security"), ReviewEvidenceBundle())
+    evidence = ReviewEvidenceBundle(
+        skipped=(SkippedReviewUnit(path="src/big.py", reason="token_limit_exceeded"),)
+    )
+    prepared(_plan("security"), evidence)
     loop = _build_loop(tmp_path, runner=_NoPlanRunner(), subagents=_Subagents())
     _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    assert "Review evidence unavailable" in (outcome.error or "")
+    # A diff run that produced no accepted evidence still fails, and the
+    # message names the unreviewed units so the coverage gap is visible.
+    assert "Diff review cannot start" in (outcome.error or "")
+    assert "src/big.py" in (outcome.error or "")
+    assert "token_limit_exceeded" in (outcome.error or "")
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +629,11 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
         "security",
         "bug",
     ]
+    # The planner-injected evidence is proved to the reviewer so a valid
+    # ``findings: []`` submission is not misread as incomplete.
+    assert all(
+        call["origin_metadata"]["assigned_evidence"] == 1 for call in subagents.calls
+    )
     assert "No actionable issues found" in (outcome.report_markdown or "")
 
 
@@ -1144,6 +1165,184 @@ async def test_execute_without_a_live_run_reports_failure(tmp_path) -> None:
 
 def test_review_planning_error_is_the_module_contract() -> None:
     assert issubclass(ReviewPlanningError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# Fixed review budget
+# ---------------------------------------------------------------------------
+
+
+class _CapturingPlanRunner:
+    """Planner recording its ``AgentRunSpec`` and accepting one assignment."""
+
+    def __init__(self) -> None:
+        self.specs: list[Any] = []
+
+    async def run(self, spec: Any) -> AgentRunResult:
+        self.specs.append(spec)
+        tool = spec.tools.get("submit_review_plan")
+        assert tool is not None
+        await tool.execute(
+            assignments=[
+                {
+                    "dimension": "security",
+                    "focus": "authentication state",
+                    "evidence_ids": ["ev-001"],
+                }
+            ]
+        )
+        return AgentRunResult(final_content="", messages=[], usage={})
+
+
+@pytest.mark.asyncio
+async def test_review_run_binds_the_fixed_window_and_reviewer_limits(
+    tmp_path, prepared
+) -> None:
+    """Planner and reviewers use the fixed review window and reviewer limits."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(_plan("security"), _evidence())
+    runner = _CapturingPlanRunner()
+    subagents = _Subagents()
+    loop = _build_loop(tmp_path, runner=runner, subagents=subagents)
+    _register_run(loop)
+
+    await loop.execute(_request())
+
+    assert runner.specs[0].context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
+    limits = subagents.calls[0]["execution_limits"]
+    assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
+    assert limits.max_tokens == REVIEWER_MAX_OUTPUT_TOKENS
+    assert limits.timeout_seconds == REVIEWER_TIMEOUT_SECONDS
+    assert limits.context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
+    # Review navigation metadata carries the same fixed window for evidence.
+    assert (
+        subagents.calls[0]["origin_metadata"][ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS]
+        == REVIEW_CONTEXT_WINDOW_TOKENS
+    )
+
+
+def test_review_window_is_fixed_and_survives_a_model_switch(tmp_path) -> None:
+    """The conversation-side model switch never widens the review window."""
+    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
+
+    loop.set_runtime_model(None, "switched-model", 131_072)  # type: ignore[arg-type]
+
+    assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
+
+
+def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
+    assert review_budget_contract() == {
+        "context_window_tokens": 200_000,
+        "planner_manifest_budget_tokens": 80_000,
+        "reviewer_max_output_tokens": 8_192,
+        "reviewer_model_request_limit": 30,
+        "reviewer_timeout_seconds": 180,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_records_manifest_stats_on_state(tmp_path, prepared) -> None:
+    """The run's audit trail records what the planner actually saw."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(
+        _plan("security", "bug"),
+        _evidence(),
+        manifest=build_evidence_manifest(_evidence()),
+    )
+    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    state = _register_run(loop)
+
+    await loop.execute(_request())
+
+    assert state.manifest_stats["version"] == "evidence-manifest/1"
+    assert state.manifest_stats["budget_tokens"] == 80_000
+    assert state.manifest_stats["retained"] == 1
+    assert state.manifest_stats["omitted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
+    tmp_path, prepared
+) -> None:
+    """The validator diff boundary is the snapshot's changed set, not empty.
+
+    A regression here silently disabled ``validator``'s out-of-scope check (so
+    findings in unmodified files were accepted) and made coverage report an
+    empty changed-file list.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(_plan("security", "bug"), _evidence())
+    subagents = _Subagents()
+    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    state = _register_run(loop)
+    loop._snapshots.write(
+        build_snapshot(
+            run_id=state.run_id,
+            session_key=SESSION_KEY,
+            action="diff",
+            target_type="local",
+            target=str(tmp_path),
+            input_fingerprint="fp",
+            net_diff={"app.py": "@@ -0,0 +1 @@\n+value = 1"},
+            changed_files=["app.py", "src/db.py"],
+        )
+    )
+
+    await loop.execute(_request())
+
+    assert state.changed_files == ["app.py", "src/db.py"]
+    # The frozen diff is an internal planning input; it never reaches reviewer
+    # metadata (where it would be persisted with the subagent result).
+    assert all(
+        ReviewMetaKey.FROZEN_DIFF not in call["origin_metadata"]
+        for call in subagents.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_reviews_the_frozen_snapshot_diff_not_the_worktree(
+    tmp_path, monkeypatch
+) -> None:
+    """The plan is built from the snapshot net diff, ignoring live edits.
+
+    ``prepare_code_review_context`` is the PREPARE entry point, so the frozen
+    diff handoff (``ReviewMetaKey.FROZEN_DIFF``) must be present in the metadata
+    it receives before prefetch can dispatch against it.
+    """
+    from nanoreview.review.input.snapshot import ReviewSnapshotStore
+
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    async def _prepare(_messages, meta, progress_callback=None):
+        captured.update(meta)
+        return ReviewPreparation(_plan("security"), "plan", _evidence())
+
+    monkeypatch.setattr(
+        "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
+    )
+    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    state = _register_run(loop)
+    ReviewSnapshotStore(tmp_path).write(
+        build_snapshot(
+            run_id=state.run_id,
+            session_key=SESSION_KEY,
+            action="diff",
+            target_type="local",
+            target=str(tmp_path),
+            input_fingerprint="fp",
+            net_diff={"app.py": "@@ -0,0 +1 @@\n+frozen"},
+            changed_files=["app.py"],
+        )
+    )
+
+    await loop.execute(_request())
+
+    assert captured[ReviewMetaKey.FROZEN_DIFF] == {
+        "patches": {"app.py": "@@ -0,0 +1 @@\n+frozen"},
+        "skipped": {},
+    }
 
 
 # ---------------------------------------------------------------------------

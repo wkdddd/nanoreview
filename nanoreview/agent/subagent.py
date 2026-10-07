@@ -143,6 +143,8 @@ class SubagentManager:
         self,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        *,
+        review_dedup: bool = False,
     ) -> ToolContext:
         root = self.workspace if workspace is None else workspace
         cfg = (
@@ -151,7 +153,7 @@ class SubagentManager:
         return ToolContext(
             config=cfg,
             workspace=str(root.resolve()),
-            file_state_store=FileStates(),
+            file_state_store=FileStates(review_dedup=review_dedup),
         )
 
     def _build_tools(
@@ -164,18 +166,22 @@ class SubagentManager:
         denied_names: set[str] = set()
         registry = ToolRegistry()
         loader = ToolLoader()
+        # Reviewer runs get a duplicate-read ledger scoped to this single run.
+        # Each subagent builds a fresh FileStates, so the ledger never leaks
+        # across reviewers or review runs.
+        review_dedup = profile.scope.startswith("reviewer.")
         loader.load(
-            self._build_tool_context(workspace=workspace, tools_config=tools_config),
+            self._build_tool_context(
+                workspace=workspace,
+                tools_config=tools_config,
+                review_dedup=review_dedup,
+            ),
             registry,
             scope=profile.scope,
             denied_names=denied_names,
         )
         loaded_names = frozenset(registry.tool_names)
         required_tools = frozenset(getattr(profile, "required_tools", frozenset()))
-        # Reviewer profiles share a base tool contract but must also expose the
-        # local evidence tool.
-        if profile.scope.startswith("reviewer."):
-            required_tools |= frozenset({"local_review"})
         missing_tools = required_tools - loaded_names
         if missing_tools:
             missing = ", ".join(sorted(missing_tools))
@@ -266,6 +272,33 @@ class SubagentManager:
     @staticmethod
     def soft_tool_error_tools(profile: SubagentExecutionProfile) -> frozenset[str]:
         return profile.soft_tool_error_tools
+
+    @staticmethod
+    def _dedup_stats(tools: ToolRegistry | None) -> dict[str, int]:
+        """Read the reviewer-run duplicate-read/search counters, if any.
+
+        All reviewer tools share one ``FileStates`` (and thus one ledger), so
+        the first ledger found carries the whole run's totals.
+        """
+        if tools is None:
+            return {}
+        for name in tools.tool_names:
+            tool = tools.get(name)
+            ledger = getattr(getattr(tool, "_file_states", None), "review_ledger", None)
+            if ledger is not None:
+                return {
+                    "duplicate_reads": ledger.duplicate_reads,
+                    "duplicate_searches": ledger.duplicate_searches,
+                }
+        return {}
+
+    def _apply_dedup_stats(
+        self, status: SubagentStatus, tools: ToolRegistry | None
+    ) -> None:
+        """Copy the reviewer-run duplicate counters onto the run status."""
+        stats = self._dedup_stats(tools)
+        status.duplicate_reads = stats.get("duplicate_reads", 0)
+        status.duplicate_searches = stats.get("duplicate_searches", 0)
 
     def set_provider(
         self,
@@ -391,6 +424,7 @@ class SubagentManager:
 
         lifecycle_status = "error"
         result: AgentRunResult | None = None
+        tools: ToolRegistry | None = None
         try:
             metadata = dict(origin_metadata or {})
             profile = self.resolve_profile(metadata)
@@ -496,6 +530,11 @@ class SubagentManager:
             )
             effective_max_tokens = execution_limits.max_tokens if execution_limits else None
             timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
+            effective_context_window = (
+                execution_limits.context_window_tokens
+                if execution_limits and execution_limits.context_window_tokens is not None
+                else self.context_window_tokens
+            )
             # One info record of the actually effective limits replaces the
             # per-result metadata observability (quota/input estimates were
             # removed with the budget admission gate).
@@ -507,7 +546,7 @@ class SubagentManager:
                 effective_iterations,
                 effective_max_tokens,
                 timeout_seconds,
-                self.context_window_tokens,
+                effective_context_window,
                 self.context_block_limit,
             )
             timeout_scope = (
@@ -543,11 +582,20 @@ class SubagentManager:
                         # trimming as the main agent (runner._snip_history);
                         # without this value the runner skips trimming and
                         # long reviewer runs grow unbounded.
-                        context_window_tokens=self.context_window_tokens,
+                        context_window_tokens=effective_context_window,
                         context_block_limit=self.context_block_limit,
                     )
                 )
                 status.stop_reason = result.stop_reason
+                self._apply_dedup_stats(status, tools)
+                if status.duplicate_reads or status.duplicate_searches:
+                    logger.info(
+                        "subagent.dedup task_id={} label={} duplicate_reads={} duplicate_searches={}",
+                        task_id,
+                        label,
+                        status.duplicate_reads,
+                        status.duplicate_searches,
+                    )
 
                 if result.stop_reason == "tool_error":
                     status.phase = "error"
@@ -589,6 +637,7 @@ class SubagentManager:
                 completion = await self.handle_completed_result(
                     profile=profile,
                     result=result,
+                    metadata=metadata,
                 )
                 final_result = completion.content
                 status.stop_reason = completion.stop_reason or status.stop_reason
@@ -619,6 +668,7 @@ class SubagentManager:
         except TimeoutError:
             status.phase = "error"
             status.stop_reason = "timeout"
+            self._apply_dedup_stats(status, tools)
             timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
             message = f"Error: subagent execution timed out after {timeout_seconds or 0:g}s"
             logger.warning("Subagent [{}] timed out after {}s", task_id, timeout_seconds)
@@ -637,6 +687,7 @@ class SubagentManager:
         except Exception as e:
             status.phase = "error"
             status.error = str(e)
+            self._apply_dedup_stats(status, tools)
             logger.exception("Subagent [{}] failed", task_id)
             await self._announce_result(
                 task_id,
@@ -663,6 +714,7 @@ class SubagentManager:
         *,
         profile: SubagentExecutionProfile,
         result: AgentRunResult,
+        metadata: dict[str, Any] | None = None,
     ) -> SubagentCompletion:
         """Normalize the final result of the single completed AgentRun.
 
@@ -676,7 +728,7 @@ class SubagentManager:
                 status="ok" if result.stop_reason != "error" else "error",
                 stop_reason=result.stop_reason,
             )
-        return await profile.result_handler(result=result)
+        return await profile.result_handler(result=result, metadata=metadata)
 
     async def _announce_result(
         self,
@@ -726,6 +778,12 @@ class SubagentManager:
         }
         if usage:
             metadata["subagent_usage"] = dict(usage)
+        status_obj = self._task_statuses.get(task_id)
+        if status_obj is not None and (
+            status_obj.duplicate_reads or status_obj.duplicate_searches
+        ):
+            metadata["subagent_duplicate_reads"] = status_obj.duplicate_reads
+            metadata["subagent_duplicate_searches"] = status_obj.duplicate_searches
         if execution_limits is not None:
             if execution_limits.max_tokens is not None:
                 metadata["subagent_max_tokens"] = execution_limits.max_tokens

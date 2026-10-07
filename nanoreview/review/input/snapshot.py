@@ -12,14 +12,12 @@ import json
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from nanoreview.review.file_filter import review_file_filter_reason
 from nanoreview.utils.helpers import safe_filename
 
 # Directory (relative to the workspace) that stores review input snapshots.
@@ -28,108 +26,12 @@ REVIEW_SNAPSHOTS_DIR_NAME = "review-snapshots"
 # Serialized snapshot size limit, mirroring the report artifact guard.
 REVIEW_SNAPSHOT_MAX_BYTES = 10 * 1024 * 1024
 
-# Inline repository content budget for ``repo`` reviews. Diff reviews rely on
-# the captured patches instead and keep this budget unused.
-REPO_CONTENT_MAX_BYTES = 512 * 1024
-REPO_CONTENT_MAX_FILES = 200
-REPO_CONTENT_MAX_FILE_BYTES = 128 * 1024
-
 # run_id charset: keeps snapshot filenames filesystem-safe on every platform.
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ReviewSnapshotError(RuntimeError):
     """Raised when a snapshot cannot be captured or persisted."""
-
-
-@dataclass(slots=True)
-class RepoContent:
-    """Bounded inline file contents captured for a ``repo`` review."""
-
-    files: dict[str, str] = field(default_factory=dict)
-    truncated: bool = False
-    skipped: dict[str, str] = field(default_factory=dict)
-
-
-def _resolve_within(root: Path, relative: str) -> Path | None:
-    candidate = (root / relative).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return None
-    return candidate
-
-
-def collect_repo_content(
-    review_root: Path,
-    *,
-    scope_paths: list[str] | None = None,
-    max_bytes: int = REPO_CONTENT_MAX_BYTES,
-    max_files: int = REPO_CONTENT_MAX_FILES,
-) -> RepoContent:
-    """Capture text file contents for a repository review, bounded by budget.
-
-    Only files inside *review_root* are read; oversized or undecodable files
-    are recorded as skipped rather than silently dropped. When the byte or
-    file budget is exhausted the result is marked ``truncated`` so downstream
-    consumers can state the limitation instead of pretending full coverage.
-    """
-    root = review_root.expanduser().resolve()
-    scopes = [path.strip().replace("\\", "/").rstrip("/") for path in (scope_paths or []) if path]
-    result = RepoContent()
-    used = 0
-
-    candidates: list[Path] = []
-    for rel in scopes or ["."]:
-        target = _resolve_within(root, rel) if rel != "." else root
-        if target is None:
-            result.skipped[rel] = "outside_review_root"
-            continue
-        if target.is_file():
-            candidates.append(target)
-        elif target.is_dir():
-            candidates.extend(
-                path for path in sorted(target.rglob("*")) if path.is_file()
-            )
-
-    for path in dict.fromkeys(candidates):
-        if len(result.files) >= max_files:
-            result.truncated = True
-            break
-        try:
-            rel_path = path.resolve().relative_to(root).as_posix()
-        except ValueError:
-            continue
-        reason = review_file_filter_reason(rel_path)
-        if reason:
-            result.skipped[rel_path] = reason
-            continue
-        try:
-            size = path.stat().st_size
-        except OSError:
-            result.skipped[rel_path] = "unreadable_file"
-            continue
-        if size > REPO_CONTENT_MAX_FILE_BYTES or used + size > max_bytes:
-            result.truncated = True
-            result.skipped[rel_path] = "budget_exceeded"
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            result.skipped[rel_path] = "unreadable_file"
-            continue
-        result.files[rel_path] = text
-        used += size
-
-    logger.info(
-        "review.snapshot.repo_content root={} files={} bytes={} truncated={} skipped={}",
-        root,
-        len(result.files),
-        used,
-        result.truncated,
-        len(result.skipped),
-    )
-    return result
 
 
 def build_snapshot(
@@ -144,8 +46,6 @@ def build_snapshot(
     git_head: str | None = None,
     net_diff: dict[str, str] | None = None,
     changed_files: list[str] | None = None,
-    scope_files: list[str] | None = None,
-    repo_content: RepoContent | None = None,
     extra_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON snapshot payload for one admitted review run."""
@@ -160,10 +60,6 @@ def build_snapshot(
         "git_head": git_head,
         "net_diff": net_diff or {},
         "changed_files": list(changed_files or []),
-        "scope_files": list(scope_files or []),
-        "repo_content": (repo_content.files if repo_content else {}),
-        "repo_content_truncated": bool(repo_content.truncated) if repo_content else False,
-        "repo_content_skipped": (repo_content.skipped if repo_content else {}),
         "extra": extra_metadata or {},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -226,3 +122,56 @@ class ReviewSnapshotStore:
             size,
         )
         return self.reference_for(run_id)
+
+    def read(self, run_id: str) -> dict[str, Any] | None:
+        """Load a previously persisted snapshot, or ``None`` when unavailable.
+
+        The review pipeline reads the admitted snapshot back so the frozen net
+        diff and changed-file boundary captured at admission — not the live
+        worktree — are what actually get reviewed. A missing or unreadable
+        snapshot returns ``None`` so the caller can degrade explicitly rather
+        than fail an otherwise healthy run.
+        """
+        try:
+            path = self.path_for(run_id)
+        except ReviewSnapshotError as exc:
+            logger.warning("review.snapshot.read.invalid run_id={} error={}", run_id, exc)
+            return None
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("review.snapshot.read.missing run_id={} error={}", run_id, exc)
+            return None
+        if not isinstance(snapshot, dict):
+            logger.warning("review.snapshot.read.corrupt run_id={}", run_id)
+            return None
+        return snapshot
+
+    def augment(self, run_id: str, *, sections: dict[str, Any]) -> str | None:
+        """Merge extra sections into an existing snapshot and re-persist it.
+
+        Used after planning to record the final planner manifest, the budget
+        contract and the changed-file boundary on the run's immutable input
+        snapshot. Returns the wire reference, or ``None`` when the snapshot is
+        missing/unreadable — a missing snapshot must not fail an otherwise
+        healthy review, so the caller records a warning instead.
+        """
+        try:
+            path = self.path_for(run_id)
+        except ReviewSnapshotError as exc:
+            logger.warning("review.snapshot.augment.invalid run_id={} error={}", run_id, exc)
+            return None
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("review.snapshot.augment.missing run_id={} error={}", run_id, exc)
+            return None
+        if not isinstance(snapshot, dict):
+            logger.warning("review.snapshot.augment.corrupt run_id={}", run_id)
+            return None
+        snapshot.update(sections)
+        try:
+            return self.write(snapshot)
+        except ReviewSnapshotError as exc:
+            logger.warning("review.snapshot.augment.failed run_id={} error={}", run_id, exc)
+            return None

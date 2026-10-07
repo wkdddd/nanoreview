@@ -24,8 +24,8 @@ from nanoreview.review.types import (
     SkippedReviewUnit,
 )
 
+#: Only local diff review is supported, so prefetch runs for diff plans only.
 _PREFETCH_ACTIONS = {
-    ReviewAction.REPO,
     ReviewAction.DIFF,
 }
 
@@ -76,6 +76,7 @@ def _bundle_from_result(
             parent_id=unit.parent_id,
             token_count=unit.token_count,
             risk_hints=unit.risk_hints,
+            matched=tuple(unit.matched),
             preview=unit.preview or preview_text(unit.text),
             preview_coverage=unit.preview_coverage,
         )
@@ -164,7 +165,7 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
                 start_line=start,
                 end_line=end,
                 source="diff" if action == ReviewAction.DIFF else "programmatic",
-                tags=query_tags,
+                matched=query_tags,
                 excerpt=excerpt,
                 risk_hints=risk_hints,
                 preview=preview,
@@ -311,6 +312,7 @@ async def maybe_prefetch_review_context(
     )
     try:
         target_type = plan.target_type if plan.target_type != "auto" else "local"
+        frozen_diff = session_meta.get(ReviewMetaKey.FROZEN_DIFF)
         result = await evidence_service.dispatch(
             target_type=target_type,
             action=plan.action.value,
@@ -320,6 +322,7 @@ async def maybe_prefetch_review_context(
             local_scope=plan.local_scope,
             trace_id=trace_id,
             context_window_tokens=session_meta.get(ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS),
+            frozen_diff=frozen_diff if isinstance(frozen_diff, dict) else None,
         )
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000

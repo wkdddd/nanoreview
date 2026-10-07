@@ -228,9 +228,11 @@ def test_input_fingerprint_is_stable_and_input_sensitive() -> None:
 
 
 def test_input_fingerprint_normalizes_defaults() -> None:
+    # A missing action now defaults to ``diff`` (repo review is gone), so the
+    # default must normalize identically to an explicit ``DIFF``.
     assert compute_input_fingerprint(
         target=None, target_type=None, action=None
-    ) == compute_input_fingerprint(target="", target_type="AUTO", action="REPO")
+    ) == compute_input_fingerprint(target="", target_type="AUTO", action="DIFF")
 
 
 def test_compute_review_input_fingerprint_with_empty_inputs() -> None:
@@ -276,6 +278,39 @@ def test_build_report_artifact_status_overrides_running_state() -> None:
     assert artifact["status"] == "completed"
     # Writing the artifact never mutates the in-process run state.
     assert state.status is ReviewRunStatus.RUNNING
+
+
+def test_build_report_artifact_records_coverage_and_boundary() -> None:
+    """The artifact carries the review boundary and per-reviewer summary."""
+    state = _run_state(status=ReviewRunStatus.COMPLETED)
+    state.snapshot_ref = "review-snapshots/run-000111222333.json"
+    state.changed_files = ["src/app.py", "src/db.py"]
+    state.skipped_files = ["vendor/lib.py"]
+    state.manifest_stats = {"version": "evidence-manifest/1", "retained": 3, "omitted": 1}
+    reviewer = state.reviewer_state("security")
+    reviewer.status = "completed"
+    reviewer.evidence_assigned = 2
+    reviewer.duplicate_reads = 1
+    reviewer.duplicate_searches = 4
+    reviewer.add_usage({"input_tokens": 10})
+    incomplete = state.reviewer_state("performance")
+    incomplete.status = "error"
+    incomplete.error = "reviewer timed out"
+
+    artifact = build_report_artifact(state, report_markdown="# report")
+
+    assert artifact["snapshot_ref"] == state.snapshot_ref
+    coverage = artifact["coverage"]
+    assert coverage["changed_files"] == ["src/app.py", "src/db.py"]
+    assert coverage["skipped_files"] == ["vendor/lib.py"]
+    assert coverage["manifest"] == state.manifest_stats
+    assert coverage["incomplete_dimensions"] == ["performance"]
+    reviewer_cov = coverage["reviewers"]["security"]
+    assert reviewer_cov["status"] == "completed"
+    assert reviewer_cov["evidence_assigned"] == 2
+    assert reviewer_cov["duplicate_reads"] == 1
+    assert reviewer_cov["duplicate_searches"] == 4
+    assert reviewer_cov["usage"] == {"input_tokens": 10}
 
 
 def test_build_report_artifact_can_record_a_failed_run() -> None:

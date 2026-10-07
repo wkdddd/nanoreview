@@ -26,6 +26,9 @@ class SubagentExecutionLimits:
     max_iterations: int | None = None
     max_tokens: int | None = None
     timeout_seconds: float | None = None
+    #: Per-task context window override. ``None`` keeps the manager's window;
+    #: the review pipeline pins its reviewers to the fixed review window.
+    context_window_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,7 @@ class SubagentResultHandler(Protocol):
         self,
         *,
         result: AgentRunResult,
+        metadata: dict[str, Any] | None = None,
     ) -> SubagentCompletion: ...
 
 

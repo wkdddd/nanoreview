@@ -19,8 +19,10 @@ from nanoreview.agent.subagent_profiles import (
 )
 from nanoreview.utils.prompt_templates import render_template
 
-_SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep", "local_review"})
+_SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep"})
 _REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep", "review_submit"})
+#: Tools whose successful call proves the reviewer read target evidence.
+_REVIEWER_EVIDENCE_TOOLS = frozenset({"read_file", "grep"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +224,11 @@ def _canonical_review_submit(result: Any) -> str | None:
     return None
 
 
-async def _handle_reviewer_result(*, result: Any) -> SubagentCompletion:
+async def _handle_reviewer_result(
+    *,
+    result: Any,
+    metadata: dict[str, Any] | None = None,
+) -> SubagentCompletion:
     """Parse the final outcome of the reviewer's single AgentRun.
 
     Terminal retries (failed review_submit calls, prose answers) already
@@ -248,12 +254,19 @@ async def _handle_reviewer_result(*, result: Any) -> SubagentCompletion:
         )
     data = json.loads(content)
     if not data.get("findings"):
-        evidence_tools = {"read_file", "grep", "local_review"}
-        has_evidence = any(
-            event.get("name") in evidence_tools and event.get("status") == "ok"
+        # Evidence is provided two ways: the planner injects assigned excerpts
+        # into the reviewer's frozen task, and the reviewer may read the target
+        # directly with ``read_file``/``grep``. An empty finding list is only
+        # incomplete when neither channel supplied evidence — there is no
+        # repository-reader tool left to fall back on, so explicit reads are the
+        # only way to prove the reviewer looked.
+        has_assigned_evidence = bool((metadata or {}).get("assigned_evidence"))
+        has_read_evidence = any(
+            event.get("name") in _REVIEWER_EVIDENCE_TOOLS
+            and event.get("status") == "ok"
             for event in result.tool_events or []
         )
-        if not has_evidence:
+        if not (has_assigned_evidence or has_read_evidence):
             return SubagentCompletion(
                 "Error: Review incomplete - no target evidence was successfully read before submitting empty findings.",
                 status="error",

@@ -127,7 +127,7 @@ def test_build_code_review_context_uses_local_target_type() -> None:
 
     assert "- Type: local" in prompt
     assert "- URL/Path: C:\\work\\repo\\src\\app.py" in prompt
-    assert "Action repo" in prompt
+    assert "Action diff" in prompt
 
 
 def test_build_code_review_context_extracts_local_path_inside_prompt() -> None:
@@ -153,7 +153,7 @@ def test_build_code_review_context_rejects_github_target_type() -> None:
     assert "github_repo_read" not in prompt
 
 
-def test_build_code_review_context_requires_local_review_without_prefetch() -> None:
+def test_build_code_review_context_requires_reader_calls_without_prefetch() -> None:
     prompt = build_code_review_context(
         target=r"C:\work\repo\src\app.py",
         target_type="local",
@@ -248,6 +248,17 @@ def test_review_action_rejects_old_values(action: str) -> None:
         normalize_review_action(action)
 
 
+def test_review_action_defaults_to_diff_and_rejects_repo() -> None:
+    from nanoreview.review.types import ReviewAction
+
+    assert normalize_review_action(None) is ReviewAction.DIFF
+    assert normalize_review_action("") is ReviewAction.DIFF
+    assert normalize_review_action("diff") is ReviewAction.DIFF
+    # The removed repo entry point is rejected with a dedicated message.
+    with pytest.raises(ValueError, match="Repo-wide review is not supported"):
+        normalize_review_action("repo")
+
+
 def test_build_code_review_context_returns_fallback_without_target() -> None:
     prompt = build_code_review_context(user_content="how should I do a review?")
 
@@ -277,5 +288,5 @@ def test_code_review_is_not_registered_as_a_tool(tmp_path) -> None:
     assert "github_repo_read" not in loop.tool_names
     assert "repo_review" not in loop.tool_names
     assert "review_judge" not in loop.tool_names
-    assert "local_review" in loop.tool_names
+    assert "local_review" not in loop.tool_names
     assert "github_review" not in loop.tool_names

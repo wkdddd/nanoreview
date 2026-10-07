@@ -29,6 +29,7 @@ from nanoreview.agent.review_state import (
     new_review_run_id,
 )
 from nanoreview.review.input.local_git import (
+    GitDiffUnavailableError,
     GitUnavailableError,
     NetDiff,
     collect_net_diff,
@@ -42,7 +43,6 @@ from nanoreview.review.input.snapshot import (
     ReviewSnapshotError,
     ReviewSnapshotStore,
     build_snapshot,
-    collect_repo_content,
 )
 from nanoreview.review.source.utils import clean_scope_paths
 from nanoreview.review.types import (
@@ -66,6 +66,7 @@ class ReviewAdmissionCode(StrEnum):
     SCOPE_OUTSIDE_TARGET = "scope_outside_target"
     SCOPE_PATH_NOT_FOUND = "scope_path_not_found"
     NOT_A_GIT_REPO = "not_a_git_repo"
+    DIFF_UNAVAILABLE = "diff_unavailable"
     EMPTY_DIFF = "empty_diff"
     SCOPE_NO_CHANGES = "scope_no_changes"
     DUPLICATE_REVIEW = "duplicate_review"
@@ -259,15 +260,9 @@ class ReviewAdmissionService:
         scope = self._resolve_local_scope(request, resolved_target)
         review_root = Path(scope.review_root)
 
-        net_diff: NetDiff | None = None
-        repo_content = None
-        if action is ReviewAction.DIFF:
-            net_diff = self._collect_diff(review_root, scope)
-        else:
-            repo_content = collect_repo_content(
-                review_root,
-                scope_paths=scope.scope_paths or ([scope.target_path] if scope.target_path not in (None, ".") else []),
-            )
+        # Only local diff review is supported: every admitted run captures the
+        # net workspace change relative to HEAD (staged + unstaged + untracked).
+        net_diff: NetDiff = self._collect_diff(review_root, scope)
 
         plan = ReviewPlan(
             target=str(resolved_target),
@@ -291,10 +286,8 @@ class ReviewAdmissionService:
                 "scope_paths": sorted(scope.scope_paths),
                 "target_path": scope.target_path,
             },
-            evidence_manifest=(
-                [{"path": path} for path in sorted(net_diff.patches)] if net_diff else []
-            ),
-            extra_metadata={"session": session_key, "git_head": net_diff.head_sha if net_diff else None},
+            evidence_manifest=[{"path": path} for path in sorted(net_diff.patches)],
+            extra_metadata={"session": session_key, "git_head": net_diff.head_sha},
         )
         snapshot_ref = self._write_snapshot(
             build_snapshot(
@@ -310,19 +303,13 @@ class ReviewAdmissionService:
                     "scope_paths": list(scope.scope_paths),
                     "target_path": scope.target_path,
                 },
-                git_head=net_diff.head_sha if net_diff else None,
-                net_diff=net_diff.patches if net_diff else None,
-                changed_files=net_diff.changed_files if net_diff else None,
-                scope_files=sorted(repo_content.files) if repo_content else None,
-                repo_content=repo_content,
-                extra_metadata=(
-                    {
-                        "git_skipped": net_diff.skipped,
-                        "outside_scope_files": net_diff.outside_scope_files,
-                    }
-                    if net_diff
-                    else {}
-                ),
+                git_head=net_diff.head_sha,
+                net_diff=net_diff.patches,
+                changed_files=net_diff.changed_files,
+                extra_metadata={
+                    "skipped_files": net_diff.skipped,
+                    "outside_scope_files": net_diff.outside_scope_files,
+                },
             )
         )
         logger.info(
@@ -455,6 +442,13 @@ class ReviewAdmissionService:
             net_diff = collect_net_diff(
                 review_root, scope_paths=scope.scope_paths or None
             )
+        except GitDiffUnavailableError as exc:
+            # The root is a Git worktree but its diff could not be read.
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.DIFF_UNAVAILABLE,
+                f"Cannot read the workspace diff for '{review_root}': {exc}",
+                field="target",
+            ) from exc
         except GitUnavailableError as exc:
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.NOT_A_GIT_REPO,

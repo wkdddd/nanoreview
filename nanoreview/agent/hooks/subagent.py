@@ -37,6 +37,9 @@ class SubagentStatus:
     usage: dict = field(default_factory=dict)
     stop_reason: str | None = None
     error: str | None = None
+    #: Reviewer-run duplicate read/search counters (0 for non-review runs).
+    duplicate_reads: int = 0
+    duplicate_searches: int = 0
 
 
 class SubagentHook(AgentHook):
@@ -134,8 +137,8 @@ class SubagentHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         # Propagate review metadata into the subagent's ContextAware tools
-        # and the current-request context var so that local_review and
-        # read_file can make correct scope and workspace-boundary decisions.
+        # and the current-request context var so that read_file/list_dir/grep
+        # can make correct scope and workspace-boundary decisions.
         # The scope is bound here too: without it, tool calls would fall back
         # to the construction-time ``restrict_to_workspace`` and a reviewer
         # could read outside the target repository.

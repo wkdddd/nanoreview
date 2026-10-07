@@ -88,6 +88,44 @@ def _matches_type(name: str, file_type: str | None) -> bool:
     return any(fnmatch.fnmatch(name.lower(), pattern.lower()) for pattern in patterns)
 
 
+def _grep_signature(
+    *,
+    pattern: str,
+    target: Path,
+    glob: str | None,
+    file_type: str | None,
+    case_insensitive: bool,
+    fixed_strings: bool,
+    output_mode: str,
+    context_before: int,
+    context_after: int,
+    limit: int | None,
+    offset: int,
+) -> str:
+    """Stable identity for one resolved grep request.
+
+    Two calls share the identity only when every parameter that can change the
+    returned text matches (including the resolved target path and the
+    normalized limit/offset). A different range or file filter therefore never
+    collides.
+    """
+    return repr(
+        (
+            pattern,
+            str(target),
+            glob or "",
+            (file_type or "").lower(),
+            bool(case_insensitive),
+            bool(fixed_strings),
+            output_mode,
+            int(context_before),
+            int(context_after),
+            limit,
+            int(offset),
+        )
+    )
+
+
 class _SearchTool(_FsTool):
     _IGNORE_DIRS = set(ListDirTool._IGNORE_DIRS)
 
@@ -280,6 +318,24 @@ class GrepTool(_SearchTool):
                 limit = max_results
             else:
                 limit = _DEFAULT_HEAD_LIMIT
+            review_ledger = self._file_states.review_ledger
+            search_signature = (
+                _grep_signature(
+                    pattern=pattern,
+                    target=target,
+                    glob=glob,
+                    file_type=type,
+                    case_insensitive=case_insensitive,
+                    fixed_strings=fixed_strings,
+                    output_mode=output_mode,
+                    context_before=context_before,
+                    context_after=context_after,
+                    limit=limit,
+                    offset=offset,
+                )
+                if review_ledger is not None
+                else ""
+            )
             blocks: list[str] = []
             result_chars = 0
             seen_content_matches = 0
@@ -413,6 +469,23 @@ class GrepTool(_SearchTool):
                 )
             if notes:
                 result += "\n\n" + "\n".join(notes)
+            # Reviewer-run duplicate suppression: an identical request that
+            # already produced byte-identical output (unchanged tree) is
+            # answered with a short hint. Errors are never suppressed so a
+            # transient failure is always visible.
+            if (
+                review_ledger is not None
+                and not result.startswith("Error:")
+            ):
+                if review_ledger.search_repeat(search_signature, result):
+                    review_ledger.duplicate_searches += 1
+                    return (
+                        f"[Duplicate search suppressed: identical grep pattern={pattern!r} "
+                        f"path={path!r} mode={output_mode} already returned the same unchanged "
+                        "result earlier in this reviewer run. Reuse that result, or change the "
+                        "pattern, path, glob or range.]"
+                    )
+                review_ledger.note_search(search_signature, result)
             return result
         except PermissionError as e:
             return f"Error: {e}"

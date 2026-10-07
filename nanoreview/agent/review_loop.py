@@ -31,7 +31,6 @@ admission, routing, gating and the review -> conversation handoff.
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,12 +62,19 @@ from nanoreview.review.admission import (
     ReviewAdmission,
     register_review_run,
 )
+from nanoreview.review.input.snapshot import ReviewSnapshotStore
 from nanoreview.review.output.finalizer import (
     ReviewFinalizer,
     ReviewFinalizerResult,
     reviewer_failure_reason,
 )
+from nanoreview.review.planning.evidence import ReviewEvidenceService
+from nanoreview.review.planning.manifest import PLANNER_MANIFEST_BUDGET_TOKENS
 from nanoreview.review.planning.planner import prepare_code_review_context
+from nanoreview.review.planning.preprocessor import (
+    ProgrammaticEvidenceOptions,
+    ProgrammaticEvidenceService,
+)
 from nanoreview.review.result import ReviewResult, result_from_run_state
 from nanoreview.review.types import (
     EvidenceReference,
@@ -82,6 +88,7 @@ if TYPE_CHECKING:
     from nanoreview.agent.subagent import SubagentManager
     from nanoreview.providers.base import LLMProvider
     from nanoreview.review.output.judge import ReviewJudge
+    from nanoreview.review.planning.manifest import EvidenceManifest
     from nanoreview.session.manager import Session, SessionManager
 
 # Terminal submission attempts allowed for the planner inside one AgentRun.
@@ -89,6 +96,21 @@ _PLANNER_TERMINAL_RETRY_LIMIT = 5
 # Tool-choice forces submit_review_plan each turn, so every iteration is one
 # terminal attempt; a few spare iterations absorb empty/length recovery turns.
 _PLANNER_MAX_ITERATIONS = _PLANNER_TERMINAL_RETRY_LIMIT + 2
+
+#: Fixed context window for the whole review pipeline (Planner, reviewer,
+#: Judge). The review run does not follow the conversation agent's configured
+#: window and does not dynamically probe the provider: the project fixes it at
+#: 200k so evidence budgets and the planner manifest budget are deterministic.
+REVIEW_CONTEXT_WINDOW_TOKENS = 200_000
+#: Reviewer per-response output cap.
+REVIEWER_MAX_OUTPUT_TOKENS = 8_192
+#: Hard cap on reviewer model requests per run (each AgentRun iteration is one
+#: request). The final request is reserved for the structured ``review_submit``:
+#: ``AgentRunner`` restricts that iteration to the terminal tool and forces it,
+#: so a reviewer that spent the other requests exploring still submits.
+REVIEWER_MODEL_REQUEST_LIMIT = 30
+#: Wall-clock timeout for one reviewer run.
+REVIEWER_TIMEOUT_SECONDS = 180
 
 #: Header used when a run fails before a report can be produced, so the turn
 #: still delivers a bounded, explicit error instead of an empty response.
@@ -113,6 +135,17 @@ _RESET_METADATA_KEYS = (
     ReviewMetaKey.ERROR,
     ReviewMetaKey.HANDOFF_RUN_ID,
 )
+
+
+def review_budget_contract() -> dict[str, int]:
+    """The fixed review-run budget contract, persisted for replay/audit."""
+    return {
+        "context_window_tokens": REVIEW_CONTEXT_WINDOW_TOKENS,
+        "planner_manifest_budget_tokens": PLANNER_MANIFEST_BUDGET_TOKENS,
+        "reviewer_max_output_tokens": REVIEWER_MAX_OUTPUT_TOKENS,
+        "reviewer_model_request_limit": REVIEWER_MODEL_REQUEST_LIMIT,
+        "reviewer_timeout_seconds": REVIEWER_TIMEOUT_SECONDS,
+    }
 
 
 def persist_review_subagent_result(session: "Session", msg: InboundMessage) -> bool:
@@ -206,6 +239,15 @@ def validation_repository_root(plan: ReviewPlan, fallback: Path) -> str:
     return str(fallback.resolve())
 
 
+def _as_non_negative_int(value: Any) -> int:
+    """Coerce a wire value to a non-negative int, defaulting to 0."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
 def _review_prefetch_progress_publisher(
     events: EventSink,
 ) -> Callable[..., Awaitable[None]] | None:
@@ -297,6 +339,9 @@ class _ReviewInputs:
     changed_files: list[str]
     local_target: str | None
     execution_context: ReviewExecutionContext
+    #: The single budgeted planner manifest; its authorized IDs are the only
+    #: evidence IDs a reviewer assignment may reference.
+    manifest: "EvidenceManifest | None" = None
 
 
 class ReviewLoop:
@@ -314,10 +359,10 @@ class ReviewLoop:
         context_builder: ContextBuilder | None = None,
         max_messages: int = 120,
         max_concurrent_subagents: int = 4,
-        context_window_tokens: int | None = None,
+        review_config: Any | None = None,
         judge_factory: Callable[[], "ReviewJudge | None"] | None = None,
         artifact_store: ReviewArtifactStore | None = None,
-        evidence_provider_getter: Callable[[], Any] | None = None,
+        snapshot_store: ReviewSnapshotStore | None = None,
     ) -> None:
         self._workspace = Path(workspace)
         self._sessions = sessions
@@ -328,13 +373,26 @@ class ReviewLoop:
         self._context = context_builder or ContextBuilder(self._workspace)
         self._max_messages = max_messages if max_messages > 0 else 120
         self._max_concurrent_subagents = int(max_concurrent_subagents or 1)
-        self._context_window_tokens = context_window_tokens
+        # The review pipeline uses one fixed window, independent of the
+        # conversation agent's configured window (see the module constants).
+        self._context_window_tokens = REVIEW_CONTEXT_WINDOW_TOKENS
         self._judge_factory = judge_factory
         self._artifacts = artifact_store or ReviewArtifactStore(self._workspace)
-        #: Resolves the review tool's evidence service (``local_review``).
-        #: Resolved lazily because tools are registered
-        #: after the loop is constructed.
-        self._evidence_provider_getter = evidence_provider_getter
+        # Snapshots are written by the admission service; the loop augments the
+        # same run's snapshot after planning with the final planner manifest and
+        # budget contract so the frozen input record stays complete.
+        self._snapshots = snapshot_store or ReviewSnapshotStore(self._workspace)
+        # The review's evidence service is an internal dependency, not a tool
+        # wrapper: the planner manifest, prefetch and every reviewer frozen task
+        # read the same program-authorized evidence regardless of which model
+        # tools happen to be registered.
+        self._evidence_service = ReviewEvidenceService(
+            ProgrammaticEvidenceService(
+                self._workspace,
+                options=ProgrammaticEvidenceOptions.from_review_config(review_config),
+            ),
+            workspace=self._workspace,
+        )
         # One-shot guard for the tokenizer-unavailable warning so long runs
         # with many dimensions do not spam the log.
         self._tokenizer_fallback_warned = False
@@ -354,15 +412,16 @@ class ReviewLoop:
         model: str,
         context_window_tokens: int | None,
     ) -> None:
-        """Swap the model/window used by future review turns.
+        """Swap the model used by future review turns.
 
         The provider itself is shared through the coordinator's runner and
-        subagents; the loop only tracks the model id and context window that
-        its token estimates and subagent task construction depend on.
+        subagents; the loop only tracks the model id. The review context window
+        is fixed (see ``REVIEW_CONTEXT_WINDOW_TOKENS``) and is deliberately not
+        updated by a conversation-side model switch, so the review budget stays
+        deterministic; ``context_window_tokens`` is accepted for call-site
+        symmetry and ignored.
         """
         self._model = model
-        if context_window_tokens is not None:
-            self._context_window_tokens = context_window_tokens
 
     def get(self, session_key: str) -> ReviewRunState | None:
         return self.runs.get(session_key)
@@ -638,11 +697,39 @@ class ReviewLoop:
         review_meta[ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS] = (
             self._context_window_tokens
         )
-        evidence_provider = (
-            self._evidence_provider_getter() if self._evidence_provider_getter else None
-        )
-        if evidence_provider is not None:
-            review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = evidence_provider
+        # The evidence service is an internal dependency of the review loop, so
+        # prefetch works without a repository-reader tool being registered for
+        # the review model roles.
+        review_meta[ReviewMetaKey.EVIDENCE_PROVIDER] = self._evidence_service
+
+        # The admitted snapshot is the authoritative review input: its frozen
+        # net diff is what prefetch reviews (a post-admission edit/commit cannot
+        # change the reviewed change) and its changed-file set is the diff
+        # boundary the validator enforces. A missing snapshot degrades to the
+        # live worktree plus an empty boundary rather than failing the run.
+        snapshot = self._snapshots.read(run_state.run_id)
+        snapshot_changed_files: list[str] = []
+        if snapshot is not None:
+            raw_changed = snapshot.get("changed_files")
+            if isinstance(raw_changed, list):
+                snapshot_changed_files = [str(path) for path in raw_changed]
+            patches = snapshot.get("net_diff")
+            extra = snapshot.get("extra")
+            skipped_files = extra.get("skipped_files") if isinstance(extra, dict) else None
+            if isinstance(patches, dict) and patches:
+                review_meta[ReviewMetaKey.FROZEN_DIFF] = {
+                    "patches": {str(k): str(v) for k, v in patches.items()},
+                    "skipped": (
+                        {str(k): str(v) for k, v in skipped_files.items()}
+                        if isinstance(skipped_files, dict)
+                        else {}
+                    ),
+                }
+        else:
+            logger.warning(
+                "review.prepare.snapshot_missing run_id={} — reviewing the live worktree",
+                run_state.run_id,
+            )
 
         # The review turn's frozen/working context is built once here: the
         # planner consumes it, and the reviewer agent's message list is derived
@@ -662,7 +749,7 @@ class ReviewLoop:
         self._require_evidence(preparation.plan, evidence)
 
         changed_files, local_target, validation_workspace = (
-            self._resolve_execution_inputs(review_meta)
+            self._resolve_execution_inputs(review_meta, snapshot_changed_files)
         )
         if session is not None:
             self._sync_review_metadata(session, review_meta)
@@ -671,7 +758,11 @@ class ReviewLoop:
             **{
                 key: value
                 for key, value in review_meta.items()
-                if key != ReviewMetaKey.EVIDENCE_PROVIDER
+                if key
+                not in (
+                    ReviewMetaKey.EVIDENCE_PROVIDER,
+                    ReviewMetaKey.FROZEN_DIFF,
+                )
             },
         }
         coordinator_messages = [dict(message) for message in review_messages]
@@ -700,6 +791,7 @@ class ReviewLoop:
                 ),
                 result_callback=request.result_callback,
             ),
+            manifest=preparation.manifest,
         )
 
     @staticmethod
@@ -708,16 +800,17 @@ class ReviewLoop:
     ) -> None:
         if evidence.references:
             return
-        if plan.action.value == "diff" and plan.target_type == "local":
-            raise ReviewPlanningError(
-                "Diff review cannot start: no changed files were found for the selected local target. "
-                "Switch Scope to Repo to review the current file, or select a target with uncommitted changes."
-            )
         skipped_note = ""
         if evidence.skipped:
             skipped_note = " Unreviewed units: " + "; ".join(
                 summary.describe()
                 for summary in list(evidence.skipped_by_file().values())[:20]
+            )
+        if plan.action.value == "diff" and plan.target_type == "local":
+            raise ReviewPlanningError(
+                "Diff review cannot start: no changed files were found for the selected local target. "
+                "Stage or modify a file inside the target, or select a target with uncommitted changes."
+                + skipped_note
             )
         raise ReviewPlanningError(
             "Review evidence unavailable: no program-authorized evidence references were produced."
@@ -727,15 +820,19 @@ class ReviewLoop:
     def _resolve_execution_inputs(
         self,
         review_meta: dict[str, Any],
+        snapshot_changed_files: list[str],
     ) -> tuple[list[str], str | None, str]:
         """Derive validation workspace, changed files, and local target.
 
         Local reviews validate findings against the resolved local review root.
+        The changed-file boundary comes from the admitted snapshot's net diff,
+        so a finding in an unmodified file is rejected as out-of-scope instead
+        of being silently accepted (and coverage reports the real changed set).
         """
         validation_workspace = str(
             review_meta.get(ReviewMetaKey.LOCAL_ROOT) or self._workspace
         )
-        changed_files: list[str] = []
+        changed_files = list(dict.fromkeys(snapshot_changed_files))
         local_target = review_meta.get(ReviewMetaKey.LOCAL_TARGET)
         return changed_files, local_target, validation_workspace
 
@@ -789,12 +886,58 @@ class ReviewLoop:
             run_state.run_id,
             run_state.input_fingerprint[:12],
         )
-        return await self._collect_plan(
+        assignments = await self._collect_plan(
             coordinator_messages=inputs.coordinator_messages,
             plan=inputs.plan,
             evidence=inputs.evidence,
             run_state=run_state,
+            manifest=inputs.manifest,
         )
+        self._record_plan_snapshot(run_state, inputs)
+        return assignments
+
+    def _record_plan_snapshot(
+        self, run_state: ReviewRunState, inputs: _ReviewInputs
+    ) -> None:
+        """Persist the final planner manifest and review boundary.
+
+        The manifest is the planner's sole structured input, so the run's audit
+        trail records its budget/version, what was retained and what was omitted
+        — never the reviewed source itself.
+        """
+        run_state.changed_files = list(inputs.changed_files)
+        skipped_files = list(
+            dict.fromkeys(
+                unit.path for unit in inputs.evidence.skipped
+            )
+        )
+        run_state.skipped_files = skipped_files
+        manifest = inputs.manifest
+        sections: dict[str, Any] = {"budget": review_budget_contract()}
+        if manifest is not None:
+            payload = manifest.snapshot_payload()
+            sections["planner_manifest"] = payload
+            run_state.manifest_stats = dict(manifest.stats())
+            logger.info(
+                "review.manifest run_id={} version={} budget_tokens={} retained={} "
+                "omitted={} used_tokens={} skipped={}",
+                run_state.run_id,
+                manifest.version,
+                manifest.budget_tokens,
+                manifest.retained_count,
+                manifest.omitted_count,
+                manifest.used_tokens,
+                len(manifest.skipped),
+            )
+        ref = self._snapshots.augment(run_state.run_id, sections=sections)
+        if ref is None:
+            # The snapshot is an audit artifact written at admission; a failed
+            # augment (e.g. a run restored without a snapshot) is logged by the
+            # store but never degrades the run's own manifest statistics, which
+            # are already recorded on the run state and report.
+            logger.warning(
+                "review.manifest.snapshot_skipped run_id={}", run_state.run_id
+            )
 
     async def _collect_plan(
         self,
@@ -803,6 +946,7 @@ class ReviewLoop:
         plan: ReviewPlan,
         evidence: ReviewEvidenceBundle,
         run_state: ReviewRunState | None = None,
+        manifest: "EvidenceManifest | None" = None,
     ) -> tuple[ReviewAssignment, ...]:
         """Collect a validated plan inside a single AgentRun.
 
@@ -812,9 +956,16 @@ class ReviewLoop:
         same run: the original messages, manifest, and tool definitions stay
         in context and the concrete error is fed back to the model. Only when
         the terminal retry budget is exhausted does planning fail.
+
+        Assignments may only reference evidence IDs the planner actually saw:
+        the manifest's authorized IDs when a manifest exists, otherwise every
+        reference ID in the bundle.
         """
         allowed = {role.name for role in plan.roles}
-        evidence_ids = set(evidence.by_id())
+        if manifest is not None:
+            evidence_ids = set(manifest.authorized_ids())
+        else:
+            evidence_ids = set(evidence.by_id())
         receiver = ReviewPlanReceiver(allowed, evidence_ids, plan.routing_mode)
         tools = ToolRegistry()
         tools.register(SubmitReviewPlanTool(receiver))
@@ -1004,11 +1155,15 @@ class ReviewLoop:
         validation_workspace: str,
         local_target: str | None,
     ) -> dict[str, SubagentExecutionLimits]:
-        """Derive per-dimension execution limits from estimated input size.
+        """Derive per-dimension execution limits.
 
-        Evidence volume only scales the iteration allowance (more evidence
-        needs more review rounds, bounded to 10-30). Output size and wall
-        clock limits stay fixed. No dimension is skipped here.
+        Reviewer limits are fixed by the review budget contract: at most
+        ``REVIEWER_MODEL_REQUEST_LIMIT`` model requests (the last is reserved
+        for ``review_submit`` — enforced by ``AgentRunner``'s reserved terminal
+        iteration, not merely documented), ``REVIEWER_MAX_OUTPUT_TOKENS`` output
+        tokens per response, ``REVIEWER_TIMEOUT_SECONDS`` wall clock and the
+        fixed review context window. Evidence volume is recorded for observability but no
+        longer scales the request allowance, and no dimension is skipped here.
         """
         reference_map = evidence.by_id()
         limits: dict[str, SubagentExecutionLimits] = {}
@@ -1022,18 +1177,24 @@ class ReviewLoop:
                 validation_workspace=validation_workspace,
                 local_target=local_target,
             )
-            max_rounds = max(10, min(30, 10 + math.ceil(input_tokens / 4_000)))
             limits[assignment.dimension] = SubagentExecutionLimits(
-                max_iterations=max_rounds,
-                max_tokens=2_048,
-                timeout_seconds=180,
+                max_iterations=REVIEWER_MODEL_REQUEST_LIMIT,
+                max_tokens=REVIEWER_MAX_OUTPUT_TOKENS,
+                timeout_seconds=REVIEWER_TIMEOUT_SECONDS,
+                context_window_tokens=REVIEW_CONTEXT_WINDOW_TOKENS,
             )
-        rounds_values = [limit.max_iterations or 0 for limit in limits.values()]
+            logger.info(
+                "review.subagent.limit dimension={} evidence_units={} estimated_input_tokens={}",
+                assignment.dimension,
+                len(references),
+                input_tokens,
+            )
         logger.info(
-            "review.subagent.limits dimensions={} rounds_min={} rounds_max={}",
+            "review.subagent.limits dimensions={} max_iterations={} max_tokens={} timeout_seconds={}",
             len(limits),
-            min(rounds_values) if rounds_values else 0,
-            max(rounds_values) if rounds_values else 0,
+            REVIEWER_MODEL_REQUEST_LIMIT,
+            REVIEWER_MAX_OUTPUT_TOKENS,
+            REVIEWER_TIMEOUT_SECONDS,
         )
         return limits
 
@@ -1124,7 +1285,9 @@ class ReviewLoop:
                     )
                     continue
                 if run_state is not None:
-                    run_state.reviewer_state(assignment.dimension).status = "running"
+                    reviewer = run_state.reviewer_state(assignment.dimension)
+                    reviewer.status = "running"
+                    reviewer.evidence_assigned = len(references)
                 task = self._build_subagent_task(
                     plan=plan,
                     assignment=assignment,
@@ -1141,6 +1304,11 @@ class ReviewLoop:
                         **context.metadata,
                         "task_kind": "reviewer",
                         "profile_id": assignment.dimension,
+                        # The planner-injected evidence is proof the reviewer
+                        # had something to review; without it a valid
+                        # ``findings: []`` submission is misread as incomplete
+                        # because reviewers have no repository-reader tool.
+                        "assigned_evidence": len(references),
                         "repository_root": validation_repository_root(
                             plan, self._workspace
                         ),
@@ -1176,6 +1344,8 @@ class ReviewLoop:
             dimension = str(metadata.get("subagent_label") or "unknown")
             raw = str(metadata.get("subagent_result") or result.content)
             reviewer_usage = metadata.get("subagent_usage")
+            reviewer_duplicate_reads = metadata.get("subagent_duplicate_reads")
+            reviewer_duplicate_searches = metadata.get("subagent_duplicate_searches")
             # Failure of one reviewer must not be silently reported as success:
             # the terminal status carried by the subagent result decides the
             # reviewer state, while the raw output (including the error text)
@@ -1207,6 +1377,21 @@ class ReviewLoop:
                 # losing every unit.
                 reviewer.add_usage(reviewer_usage)
                 run_state.add_usage(reviewer_usage)
+                # Duplicate-work counters describe review *efficiency*, not
+                # correctness, so they are recorded for both outcomes.
+                reviewer.duplicate_reads = _as_non_negative_int(reviewer_duplicate_reads)
+                reviewer.duplicate_searches = _as_non_negative_int(
+                    reviewer_duplicate_searches
+                )
+                logger.info(
+                    "review.dispatch.reviewer_stats dimension={} status={} "
+                    "evidence_assigned={} duplicate_reads={} duplicate_searches={}",
+                    dimension,
+                    reviewer.status,
+                    reviewer.evidence_assigned,
+                    reviewer.duplicate_reads,
+                    reviewer.duplicate_searches,
+                )
             if not succeeded:
                 logger.warning(
                     "review.dispatch.reviewer_failed dimension={} status={} error={}",

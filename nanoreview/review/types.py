@@ -28,6 +28,11 @@ class ReviewMetaKey:
     ALLOWED_DIMENSIONS = "allowed_review_dimensions"
     EVIDENCE_PROVIDER = "_review_evidence_service"
     DIFF_CONTEXT_WINDOW_TOKENS = "_review_diff_context_window_tokens"
+    #: In-process handoff of the admitted snapshot's frozen net diff, so
+    #: prefetch reviews exactly the change captured at admission instead of
+    #: re-reading a worktree that may have moved on. Never persisted to session
+    #: metadata and never forwarded to reviewer metadata.
+    FROZEN_DIFF = "_review_frozen_diff"
     # One-shot ReviewAgent run state (stable wire contract consumed by
     # WebUI/API and the report artifact API).
     RUN_ID = "review_run_id"
@@ -180,6 +185,9 @@ class EvidenceReference:
     parent_id: str | None = None
     token_count: int = 0
     preview: str = ""
+    # User review-query hit words found in the unit. Program-generated candidate
+    # risk clues live in ``risk_hints`` and never leak in here.
+    matched: tuple[str, ...] = ()
     # Program-generated candidate risk routing clues (e.g. "security:token").
     # They suggest where the planner should look; they are never confirmed
     # findings, and query hit words stay in the manifest `matched:` field.
@@ -384,6 +392,7 @@ class ReviewEvidenceProvider(Protocol):
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
         context_window_tokens: int | None = None,
+        frozen_diff: dict[str, Any] | None = None,
     ) -> str: ...
 
     async def dispatch(
@@ -399,4 +408,5 @@ class ReviewEvidenceProvider(Protocol):
         local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
         context_window_tokens: int | None = None,
+        frozen_diff: dict[str, Any] | None = None,
     ) -> str: ...

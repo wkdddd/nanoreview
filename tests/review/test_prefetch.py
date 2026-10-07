@@ -8,7 +8,12 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceResult,
     SkippedUnit,
 )
-from nanoreview.review.types import LocalReviewScope, ReviewAction, ReviewPlan
+from nanoreview.review.types import (
+    LocalReviewScope,
+    ReviewAction,
+    ReviewMetaKey,
+    ReviewPlan,
+)
 
 
 class _EvidenceService:
@@ -92,13 +97,13 @@ def _structured_result() -> ProgrammaticEvidenceResult:
     )
 
 
-async def test_prefetch_calls_review_evidence_service_and_compacts_evidence() -> None:
+async def test_prefetch_dispatches_to_evidence_service_for_diff() -> None:
     evidence_service = _EvidenceService()
     plan = ReviewPlan(
         target=".",
         target_name="workspace",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[],
         routing_mode="auto",
         user_requirements="review auth",
@@ -113,14 +118,68 @@ async def test_prefetch_calls_review_evidence_service_and_compacts_evidence() ->
     assert evidence_service.calls[0]["review_query"] == "review auth"
     assert "local_scope" in evidence_service.calls[0]
     assert evidence_service.calls[0]["target_type"] == "local"
-    assert evidence_service.calls[0]["action"] == "repo"
+    assert evidence_service.calls[0]["action"] == "diff"
     assert summary.attempted is True
     assert summary.status == "ok"
+    # Diff prefetch preserves the filtered patch body verbatim.
     assert "## src/auth.py:1-10" in (summary.summary or "")
-    assert "ignored body line" not in (summary.summary or "")
+    assert "ignored body line" in (summary.summary or "")
     assert summary.evidence is not None
     assert summary.evidence.references[0].path == "src/auth.py"
     assert summary.evidence.references[0].id == "ev-001"
+
+
+async def test_prefetch_forwards_the_frozen_diff_to_the_evidence_service() -> None:
+    """The admitted snapshot's net diff is what prefetch reviews.
+
+    The review must execute against the frozen change captured at admission,
+    not re-read a worktree the user may have edited after admitting the run.
+    """
+    evidence_service = _EvidenceService()
+    plan = ReviewPlan(
+        target=".",
+        target_name="workspace",
+        target_type="local",
+        action=ReviewAction.DIFF,
+        roles=[],
+        routing_mode="auto",
+        user_requirements="review auth",
+    )
+    frozen = {
+        "patches": {"src/auth.py": "@@ -1 +1 @@\n-old\n+new"},
+        "skipped": {"src/gen.py": "generated"},
+    }
+
+    await maybe_prefetch_review_context(
+        plan,
+        {
+            "_review_evidence_service": evidence_service,
+            ReviewMetaKey.FROZEN_DIFF: frozen,
+        },
+    )
+
+    assert evidence_service.calls
+    assert evidence_service.calls[0]["frozen_diff"] == frozen
+
+
+async def test_prefetch_omits_frozen_diff_when_absent() -> None:
+    evidence_service = _EvidenceService()
+    plan = ReviewPlan(
+        target=".",
+        target_name="workspace",
+        target_type="local",
+        action=ReviewAction.DIFF,
+        roles=[],
+        routing_mode="auto",
+    )
+
+    await maybe_prefetch_review_context(
+        plan,
+        {"_review_evidence_service": evidence_service},
+    )
+
+    assert evidence_service.calls
+    assert evidence_service.calls[0]["frozen_diff"] is None
 
 
 async def test_prefetch_emits_progress_events() -> None:
@@ -136,7 +195,7 @@ async def test_prefetch_emits_progress_events() -> None:
         target=".",
         target_name="workspace",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[],
         routing_mode="auto",
         user_requirements="review auth",
@@ -158,7 +217,7 @@ async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
         target=".",
         target_name="repo",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[],
         routing_mode="auto",
     )
@@ -197,7 +256,7 @@ def test_github_blob_url_is_treated_as_an_opaque_local_target() -> None:
         user_content="审查",
         focus="performance",
         target_type="github",
-        action="repo",
+        action="diff",
     )
 
     assert plan is not None
@@ -217,7 +276,7 @@ def test_local_file_target_becomes_file_scope(tmp_path, monkeypatch) -> None:
         target=str(target),
         user_content="审查",
         target_type="local",
-        action="repo",
+        action="diff",
     )
 
     assert plan is not None
@@ -234,7 +293,7 @@ async def test_prefetch_dispatches_without_remote_scope_fields() -> None:
         target=".",
         user_content="审查",
         target_type="local",
-        action="repo",
+        action="diff",
     )
 
     assert plan is not None
@@ -258,7 +317,7 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
         target=".",
         target_name="workspace",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[],
         routing_mode="auto",
     )
@@ -301,7 +360,7 @@ async def test_legacy_provider_migrates_risk_labels_to_risk_hints() -> None:
         target=".",
         target_name="workspace",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[],
         routing_mode="auto",
     )
@@ -313,9 +372,9 @@ async def test_legacy_provider_migrates_risk_labels_to_risk_hints() -> None:
 
     assert result.evidence is not None
     reference = result.evidence.references[0]
-    # Old `risk:*` entries migrate to risk_hints; matched keeps query words only.
+    # Old `risk:*` entries migrate to risk_hints; query hit words move to matched.
     assert reference.risk_hints == ("security", "entrypoint")
-    assert reference.tags == ("login",)
+    assert reference.matched == ("login",)
     # The preview is sampled from the provider snippet and its coverage is
     # explicitly marked instead of claiming full-chunk coverage.
     assert reference.preview
@@ -334,7 +393,7 @@ async def test_prefetch_aggregates_skipped_files_per_path() -> None:
         target=".",
         target_name="workspace",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=[],
         routing_mode="auto",
     )

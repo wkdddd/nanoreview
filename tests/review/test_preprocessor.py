@@ -387,8 +387,9 @@ def test_small_diff_uses_direct_mode(tmp_path: Path) -> None:
 def test_oversized_hunk_without_safe_split_is_skipped(tmp_path: Path) -> None:
     service = ProgrammaticEvidenceService(tmp_path)
 
+    # Above the 8k per-file diff threshold with no ``@@`` boundary to split at.
     result = service.diff_units(
-        {"src/large.py": "+" + "x" * 12_000},
+        {"src/large.py": "+" + "x" * 40_000},
         review_query="login",
         context_window_tokens=SMALL_WINDOW,
     )
@@ -397,6 +398,53 @@ def test_oversized_hunk_without_safe_split_is_skipped(tmp_path: Path) -> None:
     assert [(skip.path, skip.reason) for skip in result.skipped] == [
         ("src/large.py", "token_limit_exceeded")
     ]
+
+
+def test_small_changed_file_below_threshold_stays_one_diff_unit(tmp_path: Path) -> None:
+    service = ProgrammaticEvidenceService(tmp_path)
+    # A changed file whose patch is under 8k tokens is one complete diff unit,
+    # even though the whole target may be large.
+    patch = "@@ -1,3 +1,3 @@\n-a = 1\n+b = 2\n c = 3\n d = 4"
+
+    result = service.diff_units({"src/small.py": patch}, review_query="login")
+
+    assert [unit.kind for unit in result.units] == ["diff"]
+    assert result.units[0].text == patch
+    assert result.units[0].token_count == estimate_tokens(patch)
+    assert result.units[0].token_count < 8_000
+
+
+def test_changed_file_at_threshold_splits_by_hunks(tmp_path: Path) -> None:
+    service = ProgrammaticEvidenceService(tmp_path)
+    # Two hunks, each under the threshold, summing above it: the file splits
+    # into per-hunk units using the existing hunk strategy.
+    big = "x" * 20_000
+    patch = f"@@ -1,1 +1,1 @@\n-a\n+{big}\n@@ -50,1 +50,1 @@\n-b\n+{big}"
+
+    result = service.diff_units({"src/multi.py": patch}, review_query="login")
+
+    assert estimate_tokens(patch) >= 8_000
+    assert len(result.units) == 2
+    assert all(unit.kind == "diff" for unit in result.units)
+    assert {unit.start_line for unit in result.units} == {1, 50}
+    assert result.skipped == []
+
+
+def test_truncated_file_is_marked_in_evidence(tmp_path: Path) -> None:
+    from nanoreview.review.planning.preprocessor import (
+        TRUNCATION_MARKER,
+        ProgrammaticEvidenceOptions,
+    )
+
+    options = ProgrammaticEvidenceOptions(max_file_chars=50)
+    service = ProgrammaticEvidenceService(tmp_path, options=options)
+    _write(tmp_path / "app.py", "value = 1\n" * 50)
+
+    files = service._collect_files(_request(files=[tmp_path / "app.py"]))
+
+    text = files["app.py"]
+    assert text.endswith(TRUNCATION_MARKER)
+    assert len(text) == options.max_file_chars + len(TRUNCATION_MARKER)
 
 
 def test_estimate_tokens_and_budget_derivation() -> None:
@@ -416,6 +464,19 @@ def test_estimate_tokens_and_budget_derivation() -> None:
     assert budget.chunk_cap_tokens == 2_873
     assert budget.task_cap_tokens == 5_746
     assert budget.related_budget_tokens == 1_436
+
+
+def test_review_window_derives_150k_evidence_and_37_5k_related() -> None:
+    budget = EvidenceBudget.from_options(
+        evidence_token_budget=150_000,
+        subagent_evidence_budget_chars=24_000,
+        context_window_tokens=200_000,
+    )
+    # window 200000 - overhead 9000 - margin 20000 = 171000 usable.
+    assert budget.usable_input_tokens == 171_000
+    assert budget.evidence_budget_tokens == 150_000
+    # related evidence keeps a quarter of the main evidence budget.
+    assert budget.related_budget_tokens == 37_500
 
 
 def test_options_from_review_config_maps_budget_fields() -> None:

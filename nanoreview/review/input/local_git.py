@@ -23,6 +23,10 @@ class GitUnavailableError(RuntimeError):
     """Raised when Git cannot be queried for a local diff review."""
 
 
+class GitDiffUnavailableError(GitUnavailableError):
+    """Raised when the root is a worktree but its diff cannot be read."""
+
+
 @dataclass(slots=True)
 class NetDiff:
     """Net workspace change relative to ``HEAD``, bounded to one scope."""
@@ -117,7 +121,7 @@ def collect_net_diff(
     try:
         head_sha = _git("rev-parse", "HEAD", cwd=git_root).strip()
     except (subprocess.SubprocessError, OSError) as exc:
-        raise GitUnavailableError(f"cannot resolve HEAD: {exc}") from exc
+        raise GitDiffUnavailableError(f"cannot resolve HEAD: {exc}") from exc
 
     try:
         tracked = set(_git("diff", "--name-only", "HEAD", cwd=git_root).splitlines())
@@ -125,7 +129,7 @@ def collect_net_diff(
             _git("ls-files", "--others", "--exclude-standard", cwd=git_root).splitlines()
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        raise GitUnavailableError(f"cannot read workspace diff: {exc}") from exc
+        raise GitDiffUnavailableError(f"cannot read workspace diff: {exc}") from exc
 
     scopes = clean_scope_paths(scope_paths)
     diff = NetDiff(head_sha=head_sha)

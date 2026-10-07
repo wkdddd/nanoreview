@@ -1049,7 +1049,7 @@ def review(
         help="Comma-separated reviewer dimensions (bug,security,performance,maintainability), or auto",
     ),
     target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto or local"),
-    action: str = typer.Option("repo", "--action", help="Review action: repo or diff"),
+    action: str = typer.Option("diff", "--action", help="Review action: diff (only local diff review is supported)"),
     max_concurrent_subagents: int | None = typer.Option(
         None,
         "--max-concurrent-subagents",
@@ -1079,6 +1079,7 @@ def review(
         ReviewAdmissionRequest,
     )
     from nanoreview.review.input import normalize_review_action
+    from nanoreview.review.result import ReviewHandoffState
     from nanoreview.review.types import ReviewMetaKey
 
     if target_type not in ("auto", "local"):
@@ -1185,6 +1186,17 @@ def review(
 
             if fail_on:
                 exit_code = _check_fail_on(full_output, fail_on)
+
+            # A review that never reached a complete handoff (failed dimensions,
+            # judge trouble, a missing artifact, or an unsettled run) is a
+            # non-zero result even without ``--fail-on``; ``--fail-on`` only
+            # ever adds severity-based exit codes on top of that.
+            review_result = agent_loop.review_loop.result(admission.session_key)
+            if (
+                review_result is None
+                or review_result.handoff is not ReviewHandoffState.COMPLETE
+            ):
+                exit_code = exit_code or 1
 
             if interactive:
                 console.print(

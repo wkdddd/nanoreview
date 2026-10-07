@@ -67,6 +67,7 @@ from nanoreview.agent.event_sink import build_bus_event_sink, event_text, metada
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.memory import Consolidator
 from nanoreview.agent.review_loop import (
+    REVIEW_CONTEXT_WINDOW_TOKENS,
     ReviewLoop,
     ReviewTurnRequest,
     persist_review_subagent_result,
@@ -390,9 +391,8 @@ class SessionCoordinator:
             max_concurrent_subagents=int(
                 getattr(self.review_config, "max_concurrent_subagents", 4) or 4
             ),
-            context_window_tokens=self.context_window_tokens,
+            review_config=self.review_config,
             judge_factory=self._build_review_judge,
-            evidence_provider_getter=self._review_evidence_provider,
         )
         #: Authoritative in-process review runs, owned by ``ReviewLoop``.
         self._review_runs: dict[str, ReviewRunState] = self.review_loop.runs
@@ -648,7 +648,11 @@ class SessionCoordinator:
         )
 
     def _build_review_judge(self) -> ReviewJudge | None:
-        """Build the judge on the coordinator/plan runner and model."""
+        """Build the judge on the coordinator/plan runner and model.
+
+        The judge shares the fixed review context window rather than the
+        conversation agent's window, so review budgeting stays deterministic.
+        """
         judge_settings = getattr(self.review_config, "judge", None)
         if judge_settings is not None and not getattr(judge_settings, "enabled", True):
             return None
@@ -656,7 +660,7 @@ class SessionCoordinator:
             enabled=bool(getattr(judge_settings, "enabled", True)),
             timeout_seconds=int(getattr(judge_settings, "timeout_seconds", 60)),
             max_tokens=int(getattr(judge_settings, "max_tokens", 2048)),
-            context_window_tokens=int(self.context_window_tokens or 0) or None,
+            context_window_tokens=REVIEW_CONTEXT_WINDOW_TOKENS,
         )
         return ReviewJudge(
             runner=self.runner,
@@ -664,13 +668,6 @@ class SessionCoordinator:
             config=config,
             common_rules_workspace=self.workspace,
         )
-
-    def _review_evidence_provider(self) -> Any | None:
-        """Return the review tool's shared evidence service, if registered."""
-        tool = self.tools.get("local_review")
-        if tool is None:
-            return None
-        return getattr(tool, "evidence_provider", None)
 
     # -- bus helpers --------------------------------------------------------
 

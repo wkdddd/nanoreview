@@ -23,6 +23,7 @@ from nanoreview.cli import commands
 from nanoreview.config.schema import Config
 from nanoreview.events import StreamDeltaEvent
 from nanoreview.providers.base import LLMProvider, LLMResponse
+from nanoreview.review.result import ReviewHandoffState
 
 REVIEW_SESSION_KEY = "cli:review:deadbeef"
 
@@ -197,6 +198,8 @@ class _FakeLoop:
         self,
         report_chunks: list[str] | None = None,
         response_content: str = "",
+        handoff: str = "complete",
+        review_result: Any = "default",
     ) -> None:
         self.bus = MessageBus()
         self.channels_config = None
@@ -205,6 +208,16 @@ class _FakeLoop:
         self.direct_calls: list[dict[str, Any]] = []
         self._report_chunks = report_chunks or []
         self._response_content = response_content
+        # The review command reads the terminal handoff state to decide its
+        # exit code: anything short of ``complete`` exits non-zero.
+        self.handoff = handoff
+        self._review_result = review_result
+        self.review_loop = SimpleNamespace(result=self._result)
+
+    def _result(self, session_key: str) -> Any:
+        if self._review_result == "default":
+            return SimpleNamespace(handoff=ReviewHandoffState(self.handoff))
+        return self._review_result
 
     def admit_review(self, request: Any) -> _FakeAdmission:
         self.review_requests.append(request)
@@ -356,6 +369,49 @@ def test_review_fail_on_keeps_gate_status_after_explicit_chat(
 
     assert result.exit_code == 1
     assert len(sessions) == 1
+
+
+@pytest.mark.parametrize("handoff", ["partial", "failed"])
+def test_review_exits_non_zero_on_an_incomplete_handoff(
+    review_stubs, tmp_path, handoff: str
+) -> None:
+    """A partial/failed review is a non-zero result even without --fail-on."""
+    loop = _FakeLoop(response_content="## Report\n\nok", handoff=handoff)
+    review_stubs(loop)
+
+    result = CliRunner().invoke(
+        commands.app, ["review", str(tmp_path), "--action", "diff", "--no-chat"]
+    )
+
+    assert result.exit_code == 1, result.output
+
+
+def test_review_exits_non_zero_when_no_review_result_exists(
+    review_stubs, tmp_path
+) -> None:
+    """An unsettled run (no terminal result) is reported as a failure."""
+    loop = _FakeLoop(response_content="## Report\n\nok", review_result=None)
+    review_stubs(loop)
+
+    result = CliRunner().invoke(
+        commands.app, ["review", str(tmp_path), "--action", "diff", "--no-chat"]
+    )
+
+    assert result.exit_code == 1, result.output
+
+
+def test_review_complete_handoff_without_findings_exits_zero(
+    review_stubs, tmp_path
+) -> None:
+    """A complete review with no findings still exits 0."""
+    loop = _FakeLoop(response_content="## Report\n\nNo actionable issues found.")
+    review_stubs(loop)
+
+    result = CliRunner().invoke(
+        commands.app, ["review", str(tmp_path), "--action", "diff", "--no-chat"]
+    )
+
+    assert result.exit_code == 0, result.output
 
 
 class _EchoProvider(LLMProvider):

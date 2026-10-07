@@ -20,7 +20,7 @@ def _plan() -> ReviewPlan:
         target=".",
         target_name="workspace",
         target_type="local",
-        action=ReviewAction.REPO,
+        action=ReviewAction.DIFF,
         roles=list(ALL_REVIEW_ROLES.values()),
         routing_mode="auto",
         user_requirements="review auth",
@@ -39,6 +39,7 @@ def _evidence() -> ReviewEvidenceBundle:
                 token_count=8,
                 preview="def login(token):\n    return verify(token)",
                 risk_hints=("security:auth", "security:token"),
+                matched=("token",),
                 preview_coverage="chunk lines 10-42; preview covers lines 10-11",
             ),
             EvidenceReference(
@@ -70,9 +71,11 @@ def test_narrow_coordinator_prompt_renders_risk_hints_and_coverage() -> None:
 
     # Each reference renders its hints and coverage next to the preview.
     assert "risk_hints: security:auth, security:token" in prompt
+    assert "matched: token" in prompt
     assert "preview_coverage: chunk lines 10-42; preview covers lines 10-11" in prompt
     # Units without hints fall back to none/unknown instead of vanishing.
     assert "risk_hints: none" in prompt
+    assert "matched: none" in prompt
     assert "preview_coverage: unknown" in prompt
     # The prompt states hints are candidate clues, never confirmed findings,
     # and units without hints stay valid review scope.

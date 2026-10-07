@@ -22,7 +22,6 @@ from nanoreview.review.profiles import (
     get_reviewer_profile,
     public_reviewer_profiles,
 )
-from nanoreview.review.source.local import LocalRepoReader
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     DEFAULT_REVIEW_ROLES,
@@ -55,7 +54,6 @@ __all__ = [
     "Finding",
     "FindingVerdict",
     "EvidenceReference",
-    "LocalRepoReader",
     "ReviewAction",
     "ReviewAssignment",
     "ReviewEvidenceBundle",

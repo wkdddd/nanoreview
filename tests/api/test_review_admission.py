@@ -8,6 +8,7 @@ hands the pre-registered run to the executor.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,31 @@ class _DummyProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return "dummy"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _make_reviewable_repo(root: Path, rel: str = "pkg/mod.py") -> Path:
+    """Init a repo with a committed baseline, then leave one file changed."""
+    _git(root, "init")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "Test User")
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("VALUE = 1\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "init")
+    path.write_text("VALUE = 2\n", encoding="utf-8")
+    return path.parent
 
 
 @pytest.fixture()
@@ -86,9 +112,7 @@ async def test_missing_target_returns_404(tmp_path: Path, loop: SessionCoordinat
 async def test_accepted_review_delegates_the_registered_run(
     tmp_path: Path, loop: SessionCoordinator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    target = tmp_path / "pkg"
-    target.mkdir()
-    (target / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    target = _make_reviewable_repo(tmp_path)
 
     observed: dict[str, Any] = {}
 
@@ -105,7 +129,7 @@ async def test_accepted_review_delegates_the_registered_run(
             "/v1/chat/completions",
             json={
                 "messages": [{"role": "user", "content": ""}],
-                "review": {"target": str(target), "action": "repo"},
+                "review": {"target": str(target), "action": "diff"},
             },
         )
         assert response.status == 200
@@ -115,4 +139,4 @@ async def test_accepted_review_delegates_the_registered_run(
     assert observed["run_id"]
     assert observed["metadata"]["_review_admitted"] == observed["run_id"]
     assert observed["metadata"]["review_target"] == str(target)
-    assert observed["metadata"]["review_action"] == "repo"
+    assert observed["metadata"]["review_action"] == "diff"

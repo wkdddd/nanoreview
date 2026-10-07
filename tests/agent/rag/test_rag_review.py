@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -167,14 +168,76 @@ async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
-async def test_local_diff_skips_single_patch_over_context_threshold(
+async def test_local_diff_prefers_the_frozen_snapshot_over_the_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen diff is reviewed verbatim; the live worktree is never read."""
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+
+    def _must_not_read(_workspace=None):  # noqa: ANN001 - patched method
+        raise AssertionError("frozen diff review must not re-read the worktree")
+
+    monkeypatch.setattr(service, "local_changed_patches", _must_not_read)
+
+    result = await service.local_changed_context(
+        review_query="review",
+        max_results=5,
+        include_tests=True,
+        frozen_diff={
+            "patches": {"src/auth.py": "@@ -1,2 +1,2 @@\n-old\n+frozen"},
+            "skipped": {},
+        },
+    )
+
+    assert "src/auth.py" in result
+    assert "+frozen" in result
+    assert service.last_changed_files == ["src/auth.py"]
+
+
+def test_local_changed_patches_uses_net_head_diff_not_staged_concat(
+    tmp_path: Path,
+) -> None:
+    """A staged-then-edited file yields one HEAD->worktree patch.
+
+    Concatenating the staged (``HEAD -> index``) and unstaged
+    (``index -> worktree``) diffs would expose the intermediate staged snapshot
+    (``STAGED``) alongside the final worktree state, so the reviewer would see
+    two states of the same change.
+    """
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    target = tmp_path / "app.py"
+    target.write_text("one\nold two\n", encoding="utf-8")
+    _git(tmp_path, "add", "app.py")
+    _git(tmp_path, "commit", "-m", "init")
+
+    target.write_text("one\nSTAGED\n", encoding="utf-8")
+    _git(tmp_path, "add", "app.py")  # intermediate staged state
+    target.write_text("one\nFINAL\n", encoding="utf-8")  # final worktree state
+
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    patches, skipped = service.local_changed_patches()
+
+    assert skipped == {}
+    patch = patches["app.py"]
+    assert "-old two" in patch
+    assert "+FINAL" in patch
+    # The intermediate staged state must never leak into the review.
+    assert "STAGED" not in patch
+
+
+@pytest.mark.asyncio
+async def test_local_diff_skips_patch_over_diff_unit_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    # Above the fixed 8k per-file diff threshold and with no ``@@`` boundary to
+    # split at, the single hunk is recorded as an unreviewed oversized unit.
     monkeypatch.setattr(
         service,
         "local_changed_patches",
-        lambda _workspace=None: ({"src/large.py": "+" + ("x" * 4_000)}, {}),
+        lambda _workspace=None: ({"src/large.py": "+" + ("x" * 40_000)}, {}),
     )
 
     result = await service.local_changed_context(
@@ -190,6 +253,49 @@ async def test_local_diff_skips_single_patch_over_context_threshold(
         ("src/large.py", "token_limit_exceeded")
     ]
     assert "src/large.py" not in result
+
+
+def test_local_changed_summary_cli_fallback_maps_subdirectory_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without GitPython, diff paths map to the directory target root.
+
+    Git reports ``diff --name-only`` paths relative to the worktree root, so a
+    subdirectory target must have them converted (and the untracked listing,
+    which is cwd-relative, must be queried from the same root) before the
+    evidence service can attribute the change to the target.
+    """
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "root_only.py").write_text("x = 1\n", encoding="utf-8")
+    tracked = tmp_path / "pkg" / "app.py"
+    tracked.write_text("one\nold two\n", encoding="utf-8")
+    _git(tmp_path, "add", "pkg/app.py")
+    _git(tmp_path, "add", "root_only.py")
+    _git(tmp_path, "commit", "-m", "init")
+
+    tracked.write_text("one\nnew two\n", encoding="utf-8")  # unstaged
+    staged = tmp_path / "pkg" / "staged.py"
+    staged.write_text("a\n", encoding="utf-8")
+    _git(tmp_path, "add", "pkg/staged.py")  # staged
+    untracked = tmp_path / "pkg" / "new_file.py"
+    untracked.write_text("alpha\nbeta\n", encoding="utf-8")  # untracked
+
+    # Force the CLI fallback by making ``import git`` fail.
+    monkeypatch.setitem(sys.modules, "git", None)
+
+    target = tmp_path / "pkg"
+    service = ReviewEvidenceService(ProgrammaticEvidenceService(target))
+    summary = service.local_changed_summary()
+
+    # Every path is relative to the *target* (``pkg``), never the worktree.
+    assert summary.files == ["app.py", "new_file.py", "staged.py"]
+    assert summary.touched_lines["app.py"] == [2]
+    assert summary.touched_lines["staged.py"] == [1]
+    assert summary.touched_lines["new_file.py"] == [1, 2]
+    assert "root_only.py" not in summary.files
 
 
 def test_local_changed_summary_parses_staged_unstaged_and_untracked_lines(tmp_path: Path) -> None:

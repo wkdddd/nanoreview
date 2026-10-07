@@ -1,10 +1,11 @@
-"""Admission boundary tests for local review requests.
+"""Admission boundary tests for local diff review requests.
 
 Admission is the single place where a review is validated, snapshotted, and
 registered. These tests pin the invariants the transports depend on: rejection
 is all-or-nothing (no session, run, snapshot, or history), a diff review reads
-the net change relative to ``HEAD``, and accepted runs reuse one registration
-so a duplicate submission can never overwrite the original metadata.
+the net change relative to ``HEAD``, only local diff review is reachable, and
+accepted runs reuse one registration so a duplicate submission can never
+overwrite the original metadata.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from nanoreview.review.admission import (
     ReviewAdmissionService,
 )
 from nanoreview.review.input.snapshot import REVIEW_SNAPSHOTS_DIR_NAME
-from nanoreview.review.types import ReviewMetaKey
+from nanoreview.review.types import ReviewAction, ReviewMetaKey
 from nanoreview.session.manager import SessionManager
 
 
@@ -44,6 +45,21 @@ def _init_repo(root: Path) -> None:
     _git(root, "config", "user.name", "Test User")
 
 
+def _commit_all(root: Path, message: str = "init") -> None:
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", message)
+
+
+def _init_repo_with_commit(root: Path, files: dict[str, str]) -> None:
+    """Init a repo with a committed baseline so a later change is diffable."""
+    _init_repo(root)
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    _commit_all(root)
+
+
 @pytest.fixture()
 def service(tmp_path: Path) -> ReviewAdmissionService:
     return ReviewAdmissionService(sessions=SessionManager(tmp_path), workspace=tmp_path)
@@ -62,40 +78,70 @@ def _read_snapshot(tmp_path: Path, ref: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Repository (repo) admission
+# Diff admission
 # ---------------------------------------------------------------------------
 
 
-def test_repo_file_target_is_accepted_and_snapshotted(
+def test_diff_file_target_is_accepted_and_snapshotted(
     tmp_path: Path, service: ReviewAdmissionService
 ) -> None:
     # An explicit worktree keeps the review root deterministic: a file target
     # resolves to its enclosing Git root when one exists.
-    _init_repo(tmp_path)
-    source = tmp_path / "src"
-    source.mkdir()
-    (source / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    _init_repo_with_commit(tmp_path, {"src/app.py": "print('hi')\n"})
+    (tmp_path / "src" / "app.py").write_text("print('changed')\n", encoding="utf-8")
 
-    admission = service.admit(_request(target=str(source / "app.py")))
+    admission = service.admit(
+        _request(target=str(tmp_path / "src" / "app.py"), action="diff")
+    )
 
     assert admission.target_type == "local"
+    assert admission.action is ReviewAction.DIFF
     assert admission.scope is not None
     assert admission.scope.kind == "file"
     assert admission.snapshot_ref.startswith(f"{REVIEW_SNAPSHOTS_DIR_NAME}/")
     snapshot = _read_snapshot(tmp_path, admission.snapshot_ref)
-    assert snapshot["repo_content"]["src/app.py"] == "print('hi')\n"
+    assert snapshot["action"] == "diff"
+    assert "src/app.py" in snapshot["net_diff"]
+    assert snapshot["changed_files"] == ["src/app.py"]
+    assert snapshot["git_head"]
     assert snapshot["input_fingerprint"] == admission.input_fingerprint
     assert snapshot["run_id"] == admission.run_id
 
 
-def test_repo_admission_persists_navigation_metadata(
+def test_default_action_is_diff(
+    tmp_path: Path, service: ReviewAdmissionService
+) -> None:
+    """A request without an action defaults to local diff review."""
+    _init_repo_with_commit(tmp_path, {"base.py": "b = 0\n"})
+    (tmp_path / "base.py").write_text("b = 1\n", encoding="utf-8")
+
+    admission = service.admit(_request(target=str(tmp_path)))
+
+    assert admission.action is ReviewAction.DIFF
+
+
+def test_repo_action_is_rejected_as_invalid(
+    tmp_path: Path, service: ReviewAdmissionService
+) -> None:
+    """The removed repo entry point is rejected with a structured code."""
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    with pytest.raises(ReviewAdmissionError) as excinfo:
+        service.admit(_request(target=str(tmp_path), action="repo"))
+
+    assert excinfo.value.code is ReviewAdmissionCode.INVALID_ACTION
+    assert excinfo.value.field == "action"
+    assert not list((tmp_path / REVIEW_SNAPSHOTS_DIR_NAME).glob("*.json"))
+
+
+def test_admission_persists_navigation_metadata(
     tmp_path: Path, service: ReviewAdmissionService
 ) -> None:
     target_dir = tmp_path / "pkg"
-    target_dir.mkdir()
-    (target_dir / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    _init_repo_with_commit(tmp_path, {"pkg/mod.py": "x = 1\n"})
+    (target_dir / "mod.py").write_text("x = 2\n", encoding="utf-8")
 
-    admission = service.admit(_request(target=str(target_dir)))
+    admission = service.admit(_request(target=str(target_dir), action="diff"))
     session = SessionManager(tmp_path).get_or_create(admission.session_key)
 
     assert session.metadata[ReviewMetaKey.RUN_ID] == admission.run_id
@@ -103,7 +149,7 @@ def test_repo_admission_persists_navigation_metadata(
     assert session.metadata[ReviewMetaKey.PHASE] == "prepare"
     assert session.metadata[ReviewMetaKey.SNAPSHOT_REF] == admission.snapshot_ref
     assert session.metadata[ReviewMetaKey.LOCAL_ROOT] == str(target_dir.resolve())
-    assert session.metadata[ReviewMetaKey.ACTION] == "repo"
+    assert session.metadata[ReviewMetaKey.ACTION] == "diff"
 
 
 def test_relative_target_is_rejected_when_absolute_required(
@@ -122,9 +168,10 @@ def test_relative_target_is_rejected_when_absolute_required(
 def test_relative_target_resolves_against_cwd_for_cli(
     tmp_path: Path, service: ReviewAdmissionService
 ) -> None:
+    _init_repo_with_commit(tmp_path, {"base.py": "b = 0\n"})
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
 
-    admission = service.admit(_request(target="app.py", cwd=str(tmp_path)))
+    admission = service.admit(_request(target="app.py", cwd=str(tmp_path), action="diff"))
 
     assert admission.target == str((tmp_path / "app.py").resolve())
 
@@ -163,13 +210,14 @@ def test_scope_outside_target_is_rejected(
 def test_duplicate_review_is_rejected_without_touching_original(
     tmp_path: Path, service: ReviewAdmissionService
 ) -> None:
+    _init_repo_with_commit(tmp_path, {"base.py": "b = 0\n"})
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
-    first = service.admit(_request(target=str(tmp_path / "app.py")))
+    first = service.admit(_request(target=str(tmp_path / "app.py"), action="diff"))
     original_metadata = dict(SessionManager(tmp_path).get_or_create(first.session_key).metadata)
 
     with pytest.raises(ReviewAdmissionError) as excinfo:
         service.admit(
-            _request(target=str(tmp_path / "app.py"), focus=["security"])
+            _request(target=str(tmp_path / "app.py"), focus=["security"], action="diff")
         )
 
     assert excinfo.value.code is ReviewAdmissionCode.DUPLICATE_REVIEW
@@ -179,19 +227,38 @@ def test_duplicate_review_is_rejected_without_touching_original(
 
 
 # ---------------------------------------------------------------------------
-# Diff admission
+# Diff input rejection
 # ---------------------------------------------------------------------------
 
 
 def test_diff_outside_git_repo_is_rejected(
-    tmp_path: Path, service: ReviewAdmissionService
+    tmp_path: Path, service: ReviewAdmissionService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    # Isolate the target from any enclosing repository (the pytest tmp dir can
+    # itself live inside a worktree) so it is genuinely outside Git.
+    monkeypatch.setattr(
+        "nanoreview.review.input.local_git.find_git_root", lambda path: None
+    )
 
     with pytest.raises(ReviewAdmissionError) as excinfo:
         service.admit(_request(target=str(tmp_path), action="diff"))
 
     assert excinfo.value.code is ReviewAdmissionCode.NOT_A_GIT_REPO
+
+
+def test_diff_without_head_commit_is_rejected_as_unavailable(tmp_path: Path) -> None:
+    """A worktree with no ``HEAD`` cannot produce a diff and fails admission."""
+    _init_repo(tmp_path)
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    service = ReviewAdmissionService(
+        sessions=SessionManager(tmp_path), workspace=tmp_path
+    )
+    with pytest.raises(ReviewAdmissionError) as excinfo:
+        service.admit(_request(target=str(tmp_path), action="diff"))
+
+    assert excinfo.value.code is ReviewAdmissionCode.DIFF_UNAVAILABLE
 
 
 def test_diff_collapses_staged_and_unstaged_into_one_net_change(

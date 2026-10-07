@@ -552,18 +552,42 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
     reviewer_profile = manager.resolve_profile({"profile_id": "security"})
     reviewer = manager.build_tools(reviewer_profile, tmp_path)
 
+    # Reviewers have no repository-reader tool: authorized evidence is injected
+    # into their frozen task, and they read more context with read_file/grep.
     assert reviewer.tool_names == [
         "grep",
         "list_dir",
-        "local_review",
         "read_file",
         "review_submit",
     ]
+    assert not reviewer.has("local_review")
     assert not reviewer.has("github_review")
     assert not reviewer.has("shell")
     assert not reviewer.has("write_file")
     assert not reviewer.has("edit_file")
     assert not reviewer.has("spawn")
+
+
+def test_reviewer_tools_carry_a_run_scoped_dedup_ledger(tmp_path) -> None:
+    """Reviewer runs get a duplicate-read ledger; other profiles do not."""
+    manager = SubagentManager(
+        DummyProvider(),
+        tmp_path,
+        MessageBus(),
+        max_tool_result_chars=1000,
+        execution_profiles=reviewer_execution_profiles(),
+    )
+
+    reviewer = manager.build_tools(
+        manager.resolve_profile({"profile_id": "security"}), tmp_path
+    )
+    ledger = reviewer.get("read_file")._file_states.review_ledger
+    assert ledger is not None
+
+    non_review = manager.build_tools(
+        SubagentExecutionProfile(id="core-plumbing", scope="core"), tmp_path
+    )
+    assert non_review.get("read_file")._file_states.review_ledger is None
 
 
 def test_review_subagent_inherits_subagent_tool_config(tmp_path) -> None:
@@ -1329,8 +1353,13 @@ async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_empty_findings_with_local_review_evidence_allows_no_findings(tmp_path) -> None:
-    """A successful local_review call counts as evidence for an empty findings list."""
+async def test_empty_findings_with_assigned_evidence_allows_no_findings(tmp_path) -> None:
+    """An injected evidence assignment counts as evidence for empty findings.
+
+    Reviewers have no repository-reader tool; the planner's assigned evidence
+    (carried on the spawn metadata) is what proves the reviewer had evidence to
+    review when it submits ``findings: []``.
+    """
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -1339,13 +1368,12 @@ async def test_empty_findings_with_local_review_evidence_allows_no_findings(tmp_
         execution_profiles=reviewer_execution_profiles(),
     )
 
-    class LocalEvidenceRunner:
+    class PlainRunner:
         async def run(self, spec: AgentRunSpec) -> AgentRunResult:
             return AgentRunResult(
                 final_content=None,
                 messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
-                    {"name": "local_review", "status": "ok", "detail": "repo content"},
                     {
                         "name": "review_submit",
                         "status": "ok",
@@ -1355,7 +1383,7 @@ async def test_empty_findings_with_local_review_evidence_allows_no_findings(tmp_
                 ],
             )
 
-    manager.runner = LocalEvidenceRunner()  # type: ignore[assignment]
+    manager.runner = PlainRunner()  # type: ignore[assignment]
     status = SubagentStatus(
         task_id="task1",
         label="security",
@@ -1369,7 +1397,11 @@ async def test_empty_findings_with_local_review_evidence_allows_no_findings(tmp_
         "security",
         {"channel": "cli", "chat_id": "direct", "session_key": "cli:direct"},
         status,
-        origin_metadata={"profile_id": "security", ReviewMetaKey.TARGET_TYPE: "local"},
+        origin_metadata={
+            "profile_id": "security",
+            ReviewMetaKey.TARGET_TYPE: "local",
+            "assigned_evidence": True,
+        },
     )
 
     assert status.phase == "done"

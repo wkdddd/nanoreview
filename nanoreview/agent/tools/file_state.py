@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -16,6 +16,88 @@ class ReadState:
     limit: int | None
     content_hash: str | None
     can_dedup: bool
+
+
+def normalize_read_range(
+    offset: int,
+    limit: int | None,
+    default_limit: int,
+) -> tuple[int, int]:
+    """Normalize a read request into a comparable ``(start, count)`` identity.
+
+    ``offset`` is clamped to at least 1. A ``None`` limit falls back to the
+    tool default, so ``limit=None`` and ``limit=<default>`` describe the same
+    range and deduplicate against each other.
+    """
+    start = max(1, int(offset))
+    count = default_limit if limit is None else max(1, int(limit))
+    return start, count
+
+
+@dataclass
+class ReviewerReadLedger:
+    """Per-reviewer-run ledger of reads/searches already returned to a model.
+
+    Reviewer subagents each get their own ``FileStates`` instance (see
+    ``SubagentManager._build_tool_context``), so this ledger is naturally
+    scoped to one reviewer run and is never shared across reviewers or across
+    review runs. It is consulted only in reviewer mode; other agents keep the
+    pre-existing read-dedup behaviour unchanged.
+    """
+
+    reads: dict[str, tuple[tuple[int, int], str | None]] = field(default_factory=dict)
+    searches: dict[str, str] = field(default_factory=dict)
+    duplicate_reads: int = 0
+    duplicate_searches: int = 0
+
+    def read_repeat(
+        self,
+        path: str | Path,
+        *,
+        offset: int,
+        limit: int | None,
+        content_hash: str | None,
+        default_limit: int,
+    ) -> tuple[int, int] | None:
+        """Return the normalized range when an identical read already returned.
+
+        A repeat requires the same normalized range *and* an unchanged content
+        hash; a changed file or a different range returns ``None`` so the read
+        proceeds normally.
+        """
+        if content_hash is None:
+            return None
+        entry = self.reads.get(str(path))
+        if entry is None:
+            return None
+        previous_range, previous_hash = entry
+        current_range = normalize_read_range(offset, limit, default_limit)
+        if previous_range != current_range or previous_hash != content_hash:
+            return None
+        return current_range
+
+    def note_read(
+        self,
+        path: str | Path,
+        *,
+        offset: int,
+        limit: int | None,
+        content_hash: str | None,
+        default_limit: int,
+    ) -> None:
+        if content_hash is None:
+            return
+        self.reads[str(path)] = (
+            normalize_read_range(offset, limit, default_limit),
+            content_hash,
+        )
+
+    def search_repeat(self, signature: str, result: str) -> bool:
+        """Return True when an identical search already produced *result*."""
+        return self.searches.get(signature) == result
+
+    def note_search(self, signature: str, result: str) -> None:
+        self.searches[signature] = result
 
 
 def _hash_file(p: str) -> str | None:
@@ -31,12 +113,24 @@ class FileStates:
     Owns its own state dict so read-dedup ("File unchanged since last read")
     and read-before-edit warnings stay scoped to one agent session and do
     not leak across sessions sharing this process.
+
+    When ``review_dedup`` is set, the instance also owns a
+    :class:`ReviewerReadLedger`. Reviewer runs build a fresh ``FileStates`` per
+    subagent, so the ledger is scoped to that single reviewer run.
     """
 
-    __slots__ = ("_state",)
+    __slots__ = ("_state", "_review_ledger")
 
-    def __init__(self) -> None:
+    def __init__(self, *, review_dedup: bool = False) -> None:
         self._state: dict[str, ReadState] = {}
+        self._review_ledger: ReviewerReadLedger | None = (
+            ReviewerReadLedger() if review_dedup else None
+        )
+
+    @property
+    def review_ledger(self) -> ReviewerReadLedger | None:
+        """Reviewer-mode dedup ledger, or ``None`` for non-review sessions."""
+        return self._review_ledger
 
     def record_read(self, path: str | Path, offset: int = 1, limit: int | None = None) -> None:
         """Record that a file was read (called after  read)."""
