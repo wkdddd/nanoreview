@@ -153,6 +153,7 @@ class GrepTool(_SearchTool):
         "core", "subagent",
         "reviewer.bug", "reviewer.security",
         "reviewer.performance", "reviewer.maintainability",
+        "reviewer.general",
     }
 
     _MAX_RESULT_CHARS = 128_000

@@ -56,7 +56,11 @@ class ReviewMetaKey:
 
 ReviewTargetType = Literal["auto", "local"]
 ReviewScopeKind = Literal["file", "directory", "repo"]
-ReviewRoutingMode = Literal["auto", "explicit"]
+#: Reviewer selection mode. ``auto`` lets the planner choose specialized
+#: reviewers; ``special`` dispatches the user's chosen specialized set;
+#: ``general`` runs the single generic reviewer. The modes are mutually
+#: exclusive and ``auto``/``special`` never include the generic reviewer.
+ReviewMode = Literal["auto", "special", "general"]
 
 
 class ReviewAction(StrEnum):
@@ -114,6 +118,12 @@ ALL_REVIEW_ROLES: dict[str, ReviewRole] = {
     )
     for key, profile in REVIEWER_PROFILES.items()
 }
+#: The four specialized profiles. ``general`` is a registered profile but is
+#: deliberately excluded here: it is only reachable through ``general`` mode and
+#: never appears in ``auto``/``special`` role sets.
+SPECIAL_REVIEW_ROLE_NAMES: frozenset[str] = frozenset(
+    name for name in ALL_REVIEW_ROLES if name != "general"
+)
 DEFAULT_REVIEW_ROLES = ALL_REVIEW_ROLES
 OPTIONAL_REVIEW_ROLES: dict[str, ReviewRole] = {}
 
@@ -162,7 +172,7 @@ class ReviewPlan:
     target_type: ReviewTargetType
     action: ReviewAction
     roles: list[ReviewRole]
-    routing_mode: ReviewRoutingMode
+    mode: ReviewMode
     user_requirements: str = ""
     local_scope: LocalReviewScope | None = None
     prefetch_summary: str | None = None
@@ -185,13 +195,9 @@ class EvidenceReference:
     parent_id: str | None = None
     token_count: int = 0
     preview: str = ""
-    # User review-query hit words found in the unit. Program-generated candidate
-    # risk clues live in ``risk_hints`` and never leak in here.
+    # User review-query hit words found in the unit. Plain metadata: it never
+    # routes or orders evidence and the planner decides purely from the diff.
     matched: tuple[str, ...] = ()
-    # Program-generated candidate risk routing clues (e.g. "security:token").
-    # They suggest where the planner should look; they are never confirmed
-    # findings, and query hit words stay in the manifest `matched:` field.
-    risk_hints: tuple[str, ...] = ()
     # Human-readable statement of which real lines the preview actually covers,
     # e.g. "chunk lines 10-80; preview covers lines 10-16, 40-44".
     preview_coverage: str = ""
@@ -248,6 +254,12 @@ class ReviewEvidenceBundle:
     status: str = "ok"
     reason: str = ""
     skipped: tuple[SkippedReviewUnit, ...] = ()
+    #: Planner evidence input shape. ``direct`` inlines every unit's content in
+    #: the planner's first prompt (the whole evidence set fits the review
+    #: ``direct_cap``); ``paged`` inlines only an index and exposes the bounded
+    #: diff readers so the planner pulls content on demand. It is derived once
+    #: by preprocessing and never re-decided by the loop.
+    input_mode: str = "direct"
 
     def by_id(self) -> dict[str, EvidenceReference]:
         return {reference.id: reference for reference in self.references}
@@ -282,6 +294,110 @@ class ReviewAssignment:
     dimension: str
     focus: str
     evidence_ids: tuple[str, ...] = ()
+    #: ``planner`` when the assignment was aggregated from a triage decision,
+    #: ``user`` when the user pinned a specialized dimension directly (special
+    #: mode). Only the user-selected set is guaranteed to run.
+    source: str = "planner"
+
+
+#: Triage risk levels accepted from the planner, lowest first.
+REVIEW_RISK_LEVELS = ("low", "medium", "high", "critical")
+
+#: Bound on planner triage decisions per review. The planner groups evidence by
+#: risk judgement rather than submitting one decision per unit, and the bound
+#: keeps a runaway run from looping on the decision tool.
+MAX_TRIAGE_DECISIONS = 12
+
+#: Per-evidence triage states recorded by the program, never submitted by the
+#: model: the planner reports risk decisions and the program derives coverage.
+TRIAGE_ASSIGNED = "assigned"
+TRIAGE_DISMISSED = "dismissed"
+TRIAGE_UNEXAMINED = "unexamined"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewTriageDecision:
+    """One planner risk decision over one or more already-frozen diff evidence.
+
+    A decision is *not* a finding and never enters the report: it only tells the
+    program which reviewer dimensions should look at which evidence. ``focus``
+    and ``rationale`` become reviewer task context and run audit, nothing more.
+    """
+
+    evidence_ids: tuple[str, ...]
+    risk_level: str
+    dimensions: tuple[str, ...] = ()
+    focus: str = ""
+    rationale: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewEvidenceTriage:
+    """Program-derived coverage state of one evidence unit after planning."""
+
+    evidence_id: str
+    path: str
+    status: str = TRIAGE_UNEXAMINED
+    risk_level: str = ""
+    dimensions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewTriageSummary:
+    """Audit record of what the planner triaged, aggregated per dimension.
+
+    ``decisions`` and ``triage`` are run-audit data only: they are persisted on
+    the run state/snapshot for troubleshooting and evaluation and are
+    deliberately excluded from the report findings.
+    """
+
+    mode: str = "auto"
+    decisions: tuple[ReviewTriageDecision, ...] = ()
+    triage: tuple[ReviewEvidenceTriage, ...] = ()
+    unexamined_ids: tuple[str, ...] = ()
+    dismissed_ids: tuple[str, ...] = ()
+    #: True when the planner finished triage without assigning any reviewer.
+    no_assignments: bool = False
+    #: Bounded planner failure reason when triage never completed.
+    error: str = ""
+
+    def assigned_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.evidence_id
+            for item in self.triage
+            if item.status == TRIAGE_ASSIGNED
+        )
+
+    def snapshot_payload(self) -> dict[str, Any]:
+        """JSON-serializable audit record (no source text, no prompt)."""
+        return {
+            "mode": self.mode,
+            "decisions": [
+                {
+                    "evidence_ids": list(decision.evidence_ids),
+                    "risk_level": decision.risk_level,
+                    "dimensions": list(decision.dimensions),
+                    "focus": decision.focus,
+                    "rationale": decision.rationale,
+                }
+                for decision in self.decisions
+            ],
+            "evidence": [
+                {
+                    "id": item.evidence_id,
+                    "path": item.path,
+                    "status": item.status,
+                    "risk_level": item.risk_level,
+                    "dimensions": list(item.dimensions),
+                }
+                for item in self.triage
+            ],
+            "assigned": list(self.assigned_ids()),
+            "dismissed": list(self.dismissed_ids),
+            "unexamined": list(self.unexamined_ids),
+            "no_assignments": self.no_assignments,
+            "error": self.error,
+        }
 
 
 @dataclass(frozen=True, slots=True)

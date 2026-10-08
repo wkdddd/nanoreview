@@ -139,35 +139,9 @@ _NAME_NODE_TYPES = frozenset({"identifier", "name", "property_identifier", "type
 #: oversized single definition must be descended into for splitting.
 _BODY_WRAPPER_TYPES = frozenset({"block", "statement_block", "function_body", "declaration_list"})
 
-#: Risk routing hints and the word-boundary terms that trigger them. Hints are
-#: program-generated candidate routing clues for the planner — never review
-#: conclusions and never filters. Matching is word-boundary based so ``auth``
-#: does not match ``author`` and ``sql`` would not match ``mysql``; a trailing
-#: plural (``s``/``es``) is tolerated for natural code identifiers.
-_RISK_TERMS: dict[str, tuple[str, ...]] = {
-    "security:auth": ("auth",),
-    "security:token": ("token",),
-    "security:password": ("password",),
-    "security:secret": ("secret",),
-    "security:permission": ("permission",),
-    "security:injection": ("inject", "injection"),
-    "security:csrf": ("csrf",),
-    "security:ssrf": ("ssrf",),
-    "entrypoint:api": ("api",),
-    "entrypoint:router": ("router", "controller"),
-    "entrypoint:handler": ("handler", "server", "app", "main"),
-    "config:env": ("env",),
-    "config:settings": ("config", "settings", "pyproject", "workflow", "docker"),
-    "config:package": ("package",),
-    "tests:fixture": ("fixture", "spec"),
-    "tests:regression": ("regression", "test"),
-}
-_RISK_HINT_PATTERNS: dict[str, re.Pattern[str]] = {
-    hint: re.compile(
-        "|".join(rf"(?<![a-z0-9]){re.escape(term)}(?:s|es)?(?![a-z0-9])" for term in terms)
-    )
-    for hint, terms in _RISK_TERMS.items()
-}
+#: User review-query hit words extracted from a chunk. This is plain evidence
+#: metadata for display; it never routes or orders evidence, and the review
+#: pipeline decides purely from the frozen diff the planner actually reads.
 _TERM_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 
 # Import/export target patterns used by the related-context supplement.
@@ -351,13 +325,11 @@ class CodeUnit:
     unit_id: str = ""
     role: str = "main"  # main | related
     parent_id: str | None = None
-    score: float = 0.0
-    # User review-query hit words only (risk clues live in risk_hints).
+    # User review-query hit words only. Plain display metadata: it neither
+    # routes nor orders evidence.
     matched: list[str] = field(default_factory=list)
     # Non-risk relation/source labels: related, import, caller, test, symbol:*.
     tags: tuple[str, ...] = ()
-    # Program-generated candidate risk routing clues (e.g. "security:token").
-    risk_hints: tuple[str, ...] = ()
     # Representative planner preview plus the real lines it actually covers.
     preview: str = ""
     preview_coverage: str = ""
@@ -497,18 +469,6 @@ _SIGNATURE_RE = re.compile(
 _STRUCTURE_RE = re.compile(r"^\s*@[\w.]+|^\s*if\s+__name__\s*==|^\s*export\s+(?:default\s+)?")
 
 
-def detect_risk_hints(lowered_text: str) -> tuple[str, ...]:
-    """Detect candidate risk routing hints on already-lowercased text.
-
-    Word-boundary matching keeps ``auth`` from matching ``author`` and would
-    keep ``sql`` from matching ``mysql``. Hints are routing clues only — never
-    review conclusions and never inclusion filters.
-    """
-    if not lowered_text:
-        return ()
-    return tuple(hint for hint, pattern in _RISK_HINT_PATTERNS.items() if pattern.search(lowered_text))
-
-
 def _hunk_ranges(lines: list[str]) -> list[tuple[int, int]]:
     """New-file line ranges covered by each ``@@`` hunk header."""
     ranges: list[tuple[int, int]] = []
@@ -564,9 +524,9 @@ def _preview_line_priorities(
     """Rank preview lines: 1 = must keep … 6 = filler the sampler drops.
 
     Diff previews keep hunk headers, every added/removed line (even mid-hunk),
-    change-adjacent context, risk-hint hits and signatures. Whole-repository
-    previews keep signatures, risk-hint hits with a local window, query hit
-    lines, AST key-structure lines and the chunk edges.
+    change-adjacent context and signatures. Whole-repository previews keep
+    signatures, query hit lines, AST key-structure lines and the chunk edges.
+    Ranking is structural: nothing here infers risk or routes the review.
     """
     priorities: list[int | None] = [None] * len(lines)
     terms = {term.lower() for term in query_terms if len(term) >= 2}
@@ -575,11 +535,6 @@ def _preview_line_priorities(
         current = priorities[index]
         if current is None or priority < current:
             priorities[index] = priority
-
-    def risk_hit(line: str) -> bool:
-        # Strip the diff prefix so markers themselves do not look like code.
-        body = line[1:] if line[:1] in {"+", "-", " "} and len(line) > 1 else line
-        return bool(detect_risk_hints(body.lower()))
 
     if is_diff:
         changed: list[int] = []
@@ -591,8 +546,6 @@ def _preview_line_priorities(
                 changed.append(index)
             elif _SIGNATURE_RE.match(line):
                 assign(index, 5)
-            elif risk_hit(line):
-                assign(index, 4)
         for index in changed:
             for offset in range(-PREVIEW_HIT_CONTEXT_LINES, PREVIEW_HIT_CONTEXT_LINES + 1):
                 if offset == 0:
@@ -604,7 +557,7 @@ def _preview_line_priorities(
         for index, line in enumerate(lines):
             if _SIGNATURE_RE.match(line):
                 assign(index, 1)
-            elif risk_hit(line):
+            elif terms and any(term in line.lower() for term in terms):
                 assign(index, 2)
                 for offset in range(-PREVIEW_HIT_CONTEXT_LINES, PREVIEW_HIT_CONTEXT_LINES + 1):
                     if offset == 0:
@@ -612,8 +565,6 @@ def _preview_line_priorities(
                     neighbor = index + offset
                     if 0 <= neighbor < len(lines):
                         assign(neighbor, 2)
-            elif terms and any(term in line.lower() for term in terms):
-                assign(index, 3)
             elif _STRUCTURE_RE.match(line):
                 assign(index, 4)
         edges = (*range(min(PREVIEW_EDGE_LINES, len(lines))), *range(max(0, len(lines) - PREVIEW_EDGE_LINES), len(lines)))
@@ -836,18 +787,19 @@ class ProgrammaticEvidenceService:
             skipped.extend(file_skipped)
         terms = self._query_terms(request.review_query)
         for unit in units:
-            self._score_unit(unit, terms, (request.touched_lines or {}).get(unit.path) or [])
+            self._annotate_unit(unit, terms)
 
         if mode == "direct":
             mains = units
         else:
             mains, budget_skipped = self._apply_main_budget(units, budgets)
             skipped.extend(budget_skipped)
-            # Hard guard against pathological chunk explosions.
+            # Hard guard against pathological chunk explosions. Overflow is cut
+            # from the tail of the frozen order so the retained set is a stable
+            # prefix instead of a risk-ranked selection.
             if len(mains) > self.options.prefetch_dense_backfill_limit:
-                ordered = sorted(mains, key=lambda unit: (-unit.score, unit.path, unit.start_line))
-                overflow = ordered[self.options.prefetch_dense_backfill_limit :]
-                mains = ordered[: self.options.prefetch_dense_backfill_limit]
+                overflow = mains[self.options.prefetch_dense_backfill_limit :]
+                mains = mains[: self.options.prefetch_dense_backfill_limit]
                 skipped.extend(
                     SkippedUnit(unit.path, "budget_exhausted", unit.start_line, unit.end_line, detail="unit limit")
                     for unit in overflow
@@ -931,7 +883,7 @@ class ProgrammaticEvidenceService:
             units.extend(self._patch_units(path, patch, skipped))
         terms = self._query_terms(review_query)
         for unit in units:
-            self._score_unit(unit, terms, [])
+            self._annotate_unit(unit, terms)
         total_tokens = sum(unit.token_count for unit in units)
         mode = "direct" if total_tokens <= budgets.direct_cap_tokens else "oversized"
         if mode == "oversized":
@@ -1381,46 +1333,23 @@ class ProgrammaticEvidenceService:
         last = parse(hunks[-1])
         return first[0], max(first[1], last[1])
 
-    # -- scoring and budget filtering ------------------------------------
+    # -- annotation and budget filtering ---------------------------------
 
     @staticmethod
     def _query_terms(query: str) -> set[str]:
         return {term.lower() for term in _TERM_RE.findall(query or "")}
 
-    def _score_unit(self, unit: CodeUnit, terms: set[str], touched: list[int]) -> None:
-        """Score one unit and split routing signals by responsibility.
+    @staticmethod
+    def _annotate_unit(unit: CodeUnit, terms: set[str]) -> None:
+        """Record the user's review-query hit words on one unit.
 
-        ``matched`` keeps only user review-query hit words; program-generated
-        risk clues go to ``risk_hints`` and never leak into ``tags`` or
-        ``matched``. Diff units detect hints on added/removed lines (plus the
-        path signal); other units scan their full text.
+        This is display metadata only. Evidence keeps the order the frozen diff
+        produced it in: nothing is re-ranked by risk, query hits or touched
+        lines, so what the planner triages is exactly the admitted change in a
+        stable sequence.
         """
         lower = f"{unit.path}\n{unit.text}".lower()
-        matched = sorted(term for term in terms if term in lower)
-        risk_hints = self._unit_risk_hints(unit)
-        score = float(len(matched) * 3 + len(risk_hints))
-        if touched and unit.kind != "syntax_diagnostic":
-            if set(range(unit.start_line, unit.end_line + 1)) & set(touched):
-                score += 10.0
-        if unit.kind == "syntax_diagnostic":
-            score += 5.0
-        if unit.kind in {"file", "module"}:
-            score += 1.0
-        unit.matched = matched
-        unit.risk_hints = risk_hints
-        unit.score = score
-
-    @staticmethod
-    def _unit_risk_hints(unit: CodeUnit) -> tuple[str, ...]:
-        """Detect risk routing hints for one unit (diff: changed lines + path)."""
-        if unit.kind == "diff":
-            changed = "\n".join(
-                line[1:] for line in unit.text.splitlines() if line[:1] in {"+", "-"}
-            )
-            haystack = f"{unit.path}\n{changed}".lower()
-        else:
-            haystack = f"{unit.path}\n{unit.text}".lower()
-        return detect_risk_hints(haystack)
+        unit.matched = sorted(term for term in terms if term in lower)
 
     def _build_preview(self, unit: CodeUnit, *, terms: set[str]) -> None:
         """Render the representative planner preview and coverage label."""
@@ -1440,15 +1369,19 @@ class ProgrammaticEvidenceService:
         units: list[CodeUnit],
         budgets: EvidenceBudget,
     ) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        """Keep high-priority main units within the evidence budget."""
-        ordered = sorted(
-            (unit for unit in units if unit.role == "main"),
-            key=lambda unit: (-unit.score, unit.path, unit.start_line),
-        )
+        """Keep main units within the evidence budget, in frozen order.
+
+        The cut is positional: units arrive in the stable order preprocessing
+        produced them (file order, then line order per file) and the overflow is
+        recorded as skipped. Nothing re-ranks evidence by risk or query hits, so
+        the planner triages the admitted change itself.
+        """
         accepted: list[CodeUnit] = []
         skipped: list[SkippedUnit] = []
         used = 0
-        for unit in ordered:
+        for unit in units:
+            if unit.role != "main":
+                continue
             if used + unit.token_count > budgets.evidence_budget_tokens and accepted:
                 skipped.append(
                     SkippedUnit(unit.path, "budget_exhausted", unit.start_line, unit.end_line, detail="task budget")
@@ -1643,10 +1576,8 @@ class ProgrammaticEvidenceService:
                     f"- kind: {unit.kind}",
                     f"- tokens: {unit.token_count}",
                     f"- role: {unit.role}",
-                    # matched = user review-query hit words only.
+                    # matched = user review-query hit words only, display metadata.
                     f"- matched: {', '.join(unit.matched) or 'none'}",
-                    # risk_hints = program-generated candidate routing clues.
-                    f"- risk_hints: {', '.join(unit.risk_hints) or 'none'}",
                     *(
                         (f"- preview_coverage: {unit.preview_coverage}",)
                         if unit.preview_coverage

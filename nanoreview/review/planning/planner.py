@@ -130,7 +130,7 @@ def build_review_plan(
         )
         return None
 
-    roles, routing_mode = normalize_requested_dimensions(focus)
+    roles, mode = normalize_requested_dimensions(focus)
     normalized_type = normalize_review_target_type(target_type, target)
     if normalized_type not in {"local", "auto"}:
         normalized_type = normalize_review_target_type(None, target) or "auto"
@@ -154,13 +154,13 @@ def build_review_plan(
         target_type=target_type_value,
         action=resolved_action,
         roles=roles,
-        routing_mode=routing_mode,
+        mode=mode,
         user_requirements=user_content.strip(),
         local_scope=local_scope,
         prefetch_summary=prefetch_summary,
     )
     logger.info(
-        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} scope_paths={} routing_mode={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
+        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} scope_paths={} mode={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
         trace_id,
         plan.action.value,
         plan.target_type,
@@ -168,7 +168,7 @@ def build_review_plan(
         scope_reason,
         plan.local_scope.review_root if plan.local_scope else "",
         len(plan.local_scope.scope_paths) if plan.local_scope else 0,
-        plan.routing_mode == "explicit",
+        plan.mode,
         focus,
         [role.name for role in plan.roles],
         [role.name for role in plan.roles],

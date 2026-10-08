@@ -153,6 +153,7 @@ class ReadFileTool(_FsTool):
         "core", "memory", "subagent",
         "reviewer.bug", "reviewer.security",
         "reviewer.performance", "reviewer.maintainability",
+        "reviewer.general",
     }
 
     _MAX_CHARS = 128_000
@@ -900,6 +901,7 @@ class ListDirTool(_FsTool):
         "core", "subagent",
         "reviewer.bug", "reviewer.security",
         "reviewer.performance", "reviewer.maintainability",
+        "reviewer.general",
     }
 
     _DEFAULT_MAX = 200

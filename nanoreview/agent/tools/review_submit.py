@@ -161,6 +161,7 @@ class SubmitReviewFindingsTool(Tool):
     _scopes = {
         "reviewer.bug", "reviewer.security",
         "reviewer.performance", "reviewer.maintainability",
+        "reviewer.general",
     }
 
     @property

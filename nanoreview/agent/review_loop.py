@@ -55,7 +55,16 @@ from nanoreview.agent.review_state import (
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.agent.tools.registry import ToolRegistry
-from nanoreview.agent.tools.review_plan import ReviewPlanReceiver, SubmitReviewPlanTool
+from nanoreview.agent.tools.review_plan import (
+    MAX_DIFF_READ_CHARS,
+    DecisionReceiverAdapter,
+    FinishReviewTriageTool,
+    ListReviewDiffTool,
+    ReadReviewDiffTool,
+    ReviewDiffReader,
+    ReviewDiffUnit,
+    SubmitReviewDecisionTool,
+)
 from nanoreview.bus.events import InboundMessage
 from nanoreview.events import NO_EVENTS, EventSink, ProgressEvent
 from nanoreview.review.admission import (
@@ -75,6 +84,7 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceOptions,
     ProgrammaticEvidenceService,
 )
+from nanoreview.review.planning.triage import TriageReceiver
 from nanoreview.review.result import ReviewResult, result_from_run_state
 from nanoreview.review.types import (
     EvidenceReference,
@@ -82,6 +92,7 @@ from nanoreview.review.types import (
     ReviewEvidenceBundle,
     ReviewMetaKey,
     ReviewPlan,
+    ReviewTriageSummary,
 )
 
 if TYPE_CHECKING:
@@ -93,9 +104,16 @@ if TYPE_CHECKING:
 
 # Terminal submission attempts allowed for the planner inside one AgentRun.
 _PLANNER_TERMINAL_RETRY_LIMIT = 5
-# Tool-choice forces submit_review_plan each turn, so every iteration is one
-# terminal attempt; a few spare iterations absorb empty/length recovery turns.
-_PLANNER_MAX_ITERATIONS = _PLANNER_TERMINAL_RETRY_LIMIT + 2
+# Prose turns allowed before the planner is failed for never finishing. Triage is
+# a free-form run (read evidence → decide → finish), so narrating a turn is normal
+# progress rather than a failed submission; only genuine `finish_review_triage`
+# rejections count against ``_PLANNER_TERMINAL_RETRY_LIMIT``.
+_PLANNER_PROSE_RETRY_LIMIT = 8
+# Planner request allowance. Triage needs multiple bounded diff reads, several
+# decisions and one finish call inside a single AgentRun; the final iteration is
+# reserved for the terminal tool, so the budget must cover the reads plus the
+# correction retries a rejected decision may trigger.
+_PLANNER_MAX_ITERATIONS = 24
 
 #: Fixed context window for the whole review pipeline (Planner, reviewer,
 #: Judge). The review run does not follow the conversation agent's configured
@@ -899,11 +917,13 @@ class ReviewLoop:
     def _record_plan_snapshot(
         self, run_state: ReviewRunState, inputs: _ReviewInputs
     ) -> None:
-        """Persist the final planner manifest and review boundary.
+        """Persist the planner manifest, triage audit and review boundary.
 
         The manifest is the planner's sole structured input, so the run's audit
         trail records its budget/version, what was retained and what was omitted
-        — never the reviewed source itself.
+        — never the reviewed source itself. The triage record answers the
+        separate question of what the planner did with that input: which
+        evidence was assigned, dismissed or left unexamined.
         """
         run_state.changed_files = list(inputs.changed_files)
         skipped_files = list(
@@ -919,16 +939,19 @@ class ReviewLoop:
             sections["planner_manifest"] = payload
             run_state.manifest_stats = dict(manifest.stats())
             logger.info(
-                "review.manifest run_id={} version={} budget_tokens={} retained={} "
-                "omitted={} used_tokens={} skipped={}",
+                "review.manifest run_id={} version={} input_mode={} budget_tokens={} "
+                "retained={} omitted={} used_tokens={} skipped={}",
                 run_state.run_id,
                 manifest.version,
+                manifest.input_mode,
                 manifest.budget_tokens,
                 manifest.retained_count,
                 manifest.omitted_count,
                 manifest.used_tokens,
                 len(manifest.skipped),
             )
+        if run_state.triage is not None:
+            sections["planner_triage"] = run_state.triage.snapshot_payload()
         ref = self._snapshots.augment(run_state.run_id, sections=sections)
         if ref is None:
             # The snapshot is an audit artifact written at admission; a failed
@@ -948,31 +971,76 @@ class ReviewLoop:
         run_state: ReviewRunState | None = None,
         manifest: "EvidenceManifest | None" = None,
     ) -> tuple[ReviewAssignment, ...]:
-        """Collect a validated plan inside a single AgentRun.
+        """Run one planner triage AgentRun and aggregate its assignments.
 
-        The planner submits through the ``submit_review_plan`` terminal tool.
-        Validation failures (unknown evidence IDs, empty ``evidence_ids``,
-        disallowed dimensions, ...) are retried by ``AgentRunner`` inside the
-        same run: the original messages, manifest, and tool definitions stay
-        in context and the concrete error is fed back to the model. Only when
-        the terminal retry budget is exhausted does planning fail.
+        The planner does not submit assignments: it records risk decisions with
+        ``submit_review_decision`` and ends with ``finish_review_triage``. The
+        program aggregates the decisions into one assignment per chosen
+        dimension, so a reviewer can only run because a decision named it or
+        because the user pinned it in ``special`` mode.
 
-        Assignments may only reference evidence IDs the planner actually saw:
-        the manifest's authorized IDs when a manifest exists, otherwise every
-        reference ID in the bundle.
+        Validation failures (unknown evidence IDs, an evidence unit triaged
+        twice, an illegal dimension, a non-low risk with no dimension) are
+        retried by ``AgentRunner`` inside the same run: the original messages,
+        manifest and tool definitions stay in context and the concrete error is
+        fed back to the model. Only when the terminal retry budget is exhausted,
+        or triage never finishes, does planning fail.
         """
         allowed = {role.name for role in plan.roles}
         if manifest is not None:
-            evidence_ids = set(manifest.authorized_ids())
+            evidence_ids = manifest.authorized_ids()
         else:
-            evidence_ids = set(evidence.by_id())
-        receiver = ReviewPlanReceiver(allowed, evidence_ids, plan.routing_mode)
+            evidence_ids = tuple(evidence.by_id())
+        reference_map = evidence.by_id()
+        receiver = TriageReceiver(
+            allowed_dimensions=allowed,
+            evidence_ids=set(evidence_ids),
+            mode=plan.mode,
+            evidence_paths={
+                reference_id: reference_map[reference_id].path
+                for reference_id in evidence_ids
+                if reference_id in reference_map
+            },
+            ordered_evidence_ids=evidence_ids,
+            required_dimensions=(
+                tuple(role.name for role in plan.roles)
+                if plan.mode in {"special", "general"}
+                else ()
+            ),
+        )
         tools = ToolRegistry()
-        tools.register(SubmitReviewPlanTool(receiver))
+        tools.register(SubmitReviewDecisionTool(DecisionReceiverAdapter(receiver)))
+        tools.register(FinishReviewTriageTool(receiver))
+        if manifest is None or manifest.input_mode != "direct":
+            # The evidence does not fit one prompt, so the planner reads it in
+            # bounded pages instead. The reader is built from the frozen
+            # evidence only; it has no filesystem access. Its page budget is the
+            # run's own tool-result budget, so a page the reader says it returned
+            # is never silently truncated afterwards by AgentRunner.
+            reader = ReviewDiffReader(
+                units=tuple(
+                    ReviewDiffUnit(
+                        id=reference_id,
+                        path=str(reference_map[reference_id].path),
+                        start_line=reference_map[reference_id].start_line,
+                        end_line=reference_map[reference_id].end_line,
+                        kind=str(reference_map[reference_id].kind),
+                        token_count=reference_map[reference_id].token_count,
+                        preview=reference_map[reference_id].preview,
+                        preview_coverage=reference_map[reference_id].preview_coverage,
+                        excerpt=reference_map[reference_id].excerpt,
+                    )
+                    for reference_id in evidence_ids
+                    if reference_id in reference_map
+                ),
+                max_result_chars=min(MAX_DIFF_READ_CHARS, self._max_tool_result_chars),
+            )
+            tools.register(ListReviewDiffTool(reader))
+            tools.register(ReadReviewDiffTool(reader))
         result = await self._runner.run(
             AgentRunSpec(
-                # The coordinator task + evidence manifest are a frozen
-                # envelope; the run has no inherited history.
+                # The triage task + evidence input are a frozen envelope; the
+                # run has no inherited history.
                 frozen_messages=list(coordinator_messages),
                 working_messages=[],
                 tools=tools,
@@ -985,12 +1053,15 @@ class ReviewLoop:
                         ephemeral=True,
                     )
                 ),
-                tool_choice={
-                    "type": "function",
-                    "function": {"name": "submit_review_plan"},
-                },
-                terminal_tools=frozenset({"submit_review_plan"}),
+                # Triage is free-form: the model reads, decides, finishes. Only
+                # the terminal finish call is required, and the final iteration
+                # is reserved for it. A planner that narrates while working must
+                # not burn the submission budget, so prose turns get their own
+                # allowance; genuine finish rejections still count against
+                # ``terminal_retry_limit``.
+                terminal_tools=frozenset({"finish_review_triage"}),
                 terminal_retry_limit=_PLANNER_TERMINAL_RETRY_LIMIT,
+                prose_retry_limit=_PLANNER_PROSE_RETRY_LIMIT,
                 error_message=None,
                 concurrent_tools=False,
                 workspace=self._workspace,
@@ -999,26 +1070,73 @@ class ReviewLoop:
             )
         )
 
-        if receiver.submission is not None:
-            logger.info(
-                "review.coordinator.plan.accepted assignments={}",
-                len(receiver.submission),
+        if run_state is not None:
+            run_state.add_usage(result.usage)
+        if not receiver.finished:
+            failure = (
+                result.terminal_error
+                or result.error
+                or result.final_content
+                or "the planner did not call finish_review_triage"
             )
+            receiver.error = bound_child_error(failure)
             if run_state is not None:
-                run_state.add_usage(result.usage)
-            return receiver.submission
-        failure = (
-            result.terminal_error
-            or result.error
-            or result.final_content
-            or "coordinator did not submit a review plan"
+                run_state.triage = receiver.summary()
+            logger.warning(
+                "review.coordinator.triage.failed stop_reason={} decisions={} reason={}",
+                result.stop_reason,
+                len(receiver.decisions),
+                str(failure)[:300],
+            )
+            raise ReviewPlanningError(f"Review planning failed: {failure}")
+
+        assignments = receiver.assignments()
+        summary = receiver.summary()
+        if run_state is not None:
+            run_state.triage = summary
+        logger.info(
+            "review.coordinator.triage.accepted mode={} decisions={} assignments={} "
+            "assigned={} dismissed={} unexamined={}",
+            plan.mode,
+            len(receiver.decisions),
+            len(assignments),
+            len(summary.assigned_ids()),
+            len(summary.dismissed_ids),
+            len(summary.unexamined_ids),
         )
-        logger.warning(
-            "review.coordinator.plan.failed stop_reason={} reason={}",
-            result.stop_reason,
-            str(failure)[:300],
+        if not assignments:
+            logger.warning(
+                "review.coordinator.triage.no_assignments mode={} evidence={}",
+                plan.mode,
+                len(evidence_ids),
+            )
+        return assignments
+
+    @staticmethod
+    def _planned_no_reviewer_summary(
+        run_state: ReviewRunState,
+        assignments: tuple[ReviewAssignment, ...],
+    ) -> str:
+        """Explain a run that deliberately dispatched no reviewer.
+
+        Returns an empty string whenever a reviewer did run (or was expected to),
+        so the finalizer only softens the "no dimension results" gap when
+        planning genuinely decided no dimension needed to run. The text reports
+        program coverage counts — dismissed/unexamined — never the planner's
+        risk level or rationale, which stay out of the report.
+        """
+        if assignments:
+            return ""
+        triage: ReviewTriageSummary | None = run_state.triage
+        if triage is None:
+            return ""
+        dismissed = len(triage.dismissed_ids)
+        unexamined = len(triage.unexamined_ids)
+        return (
+            "Planning dispatched no reviewer for this change: "
+            f"{dismissed} evidence unit(s) were explicitly judged low risk and "
+            f"{unexamined} were left unexamined."
         )
-        raise ReviewPlanningError(f"Review planning failed: {failure}")
 
     async def _run_review(
         self,
@@ -1047,10 +1165,11 @@ class ReviewLoop:
             inputs.validation_workspace,
             inputs.changed_files,
             allowed_dimensions=[assignment.dimension for assignment in assignments],
-            routing_mode=inputs.plan.routing_mode,
+            mode=inputs.plan.mode,
             selected_dimensions=[assignment.dimension for assignment in assignments],
             local_target=inputs.local_target,
             skipped_files=tuple(inputs.evidence.skipped_by_file().values()),
+            planner_summary=self._planned_no_reviewer_summary(run_state, assignments),
         )
         await self._dispatch_and_collect(
             plan=inputs.plan,

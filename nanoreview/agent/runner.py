@@ -170,6 +170,15 @@ class AgentRunSpec:
     # Max terminal-tool submission attempts (failed submissions and prose
     # answers both count) before the run fails with terminal_tool_failed.
     terminal_retry_limit: int = 5
+    #: Separate allowance for *prose* terminal misses — turns that answered with
+    #: text and no tool call at all. They share ``terminal_retry_limit`` by
+    #: default, which is right for a forced-tool run where any non-tool turn is
+    #: a missed submission. A free-form run (the review planner reads, decides
+    #: and only then finishes) narrates such turns while working normally, so it
+    #: raises this instead of letting narration exhaust the submission budget
+    #: and fail a run that never submitted anything malformed. ``None`` keeps the
+    #: shared limit.
+    prose_retry_limit: int | None = None
     #: Reserve the final allowed iteration for the required terminal tool. On
     #: that iteration only the terminal tool(s) stay exposed and a single
     #: terminal tool is forced via ``tool_choice``, so a run that spent every
@@ -221,6 +230,9 @@ class _IterationOutcome:
     terminal_attempts: int
     terminal_error: str | None
     had_injections: bool
+    #: Prose terminal misses counted separately from real terminal-tool
+    #: failures, so a free-form run is not failed by ordinary narration.
+    prose_attempts: int = 0
     #: True once any iteration produced an explicit hook replacement of the
     #: final content. Carried forward so ``AgentRunResult`` can report it
     #: without re-deriving it from the public hook context.
@@ -414,9 +426,12 @@ class AgentRunner:
         had_injections = False
         injection_cycles = 0
         # Terminal-tool submission tracking: attempts count every failed or
-        # successful terminal submission (and prose answers while the terminal
-        # tool is still pending); terminal_error keeps the last concrete error.
+        # successful terminal submission; terminal_error keeps the last concrete
+        # error. Prose answers while the terminal tool is still pending are
+        # tracked separately so a run that declares ``prose_retry_limit`` (the
+        # review planner narrates while it works) is not failed by narration.
         terminal_attempts = 0
+        prose_attempts = 0
         terminal_error: str | None = None
         content_replaced = False
 
@@ -501,11 +516,13 @@ class AgentRunner:
                     terminal_attempts,
                     terminal_error,
                     had_injections,
+                    prose_attempts,
                 )
                 injection_cycles = iteration_outcome.injection_cycles
                 empty_content_retries = iteration_outcome.empty_content_retries
                 length_recovery_count = iteration_outcome.length_recovery_count
                 terminal_attempts = iteration_outcome.terminal_attempts
+                prose_attempts = iteration_outcome.prose_attempts
                 terminal_error = iteration_outcome.terminal_error
                 had_injections = had_injections or iteration_outcome.had_injections
                 content_replaced = content_replaced or iteration_outcome.content_replaced
@@ -685,6 +702,7 @@ class AgentRunner:
         terminal_attempts: int,
         terminal_error: str | None,
         had_injections: bool,
+        prose_attempts: int = 0,
     ) -> "_IterationOutcome":
         """Handle one business model response and advance the run.
 
@@ -709,6 +727,7 @@ class AgentRunner:
             terminal_attempts=terminal_attempts,
             terminal_error=terminal_error,
             had_injections=had_injections,
+            prose_attempts=prose_attempts,
         )
         #: Set once ``finalize_content_result`` reports an explicit replacement.
         is_replaced = False
@@ -1065,10 +1084,27 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 ),
             )
-            outcome.terminal_attempts += 1
-            outcome.terminal_error = _TERMINAL_PROSE_MISS_REASON
-            terminal_names = ",".join(sorted(spec.terminal_tools))
-            if outcome.terminal_attempts >= spec.terminal_retry_limit:
+            outcome.prose_attempts += 1
+            # Prose misses have their own allowance when the caller declares one
+            # (a free-form run such as the review planner, which narrates while
+            # working). Otherwise they keep sharing the submission budget, which
+            # is the correct strict reading for a forced-tool run.
+            if spec.prose_retry_limit is None:
+                # Shared budget: a prose miss is a missed submission, so it
+                # advances the same counter a rejected terminal call advances.
+                prose_used = outcome.terminal_attempts + 1
+                prose_limit = spec.terminal_retry_limit
+                outcome.terminal_attempts = prose_used
+            else:
+                prose_limit = spec.prose_retry_limit
+                prose_used = outcome.prose_attempts
+            # The miss itself counts, so the count is already post-increment and
+            # the comparison fires on exactly the Nth prose turn.
+            if prose_used >= prose_limit:
+                if spec.prose_retry_limit is not None:
+                    outcome.terminal_attempts += 1
+                outcome.terminal_error = _TERMINAL_PROSE_MISS_REASON
+                terminal_names = ",".join(sorted(spec.terminal_tools))
                 error = outcome.terminal_error
                 final_content = error
                 stop_reason = "terminal_tool_failed"
@@ -1087,9 +1123,10 @@ class AgentRunner:
                 outcome.final_content = final_content
                 return outcome
             logger.info(
-                "terminal_tool.retry tool={} attempt={} reason={}",
-                terminal_names,
-                outcome.terminal_attempts,
+                "terminal_tool.retry tool={} attempt={}/{} reason={}",
+                ",".join(sorted(spec.terminal_tools)),
+                outcome.prose_attempts,
+                prose_limit,
                 _TERMINAL_PROSE_MISS_REASON,
             )
             self._append_injected_messages(

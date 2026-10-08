@@ -45,9 +45,11 @@ reviewer_timeout_seconds = 180
 ```
 
 - review 输入只有本地 diff：evidence 以 changed hunk 为主，related 只作一层补充。文件读取超 `max_file_chars` 时追加截断标记，不得把截断内容当作完整文件 evidence。
-- Planner 只读一个结构化 manifest（`review/planning/manifest.py`），其 references 与 skipped/omitted 说明共享 80k 预算；超限优先保留高优先级 references，并记录被省略的 id/数量/原因。manifest 的 version 与 token counter 随 `EvidenceManifest.snapshot_payload()` 持久化到 review snapshot。
+- Planner 只读一个结构化 manifest（`review/planning/manifest.py`），其 references 与 skipped/omitted 说明共享 80k 预算；超限时按 frozen 顺序保留前缀并记录被省略的 id/数量/原因，**不再按风险排序**。manifest 的 version、`input_mode` 与 token counter 随 `EvidenceManifest.snapshot_payload()` 持久化到 review snapshot。
+- Planner 输入分 `direct`/`paged`：`direct` 内联全部 evidence 全文；`paged` 只渲染索引，内容由 `list_review_diff`/`read_review_diff` 分页读取，单次响应预算对齐运行期 `max_tool_result_chars`，避免 reader 声称已读后被 `AgentRunner` 再截断。有界读取的三条硬规则：请求的 ID 不得被隐藏丢弃（超预算部分显式列出 ID）；单个 unit 超过页面预算时必须在正文内标注“未完整展示”，绝不返回无标记的半个 patch；reference excerpt 上限（40k 字符）不得低于单文件完整 diff unit 的最大规模（`DIFF_UNIT_TOKEN_THRESHOLD * 4`），否则 direct 模式会静默丢 unit 尾部。
+- Planner 请求上限 `24`（`_PLANNER_MAX_ITERATIONS`），分诊需要多次有界读取 + 多条 decision + finish；不强制 `tool_choice`，由 `finish_review_triage` 的 reserved terminal iteration 保证收尾。散文回合配额 `prose_retry_limit=8` 与 terminal 提交配额（5）分开计。reviewer 的 30 次不变。
 - reviewer frozen task（授权 evidence + related evidence）是固定输入，不参与工作历史压缩；容量不足必须显式失败或记录 coverage 缺口，不得静默丢弃授权 evidence，也不得假定压缩能裁剪 frozen task。
-- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Planner（`submit_review_plan`）与 Judge（`submit_verdicts`）本就每轮强制，故行为不变；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
+- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Judge（`submit_verdicts`）本就每轮强制；Planner 靠 terminal 保留轮收尾；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
 - reviewer 内重复 `read_file`/`grep` 按单 run ledger 抑制（相同规范化范围 + 内容未变时返回短提示），`force` 不可绕过；这是上下文效率控制，不是累计 token 硬上限，也不跨 reviewer/review run 共享。
 
 ## 变更检查

@@ -10,6 +10,7 @@ from nanoreview.review import (
     DEFAULT_REVIEW_ROLES,
     OPTIONAL_REVIEW_ROLES,
     SEVERITY_ORDER,
+    SPECIAL_REVIEW_ROLE_NAMES,
     Finding,
     ReviewReport,
     build_code_review_context,
@@ -28,10 +29,13 @@ class DummyProvider(LLMProvider):
         return "dummy"
 
 
-def test_normalize_requested_dimensions_defaults_to_all_roles_in_auto_mode() -> None:
+def test_normalize_requested_dimensions_defaults_to_specialized_roles_in_auto_mode() -> None:
     roles, mode = normalize_requested_dimensions(None)
 
-    assert [role.name for role in roles] == list(ALL_REVIEW_ROLES)
+    # auto only offers the four specialized reviewers; general is never auto.
+    assert [role.name for role in roles] == [
+        name for name in ALL_REVIEW_ROLES if name != "general"
+    ]
     assert mode == "auto"
 
 
@@ -39,7 +43,7 @@ def test_normalize_requested_dimensions_selects_requested_roles_and_deduplicates
     roles, mode = normalize_requested_dimensions("security, bug, security")
 
     assert [role.name for role in roles] == ["security", "bug"]
-    assert mode == "explicit"
+    assert mode == "special"
 
 
 def test_normalize_requested_dimensions_rejects_unknown_dimension() -> None:
@@ -47,10 +51,23 @@ def test_normalize_requested_dimensions_rejects_unknown_dimension() -> None:
         normalize_requested_dimensions("security,bogus")
 
 
+def test_normalize_requested_dimensions_routes_general_alone() -> None:
+    roles, mode = normalize_requested_dimensions("general")
+
+    assert [role.name for role in roles] == ["general"]
+    assert mode == "general"
+
+
+def test_normalize_requested_dimensions_rejects_general_mixed_with_special() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        normalize_requested_dimensions("general,security")
+
+
 def test_review_role_sets() -> None:
-    assert len(DEFAULT_REVIEW_ROLES) == 4
-    assert len(OPTIONAL_REVIEW_ROLES) == 0
-    assert len(ALL_REVIEW_ROLES) == 4
+    assert len(DEFAULT_REVIEW_ROLES) == 5
+    assert OPTIONAL_REVIEW_ROLES == {}
+    assert len(ALL_REVIEW_ROLES) == 5
+    assert len(SPECIAL_REVIEW_ROLE_NAMES) == 4
 
 
 def test_build_code_review_context_mentions_all_severity_levels() -> None:
@@ -181,7 +198,8 @@ async def test_resolved_local_prompt_does_not_refetch_after_empty_prefetch() -> 
         },
     )
 
-    assert "submit_review_plan" in prompt
+    assert "submit_review_decision" in prompt
+    assert "finish_review_triage" in prompt
     assert "no program-authorized evidence references" in prompt
     assert "spawn" in prompt
 

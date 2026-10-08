@@ -65,14 +65,14 @@ from nanoreview.session.manager import SessionManager
 SESSION_KEY = "cli:review"
 
 
-def _plan(*roles: str) -> ReviewPlan:
+def _plan(*roles: str, mode: str = "special") -> ReviewPlan:
     return ReviewPlan(
         target="repo",
         target_name="repo",
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
-        routing_mode="explicit",
+        mode=mode,
     )
 
 
@@ -92,57 +92,65 @@ def _evidence() -> ReviewEvidenceBundle:
 
 
 class _NoPlanRunner:
+    """Triage runner that never finishes, so planning fails."""
+
     def __init__(self) -> None:
         self.calls = 0
 
     async def run(self, spec):
         self.calls += 1
-        assert spec.tool_choice == {
-            "type": "function",
-            "function": {"name": "submit_review_plan"},
-        }
+        # Triage is free-form: the only required contract is the terminal
+        # finish call, which this stub deliberately never makes.
+        assert "finish_review_triage" in spec.terminal_tools
+        assert spec.tool_choice is None
         return AgentRunResult(final_content="not a tool call", messages=[])
+
+
+async def _triage(spec, decisions: list[dict]) -> None:
+    """Drive the triage tools the way a planner model would."""
+    decision_tool = spec.tools.get("submit_review_decision")
+    finish_tool = spec.tools.get("finish_review_triage")
+    assert decision_tool is not None and finish_tool is not None
+    for decision in decisions:
+        result = await decision_tool.execute(**decision)
+        assert not result.startswith("Error:"), result
+    finished = await finish_tool.execute()
+    assert not finished.startswith("Error:"), finished
+
+
+def _decision(
+    evidence_ids: list[str],
+    dimensions: list[str],
+    *,
+    risk_level: str = "high",
+    focus: str = "concrete risk",
+    rationale: str = "because",
+) -> dict:
+    return {
+        "evidence_ids": evidence_ids,
+        "risk_level": risk_level,
+        "dimensions": dimensions,
+        "focus": focus,
+        "rationale": rationale,
+    }
 
 
 class _PlanRunner:
     usage: dict[str, int] = {}
 
     async def run(self, spec):
-        tool = spec.tools.get("submit_review_plan")
-        assert tool is not None
-        result = await tool.execute(
-            assignments=[
-                {
-                    "dimension": "security",
-                    "focus": "authentication state",
-                    "evidence_ids": ["ev-001"],
-                },
-                {
-                    "dimension": "bug",
-                    "focus": "exception paths",
-                    "evidence_ids": ["ev-001"],
-                },
-            ]
+        await _triage(
+            spec,
+            [_decision(["ev-001"], ["security", "bug"], focus="authentication state")],
         )
-        assert result == "review plan accepted"
         return AgentRunResult(final_content="", messages=[], usage=dict(self.usage))
 
 
 class _SingleSecurityPlanRunner:
-    """Planner that submits exactly one security dimension (for judge tests)."""
+    """Planner that triages one evidence unit into the security dimension."""
 
     async def run(self, spec):
-        tool = spec.tools.get("submit_review_plan")
-        result = await tool.execute(
-            assignments=[
-                {
-                    "dimension": "security",
-                    "focus": "authentication state",
-                    "evidence_ids": ["ev-001"],
-                }
-            ]
-        )
-        assert result == "review plan accepted"
+        await _triage(spec, [_decision(["ev-001"], ["security"], focus="authentication state")])
         return AgentRunResult(final_content="", messages=[], usage={})
 
 
@@ -572,7 +580,7 @@ async def test_local_diff_without_evidence_explains_how_to_continue(
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[ALL_REVIEW_ROLES["security"]],
-        routing_mode="auto",
+        mode="auto",
     )
     prepared(plan, ReviewEvidenceBundle())
     loop = _build_loop(tmp_path, runner=_NoPlanRunner(), subagents=_Subagents())
@@ -621,13 +629,15 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
 
     outcome = await loop.execute(_request())
 
-    assert [call["label"] for call in subagents.calls] == ["security", "bug"]
+    # One decision covered both dimensions; the program aggregates one
+    # assignment per dimension in stable dimension order.
+    assert [call["label"] for call in subagents.calls] == ["bug", "security"]
     # Review results are never published to the bus: the program dispatches each
     # dimension with an explicit reviewer profile and collects from the queue.
     assert all("deliver_to_bus" not in call for call in subagents.calls)
     assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == [
-        "security",
         "bug",
+        "security",
     ]
     # The planner-injected evidence is proved to the reviewer so a valid
     # ``findings: []`` submission is not misread as incomplete.
@@ -635,6 +645,202 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
         call["origin_metadata"]["assigned_evidence"] == 1 for call in subagents.calls
     )
     assert "No actionable issues found" in (outcome.report_markdown or "")
+
+
+class _GeneralPlanRunner:
+    """Planner that triages the whole change into the general dimension."""
+
+    async def run(self, spec):
+        await _triage(
+            spec, [_decision(["ev-001"], ["general"], focus="whole change")]
+        )
+        return AgentRunResult(final_content="", messages=[], usage={})
+
+
+@pytest.mark.asyncio
+async def test_general_mode_dispatches_one_general_reviewer(tmp_path, prepared) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _Subagents()
+    plan = ReviewPlan(
+        target="repo",
+        target_name="repo",
+        target_type="local",
+        action=ReviewAction.DIFF,
+        roles=[ALL_REVIEW_ROLES["general"]],
+        mode="general",
+    )
+    prepared(plan, _evidence())
+    loop = _build_loop(tmp_path, runner=_GeneralPlanRunner(), subagents=subagents)
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert [call["label"] for call in subagents.calls] == ["general"]
+    assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == ["general"]
+    assert "General Reviewer" in (outcome.report_markdown or "")
+
+
+@pytest.mark.asyncio
+async def test_general_mode_rejects_specialized_assignment(tmp_path, prepared) -> None:
+    """general mode must fail planning when the planner mixes dimensions."""
+
+    class _MixedPlanRunner:
+        async def run(self, spec):
+            tool = spec.tools.get("submit_review_decision")
+            result = await tool.execute(
+                **_decision(["ev-001"], ["general", "security"])
+            )
+            # The receiver rejects the specialized dimension outright; the run
+            # then ends without a finish call, exactly like any failed triage.
+            assert result.startswith("Error:")
+            assert "disallowed dimension" in result
+            return AgentRunResult(final_content="", messages=[], usage={})
+
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    plan = ReviewPlan(
+        target="repo",
+        target_name="repo",
+        target_type="local",
+        action=ReviewAction.DIFF,
+        roles=[ALL_REVIEW_ROLES["general"]],
+        mode="general",
+    )
+    prepared(plan, _evidence())
+    loop = _build_loop(tmp_path, runner=_MixedPlanRunner(), subagents=_Subagents())
+    state = _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert state.status is ReviewRunStatus.ERROR
+    assert outcome.report_markdown is not None or outcome.error
+
+
+class _NoAssignmentPlanRunner:
+    """Planner that dismisses every evidence unit as low risk."""
+
+    async def run(self, spec):
+        await _triage(
+            spec,
+            [
+                _decision(
+                    ["ev-001"], [], risk_level="low", focus="", rationale="docstring only"
+                )
+            ],
+        )
+        return AgentRunResult(final_content="", messages=[], usage={})
+
+
+@pytest.mark.asyncio
+async def test_low_risk_triage_dispatches_no_reviewer_and_says_so(
+    tmp_path, prepared
+) -> None:
+    """A dismissed change completes with an explicit no-reviewer report.
+
+    The run must still settle as ``completed`` with a report artifact — the
+    planner's decision is a legitimate outcome, not a planning failure — and the
+    report must state the triage outcome instead of claiming the review was
+    incomplete.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _Subagents()
+    prepared(_plan("security", "bug", mode="auto"), _evidence())
+    loop = _build_loop(tmp_path, runner=_NoAssignmentPlanRunner(), subagents=subagents)
+    state = _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert subagents.calls == []
+    assert state.status is ReviewRunStatus.COMPLETED
+    report = outcome.report_markdown or ""
+    assert "Planning dispatched no reviewer" in report
+    assert "1 evidence unit(s) were explicitly judged low risk" in report
+    # The deliberate outcome must not be reported as a failed/incomplete check.
+    assert "no reviewer was dispatched by planning" in report
+    assert "incomplete: no review dimension results were produced" not in report
+    # The planner's risk level stays audit data, never a report finding.
+    assert state.triage is not None
+    assert state.triage.dismissed_ids == ("ev-001",)
+    assert "critical" not in report.split("### Findings")[0]
+
+
+@pytest.mark.asyncio
+async def test_triage_records_coverage_on_run_state(tmp_path, prepared) -> None:
+    """Assigned/dismissed/unexamined coverage is recorded for the run audit."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+
+    class _PartialTriageRunner:
+        async def run(self, spec):
+            await _triage(
+                spec,
+                [
+                    _decision(["ev-001"], ["security"], focus="auth state"),
+                    _decision(
+                        ["ev-002"],
+                        [],
+                        risk_level="low",
+                        focus="",
+                        rationale="not security relevant",
+                    ),
+                ],
+            )
+            return AgentRunResult(final_content="", messages=[], usage={})
+
+    evidence = ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(id="ev-001", path="app.py", start_line=1, end_line=1, excerpt="value = 1"),
+            EvidenceReference(id="ev-002", path="other.py", start_line=1, end_line=1, excerpt="x = 2"),
+            EvidenceReference(id="ev-003", path="third.py", start_line=1, end_line=1, excerpt="y = 3"),
+        ),
+        summary="## app.py:1-1",
+    )
+    subagents = _Subagents()
+    # auto mode: the planner chooses the set, so dismissing one evidence unit is
+    # a legitimate decision rather than a missing user-pinned dimension.
+    prepared(_plan("security", "bug", "performance", "maintainability", mode="auto"), evidence)
+    loop = _build_loop(tmp_path, runner=_PartialTriageRunner(), subagents=subagents)
+    state = _register_run(loop)
+
+    await loop.execute(_request())
+
+    assert state.triage is not None
+    assert state.triage.assigned_ids() == ("ev-001",)
+    assert state.triage.dismissed_ids == ("ev-002",)
+    assert state.triage.unexamined_ids == ("ev-003",)
+    # Only the dimension a decision named is dispatched; the unexamined unit and
+    # the dismissed one start no reviewer.
+    assert [call["label"] for call in subagents.calls] == ["security"]
+    assert subagents.calls[0]["origin_metadata"]["assigned_evidence"] == 1
+
+
+@pytest.mark.asyncio
+async def test_special_mode_rejects_a_finish_that_skips_a_pinned_dimension(
+    tmp_path, prepared
+) -> None:
+    """A user-pinned dimension can never be silently dropped."""
+
+    class _SkipPinnedRunner:
+        async def run(self, spec):
+            tool = spec.tools.get("submit_review_decision")
+            finish = spec.tools.get("finish_review_triage")
+            await tool.execute(**_decision(["ev-001"], ["security"], focus="x"))
+            rejected = await finish.execute()
+            # The pinned `bug` dimension was never named, so the finish is
+            # refused; with no accepted finish the run fails planning.
+            assert rejected.startswith("Error:")
+            assert "bug" in rejected
+            return AgentRunResult(final_content="", messages=[], usage={})
+
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _Subagents()
+    prepared(_plan("security", "bug"), _evidence())
+    loop = _build_loop(tmp_path, runner=_SkipPinnedRunner(), subagents=subagents)
+    state = _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert subagents.calls == []
+    assert state.status is ReviewRunStatus.ERROR
+    assert "finish_review_triage" in (outcome.error or "")
 
 
 @pytest.mark.asyncio
@@ -1173,23 +1379,15 @@ def test_review_planning_error_is_the_module_contract() -> None:
 
 
 class _CapturingPlanRunner:
-    """Planner recording its ``AgentRunSpec`` and accepting one assignment."""
+    """Planner recording its ``AgentRunSpec`` and triaging one security unit."""
 
     def __init__(self) -> None:
         self.specs: list[Any] = []
 
     async def run(self, spec: Any) -> AgentRunResult:
         self.specs.append(spec)
-        tool = spec.tools.get("submit_review_plan")
-        assert tool is not None
-        await tool.execute(
-            assignments=[
-                {
-                    "dimension": "security",
-                    "focus": "authentication state",
-                    "evidence_ids": ["ev-001"],
-                }
-            ]
+        await _triage(
+            spec, [_decision(["ev-001"], ["security"], focus="authentication state")]
         )
         return AgentRunResult(final_content="", messages=[], usage={})
 
@@ -1255,7 +1453,8 @@ async def test_run_records_manifest_stats_on_state(tmp_path, prepared) -> None:
 
     await loop.execute(_request())
 
-    assert state.manifest_stats["version"] == "evidence-manifest/1"
+    assert state.manifest_stats["version"] == "evidence-manifest/2"
+    assert state.manifest_stats["input_mode"] == "direct"
     assert state.manifest_stats["budget_tokens"] == 80_000
     assert state.manifest_stats["retained"] == 1
     assert state.manifest_stats["omitted"] == 0

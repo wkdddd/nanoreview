@@ -176,7 +176,7 @@ class ReviewAdmissionService:
                 ReviewAdmissionCode.INVALID_ACTION, str(exc), field="action"
             ) from exc
         try:
-            roles, routing_mode = normalize_requested_dimensions(request.focus)
+            roles, mode = normalize_requested_dimensions(request.focus)
         except ValueError as exc:
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.INVALID_DIMENSIONS, str(exc), field="focus"
@@ -207,7 +207,7 @@ class ReviewAdmissionService:
                 session_key=session_key,
                 action=action,
                 roles=roles,
-                routing_mode=routing_mode,
+                mode=mode,
                 target=target,
             )
         )
@@ -253,7 +253,7 @@ class ReviewAdmissionService:
         session_key: str,
         action: ReviewAction,
         roles: list[Any],
-        routing_mode: str,
+        mode: str,
         target: str,
     ) -> ReviewAdmission:
         resolved_target = self._resolve_local_target(request, target)
@@ -270,7 +270,7 @@ class ReviewAdmissionService:
             target_type="local",
             action=action,
             roles=roles,
-            routing_mode=routing_mode,  # type: ignore[arg-type]
+            mode=mode,  # type: ignore[arg-type]
             user_requirements=(request.content or "").strip(),
             local_scope=scope,
         )

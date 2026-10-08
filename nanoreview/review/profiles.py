@@ -11,6 +11,7 @@ from loguru import logger
 
 from nanoreview.agent.subagent_profiles import (
     BUG_REVIEWER_SCOPE,
+    GENERAL_REVIEWER_SCOPE,
     MAINTAINABILITY_REVIEWER_SCOPE,
     PERFORMANCE_REVIEWER_SCOPE,
     SECURITY_REVIEWER_SCOPE,
@@ -23,6 +24,17 @@ _SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep"})
 _REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep", "review_submit"})
 #: Tools whose successful call proves the reviewer read target evidence.
 _REVIEWER_EVIDENCE_TOOLS = frozenset({"read_file", "grep"})
+
+#: Profile id -> execution scope. Every registered profile must appear here;
+#: lookup is explicit so a newly registered profile without a scope fails loudly
+#: instead of silently falling back to some generic boundary.
+_SCOPE_BY_PROFILE_ID: dict[str, str] = {
+    "bug": BUG_REVIEWER_SCOPE,
+    "security": SECURITY_REVIEWER_SCOPE,
+    "performance": PERFORMANCE_REVIEWER_SCOPE,
+    "maintainability": MAINTAINABILITY_REVIEWER_SCOPE,
+    "general": GENERAL_REVIEWER_SCOPE,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,15 +55,9 @@ class ReviewerProfile:
         }
 
     def execution_profile(self) -> SubagentExecutionProfile:
-        scope_by_id = {
-            "bug": BUG_REVIEWER_SCOPE,
-            "security": SECURITY_REVIEWER_SCOPE,
-            "performance": PERFORMANCE_REVIEWER_SCOPE,
-            "maintainability": MAINTAINABILITY_REVIEWER_SCOPE,
-        }
         return SubagentExecutionProfile(
             id=self.id,
-            scope=scope_by_id[self.id],
+            scope=_SCOPE_BY_PROFILE_ID[self.id],
             required_tools=_REVIEWER_REQUIRED_TOOLS,
             terminal_tools=frozenset({"review_submit"}),
             soft_tool_error_tools=_SOFT_TOOLS,
@@ -141,6 +147,29 @@ REVIEWER_PROFILES: dict[str, ReviewerProfile] = {
             array_fields=frozenset({"affected_modules"}),
         ),
         report_fields=(("violated_boundary", "Violated boundary"), ("change_amplification", "Change amplification"), ("affected_modules", "Affected modules")),
+    ),
+    "general": ReviewerProfile(
+        id="general",
+        label="General Reviewer",
+        planner_description=(
+            "Perform a single balanced review covering functional correctness, boundaries, "
+            "error handling, security, performance, and maintainability for the change."
+        ),
+        prompt_template="agent/reviewers/general.md",
+        context_policy=(
+            "Inspect the change across functional, boundary, error-handling, security, "
+            "performance, and maintainability concerns; follow callers and exceptional "
+            "paths only as far as the evidence requires."
+        ),
+        details_schema=_string_details(
+            "concern", "symptom", "affected_behavior", "recommended_fix"
+        ),
+        report_fields=(
+            ("concern", "Concern"),
+            ("symptom", "Symptom"),
+            ("affected_behavior", "Affected behavior"),
+            ("recommended_fix", "Recommended fix"),
+        ),
     ),
 }
 

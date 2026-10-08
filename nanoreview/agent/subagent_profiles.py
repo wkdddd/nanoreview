@@ -17,6 +17,7 @@ BUG_REVIEWER_SCOPE = "reviewer.bug"
 SECURITY_REVIEWER_SCOPE = "reviewer.security"
 PERFORMANCE_REVIEWER_SCOPE = "reviewer.performance"
 MAINTAINABILITY_REVIEWER_SCOPE = "reviewer.maintainability"
+GENERAL_REVIEWER_SCOPE = "reviewer.general"
 
 
 @dataclass(frozen=True, slots=True)

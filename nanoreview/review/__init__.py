@@ -27,6 +27,7 @@ from nanoreview.review.types import (
     DEFAULT_REVIEW_ROLES,
     OPTIONAL_REVIEW_ROLES,
     SEVERITY_ORDER,
+    SPECIAL_REVIEW_ROLE_NAMES,
     EvidenceReference,
     Finding,
     FindingVerdict,
@@ -49,6 +50,7 @@ from nanoreview.review.types import (
 __all__ = [
     "ALL_REVIEW_ROLES",
     "DEFAULT_REVIEW_ROLES",
+    "SPECIAL_REVIEW_ROLE_NAMES",
     "OPTIONAL_REVIEW_ROLES",
     "SEVERITY_ORDER",
     "Finding",

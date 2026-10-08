@@ -540,6 +540,66 @@ async def test_terminal_tool_prose_answer_counts_as_attempt_and_fails_at_limit()
     assert provider.calls == 2
 
 
+@pytest.mark.asyncio
+async def test_prose_retry_limit_does_not_consume_the_submission_budget() -> None:
+    """A free-form run may narrate without exhausting its terminal budget.
+
+    The review planner reads evidence, decides and only then finishes, so a
+    prose turn is normal progress. When the caller declares ``prose_retry_limit``
+    those turns get their own allowance: four narration turns must not fail a run
+    whose terminal submission was never malformed.
+    """
+    tools = ToolRegistry()
+    tools.register(TerminalTool())
+    provider = ScriptedProvider(
+        [
+            _prose_response("reviewed ev-001"),
+            _prose_response("reviewed ev-002"),
+            _prose_response("reviewed ev-003"),
+            _prose_response("reviewed ev-004"),
+            _terminal_call_response(),
+        ]
+    )
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            terminal_retry_limit=2,
+            prose_retry_limit=8,
+            max_iterations=8,
+        )
+    )
+
+    assert result.stop_reason == "completed"
+    # Only the accepted submission counted as a terminal attempt.
+    assert result.terminal_attempts == 1
+    assert provider.calls == 5
+
+
+@pytest.mark.asyncio
+async def test_prose_retry_limit_still_fails_a_run_that_never_submits() -> None:
+    """The separate allowance is bounded, not unbounded."""
+    tools = ToolRegistry()
+    tools.register(TerminalTool())
+    provider = ScriptedProvider([_prose_response()])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(
+            tools,
+            terminal_tools=frozenset({"terminal_tool"}),
+            terminal_retry_limit=5,
+            prose_retry_limit=2,
+            max_iterations=6,
+        )
+    )
+
+    assert result.stop_reason == "terminal_tool_failed"
+    assert provider.calls == 2
+
+
 class ExploreTool(Tool):
     """Non-terminal tool used to spend iterations without submitting."""
 

@@ -11,7 +11,6 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceRequest,
     ProgrammaticEvidenceService,
     build_unit_preview,
-    detect_risk_hints,
     estimate_tokens,
 )
 
@@ -337,9 +336,9 @@ def test_supported_and_unsupported_diff_files_are_isolated(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_total_budget_exhaustion_keeps_high_priority_units(tmp_path: Path) -> None:
+async def test_total_budget_exhaustion_skips_tail_in_frozen_order(tmp_path: Path) -> None:
     # Two files of ~3300 tokens each: total ~6600 exceeds the 5746 budget, so
-    # the lowest priority chunks are recorded as budget_exhausted.
+    # the tail of the frozen order is recorded as budget_exhausted.
     first = "\n".join(
         f"def login_{index}(token):\n    return verify(token)\n" for index in range(300)
     )
@@ -356,8 +355,12 @@ async def test_total_budget_exhaustion_keeps_high_priority_units(tmp_path: Path)
     assert result.accepted_tokens <= 5746
     reasons = {skip.reason for skip in result.skipped}
     assert "budget_exhausted" in reasons
-    # High-priority login chunks survive budget filtering.
-    assert any("login" in unit.matched for unit in result.units)
+    # The cut is positional: the retained units are a prefix of the frozen
+    # order, so the first file's leading chunks survive and the tail is skipped.
+    assert result.units[0].path == "auth.py"
+    assert [unit.unit_id for unit in result.units] == [
+        f"ev-{index:03d}" for index in range(1, len(result.units) + 1)
+    ]
 
 
 @pytest.mark.asyncio
@@ -547,18 +550,20 @@ async def test_small_chunk_preview_keeps_full_text(tmp_path: Path) -> None:
     unit = result.units[0]
     assert unit.preview == text
     assert unit.preview_coverage == "full chunk lines 1-2"
-    # The path "auth.py" and the code both contribute risk hints to the manifest.
-    assert "- risk_hints: security:auth, security:token" in result.context
+    # The manifest carries query hits and coverage as plain metadata and no
+    # program-generated risk signal of any kind.
+    assert "- matched: login, token" in result.context
+    assert "risk_hints" not in result.context
     assert "- preview_coverage: full chunk lines 1-2" in result.context
 
 
-def test_mid_size_chunk_sampling_keeps_risk_line_without_premature_truncation() -> None:
+def test_mid_size_chunk_sampling_keeps_query_line_without_premature_truncation() -> None:
     # 600 < len(text) <= 3000: sampling may exceed the 600 target.
     text = "\n".join(
         [
             "def handler(payload):",
             *[f"    value_{index} = compute_{index}(payload)" for index in range(30)],
-            "    api_token = load_secret()",
+            "    payload_secret = load_secret()",
             *[f"    tail_{index} = finalize_{index}(payload)" for index in range(30)],
             "    return payload",
         ]
@@ -566,11 +571,16 @@ def test_mid_size_chunk_sampling_keeps_risk_line_without_premature_truncation() 
     assert 600 < len(text) <= 3_000
 
     preview, coverage = build_unit_preview(
-        text, kind="function", start_line=10, query_terms=set(), target_chars=600, hard_limit=3_000
+        text,
+        kind="function",
+        start_line=10,
+        query_terms={"payload_secret"},
+        target_chars=600,
+        hard_limit=3_000,
     )
 
-    # The mid-chunk risk line and its local window survive sampling.
-    assert "api_token = load_secret()" in preview
+    # The mid-chunk query hit and its local window survive sampling.
+    assert "payload_secret = load_secret()" in preview
     assert "... omitted lines" in preview
     assert len(preview) <= 3_000
     assert "(truncated)" not in preview  # no premature hard truncation at 600
@@ -583,7 +593,7 @@ def test_oversized_chunk_is_trimmed_by_priority_with_omission_ranges() -> None:
         [
             "def handler(payload):",
             *[f"    value_{index} = compute_{index}(payload)" for index in range(250)],
-            "    password = load_secret()",
+            "    payload_secret = load_secret()",
             *[f"    tail_{index} = finalize_{index}(payload)" for index in range(250)],
             "    return payload",
         ]
@@ -591,13 +601,19 @@ def test_oversized_chunk_is_trimmed_by_priority_with_omission_ranges() -> None:
     assert len(text) > 3_000
 
     preview, coverage = build_unit_preview(
-        text, kind="function", start_line=1, query_terms=set(), target_chars=600, hard_limit=3_000
+        text,
+        kind="function",
+        start_line=1,
+        query_terms={"payload_secret"},
+        target_chars=600,
+        hard_limit=3_000,
     )
 
     assert len(preview) <= 3_000
-    # Priority trim still keeps the signature and the risk line.
+    # Priority trim keeps the signature; the query hit is ranked below it but
+    # above filler, so it survives the first drop pass.
     assert preview.startswith("def handler(payload):")
-    assert "password = load_secret()" in preview
+    assert "payload_secret = load_secret()" in preview
     assert "... omitted lines" in preview
     assert "chunk lines 1-" in coverage
 
@@ -617,14 +633,14 @@ def test_single_line_preview_respects_hard_limit() -> None:
     assert preview.endswith("\n... (preview truncated)")
 
 
-def test_risk_line_in_chunk_middle_includes_local_context_window() -> None:
+def test_query_hit_in_chunk_middle_includes_local_context_window() -> None:
     text = "\n".join(
         [
             "def handler(payload):",
             *[f"    filler_{index} = step(index)" for index in range(40)],
-            "    csrf_token = rotate()",
+            "    audit_token = rotate()",
             "    before = payload",
-            "    after = csrf_token",
+            "    after = audit_token",
             "    after2 = payload",
             *[f"    more_{index} = step(index)" for index in range(40)],
             "    return payload",
@@ -632,14 +648,19 @@ def test_risk_line_in_chunk_middle_includes_local_context_window() -> None:
     )
 
     preview, _coverage = build_unit_preview(
-        text, kind="function", start_line=1, query_terms=set(), target_chars=600, hard_limit=3_000
+        text,
+        kind="function",
+        start_line=1,
+        query_terms={"audit_token"},
+        target_chars=600,
+        hard_limit=3_000,
     )
 
     preview_lines = preview.splitlines()
-    hit_index = next(index for index, line in enumerate(preview_lines) if "csrf_token = rotate()" in line)
-    # The ±2 window lines around the risk hit are kept alongside it.
+    hit_index = next(index for index, line in enumerate(preview_lines) if "audit_token = rotate()" in line)
+    # The ±2 window lines around the query hit are kept alongside it.
     assert "before = payload" in preview_lines[hit_index + 1]
-    assert "after = csrf_token" in preview_lines[hit_index + 2]
+    assert "after = audit_token" in preview_lines[hit_index + 2]
 
 
 def test_diff_preview_keeps_hunk_headers_and_changed_lines() -> None:
@@ -675,7 +696,7 @@ def test_repo_preview_never_fabricates_diff_markers() -> None:
         [
             "def handler(payload):",
             *[f"    filler_{index} = step(index)" for index in range(80)],
-            "    csrf_token = rotate()",
+            "    audit_token = rotate()",
             *[f"    more_{index} = step(index)" for index in range(80)],
             "    return payload",
         ]
@@ -734,21 +755,8 @@ def test_diff_preview_coverage_aligns_with_hunk_new_file_lines() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Risk hints
+# Evidence metadata and ordering
 # ---------------------------------------------------------------------------
-
-
-def test_risk_hints_use_word_boundaries() -> None:
-    # auth must not match author / authenticate.
-    assert "security:auth" not in detect_risk_hints("def author(credential): pass")
-    assert "security:auth" not in detect_risk_hints("authenticated_user = get_user()")
-    assert "security:auth" in detect_risk_hints("def auth(user): pass")
-    # sql/path style false positives stay silent (not hint terms at all).
-    assert detect_risk_hints("mysql_query(xpath_expr)") == ()
-    # Real hits are detected, including snake_case identifiers.
-    hints = detect_risk_hints("password = get_password()\napi_router = Router()\n")
-    assert "security:password" in hints
-    assert "entrypoint:router" in hints
 
 
 @pytest.mark.asyncio
@@ -759,12 +767,11 @@ async def test_matched_keeps_only_query_hit_words(tmp_path: Path) -> None:
 
     unit = result.units[0]
     assert unit.matched == ["login"]
-    assert "security:password" in unit.risk_hints
     assert not any(tag.startswith("risk:") for tag in unit.tags)
     assert unit.tags == ()  # whole-file direct unit carries no relation tags
 
 
-def test_risk_hints_stay_independent_from_relation_tags(tmp_path: Path) -> None:
+def test_annotate_unit_keeps_relation_tags_independent(tmp_path: Path) -> None:
     from nanoreview.review.planning.preprocessor import (
         CodeUnit,
         EvidenceBudget,
@@ -795,35 +802,52 @@ def test_risk_hints_stay_independent_from_relation_tags(tmp_path: Path) -> None:
             unit_id="ev-001",
         )
     ]
-    service._score_unit(mains[0], {"login"}, [])
+    service._annotate_unit(mains[0], {"login"})
 
     related = service._supplement_related(
         mains, files=files, inventory=inventory, budgets=budgets, include_tests=True, related_tests=True
     )
 
-    # Main unit: risk clues in risk_hints, tags untouched. The path signal
-    # "src/app.py" also yields the entrypoint:handler hint by design.
-    assert mains[0].risk_hints == ("security:token", "entrypoint:handler")
+    # Main unit carries only the query hit; nothing tags it with a risk label.
+    assert mains[0].matched == ["login"]
     assert mains[0].tags == ()
     # Related unit: relation tags only, no risk labels.
     assert related[0].tags[:2] == ("related", "caller")
     assert not any(tag.startswith("risk:") for tag in related[0].tags)
-    assert related[0].risk_hints == ()
 
 
 @pytest.mark.asyncio
-async def test_chunks_without_risk_hints_still_reach_planner(tmp_path: Path) -> None:
-    # Plain code with no risk terms still produces units and manifest entries.
+async def test_chunks_without_query_hits_still_reach_planner(tmp_path: Path) -> None:
+    # Plain code with no query hits still produces units and manifest entries.
     _write(tmp_path / "plain.py", "def compute(value):\n    return value * 2\n")
 
     result = await ProgrammaticEvidenceService(tmp_path).retrieve(_request(query="compute"))
 
     assert result.units
     unit = result.units[0]
-    assert unit.risk_hints == ()
     assert unit.matched == ["compute"]
     assert "plain.py" in result.context
-    assert "- risk_hints: none" in result.context
+    assert "- matched: compute" in result.context
+
+
+@pytest.mark.asyncio
+async def test_evidence_order_is_frozen_and_not_risk_ranked(tmp_path: Path) -> None:
+    """A risky-looking file must not jump ahead of an earlier plain file.
+
+    Ordering is the frozen diff order (file order, then line order); nothing in
+    preprocessing re-ranks evidence by risk keywords or query hits.
+    """
+    _write(tmp_path / "aaa_plain.py", "def compute(value):\n    return value\n")
+    _write(tmp_path / "zzz_auth.py", "def login(password, token):\n    return token\n")
+
+    result = await ProgrammaticEvidenceService(tmp_path).retrieve(_request(query="login"))
+
+    assert [entry.path for entry in result.inventory] == [
+        "aaa_plain.py",
+        "zzz_auth.py",
+    ]
+    assert [unit.path for unit in result.units] == ["aaa_plain.py", "zzz_auth.py"]
+    assert [unit.unit_id for unit in result.units] == ["ev-001", "ev-002"]
 
 
 def test_manifest_keeps_single_budget_truncation() -> None:

@@ -90,17 +90,25 @@ def render_review_report(
     target_name: str,
     dimensions: list[ReviewDimensionResult],
     *,
-    routing_mode: str = "explicit",
+    mode: str = "special",
     selected_dimensions: tuple[str, ...] | list[str] = (),
     skipped_files: tuple[FileSkipSummary, ...] | list[FileSkipSummary] = (),
     judge_stats: ReviewJudgeStats | None = None,
+    planner_summary: str = "",
 ) -> str:
-    """Render final Markdown report from validated dimension results."""
+    """Render final Markdown report from validated dimension results.
+
+    ``planner_summary`` is a bounded, program-generated sentence explaining a run
+    that dispatched no reviewer on purpose (every evidence unit dismissed or left
+    unexamined). It replaces the "no dimension results" gap wording; planner
+    decisions and risk levels still never appear as findings.
+    """
     confirmed = collect_confirmed_findings(dimensions)
     all_accepted = [finding for _, finding in confirmed]
     all_uncertain = _collect_uncertain(dimensions)
     all_rejected = _collect_rejected(dimensions)
 
+    planned_no_reviewers = bool(planner_summary) and not dimensions
     stats = _severity_stats(all_accepted)
     incomplete = bool(skipped_files) or _has_incomplete_checks(dimensions)
     summary = _build_summary(
@@ -109,12 +117,21 @@ def render_review_report(
         uncertain_count=len(all_uncertain),
         rejected_count=len(all_rejected),
         incomplete=incomplete,
+        planned_no_reviewers=planned_no_reviewers,
     )
 
     sections: list[str] = []
     sections.append(f"## Code Review Report: {_escape_markdown_inline(target_name)}\n")
     sections.append(f"### Executive Summary\n\n{summary}\n")
-    sections.append(_render_selected_reviewers(routing_mode, selected_dimensions))
+    sections.append(_render_selected_reviewers(mode, selected_dimensions))
+    if planned_no_reviewers:
+        sections.append(
+            "### Triage Outcome\n\n"
+            f"{_escape_markdown_inline(planner_summary)}\n\n"
+            "No reviewer was dispatched, so this report contains no findings. "
+            "Re-run the review with an explicit dimension selection to force a "
+            "reviewer over this change.\n"
+        )
     if skipped_files:
         sections.append(_render_skipped_files(skipped_files))
     sections.append(_render_findings(
@@ -122,8 +139,11 @@ def render_review_report(
         uncertain_count=len(all_uncertain),
         rejected_count=len(all_rejected),
         incomplete=incomplete,
+        planned_no_reviewers=planned_no_reviewers,
     ))
-    sections.append(_render_checks_performed(dimensions))
+    sections.append(_render_checks_performed(
+        dimensions, planned_no_reviewers=planned_no_reviewers
+    ))
     if judge_stats is not None:
         sections.append(_render_judge_stats(judge_stats))
     if all_uncertain:
@@ -135,6 +155,7 @@ def render_review_report(
         uncertain_count=len(all_uncertain),
         rejected_count=len(all_rejected),
         incomplete=incomplete,
+        planned_no_reviewers=planned_no_reviewers,
     ))
     return "\n".join(sections)
 
@@ -206,9 +227,12 @@ def _build_summary(
     uncertain_count: int = 0,
     rejected_count: int = 0,
     incomplete: bool = False,
+    planned_no_reviewers: bool = False,
 ) -> str:
     total = sum(stats.values())
     if total == 0:
+        if planned_no_reviewers:
+            return "No reviewer was dispatched: planning dismissed or left unexamined every evidence unit."
         if incomplete:
             return "Review incomplete. Some checks could not access enough evidence to produce a reliable result."
         if uncertain_count:
@@ -240,8 +264,11 @@ def _render_findings(
     uncertain_count: int = 0,
     rejected_count: int = 0,
     incomplete: bool = False,
+    planned_no_reviewers: bool = False,
 ) -> str:
     if not findings:
+        if planned_no_reviewers:
+            return "### Findings\n\nNo reviewer was dispatched, so no finding was produced by this run.\n"
         if incomplete:
             return "### Findings\n\nReview incomplete; no reliable finding set was produced.\n"
         if uncertain_count:
@@ -286,11 +313,11 @@ def _render_findings(
 
 
 def _render_selected_reviewers(
-    routing_mode: str,
+    mode: str,
     selected_dimensions: tuple[str, ...] | list[str],
 ) -> str:
     lines = ["### Selected Reviewers\n"]
-    lines.append(f"- Routing: {_escape_markdown_inline(routing_mode)}")
+    lines.append(f"- Mode: {_escape_markdown_inline(mode)}")
     for dimension in selected_dimensions:
         profile = get_reviewer_profile(dimension)
         label = profile.label if profile is not None else dimension
@@ -314,10 +341,19 @@ def _render_skipped_files(skipped: tuple[FileSkipSummary, ...] | list[FileSkipSu
     return "\n".join(lines)
 
 
-def _render_checks_performed(dims: list[ReviewDimensionResult]) -> str:
+def _render_checks_performed(
+    dims: list[ReviewDimensionResult],
+    *,
+    planned_no_reviewers: bool = False,
+) -> str:
     lines = ["### Checks Performed\n"]
     if not dims:
-        lines.append("- [ ] review - incomplete: no review dimension results were produced")
+        # A deliberate no-reviewer outcome is not a failed check: reporting it
+        # as "incomplete" would contradict the triage-outcome section above.
+        if planned_no_reviewers:
+            lines.append("- [ ] review - no reviewer was dispatched by planning")
+        else:
+            lines.append("- [ ] review - incomplete: no review dimension results were produced")
         lines.append("")
         return "\n".join(lines)
     for d in dims:
@@ -389,9 +425,17 @@ def _render_recommendations(
     uncertain_count: int = 0,
     rejected_count: int = 0,
     incomplete: bool = False,
+    planned_no_reviewers: bool = False,
 ) -> str:
     lines = ["### Recommendations\n"]
     if not findings:
+        if planned_no_reviewers:
+            lines.append(
+                "1. No reviewer ran because planning dismissed or left unexamined "
+                "every evidence unit. Re-run with an explicit dimension selection "
+                "if you want this change reviewed anyway.\n"
+            )
+            return "\n".join(lines)
         if incomplete:
             lines.append("1. Re-run the review after the missing evidence or failed checks are resolved.\n")
             return "\n".join(lines)

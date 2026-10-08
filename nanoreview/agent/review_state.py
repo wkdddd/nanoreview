@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         ReviewAssignment,
         ReviewEvidenceBundle,
         ReviewPlan,
+        ReviewTriageSummary,
     )
 
 # Serialized artifact size limit, mirroring the shared media upload guard.
@@ -171,6 +172,11 @@ class ReviewRunState:
     skipped_files: list[str] = field(default_factory=list)
     #: Budgeted planner manifest statistics (version/budget/retained/omitted).
     manifest_stats: dict[str, Any] = field(default_factory=dict)
+    #: Planner triage audit: decisions, per-evidence coverage (assigned /
+    #: dismissed / unexamined) and each dimension's assigned scope. Persisted
+    #: for troubleshooting and evaluation only — it never becomes report
+    #: findings or a Judge input.
+    triage: "ReviewTriageSummary | None" = None
 
     def enter_phase(self, phase: ReviewPhase) -> None:
         if self.status is not ReviewRunStatus.RUNNING:
@@ -460,6 +466,7 @@ def _coverage_payload(state: ReviewRunState) -> dict[str, Any]:
         "changed_files": list(state.changed_files),
         "skipped_files": list(state.skipped_files),
         "manifest": dict(state.manifest_stats),
+        "triage": state.triage.snapshot_payload() if state.triage is not None else {},
         "reviewers": reviewers,
         "incomplete_dimensions": incomplete,
         "judge_batches": judge_batches,

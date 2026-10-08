@@ -24,6 +24,7 @@ def _reference(index: int, **overrides: object) -> EvidenceReference:
         "end_line": 10,
         "kind": "function",
         "token_count": 20,
+        "excerpt": f"def f{index}():\n    return {index}",
         "preview": f"def f{index}():\n    return {index}",
     }
     payload.update(overrides)
@@ -72,7 +73,7 @@ def test_augment_returns_none_when_the_snapshot_is_missing(tmp_path) -> None:
 
 def test_manifest_snapshot_payload_records_layout_not_source() -> None:
     bundle = ReviewEvidenceBundle(
-        references=(_reference(1, matched=("token",), risk_hints=("security:token",)),)
+        references=(_reference(1, matched=("token",)),)
     )
     manifest = build_evidence_manifest(bundle)
 
@@ -81,13 +82,15 @@ def test_manifest_snapshot_payload_records_layout_not_source() -> None:
     assert payload["version"] == manifest.version
     assert payload["token_counter"] == manifest.token_counter
     assert payload["budget_tokens"] == manifest.budget_tokens
+    assert payload["input_mode"] == "direct"
     assert payload["retained"] == 1
     entry = payload["entries"][0]
     assert entry["id"] == "ev-001"
     assert entry["matched"] == ["token"]
-    assert entry["risk_hints"] == ["security:token"]
-    # The preview is summarized by length, never copied verbatim.
-    assert entry["preview_chars"] == len(manifest.entries[0].preview)
+    assert "risk_hints" not in entry
+    # The inlined content is summarized by length, never copied verbatim.
+    assert entry["content_chars"] == len(manifest.entries[0].content)
+    assert "content" not in entry
     assert "preview" not in entry
 
 

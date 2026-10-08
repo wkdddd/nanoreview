@@ -84,9 +84,10 @@ class ReviewFinalizer:
         *,
         allowed_dimensions: list[str] | set[str] | None = None,
         local_target: str | None = None,
-        routing_mode: str = "explicit",
+        mode: str = "special",
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
         skipped_files: list[FileSkipSummary] | tuple[FileSkipSummary, ...] = (),
+        planner_summary: str = "",
     ) -> None:
         self._workspace = workspace
         self._changed_files = list(changed_files or [])
@@ -100,9 +101,13 @@ class ReviewFinalizer:
         self._dimensions: list[ReviewDimensionResult] = []
         self._errors: list[str] = []
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
-        self._routing_mode = routing_mode
+        self._mode = mode
         self._selected_dimensions = tuple(selected_dimensions or ())
         self._skipped_files = tuple(skipped_files)
+        #: Bounded explanation rendered when planning deliberately dispatched no
+        #: reviewer. An empty value means "reviewers were expected", so a report
+        #: with no dimension results is a real gap rather than a triage outcome.
+        self._planner_summary = planner_summary
         self._judge_stats: ReviewJudgeStats | None = None
 
     def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
@@ -413,8 +418,15 @@ class ReviewFinalizer:
             dimension.judged = judged
 
     def finalize(self, target_name: str) -> ReviewFinalizerResult:
-        """Produce final report markdown from all ingested dimensions."""
-        if not self._dimensions:
+        """Produce final report markdown from all ingested dimensions.
+
+        A run with no dimension results is only an error when reviewers were
+        expected. When planning finished with no assignments (every evidence
+        unit dismissed or left unexamined), the report states that outcome
+        explicitly instead of claiming the review failed to run.
+        """
+        planned_no_reviewers = self._planner_summary and not self._dimensions
+        if not self._dimensions and not planned_no_reviewers:
             self._errors.append("No review dimension results were produced.")
         self._apply_judged_defaults()
         needs_confirmation = self.get_needs_confirmation()
@@ -422,10 +434,11 @@ class ReviewFinalizer:
             report = render_review_report(
                 target_name,
                 self._dimensions,
-                routing_mode=self._routing_mode,
+                mode=self._mode,
                 selected_dimensions=self._selected_dimensions,
                 skipped_files=self._skipped_files,
                 judge_stats=self._judge_stats,
+                planner_summary=self._planner_summary,
             )
         except Exception as exc:
             logger.error("report rendering failed: {}", exc)
