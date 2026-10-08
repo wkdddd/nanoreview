@@ -49,6 +49,11 @@ class ProviderSpec:
 
     # gateway behavior
     strip_model_prefix: bool = False  # strip "provider/" before sending to gateway
+    # strip only when the first model segment matches one of these routing
+    # prefixes, keeping the rest of the ID intact. Needed for providers whose
+    # model IDs contain a namespace, e.g. ModelScope's "Qwen/Qwen3-32B":
+    # "modelscope/Qwen/Qwen3-32B" → "Qwen/Qwen3-32B".
+    strip_model_prefixes: tuple[str, ...] = ()
     supports_max_completion_tokens: bool = False
 
     # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
@@ -272,6 +277,21 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="DashScope",
         backend="openai_compat",
         default_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        thinking_style="enable_thinking",
+    ),
+    # ModelScope (魔搭社区): OpenAI-compatible API-Inference gateway.
+    # Model IDs keep their "Namespace/model" form (e.g. "Qwen/Qwen3-32B"); a
+    # leading "modelscope/" routing prefix is stripped before the request.
+    ProviderSpec(
+        name="modelscope",
+        keywords=("modelscope",),
+        env_key="MODELSCOPE_API_KEY",
+        display_name="ModelScope",
+        backend="openai_compat",
+        is_gateway=True,
+        detect_by_base_keyword="modelscope",
+        default_api_base="https://api-inference.modelscope.cn/v1",
+        strip_model_prefixes=("modelscope",),
         thinking_style="enable_thinking",
     ),
     # Moonshot (月之暗面): Kimi K2.5 / K2.6 enforce temperature >= 1.0.

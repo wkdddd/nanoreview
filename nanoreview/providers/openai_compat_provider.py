@@ -41,6 +41,12 @@ from nanoreview.providers.openai_responses import (
 if TYPE_CHECKING:
     from nanoreview.providers.registry import ProviderSpec
 
+
+def _provider_prefix_key(name: str) -> str:
+    """Normalize a routing prefix so "modelscope" == "model-scope" == "model_scope"."""
+    return name.replace("-", "_").lower()
+
+
 _ALLOWED_MSG_KEYS = frozenset({
     "role", "content", "tool_calls", "tool_call_id", "name",
     "reasoning_content", "extra_content",
@@ -492,6 +498,29 @@ class OpenAICompatProvider(LLMProvider):
         name = model_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
 
+    def _request_model_name(self, model_name: str) -> str:
+        """Resolve the model ID actually sent on the wire.
+
+        ``strip_model_prefix`` drops everything up to the last ``/`` (gateways
+        like AiHubMix that only accept bare names). ``strip_model_prefixes``
+        drops just a matching leading routing prefix, preserving namespaced IDs
+        such as ModelScope's ``Qwen/Qwen3-32B``.
+        """
+        spec = self._spec
+        if not spec or "/" not in model_name:
+            return model_name
+        if spec.strip_model_prefix:
+            return model_name.split("/")[-1]
+
+        route_prefixes = spec.strip_model_prefixes
+        if not route_prefixes:
+            return model_name
+        model_prefix, routed_model = model_name.split("/", 1)
+        model_prefix_key = _provider_prefix_key(model_prefix)
+        if any(_provider_prefix_key(prefix) == model_prefix_key for prefix in route_prefixes):
+            return routed_model
+        return model_name
+
     def _build_kwargs(
         self,
         messages: list[dict[str, Any]],
@@ -511,8 +540,7 @@ class OpenAICompatProvider(LLMProvider):
             if any(model_name.lower().startswith(k) for k in ("anthropic/", "claude")):
                 messages, tools = self._apply_cache_control(messages, tools)
 
-        if spec and spec.strip_model_prefix:
-            model_name = model_name.split("/")[-1]
+        model_name = self._request_model_name(model_name)
 
         kwargs: dict[str, Any] = {
             "model": model_name,
@@ -716,9 +744,7 @@ class OpenAICompatProvider(LLMProvider):
     ) -> dict[str, Any]:
         """Build a Responses API body for direct OpenAI requests."""
         _ = response_format
-        model_name = model or self.default_model
-        if self._spec and self._spec.strip_model_prefix:
-            model_name = model_name.split("/")[-1]
+        model_name = self._request_model_name(model or self.default_model)
         sanitized_messages = self._sanitize_messages(self._sanitize_empty_content(messages))
         instructions, input_items = convert_messages(sanitized_messages)
 
