@@ -332,7 +332,7 @@ def _render_skipped_files(skipped: tuple[FileSkipSummary, ...] | list[FileSkipSu
     lines = ["### Scope Not Reviewed\n"]
     lines.append(
         "The following files or line ranges were excluded from the review scope by preprocessing "
-        "(oversized units, unsupported code types, missing grammars, parse failures, or budget limits):\n"
+        "(filtered files, unavailable patches, oversized hunk units, or budget limits):\n"
     )
     for summary in skipped:
         # describe() renders the path plus unreviewed line ranges and reasons.

@@ -83,7 +83,7 @@ def _structured_result() -> ProgrammaticEvidenceResult:
             ),
         ],
         skipped=[
-            SkippedUnit(path="src/Legacy.java", reason="unsupported_code_type"),
+            SkippedUnit(path="src/logo.png", reason="binary_file"),
             SkippedUnit(path="src/big.py", reason="token_limit_exceeded", start_line=5, end_line=9),
             SkippedUnit(path="src/big.py", reason="budget_exhausted", start_line=10, end_line=20),
         ],
@@ -432,10 +432,10 @@ async def test_prefetch_aggregates_skipped_files_per_path() -> None:
     assert result.evidence is not None
     # Two skipped chunks of the same file aggregate into one summary entry.
     skipped_by_file = result.evidence.skipped_by_file()
-    assert set(skipped_by_file) == {"src/Legacy.java", "src/big.py"}
-    java_summary = skipped_by_file["src/Legacy.java"]
-    assert java_summary.whole_file is True
-    assert java_summary.reasons == ("unsupported_code_type",)
+    assert set(skipped_by_file) == {"src/logo.png", "src/big.py"}
+    whole_file_summary = skipped_by_file["src/logo.png"]
+    assert whole_file_summary.whole_file is True
+    assert whole_file_summary.reasons == ("binary_file",)
     big_summary = skipped_by_file["src/big.py"]
     assert big_summary.whole_file is False
     assert big_summary.ranges == ((5, 9), (10, 20))

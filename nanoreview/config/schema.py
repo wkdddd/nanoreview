@@ -276,12 +276,10 @@ class ReviewConfig(Base):
     # Upper bound on accepted evidence tokens. The effective budget is also
     # clamped by the provider context window (see EvidenceBudget.from_options);
     # values above the usable window cannot widen it. ReviewLoop fixes the
-    # context window at 200k, giving a usable window of 171k and a 150k main
-    # evidence budget with a 37.5k related-evidence quarter.
+    # context window at 200k, giving a usable window of 171k and a 150k diff
+    # evidence budget.
     evidence_token_budget: int = Field(default=150_000, ge=10_000)
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
-    prefetch_dense_backfill_limit: int = Field(default=256, ge=0)
-    subagent_evidence_budget_chars: int = Field(default=24_000, ge=4_000)
     # Per-unit planner preview budget: soft target and absolute ceiling.
     preview_target_chars: int = Field(default=600, ge=1)
     preview_hard_limit: int = Field(default=3_000, ge=1)

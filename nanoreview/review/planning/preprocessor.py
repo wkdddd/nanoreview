@@ -1,152 +1,46 @@
-"""Deterministic repository evidence pre-processing for review workflows.
+"""Deterministic diff evidence pre-processing for review workflows.
 
-Pipeline (per review target):
+Pipeline (per review run):
 
-1. **Inventory** — enumerate candidate files, classify each path as supported
-   code (Python/JavaScript/TypeScript/JSX/TSX), unsupported code, document or
-   config, and measure total size.
-2. **Scale assessment** — three-state decision driven by the remaining token
-   budget: small targets keep whole files/diffs directly, medium targets enter
-   semantic chunking, oversized targets are filtered per file/chunk.
-3. **Type/parse filtering** — unsupported code types and missing grammars are
-   recorded as skipped units; supported files are parsed with tree-sitter and
-   real syntax errors surface as standalone ``syntax_diagnostic`` evidence.
-4. **Semantic chunking** — chunks follow function/method/class/module
-   boundaries; oversized units are recursively split, tiny ones merged with
-   adjacent same-level units.
-5. **Related-context supplement** — at most one layer of import/export,
-   caller, config and test-related chunks is attached to accepted main chunks.
-6. **Budget filtering** — when the total exceeds the evidence budget, high
-   priority units are kept and the remainder is recorded as unreviewed.
+1. **Patch/hunk splitting** — a changed file whose patch is below
+   ``DIFF_UNIT_TOKEN_THRESHOLD`` stays one complete diff unit; at or above it
+   the patch is split at ``@@`` boundaries and an oversized hunk is skipped.
+2. **Query annotation** — the user's review-query hit words are recorded on
+   each unit as display metadata; they never order or route evidence.
+3. **Budget filtering** — units keep the frozen order; the ones that no longer
+   fit are recorded as unreviewed (a later, smaller unit may still be kept).
+4. **ID, preview and manifest** — stable ``ev-NNN`` IDs, one representative
+   preview per unit and the manifest text handed to the Planner.
 
-Every skipped file/chunk is reported with a reason so progress events and the
+Every changed path is processed: preprocessing makes no language decision, so
+a diff in a language without a bundled grammar is still reviewed as diff text.
+
+Preprocessing consumes the diff only: it never enumerates the repository,
+never reads whole source files and never parses ASTs. Reading a changed file's
+surrounding context is the reviewer's own restricted-scope job, and repository
+indexing belongs to the independent RAG module.
+
+Every skipped file/hunk is reported with a reason so progress events and the
 final report can show exactly what was not reviewed.
 """
 
 from __future__ import annotations
 
-import asyncio
-import fnmatch
-import os
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 from loguru import logger
 
-from nanoreview.review.file_filter import (
-    DEFAULT_REVIEW_BINARY_EXTS,
-    DEFAULT_REVIEW_IGNORE_DIRS,
-    DEFAULT_REVIEW_IGNORE_GLOBS,
-    review_file_filter_reason,
-)
-
 # ---------------------------------------------------------------------------
-# File classification
+# Query term extraction
 # ---------------------------------------------------------------------------
 
-#: Code languages the preprocessor can parse with tree-sitter.
-SUPPORTED_SUFFIXES: dict[str, str] = {
-    ".py": "python",
-    ".js": "javascript",
-    ".mjs": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".tsx": "tsx",
-}
-
-#: Code files outside the supported language set. They never fall back to a
-#: line-window; they are skipped with ``unsupported_code_type``.
-KNOWN_CODE_SUFFIXES: frozenset[str] = frozenset(
-    {
-        ".go", ".rs", ".java", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp",
-        ".cs", ".rb", ".kt", ".swift", ".scala", ".php", ".vue", ".svelte",
-        ".sh", ".bash", ".zsh", ".ps1", ".bat", ".sql", ".css", ".scss",
-        ".less", ".html", ".htm", ".m", ".mm", ".dart", ".ex", ".exs",
-        ".erl", ".hs", ".clj", ".lua", ".pl", ".r", ".jl",
-    }
-)
-
-DOCUMENT_SUFFIXES: frozenset[str] = frozenset({".md", ".txt", ".rst", ".adoc", ".org"})
-CONFIG_SUFFIXES: frozenset[str] = frozenset(
-    {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".xml", ".properties", ".editorconfig"}
-)
-
-# ---------------------------------------------------------------------------
-# Grammar registry (loaded on demand; missing packs degrade per file)
-# ---------------------------------------------------------------------------
-
-_GRAMMAR_LOADERS: dict[str, str] = {
-    "python": "tree_sitter_python:language",
-    "javascript": "tree_sitter_javascript:language",
-    "typescript": "tree_sitter_typescript:language_typescript",
-    "tsx": "tree_sitter_typescript:language_tsx",
-}
-
-_DEFINITION_TYPES: dict[str, frozenset[str]] = {
-    "python": frozenset({"function_definition", "class_definition"}),
-    "javascript": frozenset(
-        {"function_declaration", "class_declaration", "method_definition", "arrow_function"}
-    ),
-    "typescript": frozenset(
-        {"function_declaration", "class_declaration", "method_definition", "arrow_function"}
-    ),
-    "tsx": frozenset(
-        {"function_declaration", "class_declaration", "method_definition", "arrow_function"}
-    ),
-}
-
-#: Statement-level node types used when a definition must be split further.
-_STATEMENT_TYPES: dict[str, frozenset[str]] = {
-    "python": frozenset(
-        {
-            "function_definition", "class_definition", "decorated_definition",
-            "expression_statement", "if_statement", "for_statement",
-            "while_statement", "try_statement", "with_statement", "assignment",
-        }
-    ),
-    "javascript": frozenset(
-        {
-            "function_declaration", "class_declaration", "method_definition",
-            "expression_statement", "if_statement", "for_statement",
-            "while_statement", "try_statement", "variable_declaration",
-            "switch_statement", "export_statement",
-        }
-    ),
-    "typescript": frozenset(
-        {
-            "function_declaration", "class_declaration", "method_definition",
-            "expression_statement", "if_statement", "for_statement",
-            "while_statement", "try_statement", "variable_declaration",
-            "switch_statement", "export_statement",
-        }
-    ),
-    "tsx": frozenset(
-        {
-            "function_declaration", "class_declaration", "method_definition",
-            "expression_statement", "if_statement", "for_statement",
-            "while_statement", "try_statement", "variable_declaration",
-            "switch_statement", "export_statement",
-        }
-    ),
-}
-
-_NAME_NODE_TYPES = frozenset({"identifier", "name", "property_identifier", "type_identifier"})
-
-#: Wrapper nodes holding the statement body of a definition; used when an
-#: oversized single definition must be descended into for splitting.
-_BODY_WRAPPER_TYPES = frozenset({"block", "statement_block", "function_body", "declaration_list"})
-
-#: User review-query hit words extracted from a chunk. This is plain evidence
+#: User review-query hit words extracted from a unit. This is plain evidence
 #: metadata for display; it never routes or orders evidence, and the review
 #: pipeline decides purely from the frozen diff the planner actually reads.
 _TERM_RE = re.compile(r"[A-Za-z0-9_]{2,}")
-
-# Import/export target patterns used by the related-context supplement.
-_PY_IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+([\w.]+)", re.MULTILINE)
-_JS_IMPORT_RE = re.compile(r"""(?:from\s+|require\(\s*|import\s+)["']([^"']+)["']""")
 
 # ---------------------------------------------------------------------------
 # Token budget accounting
@@ -154,31 +48,21 @@ _JS_IMPORT_RE = re.compile(r"""(?:from\s+|require\(\s*|import\s+)["']([^"']+)["'
 
 #: Static reservations subtracted from the provider context window before any
 #: evidence token caps are derived (system prompt, tool descriptions, output
-#: reserve). Keeps direct/chunk/task caps conservative.
+#: reserve). Keeps direct caps conservative.
 SYSTEM_PROMPT_TOKENS = 2_000
 TOOL_DESCRIPTIONS_TOKENS = 3_000
 OUTPUT_RESERVE_TOKENS = 4_000
 SAFETY_MARGIN_RATIO = 0.10
 
 #: Hard clamps for derived caps.
-MIN_CHUNK_TOKENS = 400
-MAX_CHUNK_TOKENS = 4_000
+MIN_DIRECT_UNIT_TOKENS = 1_600
 MIN_USABLE_TOKENS = 1_000
 
 #: Per-file diff unit threshold. A changed file whose patch is below this many
-#: tokens is kept as one complete diff unit; at or above it the existing
-#: hunk-splitting strategy applies. Judged per file, so a large target does not
-#: force every small changed file into hunks.
+#: tokens is kept as one complete diff unit; at or above it the hunk-splitting
+#: strategy applies. Judged per file, so a large target does not force every
+#: small changed file into hunks.
 DIFF_UNIT_TOKEN_THRESHOLD = 8_000
-
-#: Appended to a file clipped at ``ProgrammaticEvidenceOptions.max_file_chars``
-#: so its evidence can never be described as the complete file.
-TRUNCATION_MARKER = "\n... (file truncated at max_file_chars) ..."
-
-#: Fixed context lines prepended/appended to semantic chunk text. Overlap is
-#: comprehension context only; canonical start/end lines (and therefore the
-#: authorized review scope) never widen because of it.
-OVERLAP_CONTEXT_LINES = 10
 
 
 def estimate_tokens(text: str) -> int:
@@ -193,16 +77,12 @@ class EvidenceBudget:
     usable_input_tokens: int
     evidence_budget_tokens: int
     direct_cap_tokens: int
-    chunk_cap_tokens: int
-    task_cap_tokens: int
-    related_budget_tokens: int
 
     @classmethod
     def from_options(
         cls,
         *,
         evidence_token_budget: int,
-        subagent_evidence_budget_chars: int,
         context_window_tokens: int | None,
     ) -> "EvidenceBudget":
         window = context_window_tokens or 65_536
@@ -226,20 +106,12 @@ class EvidenceBudget:
             evidence_token_budget,
             usable,
         )
-        # Per-subagent evidence task cap (chars -> tokens).
-        task_cap = max(MIN_CHUNK_TOKENS // 2, subagent_evidence_budget_chars // 4)
-        task_cap = min(task_cap, usable)
-        # A single chunk should leave room for sibling chunks in one task.
-        chunk_cap = max(MIN_CHUNK_TOKENS, min(task_cap // 2, MAX_CHUNK_TOKENS))
-        # Small targets below this stay whole-file (direct mode).
-        direct_cap = min(evidence_budget, max(4 * MIN_CHUNK_TOKENS, usable // 4))
+        # Small diffs below this stay in direct mode (whole evidence inlined).
+        direct_cap = min(evidence_budget, max(MIN_DIRECT_UNIT_TOKENS, usable // 4))
         return cls(
             usable_input_tokens=usable,
             evidence_budget_tokens=evidence_budget,
             direct_cap_tokens=direct_cap,
-            chunk_cap_tokens=chunk_cap,
-            task_cap_tokens=task_cap,
-            related_budget_tokens=max(MIN_CHUNK_TOKENS, evidence_budget // 4),
         )
 
 
@@ -250,22 +122,12 @@ class EvidenceBudget:
 
 @dataclass(slots=True)
 class ProgrammaticEvidenceOptions:
-    max_files: int = 2000
-    max_file_chars: int = 80_000
-    max_results: int = 8
-    snippet_lines: int = 8
-    include_tests: bool = True
-    binary_extensions: set[str] = field(default_factory=lambda: set(DEFAULT_REVIEW_BINARY_EXTS))
-    ignore_dirs: set[str] = field(default_factory=lambda: set(DEFAULT_REVIEW_IGNORE_DIRS))
-    ignore_globs: tuple[str, ...] = DEFAULT_REVIEW_IGNORE_GLOBS
     # Budget knobs mirrored from ReviewConfig so callers can inject config.
     evidence_token_budget: int = 100_000
     prefetch_budget_chars: int = 16_000
-    subagent_evidence_budget_chars: int = 24_000
-    prefetch_dense_backfill_limit: int = 256
     context_window_tokens: int | None = 65_536
     # Per-unit planner preview budget: ``preview_target_chars`` is a soft goal
-    # (mid-size chunks may exceed it), ``preview_hard_limit`` is the absolute
+    # (mid-size units may exceed it), ``preview_hard_limit`` is the absolute
     # per-preview ceiling. The overall manifest cap stays prefetch_budget_chars.
     preview_target_chars: int = 600
     preview_hard_limit: int = 3_000
@@ -285,8 +147,6 @@ class ProgrammaticEvidenceOptions:
         for name, attr in (
             ("evidence_token_budget", "evidence_token_budget"),
             ("prefetch_budget_chars", "prefetch_budget_chars"),
-            ("subagent_evidence_budget_chars", "subagent_evidence_budget_chars"),
-            ("prefetch_dense_backfill_limit", "prefetch_dense_backfill_limit"),
             ("preview_target_chars", "preview_target_chars"),
             ("preview_hard_limit", "preview_hard_limit"),
         ):
@@ -299,24 +159,11 @@ class ProgrammaticEvidenceOptions:
 
 
 @dataclass(slots=True)
-class ProgrammaticEvidenceRequest:
-    source_type: str
-    review_query: str
-    max_results: int | None = None
-    files: Iterable[Path] | None = None
-    include_tests: bool | None = None
-    related_tests: bool = True
-    touched_lines: dict[str, list[int]] | None = None
-    trace_id: str = ""
-    context_window_tokens: int | None = None
-
-
-@dataclass(slots=True)
 class CodeUnit:
-    """One accepted processing unit (file, chunk, diff or diagnostic)."""
+    """One accepted diff processing unit."""
 
     path: str
-    kind: str  # file|module|class|function|diff|document|config|syntax_diagnostic
+    kind: str  # diff
     name: str = ""
     start_line: int = 1
     end_line: int = 1
@@ -328,13 +175,12 @@ class CodeUnit:
     # User review-query hit words only. Plain display metadata: it neither
     # routes nor orders evidence.
     matched: list[str] = field(default_factory=list)
-    # Non-risk relation/source labels: related, import, caller, test, symbol:*.
+    # Non-risk relation/source labels; no producer emits them for diff units.
     tags: tuple[str, ...] = ()
     # Representative planner preview plus the real lines it actually covers.
     preview: str = ""
     preview_coverage: str = ""
-    # First repository line covered by ``text``; None means ``start_line``.
-    # Diverges from start_line only when context overlap extended the text.
+    # First line covered by ``text``; None means ``start_line``.
     text_start_line: int | None = None
 
 
@@ -350,82 +196,13 @@ class SkippedUnit:
 
 
 @dataclass(slots=True)
-class InventoryEntry:
-    path: str
-    size_chars: int
-    file_class: str  # supported_code | unsupported_code | document | config | other
-    language: str | None = None
-
-
-@dataclass(slots=True)
 class ProgrammaticEvidenceResult:
     units: list[CodeUnit]
     skipped: list[SkippedUnit]
     context: str
-    mode: str = "chunked"  # direct | chunked | oversized
-    inventory: list[InventoryEntry] = field(default_factory=list)
+    mode: str = "direct"  # direct | oversized
     total_tokens: int = 0
     accepted_tokens: int = 0
-    cache_root: Path | None = None
-
-
-def classify_path(path: str) -> tuple[str, str | None]:
-    """Classify a repository path into a processing class and language."""
-    suffix = Path(path).suffix.lower()
-    if suffix in SUPPORTED_SUFFIXES:
-        return "supported_code", SUPPORTED_SUFFIXES[suffix]
-    if suffix in KNOWN_CODE_SUFFIXES:
-        return "unsupported_code", None
-    if suffix in DOCUMENT_SUFFIXES:
-        return "document", None
-    if suffix in CONFIG_SUFFIXES:
-        return "config", None
-    return "other", None
-
-
-class _GrammarRegistry:
-    """Lazy tree-sitter grammar loader with per-language availability."""
-
-    def __init__(self) -> None:
-        self._parsers: dict[str, Any] = {}
-        self._unavailable: set[str] = set()
-
-    def get_parser(self, language: str) -> Any | None:
-        if language in self._parsers:
-            return self._parsers[language]
-        if language in self._unavailable:
-            return None
-        spec = _GRAMMAR_LOADERS.get(language)
-        parser = None
-        if spec is not None:
-            parser = self._load(language, spec)
-        if parser is None:
-            self._unavailable.add(language)
-        else:
-            self._parsers[language] = parser
-        return parser
-
-    @staticmethod
-    def _load(language: str, spec: str) -> Any | None:
-        module_name, attr = spec.split(":", 1)
-        try:
-            import importlib
-
-            import tree_sitter
-
-            mod = importlib.import_module(module_name)
-            tree_language = tree_sitter.Language(getattr(mod, attr)())
-            return tree_sitter.Parser(tree_language)
-        except Exception as exc:  # noqa: BLE001 - grammar packs are optional
-            logger.debug("preprocessor.grammar_unavailable language={} reason={}", language, exc)
-            return None
-
-
-_GRAMMARS = _GrammarRegistry()
-
-
-def _safe_slug(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "repo"
 
 
 def preview_text(text: str, *, max_lines: int = 12, max_chars: int = 600) -> str:
@@ -524,9 +301,10 @@ def _preview_line_priorities(
     """Rank preview lines: 1 = must keep … 6 = filler the sampler drops.
 
     Diff previews keep hunk headers, every added/removed line (even mid-hunk),
-    change-adjacent context and signatures. Whole-repository previews keep
-    signatures, query hit lines, AST key-structure lines and the chunk edges.
-    Ranking is structural: nothing here infers risk or routes the review.
+    change-adjacent context and signatures. Plain-text previews (used only by
+    text-only evidence providers) keep signatures, query hit lines, structural
+    lines and the edges. Ranking is structural: nothing here infers risk or
+    routes the review.
     """
     priorities: list[int | None] = [None] * len(lines)
     terms = {term.lower() for term in query_terms if len(term) >= 2}
@@ -600,14 +378,13 @@ def build_unit_preview(
 ) -> tuple[str, str]:
     """Build a representative, line-annotated preview for one evidence unit.
 
-    Returns ``(preview, preview_coverage)``. Chunks at or below
-    ``target_chars`` keep their full text. Larger chunks are sampled by line
-    priority and may exceed the target up to ``hard_limit``, where the least
-    important lines are dropped and every skipped range is recorded with a
-    stable ``... omitted lines A-B ...`` marker plus a coverage description.
-    Diff previews use new-file line numbers; repository previews use real file
-    lines and never fabricate ``+``/``-`` diff markers. Related-role units stay
-    compact because they only supplement the authorized review scope.
+    Returns ``(preview, preview_coverage)``. Units at or below ``target_chars``
+    keep their full text. Larger units are sampled by line priority and may
+    exceed the target up to ``hard_limit``, where the least important lines are
+    dropped and every skipped range is recorded with a stable
+    ``... omitted lines A-B ...`` marker plus a coverage description.
+    Diff previews use new-file line numbers; text-only previews use the real
+    lines they were rendered from and never fabricate ``+``/``-`` markers.
     """
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     if not normalized.strip():
@@ -617,7 +394,7 @@ def build_unit_preview(
     last_line = start_line + len(lines) - 1
 
     if len(normalized) <= target_chars:
-        # Small chunks keep their full text; nothing is sampled or omitted.
+        # Small units keep their full text; nothing is sampled or omitted.
         if is_diff:
             hunks = _hunk_ranges(lines)
             coverage = "full patch"
@@ -644,7 +421,7 @@ def build_unit_preview(
         # Nothing ranked (e.g. a context-only patch): keep the leading lines.
         selected = set(range(min(8, len(lines))))
 
-    # Related context stays compact: it supplements, never widens, the scope.
+    # Supplementary context stays compact: it never widens the scope.
     budget = target_chars if role == "related" else hard_limit
 
     def assemble(sel: set[int], *, bridge: bool) -> tuple[str, list[tuple[int, int]]]:
@@ -706,151 +483,15 @@ def build_unit_preview(
 
 
 class ProgrammaticEvidenceService:
-    """Bounded, in-memory evidence selection with semantic chunking."""
+    """Bounded, deterministic diff evidence selection.
+
+    ``workspace`` is kept so callers can resolve the review root per scope; the
+    service itself never touches the working tree, it only transforms patches.
+    """
 
     def __init__(self, workspace: Path, options: ProgrammaticEvidenceOptions | None = None) -> None:
         self.workspace = workspace.expanduser().resolve()
         self.options = options or ProgrammaticEvidenceOptions()
-
-    # ------------------------------------------------------------------
-    # File enumeration (kept for evidence service scope resolution)
-    # ------------------------------------------------------------------
-
-    def iter_candidate_files(self, root: Path | None = None) -> Iterable[Path]:
-        base = (root or self.workspace).expanduser().resolve()
-        count = 0
-        for dirpath, dirnames, filenames in os.walk(base):
-            current = Path(dirpath)
-            rel_parts = current.relative_to(base).parts
-            if self._ignored_dirs(rel_parts):
-                dirnames[:] = []
-                continue
-            dirnames[:] = [name for name in dirnames if not self._ignored_dirs((*rel_parts, name))]
-            for filename in sorted(filenames):
-                if count >= self.options.max_files:
-                    return
-                path = current / filename
-                if self.is_ignored(path, base=base) or path.suffix.lower() in self.options.binary_extensions:
-                    continue
-                count += 1
-                yield path
-
-    def is_ignored(self, path: Path, *, base: Path | None = None) -> bool:
-        root = (base or self.workspace).resolve()
-        try:
-            rel = path.relative_to(root).as_posix()
-        except ValueError:
-            return True
-        return (
-            review_file_filter_reason(rel) is not None
-            or self._ignored_dirs(path.relative_to(root).parts)
-            or any(fnmatch.fnmatch(path.name, pattern) for pattern in self.options.ignore_globs)
-        )
-
-    def _ignored_dirs(self, parts: tuple[str, ...]) -> bool:
-        return bool(any(part in self.options.ignore_dirs for part in parts) or (parts and parts[0] == ".nanoreview"))
-
-    # ------------------------------------------------------------------
-    # Entry points
-    # ------------------------------------------------------------------
-
-    async def retrieve(self, request: ProgrammaticEvidenceRequest) -> ProgrammaticEvidenceResult:
-        """Run the full preprocessing pipeline off the event loop."""
-        return await asyncio.to_thread(self._retrieve_sync, request)
-
-    def _retrieve_sync(self, request: ProgrammaticEvidenceRequest) -> ProgrammaticEvidenceResult:
-        trace_id = request.trace_id or "preproc"
-        started = time.perf_counter()
-        budgets = EvidenceBudget.from_options(
-            evidence_token_budget=self.options.evidence_token_budget,
-            subagent_evidence_budget_chars=self.options.subagent_evidence_budget_chars,
-            context_window_tokens=request.context_window_tokens or self.options.context_window_tokens,
-        )
-        files = self._collect_files(request)
-        inventory = [
-            InventoryEntry(
-                path=rel,
-                size_chars=len(text),
-                file_class=file_class,
-                language=language,
-            )
-            for rel, text in files.items()
-            for file_class, language in (classify_path(rel),)
-        ]
-        total_tokens = sum(estimate_tokens(text) for text in files.values())
-        mode = self._assess_scale(total_tokens, budgets)
-        units: list[CodeUnit] = []
-        skipped: list[SkippedUnit] = []
-        for entry in inventory:
-            file_units, file_skipped = self._process_file(entry, files[entry.path], mode, budgets)
-            units.extend(file_units)
-            skipped.extend(file_skipped)
-        terms = self._query_terms(request.review_query)
-        for unit in units:
-            self._annotate_unit(unit, terms)
-
-        if mode == "direct":
-            mains = units
-        else:
-            mains, budget_skipped = self._apply_main_budget(units, budgets)
-            skipped.extend(budget_skipped)
-            # Hard guard against pathological chunk explosions. Overflow is cut
-            # from the tail of the frozen order so the retained set is a stable
-            # prefix instead of a risk-ranked selection.
-            if len(mains) > self.options.prefetch_dense_backfill_limit:
-                overflow = mains[self.options.prefetch_dense_backfill_limit :]
-                mains = mains[: self.options.prefetch_dense_backfill_limit]
-                skipped.extend(
-                    SkippedUnit(unit.path, "budget_exhausted", unit.start_line, unit.end_line, detail="unit limit")
-                    for unit in overflow
-                )
-
-        # Main IDs first so related units can reference their parent chunk.
-        mains, empty_overflow = self._assign_ids(mains, start=1)
-        skipped.extend(empty_overflow)
-        related: list[CodeUnit] = []
-        if mode != "direct":
-            related = self._supplement_related(
-                mains,
-                files=files,
-                inventory=inventory,
-                budgets=budgets,
-                include_tests=(
-                    request.include_tests
-                    if request.include_tests is not None
-                    else self.options.include_tests
-                ),
-                related_tests=request.related_tests,
-            )
-            related, _ = self._assign_ids(related, start=len(mains) + 1)
-        accepted = [*mains, *related]
-        # Rich previews are built once, after ID assignment, so both the
-        # manifest and the evidence bundle share the same sampled view.
-        for unit in accepted:
-            self._build_preview(unit, terms=terms)
-        result = ProgrammaticEvidenceResult(
-            units=accepted,
-            skipped=skipped,
-            context=self.render_manifest(accepted, skipped, budget_chars=self.options.prefetch_budget_chars),
-            mode=mode,
-            inventory=inventory,
-            total_tokens=total_tokens,
-            accepted_tokens=sum(unit.token_count for unit in accepted),
-        )
-        logger.info(
-            "preprocessor.retrieve.done trace_id={} mode={} files={} units={} related={} skipped={} "
-            "total_tokens={} accepted_tokens={} elapsed_ms={:.1f}",
-            trace_id,
-            mode,
-            len(inventory),
-            len(mains),
-            len(related),
-            len(skipped),
-            total_tokens,
-            result.accepted_tokens,
-            (time.perf_counter() - started) * 1000,
-        )
-        return result
 
     def diff_units(
         self,
@@ -862,24 +503,11 @@ class ProgrammaticEvidenceService:
         """Convert diff patches into bounded diff units with budget filtering."""
         budgets = EvidenceBudget.from_options(
             evidence_token_budget=self.options.evidence_token_budget,
-            subagent_evidence_budget_chars=self.options.subagent_evidence_budget_chars,
             context_window_tokens=context_window_tokens or self.options.context_window_tokens,
         )
         units: list[CodeUnit] = []
         skipped: list[SkippedUnit] = []
         for path, patch in patches.items():
-            # Unsupported code types never produce diff chunks; they are
-            # recorded as file-level skipped so reports explain the exclusion.
-            file_class, _ = classify_path(path)
-            if file_class == "unsupported_code":
-                skipped.append(
-                    SkippedUnit(
-                        path,
-                        "unsupported_code_type",
-                        detail=f"no parser for {Path(path).suffix}",
-                    )
-                )
-                continue
             units.extend(self._patch_units(path, patch, skipped))
         terms = self._query_terms(review_query)
         for unit in units:
@@ -900,369 +528,6 @@ class ProgrammaticEvidenceService:
             total_tokens=total_tokens,
             accepted_tokens=sum(unit.token_count for unit in units),
         )
-
-    # ------------------------------------------------------------------
-    # Stage helpers
-    # ------------------------------------------------------------------
-
-    def _collect_files(self, request: ProgrammaticEvidenceRequest) -> dict[str, str]:
-        files: dict[str, str] = {}
-        for path in request.files or self.iter_candidate_files():
-            try:
-                rel = path.relative_to(self.workspace).as_posix()
-                raw = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError, ValueError):
-                continue
-            # A file clipped at ``max_file_chars`` carries an explicit marker so
-            # its preview and coverage can never be read as a complete file.
-            if len(raw) > self.options.max_file_chars:
-                text = raw[: self.options.max_file_chars] + TRUNCATION_MARKER
-            else:
-                text = raw
-            if review_file_filter_reason(rel, text) is None:
-                files[rel] = text
-        return files
-
-    @staticmethod
-    def _assess_scale(total_tokens: int, budgets: EvidenceBudget) -> str:
-        if total_tokens <= budgets.direct_cap_tokens:
-            return "direct"
-        if total_tokens <= budgets.evidence_budget_tokens:
-            return "chunked"
-        return "oversized"
-
-    def _process_file(
-        self,
-        entry: InventoryEntry,
-        text: str,
-        mode: str,
-        budgets: EvidenceBudget,
-    ) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        if entry.file_class == "unsupported_code":
-            return [], [
-                SkippedUnit(
-                    entry.path,
-                    "unsupported_code_type",
-                    detail=f"no parser for {Path(entry.path).suffix}",
-                )
-            ]
-        if entry.file_class == "supported_code" and mode != "direct":
-            return self._parse_and_chunk(entry, text, budgets)
-        # Direct mode and auxiliary files: keep the whole file after the safety
-        # filter when it fits a single chunk; otherwise record it as skipped.
-        tokens = estimate_tokens(text)
-        if tokens <= budgets.chunk_cap_tokens or mode == "direct" and tokens <= budgets.direct_cap_tokens:
-            kind = (
-                "document"
-                if entry.file_class == "document"
-                else "config"
-                if entry.file_class == "config"
-                else "file"
-            )
-            unit = CodeUnit(
-                path=entry.path,
-                kind=kind,
-                name=Path(entry.path).name,
-                start_line=1,
-                end_line=len(text.replace("\r\n", "\n").splitlines()) or 1,
-                text=text,
-                token_count=tokens,
-                tags=("auxiliary",) if entry.file_class in {"document", "config", "other"} else (),
-            )
-            return [unit], []
-        return [], [SkippedUnit(entry.path, "token_limit_exceeded", detail=f"{tokens} tokens > chunk cap")]
-
-    # -- parsing and semantic chunking ----------------------------------
-
-    def _parse_and_chunk(
-        self,
-        entry: InventoryEntry,
-        text: str,
-        budgets: EvidenceBudget,
-    ) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        language = entry.language or ""
-        parser = _GRAMMARS.get_parser(language)
-        if parser is None:
-            return [], [SkippedUnit(entry.path, "missing_grammar", detail=f"grammar for {language} unavailable")]
-        try:
-            tree = parser.parse(text.encode("utf-8"))
-        except Exception as exc:  # noqa: BLE001 - parser crashes must degrade per file
-            logger.warning("preprocessor.parse_failed path={} reason={}", entry.path, exc)
-            return [], [SkippedUnit(entry.path, "parse_error", detail=str(exc)[:200])]
-        lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-        root = tree.root_node
-        definitions = self._walk_definitions(root, _DEFINITION_TYPES.get(language, frozenset()))
-        error_ranges = self._error_ranges(root)
-        if root.has_error:
-            covered = sum(node.end_point[0] - node.start_point[0] + 1 for node in definitions)
-            total_lines = len(lines) or 1
-            if not definitions or covered < total_lines * 0.2:
-                detail = (
-                    "; ".join(f"lines {start}-{end}" for start, end in error_ranges[:3])
-                    or "unrecoverable syntax errors"
-                )
-                return [], [SkippedUnit(entry.path, "parse_error", detail=detail)]
-
-        skipped: list[SkippedUnit] = []
-        units: list[CodeUnit] = []
-        if error_ranges and definitions:
-            # Standalone syntax diagnostic evidence for supported types.
-            diag_text = "\n".join(
-                f"{entry.path}:{start}-{end}: syntax error region" for start, end in error_ranges[:10]
-            )
-            first, last = error_ranges[0][0], error_ranges[-1][1]
-            units.append(
-                CodeUnit(
-                    path=entry.path,
-                    kind="syntax_diagnostic",
-                    name=f"{Path(entry.path).name}:syntax",
-                    start_line=first,
-                    end_line=last,
-                    text=diag_text,
-                    token_count=estimate_tokens(diag_text),
-                    tags=("syntax_diagnostic",),
-                )
-            )
-        # Definition chunks plus module-level fragments between them.
-        spans: list[tuple[int, int, str, str]] = []
-        cursor = 1
-        for node in definitions:
-            start = node.start_point[0] + 1
-            end = min(node.end_point[0] + 1, len(lines))
-            if start > end:
-                continue
-            if start > cursor:
-                spans.append((cursor, start - 1, "module", ""))
-            spans.append((start, end, self._node_kind(node), self._node_name(node)))
-            cursor = end + 1
-        if cursor <= len(lines):
-            spans.append((cursor, len(lines), "module", ""))
-        for start, end, kind, name in spans:
-            chunk_text = "\n".join(lines[start - 1 : end])
-            if not chunk_text.strip():
-                continue
-            token_count = estimate_tokens(chunk_text)
-            if token_count > budgets.chunk_cap_tokens:
-                pieces, split_skipped = self._split_span(
-                    entry.path, lines, start, end, language, budgets
-                )
-                units.extend(pieces)
-                skipped.extend(split_skipped)
-            else:
-                units.append(
-                    CodeUnit(
-                        path=entry.path,
-                        kind=kind,
-                        name=name,
-                        start_line=start,
-                        end_line=end,
-                        text=chunk_text,
-                        token_count=token_count,
-                    )
-                )
-        merged = self._merge_small_units(units, budgets)
-        # Overlap is applied after merging so adjacent chunks never duplicate
-        # context inside one another's authorized text.
-        return [self._with_context_overlap(unit, lines) for unit in merged], skipped
-
-    @staticmethod
-    def _with_context_overlap(unit: CodeUnit, lines: list[str]) -> CodeUnit:
-        """Extend a semantic chunk's text with bounded surrounding file lines.
-
-        The canonical ``start_line``/``end_line`` range stays unchanged: overlap
-        only helps understanding and never widens the authorized review scope.
-        ``token_count`` also stays canonical so budget and merge decisions keep
-        tracking the authorized scope; the actual overlapped text cost is
-        measured downstream when subagent input tokens are estimated.
-        """
-        if unit.kind == "syntax_diagnostic" or not lines:
-            return unit
-        overlap_start = max(1, unit.start_line - OVERLAP_CONTEXT_LINES)
-        overlap_end = min(len(lines), unit.end_line + OVERLAP_CONTEXT_LINES)
-        if overlap_start >= unit.start_line and overlap_end <= unit.end_line:
-            return unit
-        # Track where the extended text actually begins so preview line
-        # numbers stay aligned with real repository lines.
-        unit.text_start_line = overlap_start
-        unit.text = "\n".join(lines[overlap_start - 1 : overlap_end])
-        return unit
-
-    def _split_span(
-        self,
-        path: str,
-        lines: list[str],
-        start: int,
-        end: int,
-        language: str,
-        budgets: EvidenceBudget,
-    ) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        """Recursively split an oversized span at nested semantic boundaries."""
-        parser = _GRAMMARS.get_parser(language)
-        if parser is None:
-            return [], [SkippedUnit(path, "missing_grammar", start, end)]
-        text = "\n".join(lines[start - 1 : end])
-        try:
-            tree = parser.parse(text.encode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("preprocessor.split_parse_failed path={} reason={}", path, exc)
-            return [], [SkippedUnit(path, "parse_error", start, end, detail=str(exc)[:200])]
-        nested_types = _DEFINITION_TYPES.get(language, frozenset()) | _STATEMENT_TYPES.get(
-            language, frozenset()
-        )
-        children = [node for node in tree.root_node.children if node.type in nested_types]
-        # A single definition covering the whole span cannot shrink it (e.g. one
-        # huge function); descend into its body so its statements become the
-        # split boundaries instead of recursing on the identical span forever.
-        root_end = tree.root_node.end_point[0]
-        while (
-            len(children) == 1
-            and children[0].start_point[0] == 0
-            and children[0].end_point[0] >= root_end
-        ):
-            single = children[0]
-            body = [
-                node
-                for node in single.children
-                if node.type in _BODY_WRAPPER_TYPES
-            ]
-            children = body[0].children if body else list(single.children)
-        if not children:
-            # Cannot split safely at a semantic boundary.
-            return [], [
-                SkippedUnit(path, "token_limit_exceeded", start, end, detail="unsplittable oversized unit")
-            ]
-        units: list[CodeUnit] = []
-        skipped: list[SkippedUnit] = []
-        cursor = start
-
-        def span_unit(span_start: int, span_end: int, kind: str = "module", name: str = "") -> CodeUnit:
-            chunk_text = "\n".join(lines[span_start - 1 : span_end])
-            return CodeUnit(
-                path=path,
-                kind=kind,
-                name=name,
-                start_line=span_start,
-                end_line=span_end,
-                text=chunk_text,
-                token_count=estimate_tokens(chunk_text),
-            )
-
-        for node in children:
-            child_start = start + node.start_point[0]
-            child_end = min(start + node.end_point[0], end)
-            if child_start > cursor:
-                units.append(span_unit(cursor, child_start - 1))
-            if child_start > child_end:
-                continue
-            child_text = "\n".join(lines[child_start - 1 : child_end])
-            child_tokens = estimate_tokens(child_text)
-            if child_tokens > budgets.chunk_cap_tokens:
-                pieces, piece_skipped = self._split_span(
-                    path, lines, child_start, child_end, language, budgets
-                )
-                units.extend(pieces)
-                skipped.extend(piece_skipped)
-            else:
-                units.append(
-                    CodeUnit(
-                        path=path,
-                        kind=self._node_kind(node),
-                        name=self._node_name(node),
-                        start_line=child_start,
-                        end_line=child_end,
-                        text=child_text,
-                        token_count=child_tokens,
-                    )
-                )
-            cursor = child_end + 1
-        if cursor <= end:
-            units.append(span_unit(cursor, end))
-        return self._merge_small_units(units, budgets), skipped
-
-    def _merge_small_units(self, units: list[CodeUnit], budgets: EvidenceBudget) -> list[CodeUnit]:
-        """Merge adjacent same-file units below the merge floor."""
-        merge_floor = max(80, budgets.chunk_cap_tokens // 8)
-        merged: list[CodeUnit] = []
-        buffer: list[CodeUnit] = []
-        buffer_tokens = 0
-
-        def flush() -> None:
-            nonlocal buffer, buffer_tokens
-            if not buffer:
-                return
-            if len(buffer) == 1:
-                merged.append(buffer[0])
-            else:
-                first, last = buffer[0], buffer[-1]
-                merged.append(
-                    CodeUnit(
-                        path=first.path,
-                        kind=first.kind,
-                        name=first.name,
-                        start_line=first.start_line,
-                        end_line=last.end_line,
-                        text="\n".join(unit.text for unit in buffer),
-                        token_count=buffer_tokens,
-                        tags=first.tags,
-                    )
-                )
-            buffer = []
-            buffer_tokens = 0
-
-        for unit in units:
-            if unit.kind == "syntax_diagnostic":
-                flush()
-                merged.append(unit)
-                continue
-            buffer.append(unit)
-            buffer_tokens += unit.token_count
-            if buffer_tokens >= merge_floor:
-                flush()
-        flush()
-        return merged
-
-    @staticmethod
-    def _walk_definitions(node: Any, types: frozenset[str]) -> list[Any]:
-        """Depth-first definitions; do not descend into matched nodes."""
-        results: list[Any] = []
-        stack = [node]
-        while stack:
-            current = stack.pop()
-            if current.type in types:
-                results.append(current)
-            else:
-                stack.extend(reversed(current.children))
-        return results
-
-    @staticmethod
-    def _error_ranges(root: Any) -> list[tuple[int, int]]:
-        """Collect top-most ERROR/missing node line ranges."""
-        ranges: list[tuple[int, int]] = []
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            if node.type == "ERROR" or getattr(node, "is_missing", False):
-                ranges.append((node.start_point[0] + 1, node.end_point[0] + 1))
-                continue
-            stack.extend(node.children)
-        return sorted(ranges)
-
-    @staticmethod
-    def _node_kind(node: Any) -> str:
-        node_type = node.type
-        if any(marker in node_type for marker in ("class", "struct", "impl", "enum", "interface")):
-            return "class"
-        if any(marker in node_type for marker in ("function", "method", "arrow")):
-            return "function"
-        return "module"
-
-    @staticmethod
-    def _node_name(node: Any) -> str:
-        for child in node.children:
-            if child.type in _NAME_NODE_TYPES:
-                text = child.text
-                return text.decode("utf-8") if isinstance(text, bytes) else str(text)
-        return ""
 
     # -- diff units -------------------------------------------------------
 
@@ -1288,9 +553,16 @@ class ProgrammaticEvidenceService:
             ]
         # At or above the per-file threshold, split oversized patches by hunks.
         pieces = re.split(r"(?=^@@ )", patch, flags=re.MULTILINE)
+        # Text before the first ``@@`` is the git file header, not a hunk:
+        # emitting it would create a bogus 1-1 unit that only carries
+        # ``diff --git`` / ``+++`` lines. A patch with no hunk at all is still
+        # handled as one piece so an oversized body stays reported.
+        has_hunks = any(piece.lstrip("\r\n").startswith("@@") for piece in pieces)
         units: list[CodeUnit] = []
         for piece in pieces:
             if not piece.strip():
+                continue
+            if has_hunks and not piece.lstrip("\r\n").startswith("@@"):
                 continue
             piece_tokens = estimate_tokens(piece)
             match = re.search(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))?", piece)
@@ -1369,19 +641,19 @@ class ProgrammaticEvidenceService:
         units: list[CodeUnit],
         budgets: EvidenceBudget,
     ) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        """Keep main units within the evidence budget, in frozen order.
+        """Keep diff units within the evidence budget, in frozen order.
 
-        The cut is positional: units arrive in the stable order preprocessing
-        produced them (file order, then line order per file) and the overflow is
-        recorded as skipped. Nothing re-ranks evidence by risk or query hits, so
-        the planner triages the admitted change itself.
+        Units are visited in the stable order preprocessing produced them (file
+        order, then line order per file) and any unit that no longer fits is
+        recorded as skipped; a later unit that still fits is kept, so the
+        accepted set is the frozen order minus the overflow. Nothing re-ranks
+        evidence by risk or query hits, so the planner triages the admitted
+        change itself.
         """
         accepted: list[CodeUnit] = []
         skipped: list[SkippedUnit] = []
         used = 0
         for unit in units:
-            if unit.role != "main":
-                continue
             if used + unit.token_count > budgets.evidence_budget_tokens and accepted:
                 skipped.append(
                     SkippedUnit(unit.path, "budget_exhausted", unit.start_line, unit.end_line, detail="task budget")
@@ -1390,153 +662,6 @@ class ProgrammaticEvidenceService:
             accepted.append(unit)
             used += unit.token_count
         return accepted, skipped
-
-    def _supplement_related(
-        self,
-        mains: list[CodeUnit],
-        *,
-        files: dict[str, str],
-        inventory: list[InventoryEntry],
-        budgets: EvidenceBudget,
-        include_tests: bool,
-        related_tests: bool,
-    ) -> list[CodeUnit]:
-        """Attach at most one layer of related context to accepted mains.
-
-        Related chunks are supplementary context, not review scope: candidates
-        that do not fit the related budget are dropped silently. Only supported
-        code, documents and configs may serve as related context; unsupported
-        code types stay excluded even when they reference a main symbol.
-        """
-        main_paths = {unit.path for unit in mains}
-        allowed_paths = {
-            entry.path
-            for entry in inventory
-            if entry.file_class in {"supported_code", "document", "config"}
-        }
-        related: list[CodeUnit] = []
-        used = 0
-        related_paths: set[str] = set()
-
-        def add_related(path: str, relation: str, parent: CodeUnit | None, symbol: str = "") -> None:
-            nonlocal used
-            if path not in allowed_paths:
-                return
-            if path in main_paths or path in related_paths:
-                return
-            text = files.get(path)
-            if not text:
-                return
-            token_count = estimate_tokens(text)
-            if token_count > budgets.chunk_cap_tokens:
-                return
-            if used + token_count > budgets.related_budget_tokens:
-                return
-            lines = text.replace("\r\n", "\n").splitlines()
-            tags = ("related", relation) if not symbol else ("related", relation, f"symbol:{symbol}")
-            related.append(
-                CodeUnit(
-                    path=path,
-                    kind="file",
-                    name=Path(path).name,
-                    start_line=1,
-                    end_line=len(lines) or 1,
-                    text=text,
-                    token_count=token_count,
-                    role="related",
-                    parent_id=parent.unit_id if parent else None,
-                    tags=tags,
-                )
-            )
-            related_paths.add(path)
-            used += token_count
-
-        # Import/export targets: resolve module specifiers to inventoried paths.
-        # Resolution stays inside the allowed-class set so imports pointing at
-        # unsupported files never surface as related evidence.
-        lookup = allowed_paths
-        for unit in mains:
-            for target in self._import_targets(unit.text):
-                resolved = self._resolve_import(target, lookup)
-                if resolved:
-                    add_related(resolved, "import", unit)
-        # Callers: files referencing a main unit's symbol outside its own file.
-        symbols = sorted({unit.name for unit in mains if unit.kind in {"class", "function"} and unit.name})
-        for symbol in symbols[:20]:
-            for path in files:
-                if path in main_paths or path in related_paths:
-                    continue
-                if symbol in files[path]:
-                    add_related(path, "caller", None, symbol)
-        # Config/document files colocated with accepted mains.
-        for entry in inventory:
-            if entry.file_class not in {"config", "document"}:
-                continue
-            if entry.path in main_paths or entry.path in related_paths:
-                continue
-            parent_dir = None
-            for unit in mains:
-                candidate = Path(unit.path).parent.as_posix()
-                if candidate and (parent_dir is None or len(candidate) < len(parent_dir)):
-                    parent_dir = candidate
-            if parent_dir and entry.path.startswith(parent_dir):
-                add_related(entry.path, "config", None)
-        # Tests for accepted main paths.
-        if include_tests and related_tests:
-            for path in sorted(main_paths):
-                for test_path in self._test_candidates(path):
-                    add_related(test_path, "test", None)
-        return related
-
-    @staticmethod
-    def _import_targets(text: str) -> list[str]:
-        targets: list[str] = []
-        for match in _PY_IMPORT_RE.finditer(text):
-            targets.append(match.group(1))
-        for match in _JS_IMPORT_RE.finditer(text):
-            target = match.group(1)
-            if not target.startswith("."):
-                targets.append(target)
-        return list(dict.fromkeys(targets))[:20]
-
-    @staticmethod
-    def _resolve_import(target: str, lookup: set[str]) -> str | None:
-        normalized = target.replace(".", "/")
-        candidates = (
-            normalized,
-            f"{normalized}.py",
-            f"{normalized}.js",
-            f"{normalized}.ts",
-            f"{normalized}.tsx",
-            f"{normalized}/__init__.py",
-            f"{normalized}/index.ts",
-            f"{normalized}/index.js",
-        )
-        for candidate in candidates:
-            if candidate in lookup:
-                return candidate
-        return None
-
-    @staticmethod
-    def _test_candidates(rel_path: str) -> list[str]:
-        path = Path(rel_path)
-        if not path.suffix:
-            return []
-        stem = path.stem
-        suffix = path.suffix
-        parent = path.parent
-        candidates = [
-            parent / f"test_{stem}{suffix}",
-            parent / f"{stem}_test{suffix}",
-            Path("tests") / parent / f"test_{stem}{suffix}",
-            Path("tests") / parent / f"{stem}_test{suffix}",
-            Path("tests") / f"test_{stem}{suffix}",
-            Path("tests") / f"{stem}_test{suffix}",
-        ]
-        if stem.startswith("test_"):
-            base = stem[5:]
-            candidates.extend([parent / f"{base}{suffix}", Path("tests") / f"{base}{suffix}"])
-        return list(dict.fromkeys(candidate.as_posix() for candidate in candidates))
 
     # -- ID assignment and manifest --------------------------------------
 

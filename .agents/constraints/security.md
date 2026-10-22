@@ -29,6 +29,7 @@
 - `ReviewAction.REPO` 仅作为被拒 action 的规范名保留（错误信息与历史 metadata 识别），任何入口都不再产生它；本节点不恢复 repo review 入口。
 - 不提供 GitHub source、`github_review` 工具、远程 snapshot/cache、GitHub metadata/evidence 或远程 diff 校验入口；`ReviewPlan` 无 `target_repo`/`pr_number`/`target_ref`/`target_subpath` 字段，`ReviewMetaKey` 无 `TARGET_REF`/`GITHUB_PREFETCH_READY`/`GITHUB_PR_HEAD_REF`。
 - 通用联网能力不受影响并须保留：模型 provider HTTP/OAuth（含 `github-copilot`）、`web_search`、`web_fetch`、stdio/SSE/Streamable HTTP MCP，以及 SSRF/重定向/私网/代理校验；`_GITHUB_TOKEN` 日志脱敏、`.github/workflows` 忽略路径、`HTTP-Referer` 常量与 OAuth provider 同属非 review 能力，不随本次收敛删除。
+- **预处理只消费 diff，不是仓库读取入口**：`ReviewEvidenceService.dispatch` 只接受 `diff`，其他 action 直接抛 `ValueError`；`review/planning/preprocessor.py` 只变换 patch，不枚举目录、不读取目标源码、不做 AST 解析，因此无法把未修改文件变成 evidence。reviewer 在 `restricted` scope 内定向 `read_file`/`grep` 读 diff 外文件属于工具权限能力，与预处理边界是两件事，且不得据此扩大 accepted finding 的 changed-file 边界。
 - reviewer 的重复读取抑制是上下文效率控制，不改变只读权限；reviewer 仍可在 `restricted` scope 内用定向 `read_file`/`grep` 读取 diff 外文件作上下文，但不得据此扩大 accepted finding 的 changed-file 边界。
 - **审查内容冻结在准入快照**：prefetch 用准入时采集的净 diff（snapshot 的 `net_diff`），不重读活工作树；changed-file 边界也取自 snapshot（未修改文件的 finding 判 `uncertain`）。因此准入后对工作树的任意修改/提交/回滚都不能改变被审内容或放宽边界。净 diff 统一为 `HEAD -> worktree`，不暴露 staged 中间态。
 - 回归见 `tests/agent/tools/test_stage4_boundaries.py`、`tests/agent/tools/test_reviewer_read_dedup.py`、`tests/agent/test_review_loop.py::test_changed_file_boundary_comes_from_the_admitted_snapshot`、`tests/agent/rag/test_rag_review.py::test_local_changed_patches_uses_net_head_diff_not_staged_concat`。

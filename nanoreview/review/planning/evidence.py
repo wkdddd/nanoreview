@@ -1,4 +1,11 @@
-"""Evidence retrieval service for code-review workflows."""
+"""Evidence retrieval service for code-review workflows.
+
+Review only consumes the admitted diff: this service collects the changed
+patches (the frozen snapshot when available) and hands them to the diff
+preprocessor. It never enumerates the repository; the only whole file it may
+read is an untracked new file, whose content is needed to synthesize the patch
+that admission already counts as part of the net diff.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +21,6 @@ from loguru import logger
 
 from nanoreview.review.file_filter import review_file_filter_reason
 from nanoreview.review.planning.preprocessor import (
-    ProgrammaticEvidenceRequest,
     ProgrammaticEvidenceResult,
     ProgrammaticEvidenceService,
     SkippedUnit,
@@ -47,7 +53,6 @@ class ReviewEvidenceService:
     ) -> None:
         self.preprocessor = preprocessor
         self.workspace = (workspace or preprocessor.workspace).expanduser().resolve()
-        self.last_cache_root: Path | None = None
         self.last_changed_files: list[str] = []
         # Structured preprocessing output of the most recent dispatch; the
         # prefetch layer builds the evidence bundle from it when present.
@@ -68,31 +73,30 @@ class ReviewEvidenceService:
         context_window_tokens: int | None = None,
         frozen_diff: dict[str, Any] | None = None,
     ) -> str:
-        """Unified entry point for local review evidence retrieval.
+        """Unified entry point for review evidence retrieval.
+
+        Only the ``diff`` action is supported: review evidence is the admitted
+        change, never a repository scan. Any other action raises instead of
+        falling back to a whole-repository read.
 
         ``frozen_diff`` carries the net diff captured at admission
         (``{"patches": {...}, "skipped": {...}}``). When present, the diff is
         read from the admitted snapshot rather than the live worktree so a
         post-admission edit/commit/rollback cannot change what is reviewed.
         """
-        self.last_cache_root = None
         self.last_changed_files = []
         self.last_result = None
-        if action == "diff":
-            return await self.local_changed_context(
-                review_query=review_query,
-                max_results=max_results,
-                include_tests=include_tests,
-                local_scope=local_scope,
-                context_window_tokens=context_window_tokens,
-                frozen_diff=frozen_diff,
+        if action != "diff":
+            raise ValueError(
+                f"unsupported review action: {action!r}; review evidence is diff-only"
             )
-        return await self.local_context(
+        return await self.local_changed_context(
             review_query=review_query,
             max_results=max_results,
             include_tests=include_tests,
             local_scope=local_scope,
             context_window_tokens=context_window_tokens,
+            frozen_diff=frozen_diff,
         )
 
     def _preprocessor_for_scope(self, local_scope: LocalReviewScope | None) -> ProgrammaticEvidenceService:
@@ -102,96 +106,6 @@ class ReviewEvidenceService:
         if review_root == self.preprocessor.workspace:
             return self.preprocessor
         return ProgrammaticEvidenceService(review_root, options=self.preprocessor.options)
-
-    def _scope_files(
-        self,
-        preprocessor: ProgrammaticEvidenceService,
-        local_scope: LocalReviewScope | None,
-        candidate_paths: list[str] | None = None,
-    ) -> list[Path]:
-        scopes = clean_scope_paths(candidate_paths or [])
-        if not scopes and local_scope is not None:
-            scopes = clean_scope_paths(local_scope.scope_paths)
-        files: list[Path] = []
-        if scopes:
-            for rel in scopes:
-                candidate = (preprocessor.workspace / rel).resolve()
-                try:
-                    candidate.relative_to(preprocessor.workspace)
-                except ValueError:
-                    raise PermissionError(f"target path is outside review root: {rel}") from None
-                if candidate.is_file() and review_file_filter_reason(rel) is None:
-                    files.append(candidate)
-                elif candidate.is_dir():
-                    files.extend(preprocessor.iter_candidate_files(candidate))
-            return list(dict.fromkeys(files))
-        return list(preprocessor.iter_candidate_files())
-
-    async def local_context(
-        self,
-        *,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        local_scope: LocalReviewScope | None = None,
-        context_window_tokens: int | None = None,
-    ) -> str:
-        trace_id = "local"
-        started = time.perf_counter()
-        if not review_query or not review_query.strip():
-            log_event(
-                logger,
-                "info",
-                "review.evidence.local.done",
-                status="error",
-                trace_id=trace_id,
-                reason="missing_query",
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return "Error: review_query is required."
-
-        preprocessor = self._preprocessor_for_scope(local_scope)
-        files = self._scope_files(preprocessor, local_scope)
-        result = await preprocessor.retrieve(
-            ProgrammaticEvidenceRequest(
-                source_type="local",
-                review_query=review_query.strip(),
-                files=files,
-                max_results=max_results,
-                include_tests=include_tests,
-                related_tests=False,
-                context_window_tokens=context_window_tokens,
-            )
-        )
-        self.last_result = result
-        if not result.units:
-            log_event(
-                logger,
-                "info",
-                "review.evidence.local.done",
-                status="no_units",
-                trace_id=trace_id,
-                files_count=len(files),
-                units_count=0,
-                skipped_count=len(result.skipped),
-                context_chars=len(result.context),
-                elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-            )
-            return "No relevant repository review references found."
-        log_event(
-            logger,
-            "info",
-            "review.evidence.local.done",
-            status="success",
-            trace_id=trace_id,
-            files_count=len(files),
-            units_count=len(result.units),
-            skipped_count=len(result.skipped),
-            mode=result.mode,
-            context_chars=len(result.context),
-            elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",
-        )
-        return result.context
 
     async def local_changed_context(
         self,

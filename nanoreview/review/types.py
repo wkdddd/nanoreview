@@ -208,9 +208,6 @@ class EvidenceReference:
 
 
 # Reasons accepted for SkippedReviewUnit.reason.
-SKIPPED_REASON_UNSUPPORTED = "unsupported_code_type"
-SKIPPED_REASON_MISSING_GRAMMAR = "missing_grammar"
-SKIPPED_REASON_PARSE_ERROR = "parse_error"
 SKIPPED_REASON_TOKEN_LIMIT = "token_limit_exceeded"
 SKIPPED_REASON_BUDGET = "budget_exhausted"
 
@@ -488,17 +485,11 @@ class ReviewDimensionResult:
 
 @runtime_checkable
 class ReviewEvidenceProvider(Protocol):
-    """Structural protocol for evidence retrieval used by prefetch and loop."""
+    """Structural protocol for evidence retrieval used by prefetch and loop.
 
-    async def local_context(
-        self,
-        *,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        local_scope: LocalReviewScope | None = None,
-        context_window_tokens: int | None = None,
-    ) -> str: ...
+    Review evidence is the admitted diff only; there is no whole-repository
+    retrieval member.
+    """
 
     async def local_changed_context(
         self,
