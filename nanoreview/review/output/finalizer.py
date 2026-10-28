@@ -1,22 +1,29 @@
-"""Review finalizer: parse subagent results, validate, and render reports."""
+"""Validate reviewer findings and assemble the final review report.
+
+This module owns no candidate accumulation. The run's validated dimension
+results live in the coordinator-owned blackboard (the single result store), so
+the finalizer is a pure function of a candidate set:
+
+* :meth:`ReviewFinalizer.validate_findings` turns one reviewer's accepted
+  ``findings`` array into a validated :class:`ReviewDimensionResult`.
+* :meth:`ReviewFinalizer.judge` applies judge verdicts to a given candidate set
+  and returns a *new* set, so judge and report always read the same version.
+* :meth:`ReviewFinalizer.finalize` renders the report from that set.
+
+Nothing here reads or writes run state, and a failed reviewer is recorded as
+``incomplete`` with an explicit reason rather than silently as success.
+"""
+
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanoreview.agent.review_state import bound_child_error
-from nanoreview.review.output.judge import (
-    JudgeExecutionResult,
-    ReviewJudge,
-    ReviewJudgeStats,
-)
-from nanoreview.review.output.report import render_review_report
 from nanoreview.review.output.validator import ReviewValidator, ValidationContext
 from nanoreview.review.types import (
-    FileSkipSummary,
     FindingVerdict,
     ReviewDimensionResult,
     ReviewFindingCandidate,
@@ -27,22 +34,31 @@ from nanoreview.review.types import (
     normalize_review_dimension,
 )
 
-# Reviewer error text stored on dimension results is bounded so a huge
-# subagent transcript cannot bloat the in-memory report state.
-_REVIEWER_ERROR_MAX_CHARS = 300
+if TYPE_CHECKING:
+    from nanoreview.review.output.judge import JudgeExecutionResult, ReviewJudge, ReviewJudgeStats
+    from nanoreview.review.types import FileSkipSummary
+
+#: Reviewer failure reasons are bounded: a provider trace or transcript must
+#: never inflate the run's audit trail or the report.
+_REVIEWER_ERROR_MAX_CHARS = 500
+
+#: Status priority when the same dimension is recorded twice. A later, better
+#: outcome must not be downgraded by a stale one.
+_STATUS_PRIORITY: dict[str, int] = {
+    "validated": 3,
+    "no_findings": 2,
+    "incomplete": 1,
+    "error": 0,
+    "skipped_disallowed": -1,
+}
 
 
-def reviewer_failure_reason(status: str, raw: str) -> str:
-    """Bounded, human-readable reason for a failed reviewer result.
-
-    ``status`` is the terminal subagent status from result metadata; an empty
-    status means the producer did not report one, which is treated as a failure
-    rather than silently as success.
-    """
+def reviewer_failure_reason(status: str, detail: str) -> str:
+    """Bounded, explicit reason for a reviewer that did not complete."""
     label = status or "unknown"
-    detail = " ".join(raw.split())
-    if detail:
-        return f"reviewer status={label}: {detail}"[:_REVIEWER_ERROR_MAX_CHARS]
+    text = " ".join(detail.split())
+    if text:
+        return f"reviewer status={label}: {text}"[:_REVIEWER_ERROR_MAX_CHARS]
     return f"reviewer status={label}: no result output"
 
 
@@ -59,23 +75,13 @@ class ReviewFinalizerResult:
 
 
 class ReviewFinalizer:
-    """Parses subagent outputs, validates findings, produces final report."""
+    """Validates findings and renders the report for one review run.
 
-    _INCOMPLETE_ERROR_PATTERNS = (
-        "unable to fetch",
-        "could not fetch",
-        "context unavailable",
-        "no repository context",
-        "error:",
-        "failed",
-        "blocked",
-        "disabled",
-        "no structured findings",
-        "invalid json",
-        "无法审查",
-        "无法直接拉取",
-        "未找到",
-    )
+    The instance carries the run's fixed validation context (workspace, changed
+    files, allowed dimensions, mode, selected dimensions, skipped files and the
+    planned-no-reviewer explanation) and nothing else. It is safe to reuse for
+    every dimension of a run because it accumulates no state.
+    """
 
     def __init__(
         self,
@@ -85,7 +91,7 @@ class ReviewFinalizer:
         allowed_dimensions: list[str] | set[str] | None = None,
         local_target: str | None = None,
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
-        skipped_files: list[FileSkipSummary] | tuple[FileSkipSummary, ...] = (),
+        skipped_files: list["FileSkipSummary"] | tuple["FileSkipSummary", ...] = (),
     ) -> None:
         self._workspace = workspace
         self._changed_files = list(changed_files or [])
@@ -96,291 +102,263 @@ class ReviewFinalizer:
             local_target=local_target,
         )
         self._validator = ReviewValidator(self._ctx)
-        self._dimensions: list[ReviewDimensionResult] = []
-        self._errors: list[str] = []
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
         self._selected_dimensions = tuple(selected_dimensions or ())
         self._skipped_files = tuple(skipped_files)
-        self._judge_stats: ReviewJudgeStats | None = None
 
-    def set_allowed_dimensions(self, allowed_dimensions: list[str] | set[str] | None) -> None:
-        self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
+    # -- validation ---------------------------------------------------------
 
-    @property
-    def dimensions(self) -> list[ReviewDimensionResult]:
-        return list(self._dimensions)
-
-    def ingest_messages(self, messages: list[dict[str, Any]]) -> int:
-        """Ingest structured subagent outputs from runner messages."""
-        count = 0
-        for message in messages:
-            meta = self._subagent_metadata(message)
-            if not meta:
-                continue
-            dimension = str(meta.get("subagent_label") or meta.get("label") or "unknown")
-            raw_output = self._subagent_raw_output(message, meta)
-            if not raw_output.strip():
-                logger.warning("review.finalizer.skip_empty dimension={}", dimension)
-                continue
-            # An explicitly reported non-ok terminal status marks the output as
-            # failed regardless of its shape: a failed reviewer's raw payload
-            # (even valid findings JSON) must never be parsed into a clean
-            # no_findings result. A missing status keeps the lenient legacy
-            # behaviour for persisted messages produced before the status
-            # contract existed.
-            status = str(meta.get("subagent_status") or "").strip().lower()
-            failure_reason = None if status in ("", "ok") else reviewer_failure_reason(status, raw_output)
-            self.ingest_subagent_output(dimension, raw_output, failure_reason=failure_reason)
-            count += 1
-        logger.info("review.finalizer.ingest messages={} dimensions={}", len(messages), count)
-        return count
-
-    def ingest_subagent_output(
+    def dimension_failure(
         self,
         dimension: str,
-        raw_output: str,
-        *,
-        failure_reason: str | None = None,
+        failure_reason: str,
     ) -> ReviewDimensionResult:
-        """Parse one subagent's raw text output and validate its candidates.
+        """Record one dimension whose reviewer failed or was cancelled."""
+        normalized = self._normalize_dimension(dimension)
+        return ReviewDimensionResult(
+            dimension=normalized,
+            status="incomplete",
+            errors=[bound_child_error(failure_reason) or "reviewer did not complete"],
+        )
 
-        ``failure_reason`` marks the output as a known reviewer failure: the
-        dimension is recorded as ``incomplete`` with that reason and the raw
-        payload is not parsed, so a failed reviewer can never be presented as
-        a clean no_findings dimension.
+    def validate_findings(
+        self,
+        dimension: str,
+        findings: list[dict[str, Any]],
+    ) -> ReviewDimensionResult:
+        """Validate one reviewer's accepted findings for *dimension*.
+
+        The findings array has already passed the reviewer output contract, so
+        this step is the *review* validation: target boundary, line range,
+        evidence presence and per-dimension rules. Candidates that fail are
+        recorded as rejected/uncertain instead of being dropped.
         """
-        normalized_dimension = normalize_review_dimension(dimension) or dimension.strip().lower()
-        if self._allowed_dimensions is not None and normalized_dimension not in self._allowed_dimensions:
+        normalized = self._normalize_dimension(dimension)
+        if self._allowed_dimensions is not None and normalized not in self._allowed_dimensions:
             logger.warning(
                 "review.finalizer.skip_disallowed dimension={} allowed={}",
                 dimension,
                 sorted(self._allowed_dimensions),
             )
-            self._errors.append(f"Skipped disallowed review dimension: {dimension}")
             return ReviewDimensionResult(
-                dimension=normalized_dimension or "unknown",
+                dimension=normalized,
                 status="skipped_disallowed",
+                errors=[f"Skipped disallowed review dimension: {dimension}"],
             )
-        dimension = normalized_dimension
-        if failure_reason:
-            result = ReviewDimensionResult(
-                dimension=dimension,
-                status="incomplete",
-                errors=[failure_reason],
-            )
-            self._upsert_dimension(result)
-            return result
-        incomplete_reason = self._incomplete_reason(raw_output)
-        if incomplete_reason:
-            result = ReviewDimensionResult(
-                dimension=dimension,
-                status="incomplete",
-                errors=[incomplete_reason],
-            )
-            self._upsert_dimension(result)
-            return result
-        candidates = self._parse_candidates(dimension, raw_output)
-        if not candidates:
-            result = ReviewDimensionResult(
-                dimension=dimension,
-                status="no_findings",
-            )
-            self._upsert_dimension(result)
-            return result
-        result = self._validator.validate_candidates(candidates, dimension)
-        self._upsert_dimension(result)
-        return result
+        if not findings:
+            return ReviewDimensionResult(dimension=normalized, status="no_findings")
+        candidates = [
+            self._dict_to_candidate(item, normalized) for item in findings
+        ]
+        return self._validator.validate_candidates(candidates, normalized)
 
-    _STATUS_PRIORITY: dict[str, int] = {
-        "validated": 3, "no_findings": 2, "incomplete": 1, "error": 0, "skipped_disallowed": -1
-    }
+    # -- judge --------------------------------------------------------------
 
-    def _upsert_dimension(self, result: ReviewDimensionResult) -> None:
-        """Insert or update a dimension result,removing the redundant dimensions."""
-        for i, existing in enumerate(self._dimensions):
-            if existing.dimension == result.dimension:
-                if self._STATUS_PRIORITY.get(result.status, 0) > self._STATUS_PRIORITY.get(existing.status, 0):
-                    self._dimensions[i] = result
-                return
-        self._dimensions.append(result)
+    async def judge(
+        self,
+        judge: "ReviewJudge | None",
+        dimensions: tuple[ReviewDimensionResult, ...],
+    ) -> tuple["JudgeExecutionResult", tuple[ReviewDimensionResult, ...]]:
+        """Apply AI judge verdicts to a given candidate set.
 
-    def get_needs_confirmation(self) -> list[tuple[ReviewFindingCandidate, ReviewFindingVerdict]]:
-        """Return candidates whose final verdict requires manual confirmation.
-
-        For dimensions already through the judge this collects judged entries
-        whose final verdict is uncertain (needs_confirmation), surfacing the
-        judge's reason. Uncertain candidates that have not been judged yet
-        fall through from ``d.uncertain``. This keeps
-        ``ReviewFinalizerResult.needs_confirmation`` consistent with the
-        report's Needs Confirmation section.
-        """
-        items: list[tuple[ReviewFindingCandidate, ReviewFindingVerdict]] = []
-        for d in self._dimensions:
-            if d.judged:
-                for item in d.judged:
-                    if item.final_verdict != FindingVerdict.UNCERTAIN:
-                        continue
-                    reason = item.hard_verdict
-                    if item.judge_verdict is not None:
-                        reason = ReviewFindingVerdict(
-                            verdict=FindingVerdict.UNCERTAIN,
-                            reason=item.judge_verdict.reason,
-                        )
-                    items.append((item.candidate, reason))
-            else:
-                items.extend(d.uncertain)
-        return items
-
-    async def apply_judge(self, judge: ReviewJudge | None) -> JudgeExecutionResult:
-        """Apply AI judge verdicts to every accepted/uncertain candidate.
-
-        Consumes and returns the judge's :class:`JudgeExecutionResult`: the
-        verdict map is applied to the judged findings, ``stats`` becomes the
-        report's judge statistics, and ``error`` (a bounded batch/provider/
-        terminal failure reason) is handed back to the supervisor so the run's
-        judge batch is recorded as ``error`` without failing the whole run.
-        Candidates without a verdict — including every candidate of a failed
-        batch — are explicitly marked ``needs_confirmation`` instead of
-        silently inheriting their hard verdicts, so a candidate is never
+        Returns the judge's execution result and the *new* candidate set: the
+        caller records both, so the report and the recorded verdicts always come
+        from one candidate version. Candidates without a verdict — including
+        every candidate of a failed batch — are marked ``needs_confirmation``
+        rather than inheriting their hard verdicts, so a candidate is never
         presented as having passed the judge.
         """
+        from nanoreview.review.output.judge import JudgeExecutionResult
+
         if judge is None:
             logger.info("review.finalizer.judge.unavailable reason=not_created")
-            stats = self._mark_unjudged_needs_confirmation(
-                "AI judge is unavailable; manual verification required"
+            judged, stats = self._mark_unjudged(
+                dimensions, "AI judge is unavailable; manual verification required"
             )
-            self._judge_stats = stats
-            return JudgeExecutionResult(verdicts={}, stats=stats, usage={}, error=None)
+            return (
+                JudgeExecutionResult(verdicts={}, stats=stats, usage={}, error=None),
+                judged,
+            )
         try:
-            result = await judge.judge_dimensions(self._dimensions)
+            result = await judge.judge_dimensions(list(dimensions))
         except Exception as exc:
             # Cancellation is a BaseException and propagates untouched; any
             # other escaping judge failure degrades to needs_confirmation.
             logger.warning("review.finalizer.judge.failed reason={}", exc)
-            stats = self._mark_unjudged_needs_confirmation(
-                "AI judge failed; manual verification required"
+            judged, stats = self._mark_unjudged(
+                dimensions, "AI judge failed; manual verification required"
             )
-            self._judge_stats = stats
-            return JudgeExecutionResult(
-                verdicts={}, stats=stats, usage={}, error=bound_child_error(exc)
+            return (
+                JudgeExecutionResult(
+                    verdicts={}, stats=stats, usage={}, error=bound_child_error(exc)
+                ),
+                judged,
             )
-        self._judge_stats = result.stats
-        verdicts = result.verdicts
         if result.error:
-            logger.warning(
-                "review.finalizer.judge.partial_failure reason={}", result.error
-            )
-        if not verdicts:
-            total = self._candidate_total()
-            if total > 0:
-                # Defensive: the judge produced no verdicts at all while
-                # candidates exist — surface them for manual verification.
+            logger.warning("review.finalizer.judge.partial_failure reason={}", result.error)
+        if not result.verdicts:
+            if self._candidate_total(dimensions) > 0:
                 logger.warning(
-                    "review.finalizer.judge.no_verdicts candidates={}", total
+                    "review.finalizer.judge.no_verdicts candidates={}",
+                    self._candidate_total(dimensions),
                 )
-                stats = self._mark_unjudged_needs_confirmation(
-                    "AI judge returned no verdicts; manual verification required"
+                judged, stats = self._mark_unjudged(
+                    dimensions,
+                    "AI judge returned no verdicts; manual verification required",
                 )
-                self._judge_stats = stats
-                return JudgeExecutionResult(
-                    verdicts={}, stats=stats, usage=result.usage, error=result.error
-                )
-            self._apply_judged_defaults()
-            return result
-        for dimension in self._dimensions:
-            judged: list[ReviewJudgedFinding] = []
-            for candidate in dimension.accepted:
-                hard = ReviewFindingVerdict(
-                    verdict=FindingVerdict.ACCEPTED,
-                    reason="hard validation accepted",
-                )
-                judged.append(ReviewJudgedFinding(
-                    candidate=candidate,
-                    hard_verdict=hard,
-                    judge_verdict=self._verdict_or_needs_confirmation(
-                        verdicts, candidate,
-                        "AI judge returned no verdict for this candidate",
+                return (
+                    JudgeExecutionResult(
+                        verdicts={},
+                        stats=stats,
+                        usage=result.usage,
+                        error=result.error,
                     ),
-                ))
-            for candidate, hard in dimension.uncertain:
-                judged.append(ReviewJudgedFinding(
-                    candidate=candidate,
-                    hard_verdict=hard,
-                    judge_verdict=self._verdict_or_needs_confirmation(
-                        verdicts, candidate,
-                        "AI judge returned no verdict for this candidate",
-                    ),
-                ))
-            dimension.judged = judged
-        logger.info("review.finalizer.judge.applied dimensions={}", len(self._dimensions))
-        return result
+                    judged,
+                )
+            return result, self._apply_hard_verdicts(dimensions)
+        merged = tuple(
+            replace(dimension, judged=self._judged_for(dimension, result.verdicts))
+            for dimension in dimensions
+        )
+        logger.info("review.finalizer.judge.applied dimensions={}", len(merged))
+        return result, merged
+
+    # -- report -------------------------------------------------------------
+
+    def finalize(
+        self,
+        dimensions: tuple[ReviewDimensionResult, ...],
+        *,
+        target_name: str | None = None,
+        judge_stats: "ReviewJudgeStats | None" = None,
+    ) -> ReviewFinalizerResult:
+        """Render the report from a candidate set.
+
+        A run with no dimension results is an error: the program always
+        dispatches one task per selected reviewer, so an empty result set means
+        no reviewer produced a usable outcome.
+        """
+        errors: list[str] = []
+        if not dimensions:
+            errors.append("No review dimension results were produced.")
+        final_dimensions = list(self._apply_hard_verdicts(dimensions))
+        needs_confirmation = self._needs_confirmation(final_dimensions)
+        from nanoreview.review.output.report import render_review_report
+
+        try:
+            report = render_review_report(
+                target_name or self._target_name(),
+                final_dimensions,
+                selected_dimensions=self._selected_dimensions,
+                skipped_files=self._skipped_files,
+                judge_stats=judge_stats,
+            )
+        except Exception as exc:
+            logger.error("report rendering failed: {}", exc)
+            report = (
+                f"## Code Review Report: {target_name or self._target_name()}\n\n"
+                f"### Error\n\nReport rendering failed: {exc}\n"
+            )
+            errors.append(str(exc))
+        return ReviewFinalizerResult(
+            report_markdown=report,
+            dimensions=final_dimensions,
+            needs_confirmation=needs_confirmation,
+            errors=errors,
+        )
+
+    def _target_name(self) -> str:
+        return self._local_target or "target"
+
+    # -- helpers ------------------------------------------------------------
 
     @staticmethod
-    def _verdict_or_needs_confirmation(
+    def _judged_for(
+        dimension: ReviewDimensionResult,
         verdicts: dict[str, ReviewJudgeVerdict],
-        candidate: ReviewFindingCandidate,
-        missing_reason: str,
-    ) -> ReviewJudgeVerdict:
-        """Return the judge verdict, or an explicit needs_confirmation fallback."""
-        verdict = verdicts.get(ReviewJudge.candidate_id(candidate))
-        if verdict is not None:
-            return verdict
-        return ReviewJudgeVerdict(
-            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-            reason=missing_reason,
-            confidence="low",
-            severity=candidate.severity,
-        )
-
-    def _candidate_total(self) -> int:
-        return sum(
-            len(dimension.accepted) + len(dimension.uncertain)
-            for dimension in self._dimensions
-        )
-
-    def _mark_unjudged_needs_confirmation(self, reason: str) -> ReviewJudgeStats | None:
-        """Mark every accepted/uncertain candidate as needs_confirmation.
-
-        Used when the judge cannot run: candidates keep their hard verdicts for
-        traceability but carry an explicit judge verdict requiring manual
-        verification, so the report never presents them as judge-accepted.
-        Returns the judge statistics for the unavailable path (or None when
-        there are no candidates to judge).
-        """
-        total = 0
-        for dimension in self._dimensions:
-            judged: list[ReviewJudgedFinding] = []
-            for candidate in dimension.accepted:
-                judged.append(ReviewJudgedFinding(
+    ) -> list[ReviewJudgedFinding]:
+        judged: list[ReviewJudgedFinding] = []
+        for candidate in dimension.accepted:
+            judged.append(
+                ReviewJudgedFinding(
                     candidate=candidate,
                     hard_verdict=ReviewFindingVerdict(
                         verdict=FindingVerdict.ACCEPTED,
                         reason="hard validation accepted",
                     ),
-                    judge_verdict=ReviewJudgeVerdict(
-                        decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                        reason=reason,
-                        confidence="low",
-                        severity=candidate.severity,
+                    judge_verdict=ReviewFinalizer._verdict_or_needs_confirmation(
+                        verdicts, candidate
                     ),
-                ))
-                total += 1
-            for candidate, hard in dimension.uncertain:
-                judged.append(ReviewJudgedFinding(
+                )
+            )
+        for candidate, hard in dimension.uncertain:
+            judged.append(
+                ReviewJudgedFinding(
                     candidate=candidate,
                     hard_verdict=hard,
-                    judge_verdict=ReviewJudgeVerdict(
-                        decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                        reason=reason,
-                        confidence="low",
-                        severity=candidate.severity,
+                    judge_verdict=ReviewFinalizer._verdict_or_needs_confirmation(
+                        verdicts, candidate
                     ),
-                ))
-                total += 1
-            dimension.judged = judged
+                )
+            )
+        return judged
+
+    @staticmethod
+    def _verdict_or_needs_confirmation(
+        verdicts: dict[str, ReviewJudgeVerdict],
+        candidate: ReviewFindingCandidate,
+    ) -> ReviewJudgeVerdict:
+        from nanoreview.review.output.judge import ReviewJudge
+
+        verdict = verdicts.get(ReviewJudge.candidate_id(candidate))
+        if verdict is not None:
+            return verdict
+        return ReviewJudgeVerdict(
+            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+            reason="AI judge returned no verdict for this candidate",
+            confidence="low",
+            severity=candidate.severity,
+        )
+
+    def _mark_unjudged(
+        self,
+        dimensions: tuple[ReviewDimensionResult, ...],
+        reason: str,
+    ) -> tuple[tuple[ReviewDimensionResult, ...], "ReviewJudgeStats | None"]:
+        """Mark every accepted/uncertain candidate as needing confirmation."""
+        from nanoreview.review.output.judge import ReviewJudgeStats
+
+        total = self._candidate_total(dimensions)
+        judged_dimensions = tuple(
+            replace(
+                dimension,
+                judged=[
+                    *(
+                        ReviewJudgedFinding(
+                            candidate=candidate,
+                            hard_verdict=ReviewFindingVerdict(
+                                verdict=FindingVerdict.ACCEPTED,
+                                reason="hard validation accepted",
+                            ),
+                            judge_verdict=self._confirmation(candidate, reason),
+                        )
+                        for candidate in dimension.accepted
+                    ),
+                    *(
+                        ReviewJudgedFinding(
+                            candidate=candidate,
+                            hard_verdict=hard,
+                            judge_verdict=self._confirmation(candidate, reason),
+                        )
+                        for candidate, hard in dimension.uncertain
+                    ),
+                ],
+            )
+            for dimension in dimensions
+        )
         if total == 0:
-            return None
-        return ReviewJudgeStats(
+            return judged_dimensions, None
+        return judged_dimensions, ReviewJudgeStats(
             total_candidates=total,
             sent_candidates=0,
             returned_verdicts=0,
@@ -388,13 +366,28 @@ class ReviewFinalizer:
             batches=0,
         )
 
-    def _apply_judged_defaults(self) -> None:
-        """Fill judged lists with hard verdicts when no judge pass has run."""
-        for dimension in self._dimensions:
+    @staticmethod
+    def _confirmation(
+        candidate: ReviewFindingCandidate, reason: str
+    ) -> ReviewJudgeVerdict:
+        return ReviewJudgeVerdict(
+            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+            reason=reason,
+            confidence="low",
+            severity=candidate.severity,
+        )
+
+    @staticmethod
+    def _apply_hard_verdicts(
+        dimensions: tuple[ReviewDimensionResult, ...],
+    ) -> tuple[ReviewDimensionResult, ...]:
+        """Fill judged lists from hard verdicts when no judge pass has run."""
+        filled: list[ReviewDimensionResult] = []
+        for dimension in dimensions:
             if dimension.judged:
+                filled.append(dimension)
                 continue
-            judged: list[ReviewJudgedFinding] = []
-            judged.extend(
+            judged: list[ReviewJudgedFinding] = [
                 ReviewJudgedFinding(
                     candidate=candidate,
                     hard_verdict=ReviewFindingVerdict(
@@ -403,104 +396,45 @@ class ReviewFinalizer:
                     ),
                 )
                 for candidate in dimension.accepted
-            )
+            ]
             judged.extend(
                 ReviewJudgedFinding(candidate=candidate, hard_verdict=verdict)
                 for candidate, verdict in dimension.uncertain
             )
-            dimension.judged = judged
-
-    def finalize(self, target_name: str) -> ReviewFinalizerResult:
-        """Produce final report markdown from all ingested dimensions.
-
-        A run with no dimension results is an error: the program always
-        dispatches one task per selected reviewer, so an empty result set means
-        no reviewer produced a usable outcome.
-        """
-        if not self._dimensions:
-            self._errors.append("No review dimension results were produced.")
-        self._apply_judged_defaults()
-        needs_confirmation = self.get_needs_confirmation()
-        try:
-            report = render_review_report(
-                target_name,
-                self._dimensions,
-                selected_dimensions=self._selected_dimensions,
-                skipped_files=self._skipped_files,
-                judge_stats=self._judge_stats,
-            )
-        except Exception as exc:
-            logger.error("report rendering failed: {}", exc)
-            report = f"## Code Review Report: {target_name}\n\n### Error\n\nReport rendering failed: {exc}\n"
-            self._errors.append(str(exc))
-
-        return ReviewFinalizerResult(
-            report_markdown=report,
-            dimensions=self._dimensions,
-            needs_confirmation=needs_confirmation,
-            errors=self._errors,
-        )
-
-    def _parse_candidates(
-        self, dimension: str, raw: str
-    ) -> list[ReviewFindingCandidate]:
-        """Parse the canonical review_submit tool result."""
-        payload = self._review_submit_payload(raw)
-        if payload is None:
-            return []
-        findings = payload.get("findings")
-        if not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings):
-            return []
-        return [self._dict_to_candidate(item, dimension) for item in findings]
-
-    @classmethod
-    def _incomplete_reason(cls, raw: str) -> str:
-        text = raw.strip()
-        if not text:
-            return ""
-
-        payload = cls._review_submit_payload(text, log_diagnostics=False)
-        if payload is not None:
-            errors = payload.get("errors")
-            if isinstance(errors, list) and errors:
-                return "; ".join(str(e) for e in errors)[:300]
-            return ""
-
-        lower = text.lower()
-        if not any(pattern in lower for pattern in cls._INCOMPLETE_ERROR_PATTERNS):
-            return "No structured findings were produced by this reviewer."
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if any(pattern in stripped.lower() for pattern in cls._INCOMPLETE_ERROR_PATTERNS):
-                return stripped[:300]
-        return text[:300]
+            filled.append(replace(dimension, judged=judged))
+        return tuple(filled)
 
     @staticmethod
-    def _review_submit_payload(raw: str, *, log_diagnostics: bool = True) -> dict[str, Any] | None:
-        text = raw.strip()
-        if not text:
-            return None
-        if not text.startswith("{"):
-            logger.debug("review.finalizer.submit_payload.skip_non_json")
-            return None
-        try:
-            data = json.loads(text)
-        except (json.JSONDecodeError, TypeError) as e:
-            if log_diagnostics:
-                logger.warning("review.finalizer.submit_payload.invalid_json error={}", e)
-            return None
-        if not isinstance(data, dict) or data.get("submitted") is not True :
-            if log_diagnostics:
-                logger.warning("review.finalizer.submit_payload.invalid_schema reason=submitted")
-            return None
-        errors = data.get("errors")
-        if not isinstance(errors, list):
-            if log_diagnostics:
-                logger.warning("review.finalizer.submit_payload.invalid_schema reason=errors")
-            return None
-        return data
+    def _needs_confirmation(
+        dimensions: list[ReviewDimensionResult],
+    ) -> list[tuple[ReviewFindingCandidate, ReviewFindingVerdict]]:
+        """Candidates whose final verdict still requires manual confirmation."""
+        items: list[tuple[ReviewFindingCandidate, ReviewFindingVerdict]] = []
+        for dimension in dimensions:
+            for item in dimension.judged:
+                if item.final_verdict != FindingVerdict.UNCERTAIN:
+                    continue
+                reason = item.hard_verdict
+                if item.judge_verdict is not None:
+                    reason = ReviewFindingVerdict(
+                        verdict=FindingVerdict.UNCERTAIN,
+                        reason=item.judge_verdict.reason,
+                    )
+                items.append((item.candidate, reason))
+            for candidate, verdict in dimension.uncertain:
+                if not dimension.judged:
+                    items.append((candidate, verdict))
+        return items
+
+    @staticmethod
+    def _candidate_total(dimensions: tuple[ReviewDimensionResult, ...]) -> int:
+        return sum(
+            len(dimension.accepted) + len(dimension.uncertain)
+            for dimension in dimensions
+        )
+
+    def _normalize_dimension(self, dimension: str) -> str:
+        return normalize_review_dimension(dimension) or dimension.strip().lower()
 
     @staticmethod
     def _normalize_allowed_dimensions(
@@ -530,38 +464,9 @@ class ReviewFinalizer:
             source=str(d.get("source", "")),
         )
 
-    @staticmethod
-    def _subagent_metadata(message: dict[str, Any]) -> dict[str, Any] | None:
-        meta = message.get("_metadata")
-        if not isinstance(meta, dict):
-            meta = message.get("metadata")
-        if not isinstance(meta, dict):
-            meta = {}
-        if message.get("injected_event") == "subagent_result":
-            meta = {
-                **meta,
-                **{
-                    key: message[key]
-                    for key in (
-                        "injected_event",
-                        "subagent_task_id",
-                        "subagent_label",
-                        "subagent_status",
-                        "subagent_result",
-                    )
-                    if key in message
-                },
-            }
-        if meta.get("injected_event") != "subagent_result":
-            return None
-        return meta
 
-    @staticmethod
-    def _subagent_raw_output(message: dict[str, Any], meta: dict[str, Any]) -> str:
-        raw = meta.get("subagent_result")
-        if isinstance(raw, str):
-            return raw
-        content = message.get("content", "")
-        if not isinstance(content, str):
-            return str(content)
-        return content.strip()
+__all__ = [
+    "ReviewFinalizer",
+    "ReviewFinalizerResult",
+    "reviewer_failure_reason",
+]

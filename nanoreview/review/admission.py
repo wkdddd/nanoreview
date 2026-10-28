@@ -23,7 +23,6 @@ from loguru import logger
 from nanoreview.agent.review_state import (
     REVIEW_TERMINAL_STATUSES,
     ReviewPhase,
-    ReviewRunState,
     ReviewRunStatus,
     compute_input_fingerprint,
     new_review_run_id,
@@ -526,17 +525,6 @@ class ReviewAdmissionService:
         return payload
 
 
-def register_review_run(admission: ReviewAdmission) -> ReviewRunState:
-    """Create the authoritative in-process run state for *admission*."""
-    return ReviewRunState(
-        run_id=admission.run_id,
-        session_key=admission.session_key,
-        input_fingerprint=admission.input_fingerprint,
-        plan=admission.plan,
-        snapshot_ref=admission.snapshot_ref,
-    )
-
-
 __all__ = [
     "ReviewAdmission",
     "ReviewAdmissionCode",
@@ -544,5 +532,4 @@ __all__ = [
     "ReviewAdmissionRequest",
     "ReviewAdmissionService",
     "REVIEW_TERMINAL_STATUSES",
-    "register_review_run",
 ]

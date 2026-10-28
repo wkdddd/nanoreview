@@ -1,14 +1,27 @@
-"""Tests for ReviewFinalizer parsing and orchestration."""
-from __future__ import annotations
+"""Tests for the stateless ``ReviewFinalizer``.
 
-import json
+The finalizer owns no candidate accumulation: the run's validated dimension
+results live in the coordinator-owned blackboard. These tests therefore feed a
+candidate set in and check what comes out — validation of one reviewer's
+``findings`` array, judge application on a *given* set, and report rendering.
+
+Two invariants are pinned throughout: a candidate is never presented as having
+passed a judge that did not return a verdict for it, and a run that produced
+nothing is ``incomplete`` rather than ``clean``.
+"""
+
+from __future__ import annotations
 
 import pytest
 from loguru import logger
 
-from nanoreview.review.output.finalizer import ReviewFinalizer
-from nanoreview.review.output.judge import JudgeExecutionResult
+from nanoreview.review.output.finalizer import (
+    ReviewFinalizer,
+    reviewer_failure_reason,
+)
+from nanoreview.review.output.judge import JudgeExecutionResult, ReviewJudgeStats
 from nanoreview.review.types import (
+    ReviewDimensionResult,
     ReviewJudgeDecision,
     ReviewJudgeVerdict,
     normalize_review_dimension,
@@ -33,6 +46,16 @@ class FakeJudge:
             usage=dict(self.usage),
             error=self.error,
         )
+
+
+class ExplodingJudge:
+    """Judge stub whose pass raises outright (a provider outage)."""
+
+    def __init__(self, message: str = "provider down") -> None:
+        self.message = message
+
+    async def judge_dimensions(self, dimensions):
+        raise RuntimeError(self.message)
 
 
 @pytest.fixture
@@ -67,10 +90,11 @@ _BUG_DETAILS = {
 }
 
 
-def _submit(
+def _findings(
     findings: list[dict[str, object]],
     details: dict[str, object] | None = None,
-) -> str:
+) -> list[dict[str, object]]:
+    """Build a validated-shape findings array (what the reviewer contract emits)."""
     prepared: list[dict[str, object]] = []
     for finding in findings:
         item = dict(finding)
@@ -78,172 +102,378 @@ def _submit(
             "details", dict(details if details is not None else _SECURITY_DETAILS)
         )
         prepared.append(item)
-    return json.dumps(
-        {"submitted": True, "findings": prepared, "errors": []},
-        ensure_ascii=False,
-    )
+    return prepared
 
 
-class TestParsingReviewSubmit:
+class TestDimensionNormalization:
     def test_normalizes_review_label_suffix(self):
         assert normalize_review_dimension("Security Review") == "security"
         assert normalize_review_dimension("Maintainability Review") == "maintainability"
 
-    def test_parse_review_submit_result(self, workspace):
-        raw = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Injection",
-            "evidence": "line1",
-            "impact": "RCE",
-            "recommendation": "Parameterize",
-        }])
+
+class TestValidateFindings:
+    def test_valid_findings_become_accepted_candidates(self, workspace):
         f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("security", raw)
-        assert len(result.accepted) == 1
-        assert result.accepted[0].title == "Injection"
 
-    def test_parse_empty_review_submit_result(self, workspace):
-        f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("security", _submit([]))
-        assert result.status == "no_findings"
-
-
-class TestStrictProtocol:
-    def test_rejects_bare_json_array(self, workspace):
-        raw = json.dumps([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Legacy array",
-            "evidence": "line1",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("security", raw)
-
-        assert result.status == "incomplete"
-        assert result.accepted == []
-        assert result.errors == ["No structured findings were produced by this reviewer."]
-
-    def test_rejects_jsonl_lines(self, workspace):
-        raw = "\n".join([
-            json.dumps({
-                "severity": "medium",
-                "file": "src/app.py",
-                "line": 2,
-                "title": "Issue1",
-                "evidence": "line2",
-                "impact": "y",
-                "recommendation": "z",
-            }),
-            json.dumps({
-                "severity": "low",
-                "file": "src/app.py",
-                "line": 3,
-                "title": "Issue2",
-                "evidence": "line3",
-                "impact": "b",
-                "recommendation": "c",
-            }),
-        ])
-        f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("tests", raw)
-
-        assert result.status == "incomplete"
-        assert result.accepted == []
-
-    def test_rejects_markdown_table(self, workspace):
-        raw = (
-            "| severity | file | line | title | evidence | impact | recommendation |\n"
-            "|---|---|---|---|---|---|---|\n"
-            "| high | src/app.py | 1 | Table issue | line1 | bad | fix |"
+        result = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Injection",
+                        "evidence": "line1",
+                        "impact": "RCE",
+                        "recommendation": "Parameterize",
+                    }
+                ]
+            ),
         )
+
+        assert result.status == "validated"
+        assert [candidate.title for candidate in result.accepted] == ["Injection"]
+
+    def test_an_empty_findings_array_is_no_findings(self, workspace):
         f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("tests", raw)
 
-        assert result.status == "incomplete"
-        assert result.accepted == []
+        assert f.validate_findings("security", []).status == "no_findings"
 
+    def test_normalizes_the_dimension_label(self, workspace):
+        f = ReviewFinalizer(workspace, allowed_dimensions={"maintainability"})
 
-class TestSemanticVerdicts:
-    def test_no_confirmation_needed_when_no_uncertain(self, workspace):
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "Clear bug", "evidence": "line1", "impact": "bad", "recommendation": "fix",
-        }])
-        f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
-        assert f.get_needs_confirmation() == []
+        result = f.validate_findings(
+            "Maintainability Reviewer",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Boundary violation",
+                        "evidence": "line1",
+                        "impact": "Change amplification",
+                        "recommendation": "Introduce a stable interface",
+                    }
+                ],
+                details=_MAINTAINABILITY_DETAILS,
+            ),
+        )
 
-    def test_uncertain_items_remain_in_needs_confirmation(self, workspace):
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "Maybe", "evidence": "", "impact": "unknown", "recommendation": "check",
-        }])
-        f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
-        needs = f.get_needs_confirmation()
-        assert len(needs) == 1
-        result = f.finalize("test")
-        assert "Maybe" in result.report_markdown
-        assert "### Needs Confirmation" in result.report_markdown
+        assert result.status == "validated"
+        assert result.dimension == "maintainability"
 
-    @pytest.mark.asyncio
-    async def test_ai_judge_can_reject_hard_accepted_candidate(self, workspace):
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "False positive", "evidence": "line1", "impact": "bad", "recommendation": "fix",
-        }])
-        f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
-        judge = FakeJudge({
-            "security:src/app.py:1:false positive": ReviewJudgeVerdict(
-                decision=ReviewJudgeDecision.REJECT,
-                reason="not actionable",
-            )
-        })
+    def test_accepts_spawn_labels_with_task_suffix(self, workspace):
+        f = ReviewFinalizer(workspace, allowed_dimensions={"performance"})
 
-        await f.apply_judge(judge)
-        result = f.finalize("test")
+        validated = f.validate_findings(
+            "Performance Reviewer for review-webui/index.html",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Font loading blocks render",
+                        "evidence": "line1",
+                        "impact": "Slower first paint",
+                        "recommendation": "Use font-display swap",
+                    }
+                ],
+                details=_PERFORMANCE_DETAILS,
+            ),
+        )
+        result = f.finalize((validated,), target_name="review-webui/index.html")
 
+        assert validated.status != "skipped_disallowed"
+        assert validated.dimension == "performance"
+        assert "Font loading blocks render" in result.report_markdown
+        assert not result.errors
+
+    def test_disallowed_dimension_is_skipped_not_reported(self, workspace):
+        f = ReviewFinalizer(workspace, allowed_dimensions={"maintainability"})
+
+        skipped = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "critical",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Disallowed finding",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
+        result = f.finalize((skipped,), target_name="myproject")
+
+        assert skipped.status == "skipped_disallowed"
+        assert "Disallowed finding" not in result.report_markdown
+        assert "Review incomplete" in result.report_markdown
         assert "No actionable issues found" not in result.report_markdown
-        assert "AI judge rejected: not actionable" in result.report_markdown
 
-    def test_unified_strategy_keeps_medium_and_low_candidates(self, workspace):
-        raw = _submit([
-            {
-                "severity": "medium", "file": "src/app.py", "line": 1,
-                "title": "Medium issue", "evidence": "line1", "impact": "bad", "recommendation": "fix",
-            },
-            {
-                "severity": "low", "file": "src/app.py", "line": 2,
-                "title": "Low issue", "evidence": "line2", "impact": "bad", "recommendation": "fix",
-            },
-        ])
+    def test_medium_and_low_candidates_are_kept(self, workspace):
         f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("security", raw)
+
+        result = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "medium",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Medium issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    },
+                    {
+                        "severity": "low",
+                        "file": "src/app.py",
+                        "line": 2,
+                        "title": "Low issue",
+                        "evidence": "line2",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    },
+                ]
+            ),
+        )
 
         assert [candidate.title for candidate in result.accepted] == [
             "Medium issue",
             "Low issue",
         ]
 
-    @pytest.mark.asyncio
-    async def test_judge_unavailable_marks_candidates_needs_confirmation(self, workspace):
-        """No judge instance: candidates must not silently pass as accepted."""
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "Unjudged issue", "evidence": "line1", "impact": "bad", "recommendation": "fix",
-        }])
+
+class TestDimensionFailure:
+    def test_a_failed_reviewer_is_incomplete_with_a_bounded_reason(self, workspace):
         f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
 
-        await f.apply_judge(None)
-        result = f.finalize("test")
+        failed = f.dimension_failure("security", "provider timeout")
+        result = f.finalize((failed,), target_name="repo")
 
+        assert failed.status == "incomplete"
+        assert failed.errors == ["provider timeout"]
+        assert "Review incomplete" in result.report_markdown
+        assert "No actionable issues found" not in result.report_markdown
+
+    def test_an_empty_reason_still_explains_the_gap(self, workspace):
+        failed = ReviewFinalizer(workspace).dimension_failure("security", "   ")
+
+        assert failed.errors == ["reviewer did not complete"]
+
+    def test_failure_reason_is_bounded_and_labels_the_status(self):
+        reason = reviewer_failure_reason("error", "x" * 2_000)
+
+        assert reason.startswith("reviewer status=error: ")
+        assert len(reason) <= 500
+        assert "\n" not in reason
+
+    def test_failure_reason_without_detail_states_no_output(self):
+        assert reviewer_failure_reason("error", "") == (
+            "reviewer status=error: no result output"
+        )
+
+
+class TestFinalize:
+    def test_finalize_without_dimensions_is_incomplete_not_clean(self, workspace):
+        result = ReviewFinalizer(workspace).finalize((), target_name="repo")
+
+        assert result.errors == ["No review dimension results were produced."]
+        assert "Review incomplete" in result.report_markdown
+        assert "No actionable issues found" not in result.report_markdown
+
+    def test_finalize_produces_report(self, workspace):
+        f = ReviewFinalizer(workspace)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "critical",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "RCE",
+                        "evidence": "line1",
+                        "impact": "Full compromise",
+                        "recommendation": "Remove exec",
+                    }
+                ]
+            ),
+        )
+
+        result = f.finalize((validated,), target_name="myproject")
+
+        assert "## Code Review Report: myproject" in result.report_markdown
+        assert "RCE" in result.report_markdown
+        assert result.errors == []
+
+    def test_report_is_rendered_from_every_given_dimension(self, workspace):
+        """The finalizer renders exactly the set it is handed (no accumulation)."""
+        f = ReviewFinalizer(workspace)
+        first = f.validate_findings("security", _findings([
+            {
+                "severity": "high",
+                "file": "src/app.py",
+                "line": 1,
+                "title": "First finding",
+                "evidence": "line1",
+                "impact": "bad",
+                "recommendation": "fix",
+            }
+        ]))
+        second = f.validate_findings("bug", _findings([
+            {
+                "severity": "high",
+                "file": "src/app.py",
+                "line": 2,
+                "title": "Second finding",
+                "evidence": "line2",
+                "impact": "bad",
+                "recommendation": "fix",
+            }
+        ], details=_BUG_DETAILS))
+
+        result = f.finalize((first, second), target_name="myproject")
+
+        assert "First finding" in result.report_markdown
+        assert "Second finding" in result.report_markdown
+        # Re-finalizing the same set is idempotent (no accumulation inside).
+        again = f.finalize((first, second), target_name="myproject")
+        assert again.report_markdown == result.report_markdown
+
+    def test_a_rendering_failure_is_reported_as_an_error(self, workspace, monkeypatch):
+        import nanoreview.review.output.report as report_module
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("render exploded")
+
+        monkeypatch.setattr(report_module, "render_review_report", _boom)
+        result = ReviewFinalizer(workspace).finalize((), target_name="repo")
+
+        assert any("render exploded" in error for error in result.errors)
+        assert "Report rendering failed" in result.report_markdown
+
+
+class TestNeedsConfirmation:
+    def test_no_confirmation_needed_when_every_candidate_is_clear(self, workspace):
+        f = ReviewFinalizer(workspace)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Clear bug",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
+
+        result = f.finalize((validated,), target_name="test")
+
+        assert result.needs_confirmation == []
+
+    def test_uncertain_items_remain_in_needs_confirmation(self, workspace):
+        f = ReviewFinalizer(workspace)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Maybe",
+                        "evidence": "",
+                        "impact": "unknown",
+                        "recommendation": "check",
+                    }
+                ]
+            ),
+        )
+
+        result = f.finalize((validated,), target_name="test")
+
+        assert len(result.needs_confirmation) == 1
+        assert "Maybe" in result.report_markdown
+        assert "### Needs Confirmation" in result.report_markdown
+
+
+class TestJudge:
+    @pytest.mark.asyncio
+    async def test_ai_judge_can_reject_a_hard_accepted_candidate(self, workspace):
+        f = ReviewFinalizer(workspace)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "False positive",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
+        judge = FakeJudge(
+            {
+                "security:src/app.py:1:false positive": ReviewJudgeVerdict(
+                    decision=ReviewJudgeDecision.REJECT,
+                    reason="not actionable",
+                )
+            }
+        )
+
+        _, judged = await f.judge(judge, (validated,))
+        result = f.finalize(judged, target_name="test")
+
+        assert "No actionable issues found" not in result.report_markdown
+        assert "AI judge rejected: not actionable" in result.report_markdown
+
+    @pytest.mark.asyncio
+    async def test_a_missing_judge_marks_candidates_needs_confirmation(
+        self, workspace
+    ):
+        """No judge instance: candidates must not silently pass as accepted."""
+        f = ReviewFinalizer(workspace)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Unjudged issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
+
+        execution, judged = await f.judge(None, (validated,))
+        result = f.finalize(judged, target_name="test", judge_stats=execution.stats)
+
+        assert execution.error is None
         assert "Unjudged issue" in result.report_markdown
         assert "### Needs Confirmation" in result.report_markdown
         assert "AI judge is unavailable" in result.report_markdown
@@ -255,22 +485,32 @@ class TestSemanticVerdicts:
         assert "AI judge is unavailable" in result.needs_confirmation[0][1].reason
 
     @pytest.mark.asyncio
-    async def test_judge_total_failure_marks_candidates_needs_confirmation(self, workspace):
+    async def test_an_exploding_judge_marks_candidates_needs_confirmation(
+        self, workspace
+    ):
         """A judge that raises outright must surface candidates, not accept them."""
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "Failed judge issue", "evidence": "line1", "impact": "bad", "recommendation": "fix",
-        }])
         f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Failed judge issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
 
-        class ExplodingJudge:
-            async def judge_dimensions(self, dimensions):
-                raise RuntimeError("provider down")
+        execution, judged = await f.judge(ExplodingJudge(), (validated,))
+        result = f.finalize(judged, target_name="test", judge_stats=execution.stats)
 
-        await f.apply_judge(ExplodingJudge())
-        result = f.finalize("test")
-
+        assert execution.error is not None
         assert "Failed judge issue" in result.report_markdown
         assert "### Needs Confirmation" in result.report_markdown
         assert "AI judge failed" in result.report_markdown
@@ -280,20 +520,31 @@ class TestSemanticVerdicts:
         assert "AI judge failed" in result.needs_confirmation[0][1].reason
 
     @pytest.mark.asyncio
-    async def test_apply_judge_returns_stats_usage_and_bounded_error(self, workspace):
-        """The finalizer consumes and returns the judge's immutable result."""
-        from nanoreview.review.output.judge import ReviewJudgeStats
-
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "Partial judge issue", "evidence": "line1", "impact": "bad",
-            "recommendation": "fix",
-        }])
+    async def test_judge_returns_stats_usage_and_bounded_error(self, workspace):
+        """The finalizer passes the judge's immutable result through untouched."""
         f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Partial judge issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
         stats = ReviewJudgeStats(
-            total_candidates=1, sent_candidates=1, returned_verdicts=0,
-            needs_confirmation=1, batches=1,
+            total_candidates=1,
+            sent_candidates=1,
+            returned_verdicts=0,
+            needs_confirmation=1,
+            batches=1,
         )
         judge = FakeJudge(
             {
@@ -304,15 +555,15 @@ class TestSemanticVerdicts:
             },
             stats=stats,
             usage={"total_tokens": 42},
-            error="AI judge batch failed (terminal_tool_failed): boom",
+            error="AI judge batch failed (invalid_output): boom",
         )
 
-        returned = await f.apply_judge(judge)
-        result = f.finalize("test")
+        returned, judged = await f.judge(judge, (validated,))
+        result = f.finalize(judged, target_name="test", judge_stats=returned.stats)
 
         assert returned.stats is stats
         assert returned.usage == {"total_tokens": 42}
-        assert returned.error == "AI judge batch failed (terminal_tool_failed): boom"
+        assert returned.error == "AI judge batch failed (invalid_output): boom"
         # A judge error never silently accepts: the candidate is surfaced.
         assert len(result.needs_confirmation) == 1
         assert result.needs_confirmation[0][0].title == "Partial judge issue"
@@ -321,313 +572,136 @@ class TestSemanticVerdicts:
         assert "- Sent to judge: 1" in result.report_markdown
 
     @pytest.mark.asyncio
-    async def test_apply_judge_escalated_failure_reports_bounded_error(self, workspace):
+    async def test_an_escalated_failure_reports_a_bounded_error(self, workspace):
         """An escaping judge failure returns a bounded error for the supervisor."""
-        raw = _submit([{
-            "severity": "high", "file": "src/app.py", "line": 1,
-            "title": "Escaped judge issue", "evidence": "line1", "impact": "bad",
-            "recommendation": "fix",
-        }])
         f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Escaped judge issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
 
-        class ExplodingJudge:
-            async def judge_dimensions(self, dimensions):
-                raise RuntimeError("provider down\nwith a long trace")
-
-        returned = await f.apply_judge(ExplodingJudge())
+        returned, _ = await f.judge(
+            ExplodingJudge("provider down\nwith a long trace"), (validated,)
+        )
 
         assert returned.error is not None
         assert "provider down" in returned.error
         assert "\n" not in returned.error
         assert len(returned.error) <= 300
 
-
-class TestFinalize:
-    def test_finalize_without_dimensions_is_incomplete_not_clean(self, workspace):
+    @pytest.mark.asyncio
+    async def test_no_verdicts_for_candidates_marks_them_needs_confirmation(
+        self, workspace
+    ):
+        """An empty verdict map over real candidates is a gap, not a clean pass."""
         f = ReviewFinalizer(workspace)
-        result = f.finalize("repo")
-
-        assert result.errors == ["No review dimension results were produced."]
-        assert "Review incomplete" in result.report_markdown
-        assert "No actionable issues found" not in result.report_markdown
-
-    def test_finalize_produces_report(self, workspace):
-        raw = _submit([{
-            "severity": "critical", "file": "src/app.py", "line": 1,
-            "title": "RCE", "evidence": "line1", "impact": "Full compromise",
-            "recommendation": "Remove exec",
-        }])
-        f = ReviewFinalizer(workspace)
-        f.ingest_subagent_output("security", raw)
-        result = f.finalize("myproject")
-        assert "## Code Review Report: myproject" in result.report_markdown
-        assert "RCE" in result.report_markdown
-        assert result.errors == []
-
-    def test_tool_context_failure_renders_incomplete_not_clean(self, workspace):
-        raw = (
-            "Error: failed to fetch GitHub repository context: "
-            "Error: GitHub API rate limited. Set GITHUB_TOKEN for higher limits."
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Unreturned issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
         )
+
+        execution, judged = await f.judge(FakeJudge({}), (validated,))
+        result = f.finalize(judged, target_name="test", judge_stats=execution.stats)
+
+        assert execution.verdicts == {}
+        assert "AI judge returned no verdicts" in result.report_markdown
+        assert len(result.needs_confirmation) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_empty_candidate_set_needs_no_judge_pass(self, workspace):
         f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("tests", raw)
-        report = f.finalize("repo").report_markdown
+        empty = ReviewDimensionResult(dimension="security", status="no_findings")
 
-        assert result.status == "incomplete"
-        assert result.errors
-        assert "Review incomplete" in report
-        assert "No actionable issues found" not in report
+        execution, judged = await f.judge(FakeJudge({}), (empty,))
 
-    def test_unstructured_subagent_output_renders_incomplete_not_clean(self, workspace):
-        raw = "I inspected the files but did not call review_submit."
+        assert execution.verdicts == {}
+        assert judged == (empty,)
+
+    @pytest.mark.asyncio
+    async def test_judge_applies_verdicts_to_accepted_and_uncertain_candidates(
+        self, workspace
+    ):
         f = ReviewFinalizer(workspace)
-        result = f.ingest_subagent_output("architecture", raw)
-        report = f.finalize("repo").report_markdown
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Accepted issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
+        assert validated.accepted
+        verdicts = {
+            "security:src/app.py:1:accepted issue": ReviewJudgeVerdict(
+                decision=ReviewJudgeDecision.ACCEPT, reason="confirmed", confidence="high"
+            )
+        }
 
-        assert result.status == "incomplete"
-        assert result.errors == ["No structured findings were produced by this reviewer."]
-        assert "Review incomplete" in report
-        assert "No actionable issues found" not in report
+        _, judged = await f.judge(FakeJudge(verdicts), (validated,))
 
-    def test_unstructured_subagent_output_does_not_log_json_error(self, workspace):
+        assert len(judged) == 1
+        assert judged[0].judged[0].judge_verdict.decision is ReviewJudgeDecision.ACCEPT
+        # The judge pass returns a *new* set; the input is untouched.
+        assert validated.judged == []
+
+
+class TestLogging:
+    def test_an_unstructured_answer_does_not_log_a_json_error(self, workspace):
+        """A missing structured answer is a normal gap, not an internal error."""
         errors: list[str] = []
         sink_id = logger.add(lambda message: errors.append(str(message)), level="ERROR")
         try:
+            # The runner never hands the finalizer an unstructured answer: it
+            # rejects it first. What must not happen is a JSON parse error here.
             f = ReviewFinalizer(workspace)
-            result = f.ingest_subagent_output("bug-risk", "Plain review summary, no tool call.")
+            f.validate_findings("bug-risk", [])
         finally:
             logger.remove(sink_id)
 
-        assert result.status == "incomplete"
         assert not any("submit json error" in message for message in errors)
 
-    def test_finalizer_skips_disallowed_dimensions(self, workspace):
-        maintainability_raw = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Boundary violation",
-            "evidence": "line1",
-            "impact": "Change amplification",
-            "recommendation": "Introduce a stable interface",
-        }], details=_MAINTAINABILITY_DETAILS)
-        security_raw = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 2,
-            "title": "Security finding",
-            "evidence": "line2",
-            "impact": "Bad",
-            "recommendation": "Fix",
-        }])
-        f = ReviewFinalizer(workspace, allowed_dimensions={"maintainability"})
-
-        skipped = f.ingest_subagent_output("security", security_raw)
-        accepted = f.ingest_subagent_output("Maintainability Reviewer", maintainability_raw)
-        result = f.finalize("myproject")
-
-        assert skipped.status == "skipped_disallowed"
-        assert len(accepted.accepted) == 1
-        assert "Boundary violation" in result.report_markdown
-        assert "Security finding" not in result.report_markdown
-        assert [dimension.dimension for dimension in result.dimensions] == ["maintainability"]
-
-    def test_finalizer_accepts_spawn_labels_with_task_suffix(self, workspace):
-        raw = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Font loading blocks render",
-            "evidence": "line1",
-            "impact": "Slower first paint",
-            "recommendation": "Use font-display swap",
-        }], details=_PERFORMANCE_DETAILS)
-        f = ReviewFinalizer(workspace, allowed_dimensions={"performance"})
-
-        accepted = f.ingest_subagent_output(
-            "Performance Reviewer for review-webui/index.html",
-            raw,
+    def test_a_disallowed_dimension_logs_a_warning(self, workspace):
+        warnings: list[str] = []
+        sink_id = logger.add(
+            lambda message: warnings.append(str(message)), level="WARNING"
         )
-        result = f.finalize("review-webui/index.html")
+        try:
+            ReviewFinalizer(workspace, allowed_dimensions={"bug"}).validate_findings(
+                "security", []
+            )
+        finally:
+            logger.remove(sink_id)
 
-        assert accepted.status != "skipped_disallowed"
-        assert accepted.dimension == "performance"
-        assert "Font loading blocks render" in result.report_markdown
-        assert not result.errors
-
-    def test_finalizer_accepts_dimension_key_spawn_label(self, workspace):
-        """The orchestrator spawns reviewers with the raw dimension key as label."""
-        raw = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Blocking external stylesheet",
-            "evidence": "line1",
-            "impact": "Slower first paint",
-            "recommendation": "Preconnect or self-host critical font assets",
-        }], details=_PERFORMANCE_DETAILS)
-        f = ReviewFinalizer(workspace, allowed_dimensions={"performance"})
-
-        accepted = f.ingest_subagent_output("performance", raw)
-        result = f.finalize("review-webui/index.html")
-
-        assert accepted.status != "skipped_disallowed"
-        assert accepted.dimension == "performance"
-        assert "Blocking external stylesheet" in result.report_markdown
-        assert not result.errors
-
-    def test_ingest_runner_message_with_failed_status_is_incomplete(self, workspace):
-        """An explicit non-ok subagent status must not be parsed as a clean
-        result, even when the raw payload is valid empty-findings JSON."""
-        raw_result = _submit([])
-        message = {
-            "role": "user",
-            "content": "[Subagent 'security' failed]",
-            "_metadata": {
-                "injected_event": "subagent_result",
-                "subagent_label": "security",
-                "subagent_status": "error",
-                "subagent_result": raw_result,
-            },
-        }
-        f = ReviewFinalizer(workspace)
-        assert f.ingest_messages([message]) == 1
-        result = f.finalize("myproject")
-        assert "Review incomplete" in result.report_markdown
-        assert "No actionable issues found" not in result.report_markdown
-        security = next(d for d in result.dimensions if d.dimension == "security")
-        assert security.status == "incomplete"
-        assert "reviewer status=error" in security.errors[0]
-
-    def test_ingest_runner_message_metadata_prefers_raw_result(self, workspace):
-        raw_result = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 2,
-            "title": "Wrapped finding",
-            "evidence": "line2",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        message = {
-            "role": "user",
-            "content": "[Subagent 'security' completed]\n\nResult:\n[]",
-            "_metadata": {
-                "injected_event": "subagent_result",
-                "subagent_label": "security",
-                "subagent_result": raw_result,
-            },
-        }
-        f = ReviewFinalizer(workspace)
-        assert f.ingest_messages([message]) == 1
-        result = f.finalize("myproject")
-        assert "Wrapped finding" in result.report_markdown
-
-    def test_ingest_persisted_subagent_message_top_level_metadata(self, workspace):
-        raw_result = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 2,
-            "title": "Persisted finding",
-            "evidence": "line2",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        message = {
-            "role": "assistant",
-            "content": "[Subagent 'security' completed]\n\nResult:\n[]",
-            "injected_event": "subagent_result",
-            "subagent_label": "security",
-            "subagent_result": raw_result,
-        }
-        f = ReviewFinalizer(workspace)
-
-        assert f.ingest_messages([message]) == 1
-        result = f.finalize("myproject")
-
-        assert "Persisted finding" in result.report_markdown
-
-    def test_ingest_runner_message_requires_raw_submit_result_metadata(self, workspace):
-        raw_result = _submit([{
-            "severity": "medium",
-            "file": "src/app.py",
-            "line": 3,
-            "title": "Announced finding",
-            "evidence": "line3",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        message = {
-            "role": "user",
-            "content": (
-                "[Subagent 'tests' completed]\n\n"
-                "Result:\n"
-                "```json\n"
-                f"{raw_result}\n"
-                "```\n\n"
-                "Summarize this naturally for the user."
-            ),
-            "_metadata": {
-                "injected_event": "subagent_result",
-                "subagent_label": "tests",
-            },
-        }
-        f = ReviewFinalizer(workspace)
-
-        assert f.ingest_messages([message]) == 1
-        result = f.finalize("myproject")
-
-        assert "Announced finding" not in result.report_markdown
-        assert "Review incomplete" in result.report_markdown
-
-    def test_allowed_dimensions_set_after_construction_filters_late_results(self, workspace):
-        """A dimension outside the (late) allow-list is skipped, not reported."""
-        raw_result = _submit([{
-            "severity": "critical",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "Disallowed finding",
-            "evidence": "line1",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        f = ReviewFinalizer(workspace)
-        f.set_allowed_dimensions(["maintainability"])
-
-        accepted = f.ingest_subagent_output("security", raw_result)
-        result = f.finalize("myproject")
-
-        assert accepted.status == "skipped_disallowed"
-        assert "Disallowed finding" not in result.report_markdown
-        assert "Review incomplete" in result.report_markdown
-        assert "No actionable issues found" not in result.report_markdown
-
-    def test_incremental_subagent_outputs_accumulate(self, workspace):
-        """Ingesting per dimension accumulates findings across ingest calls."""
-        first = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 1,
-            "title": "First finding",
-            "evidence": "line1",
-            "impact": "bad",
-            "recommendation": "fix",
-        }])
-        second = _submit([{
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 2,
-            "title": "Second finding",
-            "evidence": "line2",
-            "impact": "bad",
-            "recommendation": "fix",
-        }], details=_BUG_DETAILS)
-        f = ReviewFinalizer(workspace)
-
-        f.ingest_subagent_output("security", first)
-        f.ingest_subagent_output("bug", second)
-        result = f.finalize("myproject")
-
-        assert "First finding" in result.report_markdown
-        assert "Second finding" in result.report_markdown
+        assert any("skip_disallowed" in message for message in warnings)

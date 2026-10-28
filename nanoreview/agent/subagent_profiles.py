@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from nanoreview.agent.output_contract import OutputContract
 from nanoreview.agent.runner import AgentRunResult
 
 BUG_REVIEWER_SCOPE = "reviewer.bug"
@@ -34,11 +35,18 @@ class SubagentExecutionLimits:
 
 @dataclass(frozen=True, slots=True)
 class SubagentCompletion:
-    """Normalized outcome returned by a profile-specific result handler."""
+    """Normalized outcome returned by a profile-specific result handler.
+
+    ``payload`` carries the structured final result of a profile that declares
+    an output contract. It is the only channel a controlling orchestrator reads
+    a subagent's result from — the human-readable ``content`` is a bounded
+    progress line, never the result itself.
+    """
 
     content: str
     status: str = "ok"
     stop_reason: str | None = None
+    payload: Any | None = None
 
 
 class SubagentResultHandler(Protocol):
@@ -57,12 +65,15 @@ class SubagentExecutionProfile:
     id: str
     scope: str
     required_tools: frozenset[str] = frozenset()
-    terminal_tools: frozenset[str] = frozenset()
     soft_tool_error_tools: frozenset[str] = frozenset()
     #: Tools whose untruncated result must be preserved in the run's
     #: ``tool_events``. Declared per profile; a profile that keeps none lets
     #: ordinary tool results stay bounded by default.
     preserve_tool_result_tools: frozenset[str] = frozenset()
+    #: Structured-output contract the subagent must satisfy. Declared when the
+    #: profile's result is machine-consumed; the manager fails the task instead
+    #: of handing back an answer the contract rejected.
+    output_contract_factory: Callable[[], OutputContract] | None = None
     prompt_builder: Callable[[dict[str, Any], Path], str] | None = None
     workspace_resolver: Callable[[dict[str, Any], Path], Path] | None = None
     result_handler: SubagentResultHandler | None = None

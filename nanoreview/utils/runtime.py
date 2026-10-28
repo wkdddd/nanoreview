@@ -29,6 +29,23 @@ LENGTH_RECOVERY_PROMPT = (
     "— no recap, no apology. Break remaining work into smaller steps if needed."
 )
 
+#: Length recovery for a run that must answer with one structured object.
+#: Continuing a truncated JSON fragment can never produce a parseable value, so
+#: the model is asked to restate the whole object instead of appending to it.
+STRUCTURED_LENGTH_RECOVERY_PROMPT = (
+    "Output limit reached and the answer was cut off. Reply with the complete "
+    "JSON object again from the start — do not continue the fragment, do not "
+    "add prose before or after it, and keep it short enough to fit the limit."
+)
+
+#: Last-chance instruction for the final permitted request of a structured run.
+#: That request carries no tools, so the budget cannot be spent on a tool call
+#: the run has no room to come back from.
+FINAL_STRUCTURED_ANSWER_PROMPT = (
+    "This is your final available turn and no tools are available. Reply now "
+    "with the single JSON object your task requires — no tool calls, no prose."
+)
+
 
 def empty_tool_result_message(tool_name: str) -> str:
     """Short prompt-safe marker for tools that completed without visible output."""
@@ -63,6 +80,16 @@ def build_finalization_retry_message() -> dict[str, str]:
 def build_length_recovery_message() -> dict[str, str]:
     """Prompt the model to continue after hitting output token limit."""
     return {"role": "user", "content": LENGTH_RECOVERY_PROMPT}
+
+
+def build_structured_length_recovery_message() -> dict[str, str]:
+    """Ask a structured run to restate the whole object after a truncation."""
+    return {"role": "user", "content": STRUCTURED_LENGTH_RECOVERY_PROMPT}
+
+
+def build_final_structured_answer_message() -> dict[str, str]:
+    """Tell a structured run its remaining budget is one answer, no tools."""
+    return {"role": "user", "content": FINAL_STRUCTURED_ANSWER_PROMPT}
 
 
 def external_lookup_signature(tool_name: str, arguments: dict[str, Any]) -> str | None:

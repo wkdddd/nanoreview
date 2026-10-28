@@ -15,15 +15,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from nanoreview.agent.review_board import CHILD_COMPLETED
 from nanoreview.agent.review_state import (
     REVIEW_SUMMARY_MAX_CHARS,
     REVIEW_TERMINAL_STATUSES,
-    ReviewRunState,
     ReviewRunStatus,
 )
 from nanoreview.review.types import ReviewMetaKey
+
+if TYPE_CHECKING:
+    from nanoreview.agent.review_board import ReviewBoardView
 
 #: Provenance marker attached to the review_context index message and to the
 #: injected handoff so a reader can always tell ReviewAgent output from
@@ -110,16 +113,16 @@ def _bounded(text: Any, limit: int = GAP_MAX_CHARS) -> str:
     return " ".join(str(text or "").split())[:limit]
 
 
-def _coverage(state: ReviewRunState) -> tuple[str, ...]:
+def _coverage(view: "ReviewBoardView") -> tuple[str, ...]:
     """Dimensions that actually returned a terminal successful review."""
     return tuple(
-        dimension
-        for dimension, reviewer in sorted(state.reviewers.items())
-        if reviewer.status == "completed"
+        reviewer.dimension
+        for reviewer in sorted(view.reviewers, key=lambda item: item.dimension)
+        if reviewer.status == CHILD_COMPLETED
     )
 
 
-def _gaps(state: ReviewRunState) -> tuple[str, ...]:
+def _gaps(view: "ReviewBoardView") -> tuple[str, ...]:
     """Explicit, deduplicated reasons the produced report is incomplete.
 
     A finished reviewer keeps its terminal state and is not a gap. Anything
@@ -128,17 +131,17 @@ def _gaps(state: ReviewRunState) -> tuple[str, ...]:
     more complete than it is.
     """
     gaps: list[str] = []
-    for dimension, reviewer in sorted(state.reviewers.items()):
-        if reviewer.status == "completed":
+    for reviewer in sorted(view.reviewers, key=lambda item: item.dimension):
+        if reviewer.status == CHILD_COMPLETED:
             continue
         detail = reviewer.error or f"status={reviewer.status}"
-        gaps.append(_bounded(f"dimension '{dimension}' not reviewed ({detail})"))
-    for batch_id, batch in sorted(state.judge_batches.items()):
-        if batch.status == "completed":
+        gaps.append(_bounded(f"dimension '{reviewer.dimension}' not reviewed ({detail})"))
+    for batch in sorted(view.judge_batches, key=lambda item: item.batch_id):
+        if batch.status == CHILD_COMPLETED:
             continue
         detail = batch.error or f"status={batch.status}"
-        gaps.append(_bounded(f"judge batch '{batch_id}' incomplete ({detail})"))
-    gaps.extend(_bounded(warning) for warning in state.warnings)
+        gaps.append(_bounded(f"judge batch '{batch.batch_id}' incomplete ({detail})"))
+    gaps.extend(_bounded(warning) for warning in view.warnings)
     seen: set[str] = set()
     ordered: list[str] = []
     for gap in gaps:
@@ -167,45 +170,47 @@ def _classify_handoff(
     return ReviewHandoffState.COMPLETE
 
 
-def result_from_run_state(
-    state: ReviewRunState,
+def result_from_board(
+    view: "ReviewBoardView",
     *,
     session_metadata: Mapping[str, Any] | None = None,
 ) -> ReviewResult:
-    """Build the structured result of *state*.
+    """Build the structured result of a run from its blackboard projection.
 
-    ``session_metadata`` supplies the fields that live on the session rather
-    than the run (currently the snapshot reference) for runs restored without
-    a live in-process state.
+    This is the only live-run result builder: the board is the single
+    authoritative record, so the result, the report artifact and the persisted
+    session metadata all describe the same state. ``session_metadata`` supplies
+    the fields that live on the session rather than the run (currently the
+    snapshot reference) for runs whose board was created without one.
     """
     metadata = session_metadata or {}
-    snapshot_ref = state.snapshot_ref or metadata.get(ReviewMetaKey.SNAPSHOT_REF)
-    gaps = _gaps(state)
-    handoff = _classify_handoff(state.status, state.report_ref, gaps)
+    snapshot_ref = view.snapshot_ref or metadata.get(ReviewMetaKey.SNAPSHOT_REF)
+    gaps = _gaps(view)
+    handoff = _classify_handoff(view.status, view.report_ref, gaps)
     error = ""
-    if state.status is not ReviewRunStatus.COMPLETED:
-        error = _bounded(state.warnings[-1]) if state.warnings else (
-            f"review ended with status '{state.status.value}'"
+    if view.status is not ReviewRunStatus.COMPLETED:
+        error = _bounded(view.warnings[-1]) if view.warnings else (
+            f"review ended with status '{view.status.value}'"
         )
-    elif not state.report_ref:
+    elif not view.report_ref:
         # A completed run whose artifact is gone is still a failed handoff, so
         # it must carry a reason rather than an empty error.
         error = "the review report artifact is missing"
     return ReviewResult(
-        run_id=state.run_id,
-        session_key=state.session_key,
-        status=state.status,
+        run_id=view.run_id,
+        session_key=view.session_key,
+        status=view.status,
         handoff=handoff,
-        report_ref=state.report_ref,
+        report_ref=view.report_ref,
         snapshot_ref=str(snapshot_ref) if snapshot_ref else None,
-        input_fingerprint=state.input_fingerprint,
-        summary=state.summary or error,
-        findings=tuple(state.findings),
-        coverage=_coverage(state),
+        input_fingerprint=view.input_fingerprint,
+        summary=view.summary or error,
+        findings=tuple(view.findings),
+        coverage=_coverage(view),
         gaps=gaps,
         error=error,
-        warnings=tuple(state.warnings),
-        usage=dict(state.usage),
+        warnings=tuple(view.warnings),
+        usage=dict(view.usage),
     )
 
 
@@ -390,6 +395,6 @@ __all__ = [
     "render_handoff_block",
     "render_handoff_directive",
     "render_review_context_index",
-    "result_from_run_state",
+    "result_from_board",
     "result_from_session_metadata",
 ]

@@ -38,8 +38,13 @@ from nanoreview.bus.queue import MessageBus
 from nanoreview.config.schema import AgentDefaults, ToolsConfig
 from nanoreview.events import EventSink, ProgressEvent
 from nanoreview.providers.base import LLMProvider
+from nanoreview.utils.helpers import truncate_text
 from nanoreview.utils.prompt_templates import render_template
 from nanoreview.utils.subagent_trace import append_subagent_trace, flush_subagent_trace
+
+#: Cap on the human-readable completion line carried by a subagent result.
+#: A completion notification wakes the host; it is not a result channel.
+SUBAGENT_ANNOUNCE_MAX_CHARS = 2_000
 
 _TASK_RUNNING = "running"
 _TASK_COMPLETED = "completed"
@@ -266,8 +271,10 @@ class SubagentManager:
         )
 
     @staticmethod
-    def terminal_tools(profile: SubagentExecutionProfile) -> frozenset[str]:
-        return profile.terminal_tools
+    def output_contract(profile: SubagentExecutionProfile):
+        """The structured-output contract this profile must satisfy, if any."""
+        factory = profile.output_contract_factory
+        return factory() if factory is not None else None
 
     @staticmethod
     def soft_tool_error_tools(profile: SubagentExecutionProfile) -> frozenset[str]:
@@ -573,7 +580,7 @@ class SubagentManager:
                         error_message=None,
                         fail_on_tool_error=True,
                         soft_tool_error_tools=self.soft_tool_error_tools(profile),
-                        terminal_tools=self.terminal_tools(profile),
+                        output_contract=self.output_contract(profile),
                         preserve_tool_result_tools=profile.preserve_tool_result_tools,
                         checkpoint_callback=_on_checkpoint,
                         session_key=sess_key,
@@ -613,10 +620,17 @@ class SubagentManager:
                         execution_limits=execution_limits,
                     )
                     return
-                if result.stop_reason in ("error", "compression_failed", "compression_limit"):
-                    # Run-level compression stopped the run: it is an execution
-                    # failure, not a completion. The reviewer is marked error so
-                    # the finalizer treats its dimension as incomplete.
+                if result.stop_reason in (
+                    "error",
+                    "compression_failed",
+                    "compression_limit",
+                    "invalid_output",
+                ):
+                    # Run-level compression stopped the run, or the final answer
+                    # never satisfied the profile's output contract: both are
+                    # execution failures, not completions. The reviewer is
+                    # marked error so the caller treats its assignment as
+                    # incomplete instead of parsing a rejected answer.
                     status.phase = "error"
                     reason = result.error or (
                         f"Error: reviewer run stopped with {result.stop_reason}."
@@ -643,9 +657,10 @@ class SubagentManager:
                 status.stop_reason = completion.stop_reason or status.stop_reason
 
                 logger.info("Subagent [{}] completed status={}", task_id, completion.status)
-                # A reviewer that submitted empty findings without evidence is
-                # an execution failure; missing terminal submission is still a
-                # completed lifecycle with an error result for compatibility.
+                # A reviewer that answered with empty findings without evidence
+                # is an execution failure; a run whose final answer never
+                # satisfied its output contract is still a completed lifecycle
+                # with an error result for compatibility.
                 status.phase = (
                     "error"
                     if completion.status == "error"
@@ -663,6 +678,7 @@ class SubagentManager:
                     origin_message_id,
                     usage=result.usage,
                     execution_limits=execution_limits,
+                    payload=completion.payload,
                 )
 
         except TimeoutError:
@@ -718,15 +734,16 @@ class SubagentManager:
     ) -> SubagentCompletion:
         """Normalize the final result of the single completed AgentRun.
 
-        Terminal-tool retries already happened inside ``AgentRunner``; no
-        compensation run is started here. The profile's result handler only
-        parses the final structured outcome of the finished run.
+        No compensation run is started here: the runner already gave the model
+        bounded correction attempts inside the run. The profile's result handler
+        only interprets the accepted structured payload.
         """
         if profile.result_handler is None:
             return SubagentCompletion(
                 result.final_content or result.error or "",
                 status="ok" if result.stop_reason != "error" else "error",
                 stop_reason=result.stop_reason,
+                payload=result.structured_output,
             )
         return await profile.result_handler(result=result, metadata=metadata)
 
@@ -741,8 +758,16 @@ class SubagentManager:
         origin_message_id: str | None = None,
         usage: dict[str, int] | None = None,
         execution_limits: SubagentExecutionLimits | None = None,
+        payload: Any | None = None,
     ) -> None:
-        """Hand the finished subagent result to the owning session's queue."""
+        """Hand the finished subagent result to the owning session's queue.
+
+        The completion notification only wakes the host: ``content`` is a
+        bounded human-readable line and ``subagent_result`` stays a bounded
+        reason, so a reviewer transcript or report body never travels through
+        the session queue. A profile with an output contract delivers its
+        structured result through ``subagent_payload`` instead.
+        """
         session_key = (
             origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         )
@@ -760,7 +785,7 @@ class SubagentManager:
             label=label,
             status_text=status_text,
             task=task,
-            result=result,
+            result=truncate_text(result, SUBAGENT_ANNOUNCE_MAX_CHARS) if result else "",
         )
 
         # Deliver the result to the owning session's in-process queue only: the
@@ -774,8 +799,12 @@ class SubagentManager:
             "subagent_task_id": task_id,
             "subagent_label": label,
             "subagent_status": status,
-            "subagent_result": result,
+            "subagent_result": truncate_text(result, SUBAGENT_ANNOUNCE_MAX_CHARS)
+            if result
+            else "",
         }
+        if payload is not None:
+            metadata["subagent_payload"] = payload
         if usage:
             metadata["subagent_usage"] = dict(usage)
         status_obj = self._task_statuses.get(task_id)

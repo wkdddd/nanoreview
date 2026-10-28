@@ -20,7 +20,7 @@
 
 ## 当前确认节点：run 黑板与结构化输出收敛
 
-状态：已确认，待实施（2026-10-22）。本节点为当前确认的实施任务；既有节点的待验收与后续事项另列，不自动纳入本节点范围。
+状态：已验收（2026-10-25）。生产代码、测试迁移与约束文档均已完成，经四轮 subagent 复审收敛。全量 `pytest` 为 `25 failed / 1042 passed`，25 项全部是本机禁止派生子进程导致的 git 子进程环境失败（admission 10、rag 3、channels 1、review_gate 10、api 1），属既有基线；`ruff check nanoreview/` 45 项、`tests/` 0 项（均优于或等于基线）；`git diff --check` 通过。复审修复项：`coordinator.result()` 的 running 守卫、`/new` 的持久标识清理、stop/error 出口的 summary、结构化 run 的终局答案轮（含提示双写与被拒即 `invalid_output`）、`drop_unstarted` 的 run 归属与持久标识清理、`process_direct` 各返回路径的 run 释放、judge 空 verdicts 的降级语义与提示一致、reviewer findings 一次报全字段问题。既有节点的待验收与后续事项另列，不自动纳入本节点范围。
 
 ### 已确认边界
 

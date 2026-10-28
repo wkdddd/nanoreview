@@ -6,8 +6,8 @@ from nanoreview.review.quality import (
     GOLDEN_CASES,
     ActualFinding,
     ExpectedFinding,
+    FinalAnswerStep,
     ReplayStep,
-    SubmitStep,
     evaluate_case,
     format_quality_report,
     load_golden_cases,
@@ -96,7 +96,7 @@ def test_evaluate_case_scores_a_perfect_replay() -> None:
     case = _golden()
     script = [
         _read_step(),
-        SubmitStep(
+        FinalAnswerStep(
             (
                 ActualFinding(
                     "app/users.py",
@@ -126,7 +126,7 @@ def test_evaluate_case_penalizes_a_missed_finding() -> None:
     case = _golden()
     script = [
         _read_step(),
-        SubmitStep(
+        FinalAnswerStep(
             (
                 ActualFinding(
                     "app/users.py",
@@ -150,7 +150,7 @@ def test_evaluate_case_penalizes_spurious_findings() -> None:
     case = _golden()
     script = [
         _read_step(),
-        SubmitStep(
+        FinalAnswerStep(
             (
                 ActualFinding(
                     "app/users.py",
@@ -178,7 +178,7 @@ def test_evaluate_case_penalizes_spurious_findings() -> None:
 def test_evaluate_case_is_undecidable_without_tool_coverage() -> None:
     case = _golden()
     script = [
-        SubmitStep(
+        FinalAnswerStep(
             (ActualFinding("app/users.py", 6, "SQL injection"),),
             dimension="bug",
         ),
@@ -194,7 +194,7 @@ def test_incomplete_rate_tracks_incomplete_dimensions() -> None:
     case = _golden()
     outcome = replay_case(
         case,
-        [_read_step(), SubmitStep((), dimension="bug")],
+        [_read_step(), FinalAnswerStep((), dimension="bug")],
         dimension_statuses={"bug": "completed", "security": "error"},
     )
 
@@ -207,7 +207,7 @@ def test_usage_and_elapsed_are_reported() -> None:
     case = _golden()
     outcome = replay_case(
         case,
-        [_read_step(), SubmitStep((), duration_ms=12.5, dimension="bug")],
+        [_read_step(), FinalAnswerStep((), duration_ms=12.5, dimension="bug")],
         usage={"input_tokens": 100, "output_tokens": 20},
     )
 
@@ -228,7 +228,7 @@ def test_replay_is_deterministic() -> None:
     script = [
         _read_step(),
         ReplayStep("grep", {"pattern": "SELECT"}, "app/users.py:5", duration_ms=1.0),
-        SubmitStep((ActualFinding("app/users.py", 6, "SQL injection"),), dimension="bug"),
+        FinalAnswerStep((ActualFinding("app/users.py", 6, "SQL injection"),), dimension="bug"),
     ]
 
     first = evaluate_case(case, replay_case(case, script)).to_dict()
@@ -241,7 +241,7 @@ def test_format_quality_report_renders_key_metrics() -> None:
     case = _golden()
     score = evaluate_case(
         case,
-        replay_case(case, [_read_step(), SubmitStep((), dimension="bug")]),
+        replay_case(case, [_read_step(), FinalAnswerStep((), dimension="bug")]),
     )
 
     report = format_quality_report(score)

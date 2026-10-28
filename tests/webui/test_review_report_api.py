@@ -10,9 +10,10 @@ from typing import Any
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from nanoreview.agent.review_board import ReviewBoardView
 from nanoreview.agent.review_state import (
     ReviewArtifactStore,
-    ReviewRunState,
+    ReviewPhase,
     ReviewRunStatus,
     build_report_artifact,
 )
@@ -39,13 +40,14 @@ def _make_channel(tmp_path: Path) -> WebSocketChannel:
 
 
 def _artifact_payload() -> dict[str, Any]:
-    state = ReviewRunState(
+    view = ReviewBoardView(
         run_id=RUN_ID,
         session_key=SESSION_KEY,
         input_fingerprint=FINGERPRINT,
         status=ReviewRunStatus.COMPLETED,
+        phase=ReviewPhase.DONE,
     )
-    return build_report_artifact(state, report_markdown="# Code Review Report")
+    return build_report_artifact(view, report_markdown="# Code Review Report")
 
 
 def _seed_review_session(

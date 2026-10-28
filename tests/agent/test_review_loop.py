@@ -1,11 +1,15 @@
 """ReviewLoop execution contract tests.
 
-``ReviewLoop`` is the single supervisor of one review run. These tests pin the
-parts the rest of the system depends on:
+``ReviewLoop`` is the pipeline of one review run, executed against a blackboard
+it does not own: the coordinator creates and writes the board, and the loop only
+requests writes through a narrow writer. These tests pin the parts the rest of
+the system depends on:
 
 * the fixed phase pipeline ``PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP
-  -> DONE``, with ``DONE`` written only after cleanup returned *and* the
+  -> DONE``, with ``DONE`` published only after cleanup returned *and* the
   terminal metadata was durably saved;
+* planning is one structured answer validated against the real planner
+  contract — a rejected answer fails planning instead of dispatching reviewers;
 * cleanup or terminal-save failures keep the run ``running`` (gate closed) and
   report a bounded error instead of publishing an unprovable ``DONE``;
 * a produced report (plus its artifact) for the success path, and an explicit
@@ -13,19 +17,30 @@ parts the rest of the system depends on:
 * reviewer/Judge failures never degrade into a false ``no_findings`` pass;
 * planning and artifact-write failures settle the run as ``error`` while
   cancellation settles it as ``stopped``;
-* usage from the coordinator, every reviewer and the Judge rolls up into one
-  run total.
+* usage from the planner, every reviewer and the Judge rolls up into one run
+  total.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from nanoreview.agent.review_board import (
+    CHILD_COMPLETED,
+    CHILD_ERROR,
+    CHILD_STOPPED,
+    JudgeBatchSnapshot,
+    ReviewBoardStore,
+    ReviewBoardView,
+    ReviewBoardWriter,
+    ReviewerSnapshot,
+)
 from nanoreview.agent.review_loop import (
     REVIEW_CONTEXT_WINDOW_TOKENS,
     REVIEWER_MAX_OUTPUT_TOKENS,
@@ -40,21 +55,20 @@ from nanoreview.agent.review_loop import (
 from nanoreview.agent.review_state import (
     ReviewArtifactStore,
     ReviewPhase,
-    ReviewRunState,
     ReviewRunStatus,
 )
 from nanoreview.agent.runner import AgentRunner
 from nanoreview.bus.events import InboundMessage
-from nanoreview.providers.base import LLMResponse, ToolCallRequest
+from nanoreview.providers.base import LLMResponse
 from nanoreview.review.input.snapshot import build_snapshot
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.planning.planner import ReviewPreparation
-from nanoreview.review.profiles import REVIEWER_PROFILES
 from nanoreview.review.result import ReviewHandoffState
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
     EvidenceReference,
     ReviewAction,
+    ReviewAssignment,
     ReviewEvidenceBundle,
     ReviewMetaKey,
     ReviewPlan,
@@ -63,6 +77,8 @@ from nanoreview.review.types import (
 from nanoreview.session.manager import SessionManager
 
 SESSION_KEY = "cli:review"
+RUN_ID = "run-000111222333"
+SNAPSHOT_REF = "review-snapshots/run-000111222333.json"
 
 
 def _plan(*roles: str) -> ReviewPlan:
@@ -110,18 +126,14 @@ class _FakeJudgeProvider:
         if self._error is not None:
             raise self._error
         if self._prose:
-            # Answers prose instead of the terminal tool, so the batch ends in
-            # terminal_tool_failed after real (billable) model calls.
+            # Answers prose instead of the verdict payload, so the batch ends in
+            # ``invalid_output`` after real (billable) model calls.
             return LLMResponse(
                 content="No verdicts.",
                 usage=dict(self._usage) if self._usage else {},
             )
-        tool_call = ToolCallRequest(
-            id="call-1", name="submit_verdicts", arguments={"verdicts": []}
-        )
         return LLMResponse(
-            content=None,
-            tool_calls=[tool_call],
+            content=json.dumps({"verdicts": []}),
             usage=dict(self._usage) if self._usage else {},
         )
 
@@ -139,15 +151,26 @@ def _build_judge(provider: _FakeJudgeProvider) -> ReviewJudge:
     )
 
 
-#: A finding whose details match the security profile schema and whose evidence
-#: is present in the target file, so the validator accepts it into the judge scope.
-_SECURITY_FINDING_JSON = (
-    '{"submitted":true,"findings":[{"severity":"high","file":"app.py","line":1,'
-    '"title":"Hardcoded secret","evidence":"value = 1","impact":"bad",'
-    '"recommendation":"fix","details":{"trust_boundary":"auth",'
-    '"attack_preconditions":"untrusted input","attack_path":"secret storage"}}],'
-    '"errors":[]}'
-)
+def _security_findings() -> list[dict[str, Any]]:
+    """A finding whose details match the security profile schema and whose
+    evidence is present in the target file, so the validator accepts it into the
+    judge scope."""
+    return [
+        {
+            "severity": "high",
+            "file": "app.py",
+            "line": 1,
+            "title": "Hardcoded secret",
+            "evidence": "value = 1",
+            "impact": "bad",
+            "recommendation": "fix",
+            "details": {
+                "trust_boundary": "auth",
+                "attack_preconditions": "untrusted input",
+                "attack_path": "secret storage",
+            },
+        }
+    ]
 
 
 class _Subagents:
@@ -162,7 +185,10 @@ class _Subagents:
     #: Per-dimension ``subagent_status`` override, keyed by subagent label.
     status_by_label: dict[str, str] = {}
 
-    #: Per-dimension raw reviewer output override, keyed by subagent label.
+    #: Per-dimension structured findings payload, keyed by subagent label.
+    payload_by_label: dict[str, list[dict[str, Any]]] = {}
+
+    #: Per-dimension raw reviewer output, keyed by subagent label.
     result_by_label: dict[str, str] = {}
 
     def __init__(self) -> None:
@@ -173,15 +199,19 @@ class _Subagents:
     def get_running_count(self) -> int:
         return 0
 
-    async def spawn(self, **kwargs):
+    async def spawn(self, **kwargs: Any) -> str:
         self.calls.append(kwargs)
         label = kwargs["label"]
+        findings = self.payload_by_label.get(label, [])
         metadata = {
             "subagent_label": label,
             "subagent_status": self.status_by_label.get(label, self.status),
             "subagent_result": self.result_by_label.get(
-                label, '{"submitted":true,"findings":[],"errors":[]}'
+                label, json.dumps({"findings": findings})
             ),
+            # The reviewer's accepted structured answer. The loop reads findings
+            # from here, never from the raw text.
+            "subagent_payload": {"dimension": label, "findings": findings},
         }
         if self.usage:
             metadata["subagent_usage"] = dict(self.usage)
@@ -197,31 +227,38 @@ class _Subagents:
         return "Review subagent started"
 
     async def wait_for_session_result(self, _session_key: str, *, timeout: float):
-        try:
-            return await asyncio.wait_for(self.results.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # Mirrors ``SubagentManager.wait_for_session_result``: a slow
-            # reviewer yields ``None`` and the loop keeps waiting, it does not
-            # raise into the dispatch loop.
-            return None
+        return await asyncio.wait_for(self.results.get(), timeout=timeout)
 
     async def cancel_by_session(self, session_key: str) -> int:
         self.cancelled_sessions.append(session_key)
         return 0
 
 
+class _BlockingSubagents(_Subagents):
+    """Reviewers that never return, so the run can be cancelled mid-review."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def spawn(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
 class _TrackingSubagents(_Subagents):
-    """Counts how many reviewers are in flight at the same time.
+    """Counts reviewers in flight so the concurrency cap is observable.
 
     The base stub reports a constant ``get_running_count()`` of zero and hands
-    its result back the moment it is spawned, so it can never show whether a
-    concurrency limit actually queues anything. This variant keeps an in-flight
-    counter and reports it as the live running count, so both limits the loop
-    applies — the per-review allowance and the manager-wide capacity — are
-    observable through the same object.
+    its result back the moment it is spawned, so it can never show whether the
+    limits actually queue anything. This variant keeps an in-flight counter that
+    only drops when the loop collects a result, which is exactly the window the
+    limits are meant to bound.
     """
 
-    def __init__(self, *, max_concurrent: int) -> None:
+    def __init__(self, max_concurrent: int = 2) -> None:
         super().__init__()
         self.max_concurrent_subagents = max_concurrent
         self.in_flight = 0
@@ -230,16 +267,15 @@ class _TrackingSubagents(_Subagents):
     def get_running_count(self) -> int:
         return self.in_flight
 
-    async def spawn(self, **kwargs):
+    async def spawn(self, **kwargs: Any) -> str:
         result = await super().spawn(**kwargs)
         self.in_flight += 1
         self.peak = max(self.peak, self.in_flight)
         return result
 
-    async def wait_for_session_result(self, session_key: str, *, timeout: float):
-        message = await super().wait_for_session_result(session_key, timeout=timeout)
-        if message is not None:
-            self.in_flight -= 1
+    async def wait_for_session_result(self, _session_key: str, *, timeout: float):
+        message = await super().wait_for_session_result(_session_key, timeout=timeout)
+        self.in_flight -= 1
         return message
 
 
@@ -255,21 +291,8 @@ class _FailingCleanupSubagents(_Subagents):
         raise self._error
 
 
-class _BlockingSubagents(_Subagents):
-    """Subagents whose spawn never returns, so the run can be cancelled."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.started = asyncio.Event()
-
-    async def spawn(self, **kwargs):
-        self.started.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")  # pragma: no cover
-
-
 class _InterruptedCleanupSubagents(_BlockingSubagents):
-    """Cleanup interrupted by a second cancellation."""
+    """Reviewers that block, with cleanup interrupted by a second cancellation."""
 
     async def cancel_by_session(self, session_key: str) -> int:
         self.cancelled_sessions.append(session_key)
@@ -293,24 +316,6 @@ class _FailingSaveSessions(SessionManager):
         ):
             raise OSError("disk full")
         super().save(session, fsync=fsync)
-
-
-class _PhaseRecorder(ReviewLoop):
-    """``ReviewLoop`` that records every phase the run enters.
-
-    ``DONE`` is written by direct assignment (a terminal run rejects
-    ``enter_phase``), so the recorder appends it explicitly.
-    """
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.phases: list[str] = []
-
-    def _complete_run(self, run_state, status, session=None):  # type: ignore[override]
-        result = super()._complete_run(run_state, status, session)
-        if run_state is not None:
-            self.phases.append(run_state.phase.value)
-        return result
 
 
 @pytest.fixture
@@ -340,33 +345,64 @@ def _build_loop(
     tmp_path: Path,
     *,
     subagents: Any,
+    max_concurrent_subagents: int = 4,
     judge: ReviewJudge | None = None,
-    loop_cls: type[ReviewLoop] = ReviewLoop,
     sessions: SessionManager | None = None,
     artifact_store: ReviewArtifactStore | None = None,
-    max_concurrent_subagents: int = 4,
 ) -> ReviewLoop:
-    return loop_cls(
+    session_manager = sessions or SessionManager(tmp_path)
+    boards = ReviewBoardStore(
+        sessions=session_manager,
+        artifacts=artifact_store or ReviewArtifactStore(tmp_path),
+    )
+    return ReviewLoop(
         workspace=tmp_path,
-        sessions=sessions or SessionManager(tmp_path),
+        sessions=session_manager,
         subagents=subagents,
+        boards=boards,
         model="test",
-        max_tool_result_chars=1000,
         max_concurrent_subagents=max_concurrent_subagents,
+        max_tool_result_chars=1000,
         judge_factory=(lambda: judge) if judge is not None else None,
-        artifact_store=artifact_store,
     )
 
 
-def _register_run(loop: ReviewLoop, *, plan: ReviewPlan | None = None) -> ReviewRunState:
-    state = ReviewRunState(
-        run_id="run-000111222333",
-        session_key=SESSION_KEY,
-        input_fingerprint="fp",
-        plan=plan,
+def _register_run(loop: ReviewLoop, *, plan: ReviewPlan | None = None) -> ReviewBoardWriter:
+    """Create the run's blackboard through the store the loop reads."""
+    loop._boards.create(  # noqa: SLF001 - the store is the only board writer
+        SimpleNamespace(
+            run_id=RUN_ID,
+            session_key=SESSION_KEY,
+            input_fingerprint="fp",
+            snapshot_ref=SNAPSHOT_REF,
+            plan=plan,
+        )
     )
-    loop.runs[SESSION_KEY] = state
-    return state
+    writer = loop._boards.writer(SESSION_KEY)  # noqa: SLF001
+    assert writer is not None
+    return writer
+
+
+def _board(loop: ReviewLoop) -> ReviewBoardView:
+    view = loop._boards.view(SESSION_KEY)  # noqa: SLF001
+    assert view is not None
+    return view
+
+
+def _is_running(loop: ReviewLoop) -> bool:
+    return loop._boards.running(SESSION_KEY) is not None  # noqa: SLF001
+
+
+def _reviewer(view: ReviewBoardView, dimension: str) -> ReviewerSnapshot:
+    reviewer = view.reviewer(dimension)
+    assert reviewer is not None, dimension
+    return reviewer
+
+
+def _judge_batch(view: ReviewBoardView) -> JudgeBatchSnapshot:
+    batches = view.judge_batches
+    assert len(batches) == 1, batches
+    return batches[0]
 
 
 def _request(**overrides: Any) -> ReviewTurnRequest:
@@ -395,30 +431,30 @@ async def test_successful_run_walks_every_phase_then_done(
     tmp_path, prepared, monkeypatch
 ) -> None:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
-    plan = _plan("security", "bug")
-    prepared(plan, _evidence())
+    prepared(_plan("security", "bug"), _evidence())
     subagents = _Subagents()
-    loop = _build_loop(
-        tmp_path, subagents=subagents, loop_cls=_PhaseRecorder
-    )
-    state = _register_run(loop)
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
+
     entered: list[str] = []
-    original_enter = ReviewRunState.enter_phase
+    original_advance = ReviewBoardWriter.advance
 
-    def _record_enter(self, phase):  # noqa: ANN001 - patched class method
-        original_enter(self, phase)
-        if self.phase is phase:
-            entered.append(phase.value)
+    async def _record_advance(self, phase):  # noqa: ANN001 - patched method
+        entered.append(phase.value)
+        await original_advance(self, phase)
 
-    monkeypatch.setattr(ReviewRunState, "enter_phase", _record_enter)
+    monkeypatch.setattr(ReviewBoardWriter, "advance", _record_advance)
 
     outcome = await loop.execute(_request())
 
     assert entered == ["prepare", "plan", "review", "finalize", "cleanup"]
-    assert loop.phases == ["done"]  # type: ignore[attr-defined]
-    assert state.status is ReviewRunStatus.COMPLETED
-    assert state.phase is ReviewPhase.DONE
-    assert state.report_ref is not None
+    # ``DONE`` is written by the settle step, so it never appears among the
+    # phases a run walks while it is still live.
+    assert "done" not in entered
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.COMPLETED
+    assert view.phase is ReviewPhase.DONE
+    assert view.report_ref is not None
     assert outcome.produces_report is True
     assert outcome.stop_reason == ""
     assert outcome.result is not None
@@ -435,7 +471,7 @@ async def test_progress_in_persisted_metadata_matches_phase(tmp_path, prepared) 
     sessions = SessionManager(tmp_path)
     loop = _build_loop(
         tmp_path,
-                subagents=_Subagents(),
+        subagents=_Subagents(),
         sessions=sessions,
     )
     _register_run(loop)
@@ -445,9 +481,7 @@ async def test_progress_in_persisted_metadata_matches_phase(tmp_path, prepared) 
 
     assert session.metadata[ReviewMetaKey.STATUS] == "completed"
     assert session.metadata[ReviewMetaKey.PHASE] == "done"
-    assert session.metadata[ReviewMetaKey.REPORT_REF] == loop.artifacts.reference_for(
-        "run-000111222333"
-    )
+    assert session.metadata[ReviewMetaKey.REPORT_REF] == _board(loop).report_ref
 
 
 # ---------------------------------------------------------------------------
@@ -456,60 +490,27 @@ async def test_progress_in_persisted_metadata_matches_phase(tmp_path, prepared) 
 
 
 @pytest.mark.asyncio
-async def test_prepare_failure_settles_run_as_error(tmp_path, prepared) -> None:
-    """A preparation failure closes the run with a bounded reason.
-
-    There is no planner model call any more: the plan and the evidence are
-    resolved programmatically in PREPARE, so a failure there is the only
-    planning failure left. It must never degrade into a clean report.
-    """
-    prepared(_plan("security"), _evidence())
-    loop = _build_loop(tmp_path, subagents=_Subagents())
-    state = _register_run(loop)
-
-    async def _boom(*_args, **_kwargs):
-        raise RuntimeError("prefetch backend is down")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(
-        "nanoreview.agent.review_loop.prepare_code_review_context", _boom
-    )
-    try:
-        outcome = await loop.execute(_request())
-    finally:
-        monkeypatch.undo()
-
-    assert outcome.stop_reason == "error"
-    assert outcome.produces_report is False
-    assert "prefetch backend is down" in (outcome.error or "")
-    assert outcome.report_markdown is not None
-    assert "prefetch backend is down" in outcome.report_markdown
-    assert state.status is ReviewRunStatus.ERROR
-    assert state.phase is ReviewPhase.DONE
-    assert state.warnings
-
-
-@pytest.mark.asyncio
 async def test_missing_plan_fails_before_any_dispatch(tmp_path, monkeypatch) -> None:
     """A run whose plan cannot be resolved never reaches the reviewers."""
 
     async def _no_plan(_messages, _meta, progress_callback=None):
-        return ReviewPreparation(None)
+        return ReviewPreparation(None, "fallback")
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _no_plan
     )
     subagents = _Subagents()
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
     assert outcome.stop_reason == "error"
     assert "no review plan" in (outcome.error or "")
     assert subagents.calls == []
-    assert state.status is ReviewRunStatus.ERROR
-    assert state.phase is ReviewPhase.DONE
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.ERROR
+    assert view.phase is ReviewPhase.DONE
 
 
 @pytest.mark.asyncio
@@ -525,18 +526,16 @@ async def test_local_diff_without_evidence_explains_how_to_continue(
     )
     prepared(plan, ReviewEvidenceBundle())
     loop = _build_loop(tmp_path, subagents=_Subagents())
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
     assert "Stage or modify a file inside the target" in (outcome.error or "")
-    assert state.status is ReviewRunStatus.ERROR
+    assert _board(loop).status is ReviewRunStatus.ERROR
 
 
 @pytest.mark.asyncio
-async def test_diff_without_evidence_reports_skipped_units(
-    tmp_path, prepared
-) -> None:
+async def test_diff_without_evidence_reports_skipped_units(tmp_path, prepared) -> None:
     evidence = ReviewEvidenceBundle(
         skipped=(SkippedReviewUnit(path="src/big.py", reason="token_limit_exceeded"),)
     )
@@ -570,7 +569,8 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
 
     outcome = await loop.execute(_request())
 
-    # One assignment per selected reviewer, in the user's selection order.
+    # The program builds one assignment per selected reviewer, in the order the
+    # user selected them (no model decides or reorders this).
     assert [call["label"] for call in subagents.calls] == ["security", "bug"]
     # Review results are never published to the bus: the program dispatches each
     # dimension with an explicit reviewer profile and collects from the queue.
@@ -579,8 +579,8 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
         "security",
         "bug",
     ]
-    # The host-provided evidence is proved to the reviewer so a valid
-    # ``findings: []`` submission is not misread as incomplete.
+    # The host-injected evidence is proved to the reviewer so a valid
+    # ``findings: []`` answer is not misread as incomplete.
     assert all(
         call["origin_metadata"]["assigned_evidence"] == 1 for call in subagents.calls
     )
@@ -588,28 +588,31 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
 
 
 @pytest.mark.asyncio
-async def test_general_reviewer_is_dispatched_like_any_other(tmp_path, prepared) -> None:
-    """``general`` is a peer reviewer, dispatched by its own selection."""
+async def test_general_reviewer_is_dispatched_like_any_other(
+    tmp_path, prepared
+) -> None:
+    """``general`` is a reviewer name, not a routing mode: it runs on its own."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
     prepared(_plan("general"), _evidence())
     loop = _build_loop(tmp_path, subagents=subagents)
     _register_run(loop)
 
-    outcome = await loop.execute(_request())
+    await loop.execute(_request())
 
     assert [call["label"] for call in subagents.calls] == ["general"]
-    assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == [
-        "general"
-    ]
-    assert "General Reviewer" in (outcome.report_markdown or "")
+    assert [
+        call["origin_metadata"]["profile_id"] for call in subagents.calls
+    ] == ["general"]
+    view = _board(loop)
+    assert [assignment.dimension for assignment in view.assignments] == ["general"]
 
 
 @pytest.mark.asyncio
 async def test_general_can_be_combined_with_specialized_reviewers(
     tmp_path, prepared
 ) -> None:
-    """A mixed selection dispatches every selected reviewer, once each."""
+    """A selection may mix ``general`` with any specialized reviewer."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
     prepared(_plan("general", "security"), _evidence())
@@ -618,41 +621,126 @@ async def test_general_can_be_combined_with_specialized_reviewers(
 
     await loop.execute(_request())
 
-    assert sorted(call["label"] for call in subagents.calls) == ["general", "security"]
-
-
-@pytest.mark.asyncio
-async def test_all_five_reviewers_can_be_dispatched(tmp_path, prepared) -> None:
-    """The old four-assignment cap is gone: five reviewers are all dispatched."""
-    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
-    subagents = _Subagents()
-    prepared(
-        _plan("bug", "security", "performance", "maintainability", "general"),
-        _evidence(),
-    )
-    loop = _build_loop(tmp_path, subagents=subagents)
-    _register_run(loop)
-
-    await loop.execute(_request())
-
-    assert sorted(call["label"] for call in subagents.calls) == [
-        "bug",
+    assert [call["label"] for call in subagents.calls] == ["general", "security"]
+    view = _board(loop)
+    assert [assignment.dimension for assignment in view.assignments] == [
         "general",
-        "maintainability",
-        "performance",
         "security",
     ]
 
 
 @pytest.mark.asyncio
-async def test_five_reviewers_queue_within_the_concurrency_limit(
+async def test_all_five_reviewers_can_be_dispatched(tmp_path, prepared) -> None:
+    """The four-assignment ceiling is gone: all five reviewers may run."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _Subagents()
+    roles = ("bug", "security", "performance", "maintainability", "general")
+    prepared(_plan(*roles), _evidence())
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
+
+    await loop.execute(_request())
+
+    assert [call["label"] for call in subagents.calls] == list(roles)
+    view = _board(loop)
+    assert [assignment.dimension for assignment in view.assignments] == list(roles)
+    assert all(
+        assignment.evidence_ids == ("ev-001",) for assignment in view.assignments
+    )
+
+
+@pytest.mark.asyncio
+async def test_assignments_cover_every_accepted_evidence_unit(
     tmp_path, prepared
 ) -> None:
-    """Five selections run under the per-review allowance, not all at once.
+    """Every reviewer receives the whole accepted set, with no second filter."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    evidence = ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(
+                id="ev-001",
+                path="app.py",
+                start_line=1,
+                end_line=1,
+                excerpt="## app.py:1-1\nvalue = 1",
+            ),
+            EvidenceReference(
+                id="ev-002",
+                path="db.py",
+                start_line=7,
+                end_line=9,
+                excerpt="## db.py:7-9\nquery()",
+            ),
+        ),
+        summary="## app.py:1-1",
+    )
+    subagents = _Subagents()
+    prepared(_plan("security", "bug"), evidence)
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
 
-    The old four-assignment ceiling is gone, so the queue — not a rejection —
-    is what bounds a full five-reviewer selection. The manager-wide capacity is
-    set high here so only the per-review allowance can produce the measured peak.
+    await loop.execute(_request())
+
+    view = _board(loop)
+    assert [assignment.evidence_ids for assignment in view.assignments] == [
+        ("ev-001", "ev-002"),
+        ("ev-001", "ev-002"),
+    ]
+    # The dispatched task metadata proves the same count reached the reviewer.
+    assert all(
+        call["origin_metadata"]["assigned_evidence"] == 2
+        for call in subagents.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_budget_skipped_units_are_visible_in_the_run_state(
+    tmp_path, prepared
+) -> None:
+    """Budget-skipped units stay in the audit trail instead of vanishing."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    evidence = ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(
+                id="ev-001",
+                path="app.py",
+                start_line=1,
+                end_line=1,
+                excerpt="## app.py:1-1\nvalue = 1",
+            ),
+        ),
+        skipped=(
+            SkippedReviewUnit(
+                path="src/big.py",
+                reason="budget_exhausted",
+                start_line=10,
+                end_line=20,
+            ),
+        ),
+        summary="## app.py:1-1",
+    )
+    subagents = _Subagents()
+    prepared(_plan("security"), evidence)
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    view = _board(loop)
+    assert view.skipped_files == ("src/big.py",)
+    assert view.evidence_stats["accepted_units"] == 1
+    assert view.evidence_stats["skipped_units"] == 1
+    assert "src/big.py" in (outcome.report_markdown or "")
+
+
+@pytest.mark.asyncio
+async def test_five_reviewers_queue_within_the_per_review_concurrency_limit(
+    tmp_path, prepared
+) -> None:
+    """Five selections queue instead of all running at once.
+
+    The manager-wide budget is deliberately higher than the per-review limit,
+    so only the per-review limit can produce the observed peak.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _TrackingSubagents(max_concurrent=10)
@@ -670,124 +758,36 @@ async def test_five_reviewers_queue_within_the_concurrency_limit(
 
 
 @pytest.mark.asyncio
-async def test_global_subagent_capacity_also_bounds_dispatch(tmp_path, prepared) -> None:
-    """The manager-wide capacity queues reviewers even when the run allows more.
+async def test_global_reviewer_budget_queues_when_the_per_review_limit_is_higher(
+    tmp_path, prepared
+) -> None:
+    """The manager-wide reviewer budget also bounds concurrency.
 
-    A review that permits four reviewers still cannot exceed the shared subagent
-    manager's capacity, otherwise five selections would starve other sessions.
+    Here the per-review limit is above the global budget, so only the global
+    budget can produce the observed peak.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _TrackingSubagents(max_concurrent=2)
-    prepared(_plan("bug", "security", "performance", "general"), _evidence())
-    loop = _build_loop(tmp_path, subagents=subagents, max_concurrent_subagents=4)
+    prepared(
+        _plan("bug", "security", "performance", "maintainability", "general"),
+        _evidence(),
+    )
+    loop = _build_loop(tmp_path, subagents=subagents, max_concurrent_subagents=5)
     _register_run(loop)
 
     await loop.execute(_request())
 
-    assert len(subagents.calls) == 4
+    assert len(subagents.calls) == 5
     assert subagents.peak == 2
 
 
 @pytest.mark.asyncio
-async def test_assignments_cover_every_accepted_evidence_unit(
-    tmp_path, prepared
-) -> None:
-    """Every selected reviewer receives the whole accepted evidence set.
-
-    There is no second filtering step: the accepted references are handed to
-    each reviewer as-is, so a unit can never be silently dropped between
-    preprocessing and dispatch.
-    """
-    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
-    evidence = ReviewEvidenceBundle(
-        references=(
-            EvidenceReference(
-                id="ev-001",
-                path="app.py",
-                start_line=1,
-                end_line=1,
-                excerpt="value = 1",
-            ),
-            EvidenceReference(
-                id="ev-002",
-                path="other.py",
-                start_line=1,
-                end_line=1,
-                excerpt="x = 2",
-            ),
-        ),
-        summary="## app.py:1-1",
-    )
-    subagents = _Subagents()
-    prepared(_plan("security", "bug"), evidence)
-    loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
-
-    await loop.execute(_request())
-
-    assert len(state.assignments) == 2
-    for assignment in state.assignments:
-        assert assignment.evidence_ids == ("ev-001", "ev-002")
-        # The focus is the reviewer's own scope description, not a focus string
-        # generated by triage over the evidence.
-        assert (
-            assignment.focus
-            == REVIEWER_PROFILES[assignment.dimension].description
-        )
-    assert all(
-        call["origin_metadata"]["assigned_evidence"] == 2 for call in subagents.calls
-    )
-
-
-@pytest.mark.asyncio
-async def test_budget_skipped_units_are_visible_in_the_run_state(
-    tmp_path, prepared
-) -> None:
-    """Budget-skipped units are recorded instead of disappearing silently."""
-    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
-    evidence = ReviewEvidenceBundle(
-        references=(
-            EvidenceReference(
-                id="ev-001",
-                path="app.py",
-                start_line=1,
-                end_line=1,
-                excerpt="value = 1",
-            ),
-        ),
-        skipped=(
-            SkippedReviewUnit(
-                path="src/big.py",
-                reason="budget_exhausted",
-                start_line=10,
-                end_line=20,
-            ),
-        ),
-        summary="## app.py:1-1",
-    )
-    subagents = _Subagents()
-    prepared(_plan("security"), evidence)
-    loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
-
-    await loop.execute(_request())
-
-    assert state.evidence_stats["accepted_units"] == 1
-    assert state.evidence_stats["skipped_units"] == 1
-    assert state.skipped_files == ["src/big.py"]
-    assert state.assignment_stats == [
-        {"dimension": "security", "evidence_units": 1}
-    ]
-
-
-@pytest.mark.asyncio
-async def test_run_aggregates_agent_usage_into_run_state(tmp_path, prepared) -> None:
+async def test_run_aggregates_agent_usage_into_the_board(tmp_path, prepared) -> None:
     """Reviewer tokens must roll up into one run total.
 
-    There is no planner run any more, so the reviewers are the only model
-    spend of the review pipeline itself. Judge usage is exercised in
-    tests/review/test_judge.py; the loop folds ``JudgeExecutionResult.usage``
-    into the run at the same boundary.
+    There is no planner run any more, so the total is exactly the reviewer
+    usage. Judge usage is exercised in tests/review/test_judge.py; the loop
+    folds ``JudgeExecutionResult.usage`` into the run at the same boundary.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
 
@@ -799,17 +799,18 @@ async def test_run_aggregates_agent_usage_into_run_state(tmp_path, prepared) -> 
     }
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     await loop.execute(_request())
 
-    assert state.usage == {
-        "prompt_tokens": 200,  # 2 reviewers x 100
+    view = _board(loop)
+    assert view.usage == {
+        "prompt_tokens": 200,  # 2 x 100 (reviewers)
         "completion_tokens": 40,
         "total_tokens": 240,
     }
-    assert state.reviewers["security"].usage == dict(subagents.usage)
-    assert state.reviewers["bug"].status == "completed"
+    assert _reviewer(view, "security").usage == dict(subagents.usage)
+    assert _reviewer(view, "bug").status == CHILD_COMPLETED
 
 
 @pytest.mark.asyncio
@@ -819,7 +820,7 @@ async def test_failed_reviewer_is_recorded_as_error_and_report_is_incomplete(
     """A reviewer failure must surface as ``error`` with a reason, not success.
 
     There is no outer reviewer retry: the run keeps the success path behaviour
-    (ingest, usage, callback) but the report is explicitly marked incomplete.
+    (validation, usage, callback) but the report is explicitly marked incomplete.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
 
@@ -833,23 +834,24 @@ async def test_failed_reviewer_is_recorded_as_error_and_report_is_incomplete(
     }
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    failed = state.reviewers["bug"]
-    assert failed.status == "error"
+    view = _board(loop)
+    failed = _reviewer(view, "bug")
+    assert failed.status == CHILD_ERROR
     assert failed.error
     assert "reviewer status=error" in failed.error
     assert "crashed while reading app.py" in failed.error
 
-    completed = state.reviewers["security"]
-    assert completed.status == "completed"
+    completed = _reviewer(view, "security")
+    assert completed.status == CHILD_COMPLETED
     assert completed.error == ""
 
     # Usage is folded in for both reviewers, so a partial failure does not
     # silently drop the tokens actually spent.
-    assert state.usage == {
+    assert view.usage == {
         "prompt_tokens": 200,
         "completion_tokens": 40,
         "total_tokens": 240,
@@ -858,7 +860,7 @@ async def test_failed_reviewer_is_recorded_as_error_and_report_is_incomplete(
     assert completed.usage == dict(subagents.usage)
 
     # The run completes but hands over as partial, never as a clean pass.
-    assert state.status is ReviewRunStatus.COMPLETED
+    assert view.status is ReviewRunStatus.COMPLETED
     assert outcome.result is not None
     assert outcome.result.handoff is ReviewHandoffState.PARTIAL
     assert outcome.result.gaps
@@ -870,9 +872,9 @@ async def test_missing_subagent_status_is_not_silently_treated_as_success(
 ) -> None:
     """An unreported terminal status is a failure, never a silent success.
 
-    The failed reviewer's raw output is still valid empty-findings JSON, so
-    without an explicit failure handoff the finalizer would parse it into a
-    clean ``no_findings`` dimension and the report would claim a full pass.
+    The failed reviewer's payload is still a valid empty findings array, so
+    without an explicit failure handoff the finalizer would record a clean
+    ``no_findings`` dimension and the report would claim a full pass.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
 
@@ -880,46 +882,72 @@ async def test_missing_subagent_status_is_not_silently_treated_as_success(
     subagents.status_by_label = {"security": "", "bug": "ok"}
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    assert state.reviewers["security"].status == "error"
-    assert "status=unknown" in state.reviewers["security"].error
-    assert state.reviewers["bug"].status == "completed"
+    view = _board(loop)
+    assert _reviewer(view, "security").status == CHILD_ERROR
+    assert "status=unknown" in _reviewer(view, "security").error
+    assert _reviewer(view, "bug").status == CHILD_COMPLETED
 
     # The report must reflect the failure instead of "No actionable issues
-    # found": the failed dimension is incomplete even though its raw payload
-    # was parseable.
+    # found": the failed dimension is incomplete even though its payload was
+    # well formed.
     assert "incomplete" in (outcome.report_markdown or "").lower()
     assert "No actionable issues found" not in (outcome.report_markdown or "")
 
 
 @pytest.mark.asyncio
-async def test_failed_reviewer_with_valid_json_is_reported_incomplete(
+async def test_a_failed_reviewer_with_a_valid_payload_is_reported_incomplete(
     tmp_path, prepared
 ) -> None:
-    """A non-ok terminal status wins over a parseable reviewer payload.
-
-    Even when the failed reviewer returns well-formed findings JSON, the
-    finalizer must record the dimension as incomplete, not no_findings.
-    """
+    """A non-ok terminal status wins over a parseable reviewer payload."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
 
     subagents = _Subagents()
     subagents.status_by_label = {"bug": "error"}
-    subagents.result_by_label = {
-        "bug": '{"submitted":true,"findings":[],"errors":[]}',
-    }
+    subagents.payload_by_label = {"bug": []}
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    assert state.reviewers["bug"].status == "error"
-    assert "reviewer status=error" in state.reviewers["bug"].error
+    assert _reviewer(_board(loop), "bug").status == CHILD_ERROR
+    assert "reviewer status=error" in _reviewer(_board(loop), "bug").error
     assert "incomplete" in (outcome.report_markdown or "").lower()
+    assert "No actionable issues found" not in (outcome.report_markdown or "")
+
+
+@pytest.mark.asyncio
+async def test_a_succeeded_reviewer_without_a_payload_is_a_failure(
+    tmp_path, prepared
+) -> None:
+    """``status=ok`` alone is not enough: the accepted payload is the result.
+
+    A reviewer that reported success but carried no structured findings would
+    otherwise be recorded as a clean ``no_findings`` dimension.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+
+    class _NoPayloadSubagents(_Subagents):
+        async def spawn(self, **kwargs: Any) -> str:
+            started = await super().spawn(**kwargs)
+            queued = self.results.get_nowait()
+            queued.metadata.pop("subagent_payload", None)
+            await self.results.put(queued)
+            return started
+
+    prepared(_plan("security"), _evidence())
+    loop = _build_loop(tmp_path, subagents=_NoPayloadSubagents())
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    reviewer = _reviewer(_board(loop), "security")
+    assert reviewer.status == CHILD_ERROR
+    assert "no structured findings payload" in reviewer.error
     assert "No actionable issues found" not in (outcome.report_markdown or "")
 
 
@@ -931,39 +959,43 @@ async def test_failed_reviewer_with_valid_json_is_reported_incomplete(
 def _run_with_judge(
     provider: _FakeJudgeProvider,
     *,
-    finding_json: str = _SECURITY_FINDING_JSON,
+    findings: list[dict[str, Any]] | None = None,
     tmp_path,
     prepared,
-) -> tuple[ReviewLoop, _Subagents, ReviewRunState]:
+) -> tuple[ReviewLoop, _Subagents]:
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
-    if finding_json:
-        subagents.result_by_label = {"security": finding_json}
+    if findings is not None:
+        subagents.payload_by_label = {"security": findings}
     prepared(_plan("security"), _evidence())
     loop = _build_loop(
         tmp_path,
-                subagents=subagents,
+        subagents=subagents,
         judge=_build_judge(provider),
     )
-    return loop, subagents, _register_run(loop)
+    _register_run(loop)
+    return loop, subagents
 
 
 @pytest.mark.asyncio
 async def test_judge_success_marks_batch_completed(tmp_path, prepared) -> None:
     """A clean judge pass (even all needs_confirmation) is recorded completed."""
     provider = _FakeJudgeProvider(usage={"total_tokens": 30})
-    loop, subagents, state = _run_with_judge(provider, tmp_path=tmp_path, prepared=prepared)
+    loop, subagents = _run_with_judge(
+        provider, findings=_security_findings(), tmp_path=tmp_path, prepared=prepared
+    )
 
     outcome = await loop.execute(_request())
 
     assert len(provider.calls) == 1
-    batch = state.judge_batches["judge"]
-    assert batch.status == "completed"
+    view = _board(loop)
+    batch = _judge_batch(view)
+    assert batch.status == CHILD_COMPLETED
     assert batch.error == ""
     assert batch.stats["total_candidates"] == 1
     assert batch.stats["needs_confirmation"] == 1  # empty verdicts -> confirm
     assert batch.usage == {"total_tokens": 30}
-    assert state.usage["total_tokens"] == 30
+    assert view.usage["total_tokens"] == 30
     assert "No actionable issues found" not in (outcome.report_markdown or "")
     assert len(subagents.calls) == 1
 
@@ -972,39 +1004,45 @@ async def test_judge_success_marks_batch_completed(tmp_path, prepared) -> None:
 async def test_judge_failure_marks_batch_error(tmp_path, prepared) -> None:
     """A judge provider failure records an error batch, never a false pass."""
     provider = _FakeJudgeProvider(error=RuntimeError("judge provider down"))
-    loop, subagents, state = _run_with_judge(provider, tmp_path=tmp_path, prepared=prepared)
+    loop, subagents = _run_with_judge(
+        provider, findings=_security_findings(), tmp_path=tmp_path, prepared=prepared
+    )
 
     # The judge failure is a judge-level problem: it does not abort the run.
     outcome = await loop.execute(_request())
 
-    batch = state.judge_batches["judge"]
-    assert batch.status == "error"
+    view = _board(loop)
+    batch = _judge_batch(view)
+    assert batch.status == CHILD_ERROR
     assert batch.error
     assert "judge provider down" in batch.error
     assert "No actionable issues found" not in (outcome.report_markdown or "")
     assert len(subagents.calls) == 1
-    assert state.status is ReviewRunStatus.COMPLETED
+    assert view.status is ReviewRunStatus.COMPLETED
 
 
 @pytest.mark.asyncio
 async def test_judge_failed_batch_keeps_consumed_usage(tmp_path, prepared) -> None:
-    """A failed judge batch still reports its tokens to the run state."""
+    """A failed judge batch still reports its tokens to the run."""
     provider = _FakeJudgeProvider(
         usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         prose=True,
     )
-    loop, subagents, state = _run_with_judge(provider, tmp_path=tmp_path, prepared=prepared)
+    loop, subagents = _run_with_judge(
+        provider, findings=_security_findings(), tmp_path=tmp_path, prepared=prepared
+    )
 
     outcome = await loop.execute(_request())
 
-    batch = state.judge_batches["judge"]
-    assert batch.status == "error"
+    view = _board(loop)
+    batch = _judge_batch(view)
+    assert batch.status == CHILD_ERROR
     assert batch.error
-    assert len(provider.calls) > 1  # the model was retried before failing
+    assert len(provider.calls) > 1  # the model was re-prompted before failing
     # Every attempted call was billed; none of it may be dropped.
     expected = 15 * len(provider.calls)
     assert batch.usage["total_tokens"] == expected
-    assert state.usage["total_tokens"] == expected
+    assert view.usage["total_tokens"] == expected
     assert "No actionable issues found" not in (outcome.report_markdown or "")
     assert len(subagents.calls) == 1
 
@@ -1013,16 +1051,16 @@ async def test_judge_failed_batch_keeps_consumed_usage(tmp_path, prepared) -> No
 async def test_judge_no_candidates_does_not_call_provider(tmp_path, prepared) -> None:
     """No candidates means no judge request and no leftover usage reading."""
     provider = _FakeJudgeProvider(usage={"total_tokens": 9999})
-    loop, _subagents, state = _run_with_judge(
-        provider, finding_json="", tmp_path=tmp_path, prepared=prepared
+    loop, _subagents = _run_with_judge(
+        provider, findings=None, tmp_path=tmp_path, prepared=prepared
     )
 
     await loop.execute(_request())
 
     assert provider.calls == []
-    batch = state.judge_batches["judge"]
+    batch = _judge_batch(_board(loop))
     # Empty result is a completed batch, not a false error, and no usage leaks in.
-    assert batch.status == "completed"
+    assert batch.status == CHILD_COMPLETED
     assert batch.error == ""
     assert batch.stats == {}
     assert batch.usage == {}
@@ -1042,16 +1080,17 @@ async def test_artifact_write_failure_settles_run_as_error(tmp_path, prepared) -
     store = ReviewArtifactStore(tmp_path, max_bytes=1)
     loop = _build_loop(
         tmp_path,
-                subagents=_Subagents(),
+        subagents=_Subagents(),
         artifact_store=store,
     )
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    assert state.status is ReviewRunStatus.ERROR
-    assert state.phase is ReviewPhase.DONE
-    assert state.report_ref is None
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.ERROR
+    assert view.phase is ReviewPhase.DONE
+    assert view.report_ref is None
     assert outcome.produces_report is True
     assert outcome.stop_reason == "error"
     assert outcome.result is not None
@@ -1067,7 +1106,7 @@ async def test_cancelled_run_is_cleaned_up_then_settled_stopped(
     prepared(_plan("security"), _evidence())
     subagents = _BlockingSubagents()
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     task = asyncio.create_task(loop.execute(_request()))
     await asyncio.wait_for(subagents.started.wait(), timeout=1)
@@ -1075,8 +1114,9 @@ async def test_cancelled_run_is_cleaned_up_then_settled_stopped(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert state.status is ReviewRunStatus.STOPPED
-    assert state.phase is ReviewPhase.DONE
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.STOPPED
+    assert view.phase is ReviewPhase.DONE
     assert subagents.cancelled_sessions == [SESSION_KEY]
 
 
@@ -1085,19 +1125,26 @@ async def test_finalize_reuses_cleanup_and_settles_children(tmp_path) -> None:
     """``/stop`` finalizes through the same CLEANUP -> DONE tail."""
     subagents = _Subagents()
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
-    state.enter_phase(ReviewPhase.REVIEW)
-    state.reviewer_state("security").status = "completed"
-    state.reviewer_state("bug").status = "running"
+    writer = _register_run(loop)
+    await writer.advance(ReviewPhase.REVIEW)
+    await writer.start_assignments(
+        (
+            ReviewAssignment(dimension="security", focus="auth", evidence_ids=("ev-001",)),
+            ReviewAssignment(dimension="bug", focus="logic", evidence_ids=("ev-001",)),
+        )
+    )
+    await writer.reviewer_settled("security", status=CHILD_COMPLETED)
+    await writer.reviewer_started("bug", evidence_assigned=1)
 
     result = await loop.finalize(SESSION_KEY, ReviewRunStatus.STOPPED)
 
     assert result is not None
     assert result.status is ReviewRunStatus.STOPPED
-    assert state.phase is ReviewPhase.DONE
-    assert state.reviewers["security"].status == "completed"
-    assert state.reviewers["bug"].status == "stopped"
-    assert state.reviewers["bug"].error
+    view = _board(loop)
+    assert view.phase is ReviewPhase.DONE
+    assert _reviewer(view, "security").status == CHILD_COMPLETED
+    assert _reviewer(view, "bug").status == CHILD_STOPPED
+    assert _reviewer(view, "bug").error
     assert subagents.cancelled_sessions == [SESSION_KEY]
 
 
@@ -1114,19 +1161,20 @@ async def test_finalize_settles_a_run_that_never_started(tmp_path) -> None:
     loop = _build_loop(
         tmp_path, subagents=subagents, sessions=sessions
     )
-    state = _register_run(loop)
+    _register_run(loop)
     session = sessions.get_or_create(SESSION_KEY)
-    session.metadata.update(state.metadata_payload())
+    session.metadata.update(_board(loop).metadata_payload())
     sessions.save(session)
 
     result = await loop.finalize(SESSION_KEY, ReviewRunStatus.STOPPED)
 
     assert result is not None
     assert result.status is ReviewRunStatus.STOPPED
-    assert state.status is ReviewRunStatus.STOPPED
-    assert state.phase is ReviewPhase.DONE
-    assert state.warnings
-    assert loop.get(SESSION_KEY) is state
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.STOPPED
+    assert view.phase is ReviewPhase.DONE
+    assert view.warnings
+    assert _is_running(loop) is False
     assert loop.result(SESSION_KEY) is not None
     assert session.metadata[ReviewMetaKey.STATUS] == "stopped"
     assert session.metadata[ReviewMetaKey.PHASE] == "done"
@@ -1148,10 +1196,10 @@ async def test_cleanup_failure_keeps_the_run_running(tmp_path, prepared) -> None
     subagents = _FailingCleanupSubagents(RuntimeError("shutdown timed out"))
     loop = _build_loop(
         tmp_path,
-                subagents=subagents,
+        subagents=subagents,
         sessions=sessions,
     )
-    state = _register_run(loop)
+    _register_run(loop)
 
     outcome = await loop.execute(_request())
 
@@ -1159,9 +1207,10 @@ async def test_cleanup_failure_keeps_the_run_running(tmp_path, prepared) -> None
     assert "cleanup" in (outcome.error or "")
     assert outcome.result is None
     assert outcome.report_markdown is not None
-    assert state.status is ReviewRunStatus.RUNNING
-    assert state.phase is ReviewPhase.CLEANUP
-    assert loop.running(SESSION_KEY) is state
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.RUNNING
+    assert view.phase is ReviewPhase.CLEANUP
+    assert _is_running(loop) is True
     assert loop.result(SESSION_KEY) is None
     assert sessions.get_or_create(SESSION_KEY).metadata.get(
         ReviewMetaKey.STATUS
@@ -1170,7 +1219,7 @@ async def test_cleanup_failure_keeps_the_run_running(tmp_path, prepared) -> None
 
 @pytest.mark.asyncio
 async def test_terminal_save_failure_keeps_the_run_running(tmp_path, prepared) -> None:
-    """A failed terminal save must not turn the in-memory run into ``DONE``.
+    """A failed terminal save must not turn the live run into ``DONE``.
 
     The gate is decided from the live run, so publishing the terminal status
     before the metadata is durable would open the conversation while disk still
@@ -1182,10 +1231,10 @@ async def test_terminal_save_failure_keeps_the_run_running(tmp_path, prepared) -
     sessions = _FailingSaveSessions(tmp_path)
     loop = _build_loop(
         tmp_path,
-                subagents=_Subagents(),
+        subagents=_Subagents(),
         sessions=sessions,
     )
-    state = _register_run(loop)
+    _register_run(loop)
     session = sessions.get_or_create(SESSION_KEY)
 
     outcome = await loop.execute(_request(session=session))
@@ -1193,9 +1242,10 @@ async def test_terminal_save_failure_keeps_the_run_running(tmp_path, prepared) -
     assert outcome.stop_reason == "error"
     assert "could not be persisted" in (outcome.error or "")
     assert outcome.result is None
-    assert state.status is ReviewRunStatus.RUNNING
-    assert state.phase is not ReviewPhase.DONE
-    assert loop.running(SESSION_KEY) is state
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.RUNNING
+    assert view.phase is not ReviewPhase.DONE
+    assert _is_running(loop) is True
     # The terminal metadata was rolled back, so neither the cached session nor
     # a fresh read from disk claims the run finished.
     assert session.metadata.get(ReviewMetaKey.PHASE) != "done"
@@ -1231,12 +1281,12 @@ async def test_finalize_keeps_the_gate_when_cleanup_fails(tmp_path) -> None:
     """``/stop`` over a failing cleanup returns no result and keeps the gate."""
     subagents = _FailingCleanupSubagents(RuntimeError("shutdown timed out"))
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
-    state.enter_phase(ReviewPhase.REVIEW)
+    writer = _register_run(loop)
+    await writer.advance(ReviewPhase.REVIEW)
 
     assert await loop.finalize(SESSION_KEY, ReviewRunStatus.STOPPED) is None
-    assert state.status is ReviewRunStatus.RUNNING
-    assert loop.running(SESSION_KEY) is state
+    assert _board(loop).status is ReviewRunStatus.RUNNING
+    assert _is_running(loop) is True
 
 
 @pytest.mark.asyncio
@@ -1245,15 +1295,15 @@ async def test_finalize_keeps_the_gate_when_the_save_fails(tmp_path) -> None:
     sessions = _FailingSaveSessions(tmp_path)
     loop = _build_loop(
         tmp_path,
-                subagents=_Subagents(),
+        subagents=_Subagents(),
         sessions=sessions,
     )
-    state = _register_run(loop)
-    state.enter_phase(ReviewPhase.REVIEW)
+    writer = _register_run(loop)
+    await writer.advance(ReviewPhase.REVIEW)
 
     assert await loop.finalize(SESSION_KEY, ReviewRunStatus.STOPPED) is None
-    assert state.status is ReviewRunStatus.RUNNING
-    assert loop.running(SESSION_KEY) is state
+    assert _board(loop).status is ReviewRunStatus.RUNNING
+    assert _is_running(loop) is True
 
 
 @pytest.mark.asyncio
@@ -1269,7 +1319,7 @@ async def test_second_cancellation_leaves_the_run_for_a_retry(
     prepared(_plan("security"), _evidence())
     subagents = _InterruptedCleanupSubagents()
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
 
     task = asyncio.create_task(loop.execute(_request()))
     await asyncio.wait_for(subagents.started.wait(), timeout=1)
@@ -1277,10 +1327,11 @@ async def test_second_cancellation_leaves_the_run_for_a_retry(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert state.status is ReviewRunStatus.RUNNING
-    assert state.phase is ReviewPhase.CLEANUP
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.RUNNING
+    assert view.phase is ReviewPhase.CLEANUP
     assert loop.result(SESSION_KEY) is None
-    assert any("interrupted" in warning for warning in state.warnings)
+    assert any("interrupted" in warning for warning in view.warnings)
     assert subagents.cancelled_sessions == [SESSION_KEY]
 
 
@@ -1349,23 +1400,29 @@ def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_records_evidence_and_assignment_stats_on_state(
+async def test_run_records_evidence_and_assignment_stats_on_the_board(
     tmp_path, prepared
 ) -> None:
-    """The run's audit trail records the acceptance and the task split."""
+    """The run's audit trail records the accepted evidence and the task split."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=_Subagents())
-    state = _register_run(loop)
+    _register_run(loop)
 
     await loop.execute(_request())
 
-    assert state.evidence_stats["accepted_units"] == 1
-    assert state.evidence_stats["skipped_units"] == 0
-    assert state.evidence_stats["status"] == "ok"
-    assert state.assignment_stats == [
+    view = _board(loop)
+    assert view.evidence_stats["accepted_units"] == 1
+    assert view.evidence_stats["skipped_units"] == 0
+    assert view.evidence_stats["status"] == "ok"
+    assert [dict(entry) for entry in view.assignment_stats] == [
         {"dimension": "security", "evidence_units": 1},
         {"dimension": "bug", "evidence_units": 1},
+    ]
+    # Both reviewers received the whole accepted set: no second filtering step.
+    assert [assignment.evidence_ids for assignment in view.assignments] == [
+        ("ev-001",),
+        ("ev-001",),
     ]
 
 
@@ -1377,16 +1434,15 @@ async def test_plan_snapshot_records_evidence_and_assignments(
 
     The snapshot is the run's only preserved input record, so the acceptance
     counts, the authorized evidence IDs and the per-reviewer task split must be
-    readable there — not only on the in-memory run state, which is gone after a
-    restart.
+    readable there — not only on the board, which does not survive a restart.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=_Subagents())
-    state = _register_run(loop)
-    loop._snapshots.write(
+    writer = _register_run(loop)
+    loop._snapshots.write(  # noqa: SLF001 - the store is the only snapshot writer
         build_snapshot(
-            run_id=state.run_id,
+            run_id=writer.run_id,
             session_key=SESSION_KEY,
             action="diff",
             target_type="local",
@@ -1399,7 +1455,7 @@ async def test_plan_snapshot_records_evidence_and_assignments(
 
     await loop.execute(_request())
 
-    snapshot = loop._snapshots.read(state.run_id)
+    snapshot = loop._snapshots.read(writer.run_id)  # noqa: SLF001
     assert snapshot is not None
     evidence = snapshot["evidence"]
     assert evidence["accepted_units"] == 1
@@ -1412,6 +1468,24 @@ async def test_plan_snapshot_records_evidence_and_assignments(
     # The pre-Planner keys are gone rather than written empty.
     assert "planner_manifest" not in snapshot
     assert "planner_triage" not in snapshot
+
+
+@pytest.mark.asyncio
+async def test_prepare_failure_settles_run_as_error(tmp_path, monkeypatch) -> None:
+    """A failed evidence preparation settles the run instead of hanging."""
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("prefetch backend is down")
+
+    monkeypatch.setattr(
+        "nanoreview.agent.review_loop.prepare_code_review_context", _boom
+    )
+    loop = _build_loop(tmp_path, subagents=_Subagents())
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert "prefetch backend is down" in (outcome.error or "")
+    assert _board(loop).status is ReviewRunStatus.ERROR
 
 
 @pytest.mark.asyncio
@@ -1428,10 +1502,10 @@ async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
     prepared(_plan("security", "bug"), _evidence())
     subagents = _Subagents()
     loop = _build_loop(tmp_path, subagents=subagents)
-    state = _register_run(loop)
+    _register_run(loop)
     loop._snapshots.write(
         build_snapshot(
-            run_id=state.run_id,
+            run_id=RUN_ID,
             session_key=SESSION_KEY,
             action="diff",
             target_type="local",
@@ -1444,7 +1518,7 @@ async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
 
     await loop.execute(_request())
 
-    assert state.changed_files == ["app.py", "src/db.py"]
+    assert list(_board(loop).changed_files) == ["app.py", "src/db.py"]
     # The frozen diff is an internal planning input; it never reaches reviewer
     # metadata (where it would be persisted with the subagent result).
     assert all(
@@ -1470,16 +1544,16 @@ async def test_review_reviews_the_frozen_snapshot_diff_not_the_worktree(
 
     async def _prepare(_messages, meta, progress_callback=None):
         captured.update(meta)
-        return ReviewPreparation(_plan("security"), _evidence())
+        return ReviewPreparation(_plan("security"), "plan", _evidence())
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
     )
     loop = _build_loop(tmp_path, subagents=_Subagents())
-    state = _register_run(loop)
+    _register_run(loop)
     ReviewSnapshotStore(tmp_path).write(
         build_snapshot(
-            run_id=state.run_id,
+            run_id=RUN_ID,
             session_key=SESSION_KEY,
             action="diff",
             target_type="local",
@@ -1508,16 +1582,16 @@ async def test_prepare_rejects_a_run_without_a_plan(tmp_path, monkeypatch) -> No
     """PREPARE fails loudly when the persisted target resolves to nothing."""
 
     async def _no_plan(_messages, _meta, progress_callback=None):
-        return ReviewPreparation(None)
+        return ReviewPreparation(None, "fallback")
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _no_plan
     )
     loop = _build_loop(tmp_path, subagents=_Subagents())
-    state = _register_run(loop)
+    writer = _register_run(loop)
 
     with pytest.raises(ReviewPlanningError, match="no review plan"):
-        await loop._prepare_review(_request(), state)
+        await loop._prepare_review(_request(), _board(loop), writer)
 
 
 @pytest.mark.asyncio
@@ -1539,10 +1613,10 @@ async def test_prepare_syncs_review_metadata_onto_the_session(
     loop = _build_loop(
         tmp_path, subagents=_Subagents(), sessions=sessions
     )
-    state = _register_run(loop)
+    writer = _register_run(loop)
     session = sessions.get_or_create(SESSION_KEY)
 
-    inputs = await loop._prepare_review(_request(session=session), state)
+    inputs = await loop._prepare_review(_request(session=session), _board(loop), writer)
 
     assert session.metadata[ReviewMetaKey.ALLOWED_DIMENSIONS] == ["security"]
     assert session.metadata[ReviewMetaKey.LOCAL_ROOT] == str(tmp_path)

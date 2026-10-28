@@ -39,14 +39,16 @@ context_window_tokens = 200_000
 evidence_token_budget = 150_000（diff evidence 总额；direct_cap = 42_750 以上触发预算裁剪）
 diff evidence 单文件阈值 = 8_000（`<threshold` 一个完整 unit；`>=threshold` 按 hunk 切分）
 reviewer_max_output_tokens = 8_192
-reviewer_model_request_limit = 30（最后一次请求用于 review_submit）
+reviewer_model_request_limit = 30（最后若干次仍属 reviewer，最终答案必须是结构化 findings）
+reviewer/planner/judge 输出纠正配额 = 3 / 5 / 3（`output_retry_limit`）
 reviewer_timeout_seconds = 180
 ```
 
 - review 输入只有本地 diff：evidence 就是 changed hunk，预处理不枚举仓库、不读完整源码、不做语义切块，因此不存在 related 补充预算、`max_file_chars` 截断标记或按文件规模分级的三态决策；单个超大 hunk 无法安全切分时整块记为 skipped（`token_limit_exceeded`）。
 - **没有 Planner 模型调用**：review 的模型开销只有 reviewer 与 Judge 两段。证据预处理按 frozen 顺序保留，放不下的 unit 记为 skipped（`budget_exhausted`）并随 snapshot 与 report coverage 可见，**不再按风险排序**。每个选中的 reviewer 接收全部接纳 evidence；evidence 总量由 `evidence_token_budget` 控制，`_apply_main_budget` 是顺序贪心保留（放不下的 unit 跳过、后面仍放得下的小 unit 保留）。
 - reviewer frozen task（本次授权 diff evidence）是固定输入，不参与工作历史压缩；容量不足必须显式失败或记录 coverage 缺口，不得静默丢弃授权 evidence，也不得假定压缩能裁剪 frozen task。
-- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Judge（`submit_verdicts`）本就每轮强制；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
+- **不再有保留的 terminal 提交轮**：review 全链路移除 terminal tool 协议后，`reserve_terminal_iteration` / `terminal_retry_limit` / `prose_retry_limit` 一并删除。结构正确性改由 `AgentRunSpec.output_contract` + `output_retry_limit` 保证：被拒的答案不进 `final_content`、不置 `structured_output`，只追加一条带具体原因的纠正消息继续同一 run；配额耗尽以 `invalid_output` 收场。因此「预算内一定提交成功」不再是保证，取而代之的是「被拒绝不能冒充成功」。reviewer 请求上限 30，Judge `_JUDGE_MAX_ITERATIONS = 3 + 3`。
+- **但最后一次请求不再开放工具**：结构化 run 的 `iteration == max_iterations - 1` 由 `_is_final_structured_turn()` 判定，该轮不给工具并明确要求直接给答案，避免预算被一次无法回收的工具调用耗尽后停在与内容无关的 `max_iterations`。该轮被拒同样是 `invalid_output`，不会获得额外纠正轮。
 - reviewer 内重复 `read_file`/`grep` 按单 run ledger 抑制（相同规范化范围 + 内容未变时返回短提示），`force` 不可绕过；这是上下文效率控制，不是累计 token 硬上限，也不跨 reviewer/review run 共享。
 
 ## 变更检查

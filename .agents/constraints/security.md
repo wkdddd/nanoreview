@@ -23,7 +23,7 @@
 ## Review 输入边界
 
 - review 唯一输入是本地 diff：admission 只接受 `auto`/`local` target type，`github` 等值按 `invalid_target_type` 拒绝；GitHub URL 不再特判，退化为普通本地路径校验。action 只保留 `diff`，显式 `repo` 按 `invalid_action` 拒绝；无 Git 仓库 / diff 读取失败 / 空 diff 分别映射为 `not_a_git_repo` / `diff_unavailable` / `empty_diff`，在准入阶段失败且不启动任何模型角色。
-- **`local_review`（仓库级 reader/evidence wrapper）已整体删除**：工具、`ReviewToolBase`、`LocalRepoReader`、`skills/rag` 及其专属测试全部移除，`ConversationLoop._CONVERSATION_DENIED_TOOLS` 随之取消。Review 流程的模型角色因此天然不含它：reviewer 只有 `grep`/`list_dir`/`read_file`/`review_submit`，Judge 只注册 verdict 工具；授权证据由 ReviewLoop 内部依赖 `ReviewEvidenceService` 直接注入 frozen task，不依赖工具 wrapper 注册。residual 扫描须确认 reviewer prompt 与 task 不再建议模型调用任何仓库 reader 工具。
+- **`local_review`（仓库级 reader/evidence wrapper）已整体删除**：工具、`ReviewToolBase`、`LocalRepoReader`、`skills/rag` 及其专属测试全部移除，`ConversationLoop._CONVERSATION_DENIED_TOOLS` 随之取消。Review 流程的模型角色因此天然不含它：reviewer 只有 `grep`/`list_dir`/`read_file`（无提交工具：最终答案就是结构化 JSON），Judge 注册空工具表；授权证据由 ReviewLoop 内部依赖 `ReviewEvidenceService` 直接注入 frozen task，不依赖任何工具 wrapper 注册。residual 扫描须确认 reviewer prompt 与 task 不再建议模型调用任何仓库 reader 工具。
 - **reviewer 的取证范围被锁在准入 evidence 内**：reviewer 只能读被授权的 evidence（frozen task 内联）并在 `restricted` scope 内定向 `read_file`/`grep` 目标文件；未知/未授权 evidence ID 不进入 reviewer 上下文。reviewer 不能读 diff 之外的仓库代码。
 - **`risk_hints` 已删除**：静态关键词表与检测函数不再存在，evidence 不再按风险关键词评分、排序或路由；`matched` 只是展示元数据，不能作为风险信号或补派依据。
 - `ReviewAction.REPO` 仅作为被拒 action 的规范名保留（错误信息与历史 metadata 识别），任何入口都不再产生它；本节点不恢复 repo review 入口。

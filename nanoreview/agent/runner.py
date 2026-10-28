@@ -31,6 +31,7 @@ from nanoreview.agent.hooks.lifecycle import (
     AgentRunHookContext,
     finalize_content_result,
 )
+from nanoreview.agent.output_contract import OutputContract
 from nanoreview.agent.tools.base import tool_result_is_error
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.agent.tools.safety_boundary import classify_violation
@@ -48,8 +49,10 @@ from nanoreview.utils.helpers import (
 from nanoreview.utils.prompt_templates import render_template
 from nanoreview.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
+    build_final_structured_answer_message,
     build_finalization_retry_message,
     build_length_recovery_message,
+    build_structured_length_recovery_message,
     ensure_nonempty_tool_result,
     is_blank_text,
     repeated_external_lookup_error,
@@ -87,11 +90,8 @@ _COMPRESSION_ATTEMPTS = 2
 # Max characters of a failure reason recorded/logged (never the full context).
 _COMPRESSION_RETRY_REASON_CHARS = 200
 _COMPRESSION_TEMPLATE_PATH = "agent/memory_compression.md"
-# Reason recorded when the model answers with prose instead of submitting
-# through its required terminal tool.
-_TERMINAL_PROSE_MISS_REASON = (
-    "model returned a prose response without calling the required terminal tool"
-)
+#: Stop reason of a run whose final answer never satisfied its output contract.
+_STOP_INVALID_OUTPUT = "invalid_output"
 
 
 def _bounded(reason: Any) -> str:
@@ -110,15 +110,6 @@ def _is_tool_error_result(result: Any) -> bool:
     if explicit_error is not None:
         return explicit_error
     return isinstance(result, str) and result.startswith(_TOOL_ERROR_PREFIXES)
-
-
-def _build_terminal_submission_prompt(terminal_tools: frozenset[str]) -> str:
-    """Fixed prompt injected when the model skips its terminal tool."""
-    names = ", ".join(f"`{name}`" for name in sorted(terminal_tools))
-    return (
-        f"You did not call the required terminal tool ({names}). "
-        "Call it now with JSON-compatible structured arguments and no prose."
-    )
 
 
 @dataclass(slots=True)
@@ -161,32 +152,20 @@ class AgentRunSpec:
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
     soft_tool_error_tools: frozenset[str] = field(default_factory=frozenset)
-    terminal_tools: frozenset[str] = field(default_factory=frozenset)
     #: Tools whose untruncated result is kept in ``tool_events[*].raw_result``.
     #: The runner only preserves what the caller explicitly declares, so an
     #: ordinary tool result is never persisted or propagated untruncated by
     #: default.
     preserve_tool_result_tools: frozenset[str] = field(default_factory=frozenset)
-    # Max terminal-tool submission attempts (failed submissions and prose
-    # answers both count) before the run fails with terminal_tool_failed.
-    terminal_retry_limit: int = 5
-    #: Separate allowance for *prose* terminal misses — turns that answered with
-    #: text and no tool call at all. They share ``terminal_retry_limit`` by
-    #: default, which is right for a forced-tool run where any non-tool turn is
-    #: a missed submission. A free-form run (a reviewer reads, decides
-    #: and only then finishes) narrates such turns while working normally, so it
-    #: raises this instead of letting narration exhaust the submission budget
-    #: and fail a run that never submitted anything malformed. ``None`` keeps the
-    #: shared limit.
-    prose_retry_limit: int | None = None
-    #: Reserve the final allowed iteration for the required terminal tool. On
-    #: that iteration only the terminal tool(s) stay exposed and a single
-    #: terminal tool is forced via ``tool_choice``, so a run that spent every
-    #: other request exploring still submits instead of ending as
-    #: ``max_iterations`` with no result. No effect when ``terminal_tools`` is
-    #: empty. Runs whose final iteration is not reached (early submission) are
-    #: unaffected.
-    reserve_terminal_iteration: bool = True
+    #: Structured-output contract for the run's final answer. When set, the run
+    #: only completes on a payload the contract accepts: an invalid answer is
+    #: fed back with its concrete error and the model may correct itself inside
+    #: the same run, bounded by ``output_retry_limit``. Without a contract the
+    #: run's final text is whatever the model said (conversation behaviour).
+    output_contract: OutputContract | None = None
+    #: Correction attempts allowed after an invalid final answer. The value
+    #: counts rejections, so the model always gets at least one retry.
+    output_retry_limit: int = 3
     #: Overrides the default ``agent/memory_compression.md`` prompt template.
     compression_prompt: str | None = None
     #: Wall-clock timeout applied to each compression-layer logical request.
@@ -210,10 +189,12 @@ class AgentRunResult:
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     had_injections: bool = False
     content_replaced: bool = False
-    # Terminal-tool diagnostics: how many submission attempts were made and
-    # the last concrete failure reason when the run ended terminal_tool_failed.
-    terminal_attempts: int = 0
-    terminal_error: str | None = None
+    #: Payload accepted by ``spec.output_contract``. Only a run that satisfied
+    #: its contract has one; a truncated, prose or failed answer never does.
+    structured_output: Any | None = None
+    #: How many final answers the contract rejected before the run settled.
+    output_attempts: int = 0
+    output_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -227,16 +208,15 @@ class _IterationOutcome:
     injection_cycles: int
     empty_content_retries: int
     length_recovery_count: int
-    terminal_attempts: int
-    terminal_error: str | None
-    had_injections: bool
-    #: Prose terminal misses counted separately from real terminal-tool
-    #: failures, so a free-form run is not failed by ordinary narration.
-    prose_attempts: int = 0
+    #: Rejections of the final answer by ``spec.output_contract`` so far.
+    output_attempts: int = 0
+    output_error: str | None = None
+    had_injections: bool = False
     #: True once any iteration produced an explicit hook replacement of the
     #: final content. Carried forward so ``AgentRunResult`` can report it
     #: without re-deriving it from the public hook context.
     content_replaced: bool = False
+    structured_output: Any | None = None
     stop_reason: str | None = None
     final_content: str | None = None
     error: str | None = None
@@ -425,14 +405,12 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
-        # Terminal-tool submission tracking: attempts count every failed or
-        # successful terminal submission; terminal_error keeps the last concrete
-        # error. Prose answers while the terminal tool is still pending are
-        # tracked separately so a run that declares ``prose_retry_limit`` (the
-        # reviewer narrates while it works) is not failed by narration.
-        terminal_attempts = 0
-        prose_attempts = 0
-        terminal_error: str | None = None
+        # Structured-output tracking: how many final answers the contract
+        # rejected, the last concrete rejection reason, and the payload it
+        # finally accepted. A run without a contract never sets any of them.
+        output_attempts = 0
+        output_error: str | None = None
+        structured_output: Any | None = None
         content_replaced = False
 
         # The run hook gets its own transcript: an observer appending to
@@ -461,33 +439,35 @@ class AgentRunner:
                             spec.error_message if spec.error_message is not None else error
                         )
                         break
+                # The last permitted request of a structured run is reserved for
+                # the answer itself: no tools are exposed and the model is told
+                # so, otherwise the budget can be spent on a tool call the run
+                # has no room to come back from and the whole run ends at
+                # ``max_iterations`` with nothing to hand over.
+                final_structured = self._is_final_structured_turn(spec, iteration)
+                if final_structured:
+                    # Written to both zones: the raw history keeps the record,
+                    # and the working zone is what ``_model_context`` actually
+                    # sends, so the model is told why its tools are gone.
+                    answer_request = [build_final_structured_answer_message()]
+                    self._append_injected_messages(messages, answer_request)
+                    self._append_injected_messages(
+                        state.working, [dict(item) for item in answer_request]
+                    )
+                    state.working_revision += 1
                 # The provider gets its own deep copy: in-place cleanup by the
                 # provider chain must never reach the raw history or the state.
                 messages_for_model = deepcopy(self._model_context(spec, state))
                 context = AgentHookContext(iteration=iteration, messages=messages)
                 context.session_key = spec.session_key
                 await hook.before_iteration(context)
-                # The final allowed iteration of a terminal-tool run is
-                # reserved for the submission: only the terminal tool(s) are
-                # offered (and a single one is forced), so a run that burned
-                # every other request on exploratory reads still gets one
-                # guaranteed review_submit/plan/verdict turn instead of
-                # collapsing into ``max_iterations`` without a result.
-                reserved_terminal = self._reserved_terminal_tools(spec, iteration)
-                if reserved_terminal:
-                    logger.info(
-                        "terminal_tool.reserved_iteration iteration={}/{} tools={}",
-                        iteration + 1,
-                        spec.max_iterations,
-                        sorted(reserved_terminal),
-                    )
                 ##请求模型
                 response = await self._request_model(
                     spec,
                     messages_for_model,
                     hook,
                     context,
-                    reserved_terminal=reserved_terminal,
+                    final_structured=final_structured,
                 )
                 raw_usage = self._usage_dict(response.usage)
                 context.response = response
@@ -513,23 +493,22 @@ class AgentRunner:
                     injection_cycles,
                     empty_content_retries,
                     length_recovery_count,
-                    terminal_attempts,
-                    terminal_error,
+                    output_attempts,
+                    output_error,
                     had_injections,
-                    prose_attempts,
                 )
                 injection_cycles = iteration_outcome.injection_cycles
                 empty_content_retries = iteration_outcome.empty_content_retries
                 length_recovery_count = iteration_outcome.length_recovery_count
-                terminal_attempts = iteration_outcome.terminal_attempts
-                prose_attempts = iteration_outcome.prose_attempts
-                terminal_error = iteration_outcome.terminal_error
+                output_attempts = iteration_outcome.output_attempts
+                output_error = iteration_outcome.output_error
                 had_injections = had_injections or iteration_outcome.had_injections
                 content_replaced = content_replaced or iteration_outcome.content_replaced
                 if iteration_outcome.stop_reason is not None:
                     stop_reason = iteration_outcome.stop_reason
                     error = iteration_outcome.error
                     final_content = iteration_outcome.final_content
+                    structured_output = iteration_outcome.structured_output
                     break
             else:
                 stop_reason = "max_iterations"
@@ -645,8 +624,9 @@ class AgentRunner:
             tool_events=tool_events,
             had_injections=had_injections,
             content_replaced=content_replaced,
-            terminal_attempts=terminal_attempts,
-            terminal_error=terminal_error,
+            structured_output=structured_output,
+            output_attempts=output_attempts,
+            output_error=output_error,
         )
 
     @staticmethod
@@ -699,10 +679,9 @@ class AgentRunner:
         injection_cycles: int,
         empty_content_retries: int,
         length_recovery_count: int,
-        terminal_attempts: int,
-        terminal_error: str | None,
+        output_attempts: int,
+        output_error: str | None,
         had_injections: bool,
-        prose_attempts: int = 0,
     ) -> "_IterationOutcome":
         """Handle one business model response and advance the run.
 
@@ -724,10 +703,9 @@ class AgentRunner:
             injection_cycles=injection_cycles,
             empty_content_retries=empty_content_retries,
             length_recovery_count=length_recovery_count,
-            terminal_attempts=terminal_attempts,
-            terminal_error=terminal_error,
+            output_attempts=output_attempts,
+            output_error=output_error,
             had_injections=had_injections,
-            prose_attempts=prose_attempts,
         )
         #: Set once ``finalize_content_result`` reports an explicit replacement.
         is_replaced = False
@@ -760,16 +738,6 @@ class AgentRunner:
             )
 
             await hook.before_execute_tools(context)
-
-            if spec.terminal_tools:
-                for tool_call in response.tool_calls:
-                    if tool_call.name in spec.terminal_tools:
-                        logger.info(
-                            "terminal_tool.start tool={} attempt={}/{}",
-                            tool_call.name,
-                            outcome.terminal_attempts + 1,
-                            spec.terminal_retry_limit,
-                        )
 
             results, new_events, fatal_error = await self._execute_tools(
                 spec,
@@ -833,68 +801,6 @@ class AgentRunner:
                     "pending_tool_calls": [],
                 },
             )
-            # A terminal tool signals completion: once executed successfully,
-            # break immediately instead of giving the LLM another turn that
-            # could re-invoke it in a loop. A failed terminal submission stays
-            # inside this AgentRun: the assistant and tool messages (including
-            # the error) are kept so the model can correct its submission with
-            # full context, up to spec.terminal_retry_limit attempts.
-            if spec.terminal_tools:
-                terminal_success: str | None = None
-                terminal_failure: tuple[str, str] | None = None
-                for tool_call, result in zip(response.tool_calls, results):
-                    if tool_call.name not in spec.terminal_tools:
-                        continue
-                    if _is_tool_error_result(result):
-                        terminal_failure = (tool_call.name, str(result))
-                    else:
-                        terminal_success = tool_call.name
-                        break
-                if terminal_success is not None:
-                    outcome.terminal_attempts += 1
-                    logger.info(
-                        "terminal_tool.completed tool={} attempts={}",
-                        terminal_success,
-                        outcome.terminal_attempts,
-                    )
-                    stop_reason = "completed"
-                    final_content = ""
-                    context.stop_reason = stop_reason
-                    await hook.after_iteration(context)
-                    outcome.stop_reason = stop_reason
-                    outcome.final_content = final_content
-                    return outcome
-                if terminal_failure is not None:
-                    failure_name, failure_text = terminal_failure
-                    outcome.terminal_attempts += 1
-                    outcome.terminal_error = failure_text
-                    if outcome.terminal_attempts >= spec.terminal_retry_limit:
-                        error = outcome.terminal_error
-                        final_content = error
-                        stop_reason = "terminal_tool_failed"
-                        self._append_final_message(messages, final_content)
-                        context.final_content = final_content
-                        context.error = error
-                        context.stop_reason = stop_reason
-                        logger.info(
-                            "terminal_tool.failed tool={} attempts={} reason={}",
-                            failure_name,
-                            outcome.terminal_attempts,
-                            _bounded(failure_text),
-                        )
-                        await hook.after_iteration(context)
-                        outcome.stop_reason = stop_reason
-                        outcome.error = error
-                        outcome.final_content = final_content
-                        return outcome
-                    logger.info(
-                        "terminal_tool.retry tool={} attempt={} reason={}",
-                        failure_name,
-                        outcome.terminal_attempts,
-                        _bounded(failure_text),
-                    )
-                    # Continue the current AgentRun so the same context,
-                    # plan, and tool definitions remain available.
             outcome.empty_content_retries = 0
             outcome.length_recovery_count = 0
             # Checkpoint 1: drain injections after tools, before next LLM call
@@ -979,7 +885,16 @@ class AgentRunner:
                         thinking_blocks=response.thinking_blocks,
                     ),
                 )
-                self._append_raw(messages, state, build_length_recovery_message())
+                # A truncated structured answer is a fragment, never a value the
+                # contract could accept: ask for the whole object again instead
+                # of appending the rest of a broken JSON document.
+                self._append_raw(
+                    messages,
+                    state,
+                    build_structured_length_recovery_message()
+                    if spec.output_contract is not None
+                    else build_length_recovery_message(),
+                )
                 await hook.after_iteration(context)
                 return outcome
 
@@ -1070,10 +985,11 @@ class AgentRunner:
             outcome.final_content = final_content
             return outcome
 
-        # A terminal-tool run that answers with prose instead of submitting
-        # keeps the same AgentRun: inject one fixed prompt asking for the
-        # terminal tool and count this as a terminal submission attempt.
-        if spec.terminal_tools and not is_replaced:
+        # A run with an output contract only completes on a payload the contract
+        # accepts. A rejected answer keeps the same AgentRun — the rejected text
+        # and the concrete reason stay in context — so the model can correct
+        # itself with full context, up to ``output_retry_limit`` rejections.
+        if spec.output_contract is not None and not is_replaced:
             self._append_raw(
                 messages,
                 state,
@@ -1084,38 +1000,42 @@ class AgentRunner:
                     thinking_blocks=response.thinking_blocks,
                 ),
             )
-            outcome.prose_attempts += 1
-            # Prose misses have their own allowance when the caller declares one
-            # (a free-form run such as a reviewer, which narrates while
-            # working). Otherwise they keep sharing the submission budget, which
-            # is the correct strict reading for a forced-tool run.
-            if spec.prose_retry_limit is None:
-                # Shared budget: a prose miss is a missed submission, so it
-                # advances the same counter a rejected terminal call advances.
-                prose_used = outcome.terminal_attempts + 1
-                prose_limit = spec.terminal_retry_limit
-                outcome.terminal_attempts = prose_used
-            else:
-                prose_limit = spec.prose_retry_limit
-                prose_used = outcome.prose_attempts
-            # The miss itself counts, so the count is already post-increment and
-            # the comparison fires on exactly the Nth prose turn.
-            if prose_used >= prose_limit:
-                if spec.prose_retry_limit is not None:
-                    outcome.terminal_attempts += 1
-                outcome.terminal_error = _TERMINAL_PROSE_MISS_REASON
-                terminal_names = ",".join(sorted(spec.terminal_tools))
-                error = outcome.terminal_error
+            payload, rejection = spec.output_contract.validate(clean)
+            if payload is not None:
+                final_content = clean
+                context.final_content = final_content
+                context.stop_reason = "completed"
+                await hook.after_iteration(context)
+                outcome.stop_reason = "completed"
+                outcome.final_content = final_content
+                outcome.structured_output = payload
+                logger.info(
+                    "output_contract.accepted name={} attempts={}",
+                    spec.output_contract.name,
+                    outcome.output_attempts,
+                )
+                return outcome
+            outcome.output_attempts += 1
+            outcome.output_error = rejection
+            # The last permitted request cannot be followed by a correction
+            # round: asking for one more answer would append a prompt the loop
+            # has no room to send, and the exhausted loop would then report
+            # ``max_iterations`` instead of the real reason.
+            if (
+                outcome.output_attempts >= spec.output_retry_limit
+                or self._is_final_structured_turn(spec, iteration)
+            ):
+                error = rejection or "the final answer was rejected"
                 final_content = error
-                stop_reason = "terminal_tool_failed"
+                stop_reason = _STOP_INVALID_OUTPUT
                 context.final_content = final_content
                 context.error = error
                 context.stop_reason = stop_reason
                 logger.info(
-                    "terminal_tool.failed tool={} attempts={} reason={}",
-                    terminal_names,
-                    outcome.terminal_attempts,
-                    _TERMINAL_PROSE_MISS_REASON,
+                    "output_contract.rejected name={} attempts={} reason={}",
+                    spec.output_contract.name,
+                    outcome.output_attempts,
+                    _bounded(rejection),
                 )
                 await hook.after_iteration(context)
                 outcome.stop_reason = stop_reason
@@ -1123,34 +1043,21 @@ class AgentRunner:
                 outcome.final_content = final_content
                 return outcome
             logger.info(
-                "terminal_tool.retry tool={} attempt={}/{} reason={}",
-                ",".join(sorted(spec.terminal_tools)),
-                outcome.prose_attempts,
-                prose_limit,
-                _TERMINAL_PROSE_MISS_REASON,
+                "output_contract.retry name={} attempt={}/{} reason={}",
+                spec.output_contract.name,
+                outcome.output_attempts,
+                spec.output_retry_limit,
+                _bounded(rejection),
+            )
+            repair_prompt = spec.output_contract.repair_prompt(
+                rejection or "the final answer was rejected"
             )
             self._append_injected_messages(
-                messages,
-                [
-                    {
-                        "role": "user",
-                        "content": _build_terminal_submission_prompt(
-                            spec.terminal_tools
-                        ),
-                    }
-                ],
+                messages, [{"role": "user", "content": repair_prompt}]
             )
-            # The synthetic prompt must enter the model working context too.
+            # The correction prompt must enter the model working context too.
             self._append_injected_messages(
-                state.working,
-                [
-                    {
-                        "role": "user",
-                        "content": _build_terminal_submission_prompt(
-                            spec.terminal_tools
-                        ),
-                    }
-                ],
+                state.working, [{"role": "user", "content": repair_prompt}]
             )
             # New interactive content: counts for the compression retry gate.
             state.working_revision += 1
@@ -1824,7 +1731,6 @@ class AgentRunner:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
-        tool_choice: dict[str, Any] | str | None = None,
     ) -> dict[str, Any]:
 
         kwargs: dict[str, Any] = {
@@ -1840,52 +1746,30 @@ class AgentRunner:
             kwargs["max_tokens"] = spec.max_tokens
         if spec.reasoning_effort is not None:
             kwargs["reasoning_effort"] = spec.reasoning_effort
-        # A per-request override (the reserved terminal submission turn) wins
-        # over the run-level ``tool_choice``.
-        choice = tool_choice if tool_choice is not None else spec.tool_choice
-        if choice is not None:
-            kwargs["tool_choice"] = choice
+        if spec.tool_choice is not None:
+            kwargs["tool_choice"] = spec.tool_choice
         if spec.response_format is not None:
             kwargs["response_format"] = spec.response_format
         return kwargs
 
     @staticmethod
-    def _terminal_tool_definitions(
-        spec: AgentRunSpec, names: frozenset[str]
-    ) -> list[dict[str, Any]]:
-        """Return only the definitions of ``names`` from the tool registry."""
-        selected: list[dict[str, Any]] = []
-        for schema in spec.tools.get_definitions():
-            function = schema.get("function")
-            name = (
-                function.get("name")
-                if isinstance(function, dict)
-                else schema.get("name")
-            )
-            if isinstance(name, str) and name in names:
-                selected.append(schema)
-        return selected
+    def _tool_definitions(spec: AgentRunSpec) -> list[dict[str, Any]]:
+        """The run's full tool surface (a run may legitimately have none)."""
+        return spec.tools.get_definitions()
 
-    def _reserved_terminal_tools(
-        self,
-        spec: AgentRunSpec,
-        iteration: int,
-    ) -> frozenset[str]:
-        """The terminal tools the final allowed iteration is restricted to.
+    @staticmethod
+    def _is_final_structured_turn(spec: AgentRunSpec, iteration: int) -> bool:
+        """Whether *iteration* is the last chance to answer a structured run.
 
-        Empty unless this is the last permitted iteration of a run that
-        declares terminal tools and opted into the reservation. A non-empty
-        result tells the request builder to expose only those tools (and force
-        a single one), turning the would-be ``max_iterations`` exit into a
-        guaranteed submission turn.
+        A run with an output contract must answer with its payload, not with
+        another tool call: reserving the final permitted request for the answer
+        turns the would-be ``max_iterations`` exit into a guaranteed answer
+        turn. A run without a contract (conversation) keeps its full budget.
         """
-        if (
-            not spec.reserve_terminal_iteration
-            or not spec.terminal_tools
-            or iteration != spec.max_iterations - 1
-        ):
-            return frozenset()
-        return spec.terminal_tools
+        return (
+            spec.output_contract is not None
+            and iteration == spec.max_iterations - 1
+        )
 
     async def _request_model(
         self,
@@ -1894,7 +1778,7 @@ class AgentRunner:
         hook: AgentHook,
         context: AgentHookContext,
         *,
-        reserved_terminal: frozenset[str] = frozenset(),
+        final_structured: bool = False,
     ):
         timeout_s: float | None = spec.llm_timeout_s
         if timeout_s is None:
@@ -1909,28 +1793,10 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
-        # On the reserved submission turn the model only sees the terminal
-        # tool(s); a single terminal tool is additionally forced so the turn
-        # cannot end in prose.
-        if reserved_terminal:
-            tools = self._terminal_tool_definitions(spec, reserved_terminal)
-            forced_choice = (
-                {
-                    "type": "function",
-                    "function": {"name": next(iter(reserved_terminal))},
-                }
-                if len(reserved_terminal) == 1
-                else None
-            )
-        else:
-            tools = spec.tools.get_definitions()
-            forced_choice = None
-        kwargs = self._build_request_kwargs(
-            spec,
-            messages,
-            tools=tools,
-            tool_choice=forced_choice,
-        )
+        # The reserved answer turn exposes no tools at all, so the model can
+        # only reply with text; every other turn gets the run's full surface.
+        tools = [] if final_structured else self._tool_definitions(spec)
+        kwargs = self._build_request_kwargs(spec, messages, tools=tools)
         wants_streaming = hook.wants_streaming()
 
         async def _provider_tool_event(event: dict[str, Any]) -> None:
@@ -2074,15 +1940,10 @@ class AgentRunner:
 
     @staticmethod
     def _is_fatal_tool_error(spec: AgentRunSpec, tool_name: str) -> bool:
-        """Whether a failed tool call should abort the run.
-
-        Terminal-tool failures never abort: they are retried inside the same
-        AgentRun by the terminal retry loop, keeping the error in context.
-        """
+        """Whether a failed tool call should abort the run."""
         return (
             spec.fail_on_tool_error
             and tool_name not in spec.soft_tool_error_tools
-            and tool_name not in spec.terminal_tools
         )
 
     async def _run_tool(

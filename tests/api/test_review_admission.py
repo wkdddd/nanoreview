@@ -16,8 +16,8 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.review_board import ReviewBoardView
 from nanoreview.agent.review_loop import ReviewLoopOutcome
-from nanoreview.agent.review_state import ReviewRunState
 from nanoreview.api.server import create_app
 from nanoreview.bus.queue import MessageBus
 from nanoreview.providers.base import LLMProvider, LLMResponse
@@ -117,8 +117,8 @@ async def test_accepted_review_delegates_the_registered_run(
     observed: dict[str, Any] = {}
 
     async def _fake_execute(request):
-        state: ReviewRunState | None = loop._review_runs.get("api:default")
-        observed["run_id"] = state.run_id if state else None
+        board: ReviewBoardView | None = loop._review_boards.view("api:default")
+        observed["run_id"] = board.run_id if board else None
         observed["metadata"] = dict(request.msg.metadata)
         return ReviewLoopOutcome(report_markdown="ok", produces_report=False)
 
