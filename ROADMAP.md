@@ -1,25 +1,23 @@
-# code-review 优化
-## planned
-  -> 关闭 RAG 功能 --完成
-  -> 重排预处理流程 --完成
-  -> 固化审查深度与预算 --完成
-  -> 重构 Loop / Runner 
- 去掉 safety_buffer  和 max_output_tokens
+# 文件定位
 
-  -> 再重新补充下预处理和预算
-  -> 精简工具与 Skill
-  -> 安全权限收口
-  -> 精简记忆与上下文
-  -> 整理 System Prompt
-  -> WebUI 调整
-  -> 删除遗留代码与依赖
----------------------------------------
-- 代码rag系统优化和稳定
-- 增加cli
-- 支持代码一键修改
+此文件全程由用户维护与更新，不可让ai参与，负责记录现有实现内容与项目规划
 
-## not planned
-- 自动化和定时功能
+## 链路
+
+review workflow
+pr->reviewers->judge->reviewer->反复循环调整->report  进入文档库供对话agent查看
+
+## 模型参数配置
+1. 复用nanobot的agent与subagent逻辑
+2. 允许reviewer、judge单独配置参数
+3. 控制reviewer、judge最大轮数为30
+
+
+
+
+
+
+
 
 
 

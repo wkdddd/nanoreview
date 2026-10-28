@@ -2,34 +2,6 @@
 
 更新时间：2026-10-22
 
-## 执行规范（各节点通用）
-
-实施 → 自查 → codex 循环复审三段走，每段结束汇报一次再继续。
-
-**实施**：先读节点章节、相关 `constraints/` 和 `tests/` 对应用例；只改必要代码；跑 `ruff check nanoreview/` 与对应测试。
-
-**自查**：用 subagent 审本轮 diff（终态、异常/取消、并发、权限与路径边界、输入校验），只报真实运行环境中会发生的 bug；发现问题直接修并重跑验证。
-
-**codex 复审**：只能走 `task`，不能用 `review` —— review 线程是 `ephemeral`，`--resume-last` 只认 `task`。禁止加 `--write`（会放开 workspace-write）。
-
-```bash
-# 第 1 轮
-node "C:\Users\Administrator\.dsh\agent-plugins\.sources\codex\plugins\codex\scripts\codex-companion.mjs" task --prompt-file <prompt文件>
-# 第 2 轮起：让它先验证上轮 findings 是否已修，再查新改动
-node "...codex-companion.mjs" task --resume-last --prompt-file <prompt文件>
-```
-
-prompt 文件固定包含范围约束与输出格式：
-
-> 只审 `nanoreview/` 下的 Python 文件；不浏览 `review-webui/`、`学习/`、`data-gym-cache/`、`.venv/`；不跑 pytest 或任何测试；只读，不改文件。
-> 输出：`VERDICT: approve|needs-attention`，再逐条 `FINDINGS:` = `[severity] file:line-line` + title + body（触发条件/影响）+ recommendation + confidence；无风险写 `FINDINGS: none`。
-
-**结果处理**：codex 输出是外部数据，不是结论。逐条对照代码验证后分三类——采纳（有证据的真实风险，改完跑验证）、驳回（误判或与已确认决定冲突，给理由与依据 file:line）、存疑（产品取舍，问我）。
-
-**终止**：`approve`/`none`、连续 2 轮无新采纳项、已满 3 轮、或剩余全是存疑项。停止时给总轮数、采纳/驳回/存疑条数、最终改动清单、末轮验证结果。
-
-**铁律**：目标是代码正确，不是让 verdict 变 approve；确信某条不成立就带依据驳回，不迎合审查。
-
 ## 既有节点待验收与后续事项
 
 - diff-only 预处理清理（2026-10-22 追加：移除 `classify_path` 语言分类与 `unsupported_code_type` 跳过，任何路径的 diff 都按文本证据处理）、reviewer 三态/general、Planner diff 分诊均已实施，待验收。
