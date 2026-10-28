@@ -1,7 +1,7 @@
 # Common Rules
 
-Shared rules for every NanoReview agent: the conversation agent, the review
-planner, each specialized reviewer, and the judge. Role-specific protocols
+Shared rules for every NanoReview agent: the conversation agent, each
+reviewer, and the judge. Role-specific protocols
 (review evidence formats, conversation tone, submission tools) live with their
 own prompts and are not repeated here.
 

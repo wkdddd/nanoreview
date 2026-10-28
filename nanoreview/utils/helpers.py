@@ -550,7 +550,7 @@ def merge_token_usage(
 ) -> dict[str, int]:
     """Add positive numeric token counters from *usage* into *target*.
 
-    Every agent run (coordinator planner, reviewer subagent, judge batch)
+    Every agent run (reviewer subagent, judge batch)
     reports its own usage dict; callers fold each one into the owning review
     run so a multi-agent run reports one aggregated total. Unknown keys are
     merged as-is so provider-specific counters are never dropped.

@@ -1,6 +1,6 @@
 # MCP 使用示例
 
-MCP 实现自本机 nanobot `432421bc` 提取适配，仅 Conversation Agent 使用。审查侧（planner / reviewer / Judge）不可见。
+MCP 实现自本机 nanobot `432421bc` 提取适配，仅 Conversation Agent 使用。审查侧（reviewer / Judge）不可见。
 
 配置修改后重启生效。配置结构见 `nanoreview/config/schema.py` 的 `MCPServerConfig`，字段使用 camelCase（`toolTimeout`、`enabledTools`），也接受 snake_case。
 

@@ -41,7 +41,7 @@ _SCOPE_BY_PROFILE_ID: dict[str, str] = {
 class ReviewerProfile:
     id: str
     label: str
-    planner_description: str
+    description: str
     prompt_template: str
     context_policy: str
     details_schema: dict[str, object]
@@ -51,7 +51,7 @@ class ReviewerProfile:
         return {
             "id": self.id,
             "label": self.label,
-            "description": self.planner_description,
+            "description": self.description,
         }
 
     def execution_profile(self) -> SubagentExecutionProfile:
@@ -98,7 +98,7 @@ REVIEWER_PROFILES: dict[str, ReviewerProfile] = {
     "bug": ReviewerProfile(
         id="bug",
         label="Bug Reviewer",
-        planner_description=(
+        description=(
             "Find reproducible logic errors, boundary failures, exception-path defects, "
             "state inconsistencies, regressions, and race conditions."
         ),
@@ -110,7 +110,7 @@ REVIEWER_PROFILES: dict[str, ReviewerProfile] = {
     "security": ReviewerProfile(
         id="security",
         label="Security Reviewer",
-        planner_description=(
+        description=(
             "Find exploitable authentication, authorization, injection, path, network, "
             "secret-handling, dependency, and trust-boundary defects."
         ),
@@ -122,7 +122,7 @@ REVIEWER_PROFILES: dict[str, ReviewerProfile] = {
     "performance": ReviewerProfile(
         id="performance",
         label="Performance Reviewer",
-        planner_description=(
+        description=(
             "Find material algorithmic, I/O, query, locking, blocking, memory, and "
             "scalability problems on plausible hot paths."
         ),
@@ -134,7 +134,7 @@ REVIEWER_PROFILES: dict[str, ReviewerProfile] = {
     "maintainability": ReviewerProfile(
         id="maintainability",
         label="Maintainability Reviewer",
-        planner_description=(
+        description=(
             "Find concrete boundary violations, coupling, duplication, complexity, and "
             "testability problems that amplify future changes or propagate defects."
         ),
@@ -151,7 +151,7 @@ REVIEWER_PROFILES: dict[str, ReviewerProfile] = {
     "general": ReviewerProfile(
         id="general",
         label="General Reviewer",
-        planner_description=(
+        description=(
             "Perform a single balanced review covering functional correctness, boundaries, "
             "error handling, security, performance, and maintainability for the change."
         ),
@@ -283,7 +283,7 @@ async def _handle_reviewer_result(
         )
     data = json.loads(content)
     if not data.get("findings"):
-        # Evidence is provided two ways: the planner injects assigned excerpts
+        # Evidence is provided two ways: the host injects assigned excerpts
         # into the reviewer's frozen task, and the reviewer may read the target
         # directly with ``read_file``/``grep``. An empty finding list is only
         # incomplete when neither channel supplied evidence — there is no

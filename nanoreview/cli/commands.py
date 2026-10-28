@@ -1046,7 +1046,11 @@ def review(
         None,
         "--focus",
         "-f",
-        help="Comma-separated reviewer dimensions (bug,security,performance,maintainability), or auto",
+        help=(
+            "Comma-separated reviewers to run "
+            "(bug,security,performance,maintainability,general); "
+            "defaults to general when omitted"
+        ),
     ),
     target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto or local"),
     action: str = typer.Option("diff", "--action", help="Review action: diff (only local diff review is supported)"),

@@ -9,7 +9,7 @@
 - turn 内每次重建工具调用上下文都必须沿用同一 scope。每批工具前会刷新 request context（让中途注册的工具，如重连的 MCP，拿到上下文），刷新只带 channel/chat/metadata，**scope 必须由调用方显式补回**；漏传会把 scope 重置为 `None`，后续 filesystem/shell/message 调用随即回退到构造时的 `restrict_to_workspace`（默认 `full`），使 `restricted` 在第一批工具后失效。
 - 带 `workspace_scope` 键但 payload 非法的层级会使整条解析链终止并回退配置默认，不再向下一层取用；只有该层**未声明**该键时才继续向下。非法声明不得继承更低层的更宽 scope。
 - 默认 `ToolsConfig.restrict_to_workspace=False` 即 `full`；`True` 即 `restricted`。别名 `restrict`/`full-access` 归一化为规范值。
-- ReviewLoop、planner、reviewer、Judge 固定使用 `restricted` scope（`review_workspace_scope()`），不接受会话 metadata 放宽；审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。reviewer 的 scope 由 subagent hook 写入工具调用上下文，不能只依赖 `ToolsConfig.restrict_to_workspace`（会话默认 `full` 时 reviewer 仍须只读目标仓库）。
+- ReviewLoop、reviewer、Judge 固定使用 `restricted` scope（`review_workspace_scope()`），不接受会话 metadata 放宽；审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。reviewer 的 scope 由 subagent hook 写入工具调用上下文，不能只依赖 `ToolsConfig.restrict_to_workspace`（会话默认 `full` 时 reviewer 仍须只读目标仓库）。
 - `restrict_to_workspace` 是应用层防护，不替代操作系统或容器隔离；执行隔离复用 `agent/tools/sandbox.py`。
 
 ## 网络
@@ -23,8 +23,8 @@
 ## Review 输入边界
 
 - review 唯一输入是本地 diff：admission 只接受 `auto`/`local` target type，`github` 等值按 `invalid_target_type` 拒绝；GitHub URL 不再特判，退化为普通本地路径校验。action 只保留 `diff`，显式 `repo` 按 `invalid_action` 拒绝；无 Git 仓库 / diff 读取失败 / 空 diff 分别映射为 `not_a_git_repo` / `diff_unavailable` / `empty_diff`，在准入阶段失败且不启动任何模型角色。
-- **`local_review`（仓库级 reader/evidence wrapper）已整体删除**：工具、`ReviewToolBase`、`LocalRepoReader`、`skills/rag` 及其专属测试全部移除，`ConversationLoop._CONVERSATION_DENIED_TOOLS` 随之取消。Review 流程的模型角色因此天然不含它：Planner/coordinator 只注册分诊工具（`submit_review_decision`、`finish_review_triage`，paged 模式下另有 `list_review_diff`/`read_review_diff`），四类 reviewer 只有 `grep`/`list_dir`/`read_file`/`review_submit`，Judge 只注册 verdict 工具；授权证据由 ReviewLoop 内部依赖 `ReviewEvidenceService` 直接注入 frozen task，不依赖工具 wrapper 注册。residual 扫描须确认 review coordinator/reviewer prompt 与 task 不再建议模型调用任何仓库 reader 工具。
-- **Planner 的 diff 读取工具被锁在准入 evidence 内**：`list_review_diff`/`read_review_diff` 的 `ReviewDiffReader` 只由 frozen evidence 构造，无文件系统访问，不能读任意路径、创建 evidence 或越出准入 diff；未知/未授权 evidence ID 直接拒绝。Planner 不能读 diff 之外的仓库代码。
+- **`local_review`（仓库级 reader/evidence wrapper）已整体删除**：工具、`ReviewToolBase`、`LocalRepoReader`、`skills/rag` 及其专属测试全部移除，`ConversationLoop._CONVERSATION_DENIED_TOOLS` 随之取消。Review 流程的模型角色因此天然不含它：reviewer 只有 `grep`/`list_dir`/`read_file`/`review_submit`，Judge 只注册 verdict 工具；授权证据由 ReviewLoop 内部依赖 `ReviewEvidenceService` 直接注入 frozen task，不依赖工具 wrapper 注册。residual 扫描须确认 reviewer prompt 与 task 不再建议模型调用任何仓库 reader 工具。
+- **reviewer 的取证范围被锁在准入 evidence 内**：reviewer 只能读被授权的 evidence（frozen task 内联）并在 `restricted` scope 内定向 `read_file`/`grep` 目标文件；未知/未授权 evidence ID 不进入 reviewer 上下文。reviewer 不能读 diff 之外的仓库代码。
 - **`risk_hints` 已删除**：静态关键词表与检测函数不再存在，evidence 不再按风险关键词评分、排序或路由；`matched` 只是展示元数据，不能作为风险信号或补派依据。
 - `ReviewAction.REPO` 仅作为被拒 action 的规范名保留（错误信息与历史 metadata 识别），任何入口都不再产生它；本节点不恢复 repo review 入口。
 - 不提供 GitHub source、`github_review` 工具、远程 snapshot/cache、GitHub metadata/evidence 或远程 diff 校验入口；`ReviewPlan` 无 `target_repo`/`pr_number`/`target_ref`/`target_subpath` 字段，`ReviewMetaKey` 无 `TARGET_REF`/`GITHUB_PREFETCH_READY`/`GITHUB_PR_HEAD_REF`。

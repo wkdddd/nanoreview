@@ -8,7 +8,7 @@ always: true
 
 ## Structure
 
-- `COMMON_RULES.md` — shared rules for every agent (conversation, planner, reviewers, judge).
+- `COMMON_RULES.md` — shared rules for every agent (conversation, reviewers, judge).
 - `sessions/*.jsonl` — per-session conversation history, metadata, and compact summaries.
 
 ## Session Memory

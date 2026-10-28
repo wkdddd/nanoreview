@@ -150,8 +150,9 @@ class ReviewSnapshotStore:
     def augment(self, run_id: str, *, sections: dict[str, Any]) -> str | None:
         """Merge extra sections into an existing snapshot and re-persist it.
 
-        Used after planning to record the final planner manifest, the budget
-        contract and the changed-file boundary on the run's immutable input
+        Used after planning to record the accepted evidence statistics, the budget
+        contract, the generated assignments and the changed-file boundary on
+        the run's immutable input
         snapshot. Returns the wire reference, or ``None`` when the snapshot is
         missing/unreadable — a missing snapshot must not fail an otherwise
         healthy review, so the caller records a warning instead.

@@ -33,11 +33,11 @@ ReviewProgressCallback = Callable[..., Awaitable[None]]
 
 #: Inline excerpt bound per reference (approx. one chunk cap in chars).
 #: A complete single-file diff unit can reach ``DIFF_UNIT_TOKEN_THRESHOLD``
-#: tokens (~32k chars), and the Planner's ``direct`` input inlines this excerpt
-#: as the unit's whole content, so the bound must not sit below the largest unit
-#: the program is willing to keep whole — otherwise a unit the Planner is told
-#: is complete would silently lose its tail. The Planner manifest budget is the
-#: real limit; it trims a single oversized unit explicitly and marks it.
+#: tokens (~32k chars), and the excerpt is inlined as the unit's whole content,
+#: so the bound must not sit below the largest unit the program is willing to
+#: keep whole — otherwise a unit the program treats as complete would silently
+#: lose its tail. The evidence budget is the real limit; it trims a single
+#: oversized unit explicitly and marks it.
 _EXCERPT_CHAR_LIMIT = 40_000
 
 #: Maximum skipped-file descriptions embedded in one progress event.
@@ -105,7 +105,6 @@ def _bundle_from_result(
         status="ok" if references else "empty",
         reason="" if references else "no_accepted_evidence_units",
         skipped=skipped,
-        input_mode="direct" if result.mode == "direct" else "paged",
     )
 
 
@@ -120,9 +119,7 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
     previews are sampled from that block alone and ``preview_coverage`` is
     explicitly marked as a provider snippet rather than full-chunk coverage.
     Legacy ``risk:*`` labels inside ``- matched:`` are dropped, not migrated:
-    the runtime model has no risk-hint concept any more. A legacy text provider
-    also gets ``paged`` input because the snippet set has no authorized unit
-    ordering the planner can be trusted to read whole.
+    the runtime model has no risk-hint concept any more.
     """
     summary = _compact_evidence(raw, action=action)
     references: list[EvidenceReference] = []
@@ -150,7 +147,7 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
                 ]
                 break
         # Old providers mixed risk labels into `matched`; those labels carry no
-        # meaning for the current planner, so only real query hit words remain.
+        # meaning for the current runtime, so only real query hit words remain.
         query_tags = tuple(
             item
             for item in matched_items
@@ -182,7 +179,6 @@ def _build_evidence_bundle(raw: str, *, action: ReviewAction) -> ReviewEvidenceB
         summary=summary,
         status=status,
         reason="no_structured_evidence_references" if not references else "",
-        input_mode="paged",
     )
 
 

@@ -43,13 +43,13 @@ from nanoreview.agent.review_state import (
     ReviewRunState,
     ReviewRunStatus,
 )
-from nanoreview.agent.runner import AgentRunner, AgentRunResult
+from nanoreview.agent.runner import AgentRunner
 from nanoreview.bus.events import InboundMessage
 from nanoreview.providers.base import LLMResponse, ToolCallRequest
 from nanoreview.review.input.snapshot import build_snapshot
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
-from nanoreview.review.planning.manifest import build_evidence_manifest
 from nanoreview.review.planning.planner import ReviewPreparation
+from nanoreview.review.profiles import REVIEWER_PROFILES
 from nanoreview.review.result import ReviewHandoffState
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
@@ -65,14 +65,13 @@ from nanoreview.session.manager import SessionManager
 SESSION_KEY = "cli:review"
 
 
-def _plan(*roles: str, mode: str = "special") -> ReviewPlan:
+def _plan(*roles: str) -> ReviewPlan:
     return ReviewPlan(
         target="repo",
         target_name="repo",
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
-        mode=mode,
     )
 
 
@@ -89,97 +88,6 @@ def _evidence() -> ReviewEvidenceBundle:
         ),
         summary="## app.py:1-1",
     )
-
-
-class _NoPlanRunner:
-    """Triage runner that never finishes, so planning fails."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def run(self, spec):
-        self.calls += 1
-        # Triage is free-form: the only required contract is the terminal
-        # finish call, which this stub deliberately never makes.
-        assert "finish_review_triage" in spec.terminal_tools
-        assert spec.tool_choice is None
-        return AgentRunResult(final_content="not a tool call", messages=[])
-
-
-async def _triage(spec, decisions: list[dict]) -> None:
-    """Drive the triage tools the way a planner model would."""
-    decision_tool = spec.tools.get("submit_review_decision")
-    finish_tool = spec.tools.get("finish_review_triage")
-    assert decision_tool is not None and finish_tool is not None
-    for decision in decisions:
-        result = await decision_tool.execute(**decision)
-        assert not result.startswith("Error:"), result
-    finished = await finish_tool.execute()
-    assert not finished.startswith("Error:"), finished
-
-
-def _decision(
-    evidence_ids: list[str],
-    dimensions: list[str],
-    *,
-    risk_level: str = "high",
-    focus: str = "concrete risk",
-    rationale: str = "because",
-) -> dict:
-    return {
-        "evidence_ids": evidence_ids,
-        "risk_level": risk_level,
-        "dimensions": dimensions,
-        "focus": focus,
-        "rationale": rationale,
-    }
-
-
-class _PlanRunner:
-    usage: dict[str, int] = {}
-
-    async def run(self, spec):
-        await _triage(
-            spec,
-            [_decision(["ev-001"], ["security", "bug"], focus="authentication state")],
-        )
-        return AgentRunResult(final_content="", messages=[], usage=dict(self.usage))
-
-
-class _SingleSecurityPlanRunner:
-    """Planner that triages one evidence unit into the security dimension."""
-
-    async def run(self, spec):
-        await _triage(spec, [_decision(["ev-001"], ["security"], focus="authentication state")])
-        return AgentRunResult(final_content="", messages=[], usage={})
-
-
-class _CompressionStopRunner:
-    """Coordinator runner stub stopped by run-level compression."""
-
-    def __init__(self, stop_reason: str, error: str) -> None:
-        self.stop_reason = stop_reason
-        self.error = error
-
-    async def run(self, spec):
-        return AgentRunResult(
-            final_content=None,
-            messages=list([*spec.frozen_messages, *spec.working_messages]),
-            stop_reason=self.stop_reason,
-            error=self.error,
-        )
-
-
-class _BlockingPlanner:
-    """Planner that never returns, so the run can be cancelled mid-flight."""
-
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-
-    async def run(self, spec):
-        self.started.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")  # pragma: no cover
 
 
 class _FakeJudgeProvider:
@@ -289,11 +197,50 @@ class _Subagents:
         return "Review subagent started"
 
     async def wait_for_session_result(self, _session_key: str, *, timeout: float):
-        return await asyncio.wait_for(self.results.get(), timeout=timeout)
+        try:
+            return await asyncio.wait_for(self.results.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # Mirrors ``SubagentManager.wait_for_session_result``: a slow
+            # reviewer yields ``None`` and the loop keeps waiting, it does not
+            # raise into the dispatch loop.
+            return None
 
     async def cancel_by_session(self, session_key: str) -> int:
         self.cancelled_sessions.append(session_key)
         return 0
+
+
+class _TrackingSubagents(_Subagents):
+    """Counts how many reviewers are in flight at the same time.
+
+    The base stub reports a constant ``get_running_count()`` of zero and hands
+    its result back the moment it is spawned, so it can never show whether a
+    concurrency limit actually queues anything. This variant keeps an in-flight
+    counter and reports it as the live running count, so both limits the loop
+    applies — the per-review allowance and the manager-wide capacity — are
+    observable through the same object.
+    """
+
+    def __init__(self, *, max_concurrent: int) -> None:
+        super().__init__()
+        self.max_concurrent_subagents = max_concurrent
+        self.in_flight = 0
+        self.peak = 0
+
+    def get_running_count(self) -> int:
+        return self.in_flight
+
+    async def spawn(self, **kwargs):
+        result = await super().spawn(**kwargs)
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        return result
+
+    async def wait_for_session_result(self, session_key: str, *, timeout: float):
+        message = await super().wait_for_session_result(session_key, timeout=timeout)
+        if message is not None:
+            self.in_flight -= 1
+        return message
 
 
 class _FailingCleanupSubagents(_Subagents):
@@ -308,7 +255,20 @@ class _FailingCleanupSubagents(_Subagents):
         raise self._error
 
 
-class _InterruptedCleanupSubagents(_Subagents):
+class _BlockingSubagents(_Subagents):
+    """Subagents whose spawn never returns, so the run can be cancelled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def spawn(self, **kwargs):
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+class _InterruptedCleanupSubagents(_BlockingSubagents):
     """Cleanup interrupted by a second cancellation."""
 
     async def cancel_by_session(self, session_key: str) -> int:
@@ -365,12 +325,9 @@ def prepared(monkeypatch):
     def _install(
         plan: ReviewPlan,
         evidence: ReviewEvidenceBundle,
-        *,
-        prompt: str = "plan",
-        manifest: object | None = None,
     ) -> None:
         async def _prepare(_messages, _meta, progress_callback=None):
-            return ReviewPreparation(plan, prompt, evidence, manifest=manifest)
+            return ReviewPreparation(plan, evidence)
 
         monkeypatch.setattr(
             "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
@@ -382,20 +339,20 @@ def prepared(monkeypatch):
 def _build_loop(
     tmp_path: Path,
     *,
-    runner: Any,
     subagents: Any,
     judge: ReviewJudge | None = None,
     loop_cls: type[ReviewLoop] = ReviewLoop,
     sessions: SessionManager | None = None,
     artifact_store: ReviewArtifactStore | None = None,
+    max_concurrent_subagents: int = 4,
 ) -> ReviewLoop:
     return loop_cls(
         workspace=tmp_path,
         sessions=sessions or SessionManager(tmp_path),
-        runner=runner,
         subagents=subagents,
         model="test",
         max_tool_result_chars=1000,
+        max_concurrent_subagents=max_concurrent_subagents,
         judge_factory=(lambda: judge) if judge is not None else None,
         artifact_store=artifact_store,
     )
@@ -442,7 +399,7 @@ async def test_successful_run_walks_every_phase_then_done(
     prepared(plan, _evidence())
     subagents = _Subagents()
     loop = _build_loop(
-        tmp_path, runner=_PlanRunner(), subagents=subagents, loop_cls=_PhaseRecorder
+        tmp_path, subagents=subagents, loop_cls=_PhaseRecorder
     )
     state = _register_run(loop)
     entered: list[str] = []
@@ -478,8 +435,7 @@ async def test_progress_in_persisted_metadata_matches_phase(tmp_path, prepared) 
     sessions = SessionManager(tmp_path)
     loop = _build_loop(
         tmp_path,
-        runner=_SingleSecurityPlanRunner(),
-        subagents=_Subagents(),
+                subagents=_Subagents(),
         sessions=sessions,
     )
     _register_run(loop)
@@ -500,51 +456,37 @@ async def test_progress_in_persisted_metadata_matches_phase(tmp_path, prepared) 
 
 
 @pytest.mark.asyncio
-async def test_plan_failure_settles_run_as_error(tmp_path, prepared) -> None:
-    """Planning retries happen inside AgentRunner; the loop settles ``error``.
+async def test_prepare_failure_settles_run_as_error(tmp_path, prepared) -> None:
+    """A preparation failure closes the run with a bounded reason.
 
-    The planner runs once, the concrete failure is surfaced in the outcome, and
-    the run is closed with a bounded reason instead of a clean report.
+    There is no planner model call any more: the plan and the evidence are
+    resolved programmatically in PREPARE, so a failure there is the only
+    planning failure left. It must never degrade into a clean report.
     """
-    runner = _NoPlanRunner()
     prepared(_plan("security"), _evidence())
-    loop = _build_loop(tmp_path, runner=runner, subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     state = _register_run(loop)
 
-    outcome = await loop.execute(_request())
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("prefetch backend is down")
 
-    assert runner.calls == 1
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "nanoreview.agent.review_loop.prepare_code_review_context", _boom
+    )
+    try:
+        outcome = await loop.execute(_request())
+    finally:
+        monkeypatch.undo()
+
     assert outcome.stop_reason == "error"
     assert outcome.produces_report is False
-    assert "not a tool call" in (outcome.error or "")
+    assert "prefetch backend is down" in (outcome.error or "")
     assert outcome.report_markdown is not None
-    assert "not a tool call" in outcome.report_markdown
+    assert "prefetch backend is down" in outcome.report_markdown
     assert state.status is ReviewRunStatus.ERROR
     assert state.phase is ReviewPhase.DONE
     assert state.warnings
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("stop_reason", ["compression_failed", "compression_limit"])
-async def test_compression_stop_settles_run_as_error(
-    tmp_path, prepared, stop_reason: str
-) -> None:
-    """A compression-stopped coordinator run surfaces as a bounded failure."""
-    prepared(_plan("security"), _evidence())
-    loop = _build_loop(
-        tmp_path,
-        runner=_CompressionStopRunner(
-            stop_reason, "sync compression failed after 2 attempts: no content"
-        ),
-        subagents=_Subagents(),
-    )
-    state = _register_run(loop)
-
-    outcome = await loop.execute(_request())
-
-    assert outcome.stop_reason == "error"
-    assert "compression" in (outcome.error or "")
-    assert state.status is ReviewRunStatus.ERROR
 
 
 @pytest.mark.asyncio
@@ -552,13 +494,13 @@ async def test_missing_plan_fails_before_any_dispatch(tmp_path, monkeypatch) -> 
     """A run whose plan cannot be resolved never reaches the reviewers."""
 
     async def _no_plan(_messages, _meta, progress_callback=None):
-        return ReviewPreparation(None, "fallback")
+        return ReviewPreparation(None)
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _no_plan
     )
     subagents = _Subagents()
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     outcome = await loop.execute(_request())
@@ -580,10 +522,9 @@ async def test_local_diff_without_evidence_explains_how_to_continue(
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[ALL_REVIEW_ROLES["security"]],
-        mode="auto",
     )
     prepared(plan, ReviewEvidenceBundle())
-    loop = _build_loop(tmp_path, runner=_NoPlanRunner(), subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     state = _register_run(loop)
 
     outcome = await loop.execute(_request())
@@ -600,7 +541,7 @@ async def test_diff_without_evidence_reports_skipped_units(
         skipped=(SkippedReviewUnit(path="src/big.py", reason="token_limit_exceeded"),)
     )
     prepared(_plan("security"), evidence)
-    loop = _build_loop(tmp_path, runner=_NoPlanRunner(), subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     _register_run(loop)
 
     outcome = await loop.execute(_request())
@@ -624,22 +565,21 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
     prepared(_plan("security", "bug"), _evidence())
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    # One decision covered both dimensions; the program aggregates one
-    # assignment per dimension in stable dimension order.
-    assert [call["label"] for call in subagents.calls] == ["bug", "security"]
+    # One assignment per selected reviewer, in the user's selection order.
+    assert [call["label"] for call in subagents.calls] == ["security", "bug"]
     # Review results are never published to the bus: the program dispatches each
     # dimension with an explicit reviewer profile and collects from the queue.
     assert all("deliver_to_bus" not in call for call in subagents.calls)
     assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == [
-        "bug",
         "security",
+        "bug",
     ]
-    # The planner-injected evidence is proved to the reviewer so a valid
+    # The host-provided evidence is proved to the reviewer so a valid
     # ``findings: []`` submission is not misread as incomplete.
     assert all(
         call["origin_metadata"]["assigned_evidence"] == 1 for call in subagents.calls
@@ -647,217 +587,210 @@ async def test_program_dispatches_planned_dimensions_without_bus_injection(
     assert "No actionable issues found" in (outcome.report_markdown or "")
 
 
-class _GeneralPlanRunner:
-    """Planner that triages the whole change into the general dimension."""
-
-    async def run(self, spec):
-        await _triage(
-            spec, [_decision(["ev-001"], ["general"], focus="whole change")]
-        )
-        return AgentRunResult(final_content="", messages=[], usage={})
-
-
 @pytest.mark.asyncio
-async def test_general_mode_dispatches_one_general_reviewer(tmp_path, prepared) -> None:
+async def test_general_reviewer_is_dispatched_like_any_other(tmp_path, prepared) -> None:
+    """``general`` is a peer reviewer, dispatched by its own selection."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
-    plan = ReviewPlan(
-        target="repo",
-        target_name="repo",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[ALL_REVIEW_ROLES["general"]],
-        mode="general",
-    )
-    prepared(plan, _evidence())
-    loop = _build_loop(tmp_path, runner=_GeneralPlanRunner(), subagents=subagents)
+    prepared(_plan("general"), _evidence())
+    loop = _build_loop(tmp_path, subagents=subagents)
     _register_run(loop)
 
     outcome = await loop.execute(_request())
 
     assert [call["label"] for call in subagents.calls] == ["general"]
-    assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == ["general"]
+    assert [call["origin_metadata"]["profile_id"] for call in subagents.calls] == [
+        "general"
+    ]
     assert "General Reviewer" in (outcome.report_markdown or "")
 
 
 @pytest.mark.asyncio
-async def test_general_mode_rejects_specialized_assignment(tmp_path, prepared) -> None:
-    """general mode must fail planning when the planner mixes dimensions."""
-
-    class _MixedPlanRunner:
-        async def run(self, spec):
-            tool = spec.tools.get("submit_review_decision")
-            result = await tool.execute(
-                **_decision(["ev-001"], ["general", "security"])
-            )
-            # The receiver rejects the specialized dimension outright; the run
-            # then ends without a finish call, exactly like any failed triage.
-            assert result.startswith("Error:")
-            assert "disallowed dimension" in result
-            return AgentRunResult(final_content="", messages=[], usage={})
-
-    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
-    plan = ReviewPlan(
-        target="repo",
-        target_name="repo",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[ALL_REVIEW_ROLES["general"]],
-        mode="general",
-    )
-    prepared(plan, _evidence())
-    loop = _build_loop(tmp_path, runner=_MixedPlanRunner(), subagents=_Subagents())
-    state = _register_run(loop)
-
-    outcome = await loop.execute(_request())
-
-    assert state.status is ReviewRunStatus.ERROR
-    assert outcome.report_markdown is not None or outcome.error
-
-
-class _NoAssignmentPlanRunner:
-    """Planner that dismisses every evidence unit as low risk."""
-
-    async def run(self, spec):
-        await _triage(
-            spec,
-            [
-                _decision(
-                    ["ev-001"], [], risk_level="low", focus="", rationale="docstring only"
-                )
-            ],
-        )
-        return AgentRunResult(final_content="", messages=[], usage={})
-
-
-@pytest.mark.asyncio
-async def test_low_risk_triage_dispatches_no_reviewer_and_says_so(
+async def test_general_can_be_combined_with_specialized_reviewers(
     tmp_path, prepared
 ) -> None:
-    """A dismissed change completes with an explicit no-reviewer report.
-
-    The run must still settle as ``completed`` with a report artifact — the
-    planner's decision is a legitimate outcome, not a planning failure — and the
-    report must state the triage outcome instead of claiming the review was
-    incomplete.
-    """
+    """A mixed selection dispatches every selected reviewer, once each."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     subagents = _Subagents()
-    prepared(_plan("security", "bug", mode="auto"), _evidence())
-    loop = _build_loop(tmp_path, runner=_NoAssignmentPlanRunner(), subagents=subagents)
-    state = _register_run(loop)
+    prepared(_plan("general", "security"), _evidence())
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
 
-    outcome = await loop.execute(_request())
+    await loop.execute(_request())
 
-    assert subagents.calls == []
-    assert state.status is ReviewRunStatus.COMPLETED
-    report = outcome.report_markdown or ""
-    assert "Planning dispatched no reviewer" in report
-    assert "1 evidence unit(s) were explicitly judged low risk" in report
-    # The deliberate outcome must not be reported as a failed/incomplete check.
-    assert "no reviewer was dispatched by planning" in report
-    assert "incomplete: no review dimension results were produced" not in report
-    # The planner's risk level stays audit data, never a report finding.
-    assert state.triage is not None
-    assert state.triage.dismissed_ids == ("ev-001",)
-    assert "critical" not in report.split("### Findings")[0]
+    assert sorted(call["label"] for call in subagents.calls) == ["general", "security"]
 
 
 @pytest.mark.asyncio
-async def test_triage_records_coverage_on_run_state(tmp_path, prepared) -> None:
-    """Assigned/dismissed/unexamined coverage is recorded for the run audit."""
+async def test_all_five_reviewers_can_be_dispatched(tmp_path, prepared) -> None:
+    """The old four-assignment cap is gone: five reviewers are all dispatched."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _Subagents()
+    prepared(
+        _plan("bug", "security", "performance", "maintainability", "general"),
+        _evidence(),
+    )
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
 
-    class _PartialTriageRunner:
-        async def run(self, spec):
-            await _triage(
-                spec,
-                [
-                    _decision(["ev-001"], ["security"], focus="auth state"),
-                    _decision(
-                        ["ev-002"],
-                        [],
-                        risk_level="low",
-                        focus="",
-                        rationale="not security relevant",
-                    ),
-                ],
-            )
-            return AgentRunResult(final_content="", messages=[], usage={})
+    await loop.execute(_request())
 
+    assert sorted(call["label"] for call in subagents.calls) == [
+        "bug",
+        "general",
+        "maintainability",
+        "performance",
+        "security",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_five_reviewers_queue_within_the_concurrency_limit(
+    tmp_path, prepared
+) -> None:
+    """Five selections run under the per-review allowance, not all at once.
+
+    The old four-assignment ceiling is gone, so the queue — not a rejection —
+    is what bounds a full five-reviewer selection. The manager-wide capacity is
+    set high here so only the per-review allowance can produce the measured peak.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _TrackingSubagents(max_concurrent=10)
+    prepared(
+        _plan("bug", "security", "performance", "maintainability", "general"),
+        _evidence(),
+    )
+    loop = _build_loop(tmp_path, subagents=subagents, max_concurrent_subagents=2)
+    _register_run(loop)
+
+    await loop.execute(_request())
+
+    assert len(subagents.calls) == 5
+    assert subagents.peak == 2
+
+
+@pytest.mark.asyncio
+async def test_global_subagent_capacity_also_bounds_dispatch(tmp_path, prepared) -> None:
+    """The manager-wide capacity queues reviewers even when the run allows more.
+
+    A review that permits four reviewers still cannot exceed the shared subagent
+    manager's capacity, otherwise five selections would starve other sessions.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _TrackingSubagents(max_concurrent=2)
+    prepared(_plan("bug", "security", "performance", "general"), _evidence())
+    loop = _build_loop(tmp_path, subagents=subagents, max_concurrent_subagents=4)
+    _register_run(loop)
+
+    await loop.execute(_request())
+
+    assert len(subagents.calls) == 4
+    assert subagents.peak == 2
+
+
+@pytest.mark.asyncio
+async def test_assignments_cover_every_accepted_evidence_unit(
+    tmp_path, prepared
+) -> None:
+    """Every selected reviewer receives the whole accepted evidence set.
+
+    There is no second filtering step: the accepted references are handed to
+    each reviewer as-is, so a unit can never be silently dropped between
+    preprocessing and dispatch.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     evidence = ReviewEvidenceBundle(
         references=(
-            EvidenceReference(id="ev-001", path="app.py", start_line=1, end_line=1, excerpt="value = 1"),
-            EvidenceReference(id="ev-002", path="other.py", start_line=1, end_line=1, excerpt="x = 2"),
-            EvidenceReference(id="ev-003", path="third.py", start_line=1, end_line=1, excerpt="y = 3"),
+            EvidenceReference(
+                id="ev-001",
+                path="app.py",
+                start_line=1,
+                end_line=1,
+                excerpt="value = 1",
+            ),
+            EvidenceReference(
+                id="ev-002",
+                path="other.py",
+                start_line=1,
+                end_line=1,
+                excerpt="x = 2",
+            ),
         ),
         summary="## app.py:1-1",
     )
     subagents = _Subagents()
-    # auto mode: the planner chooses the set, so dismissing one evidence unit is
-    # a legitimate decision rather than a missing user-pinned dimension.
-    prepared(_plan("security", "bug", "performance", "maintainability", mode="auto"), evidence)
-    loop = _build_loop(tmp_path, runner=_PartialTriageRunner(), subagents=subagents)
+    prepared(_plan("security", "bug"), evidence)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     await loop.execute(_request())
 
-    assert state.triage is not None
-    assert state.triage.assigned_ids() == ("ev-001",)
-    assert state.triage.dismissed_ids == ("ev-002",)
-    assert state.triage.unexamined_ids == ("ev-003",)
-    # Only the dimension a decision named is dispatched; the unexamined unit and
-    # the dismissed one start no reviewer.
-    assert [call["label"] for call in subagents.calls] == ["security"]
-    assert subagents.calls[0]["origin_metadata"]["assigned_evidence"] == 1
+    assert len(state.assignments) == 2
+    for assignment in state.assignments:
+        assert assignment.evidence_ids == ("ev-001", "ev-002")
+        # The focus is the reviewer's own scope description, not a focus string
+        # generated by triage over the evidence.
+        assert (
+            assignment.focus
+            == REVIEWER_PROFILES[assignment.dimension].description
+        )
+    assert all(
+        call["origin_metadata"]["assigned_evidence"] == 2 for call in subagents.calls
+    )
 
 
 @pytest.mark.asyncio
-async def test_special_mode_rejects_a_finish_that_skips_a_pinned_dimension(
+async def test_budget_skipped_units_are_visible_in_the_run_state(
     tmp_path, prepared
 ) -> None:
-    """A user-pinned dimension can never be silently dropped."""
-
-    class _SkipPinnedRunner:
-        async def run(self, spec):
-            tool = spec.tools.get("submit_review_decision")
-            finish = spec.tools.get("finish_review_triage")
-            await tool.execute(**_decision(["ev-001"], ["security"], focus="x"))
-            rejected = await finish.execute()
-            # The pinned `bug` dimension was never named, so the finish is
-            # refused; with no accepted finish the run fails planning.
-            assert rejected.startswith("Error:")
-            assert "bug" in rejected
-            return AgentRunResult(final_content="", messages=[], usage={})
-
+    """Budget-skipped units are recorded instead of disappearing silently."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    evidence = ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(
+                id="ev-001",
+                path="app.py",
+                start_line=1,
+                end_line=1,
+                excerpt="value = 1",
+            ),
+        ),
+        skipped=(
+            SkippedReviewUnit(
+                path="src/big.py",
+                reason="budget_exhausted",
+                start_line=10,
+                end_line=20,
+            ),
+        ),
+        summary="## app.py:1-1",
+    )
     subagents = _Subagents()
-    prepared(_plan("security", "bug"), _evidence())
-    loop = _build_loop(tmp_path, runner=_SkipPinnedRunner(), subagents=subagents)
+    prepared(_plan("security"), evidence)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
-    outcome = await loop.execute(_request())
+    await loop.execute(_request())
 
-    assert subagents.calls == []
-    assert state.status is ReviewRunStatus.ERROR
-    assert "finish_review_triage" in (outcome.error or "")
+    assert state.evidence_stats["accepted_units"] == 1
+    assert state.evidence_stats["skipped_units"] == 1
+    assert state.skipped_files == ["src/big.py"]
+    assert state.assignment_stats == [
+        {"dimension": "security", "evidence_units": 1}
+    ]
 
 
 @pytest.mark.asyncio
 async def test_run_aggregates_agent_usage_into_run_state(tmp_path, prepared) -> None:
-    """Coordinator and reviewer tokens must roll up into one run total.
+    """Reviewer tokens must roll up into one run total.
 
-    Judge usage is exercised in tests/review/test_judge.py; the loop folds
-    ``JudgeExecutionResult.usage`` into the run at the same boundary.
+    There is no planner run any more, so the reviewers are the only model
+    spend of the review pipeline itself. Judge usage is exercised in
+    tests/review/test_judge.py; the loop folds ``JudgeExecutionResult.usage``
+    into the run at the same boundary.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
 
-    plan_runner = _PlanRunner()
-    plan_runner.usage = {
-        "prompt_tokens": 10,
-        "completion_tokens": 2,
-        "total_tokens": 12,
-    }
     subagents = _Subagents()
     subagents.usage = {
         "prompt_tokens": 100,
@@ -865,15 +798,15 @@ async def test_run_aggregates_agent_usage_into_run_state(tmp_path, prepared) -> 
         "total_tokens": 120,
     }
     prepared(_plan("security", "bug"), _evidence())
-    loop = _build_loop(tmp_path, runner=plan_runner, subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     await loop.execute(_request())
 
     assert state.usage == {
-        "prompt_tokens": 210,  # 10 (coordinator) + 2 x 100 (reviewers)
-        "completion_tokens": 42,
-        "total_tokens": 252,
+        "prompt_tokens": 200,  # 2 reviewers x 100
+        "completion_tokens": 40,
+        "total_tokens": 240,
     }
     assert state.reviewers["security"].usage == dict(subagents.usage)
     assert state.reviewers["bug"].status == "completed"
@@ -899,7 +832,7 @@ async def test_failed_reviewer_is_recorded_as_error_and_report_is_incomplete(
         "total_tokens": 120,
     }
     prepared(_plan("security", "bug"), _evidence())
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     outcome = await loop.execute(_request())
@@ -946,7 +879,7 @@ async def test_missing_subagent_status_is_not_silently_treated_as_success(
     subagents = _Subagents()
     subagents.status_by_label = {"security": "", "bug": "ok"}
     prepared(_plan("security", "bug"), _evidence())
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     outcome = await loop.execute(_request())
@@ -979,7 +912,7 @@ async def test_failed_reviewer_with_valid_json_is_reported_incomplete(
         "bug": '{"submitted":true,"findings":[],"errors":[]}',
     }
     prepared(_plan("security", "bug"), _evidence())
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     outcome = await loop.execute(_request())
@@ -1009,8 +942,7 @@ def _run_with_judge(
     prepared(_plan("security"), _evidence())
     loop = _build_loop(
         tmp_path,
-        runner=_SingleSecurityPlanRunner(),
-        subagents=subagents,
+                subagents=subagents,
         judge=_build_judge(provider),
     )
     return loop, subagents, _register_run(loop)
@@ -1110,8 +1042,7 @@ async def test_artifact_write_failure_settles_run_as_error(tmp_path, prepared) -
     store = ReviewArtifactStore(tmp_path, max_bytes=1)
     loop = _build_loop(
         tmp_path,
-        runner=_SingleSecurityPlanRunner(),
-        subagents=_Subagents(),
+                subagents=_Subagents(),
         artifact_store=store,
     )
     state = _register_run(loop)
@@ -1134,13 +1065,12 @@ async def test_cancelled_run_is_cleaned_up_then_settled_stopped(
 ) -> None:
     """Cancellation waits for cleanup and persists ``stopped`` + ``DONE``."""
     prepared(_plan("security"), _evidence())
-    planner = _BlockingPlanner()
-    subagents = _Subagents()
-    loop = _build_loop(tmp_path, runner=planner, subagents=subagents)
+    subagents = _BlockingSubagents()
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     task = asyncio.create_task(loop.execute(_request()))
-    await asyncio.wait_for(planner.started.wait(), timeout=1)
+    await asyncio.wait_for(subagents.started.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -1154,7 +1084,7 @@ async def test_cancelled_run_is_cleaned_up_then_settled_stopped(
 async def test_finalize_reuses_cleanup_and_settles_children(tmp_path) -> None:
     """``/stop`` finalizes through the same CLEANUP -> DONE tail."""
     subagents = _Subagents()
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
     state.enter_phase(ReviewPhase.REVIEW)
     state.reviewer_state("security").status = "completed"
@@ -1182,7 +1112,7 @@ async def test_finalize_settles_a_run_that_never_started(tmp_path) -> None:
     subagents = _Subagents()
     sessions = SessionManager(tmp_path)
     loop = _build_loop(
-        tmp_path, runner=_PlanRunner(), subagents=subagents, sessions=sessions
+        tmp_path, subagents=subagents, sessions=sessions
     )
     state = _register_run(loop)
     session = sessions.get_or_create(SESSION_KEY)
@@ -1218,8 +1148,7 @@ async def test_cleanup_failure_keeps_the_run_running(tmp_path, prepared) -> None
     subagents = _FailingCleanupSubagents(RuntimeError("shutdown timed out"))
     loop = _build_loop(
         tmp_path,
-        runner=_SingleSecurityPlanRunner(),
-        subagents=subagents,
+                subagents=subagents,
         sessions=sessions,
     )
     state = _register_run(loop)
@@ -1253,8 +1182,7 @@ async def test_terminal_save_failure_keeps_the_run_running(tmp_path, prepared) -
     sessions = _FailingSaveSessions(tmp_path)
     loop = _build_loop(
         tmp_path,
-        runner=_SingleSecurityPlanRunner(),
-        subagents=_Subagents(),
+                subagents=_Subagents(),
         sessions=sessions,
     )
     state = _register_run(loop)
@@ -1302,7 +1230,7 @@ async def test_unsettled_report_without_report_text_still_names_the_failure(
 async def test_finalize_keeps_the_gate_when_cleanup_fails(tmp_path) -> None:
     """``/stop`` over a failing cleanup returns no result and keeps the gate."""
     subagents = _FailingCleanupSubagents(RuntimeError("shutdown timed out"))
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
     state.enter_phase(ReviewPhase.REVIEW)
 
@@ -1317,8 +1245,7 @@ async def test_finalize_keeps_the_gate_when_the_save_fails(tmp_path) -> None:
     sessions = _FailingSaveSessions(tmp_path)
     loop = _build_loop(
         tmp_path,
-        runner=_PlanRunner(),
-        subagents=_Subagents(),
+                subagents=_Subagents(),
         sessions=sessions,
     )
     state = _register_run(loop)
@@ -1340,13 +1267,12 @@ async def test_second_cancellation_leaves_the_run_for_a_retry(
     that was never released — is what this pins against.
     """
     prepared(_plan("security"), _evidence())
-    planner = _BlockingPlanner()
     subagents = _InterruptedCleanupSubagents()
-    loop = _build_loop(tmp_path, runner=planner, subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
 
     task = asyncio.create_task(loop.execute(_request()))
-    await asyncio.wait_for(planner.started.wait(), timeout=1)
+    await asyncio.wait_for(subagents.started.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -1360,7 +1286,7 @@ async def test_second_cancellation_leaves_the_run_for_a_retry(
 
 @pytest.mark.asyncio
 async def test_execute_without_a_live_run_reports_failure(tmp_path) -> None:
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
 
     outcome = await loop.execute(_request())
 
@@ -1378,35 +1304,19 @@ def test_review_planning_error_is_the_module_contract() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _CapturingPlanRunner:
-    """Planner recording its ``AgentRunSpec`` and triaging one security unit."""
-
-    def __init__(self) -> None:
-        self.specs: list[Any] = []
-
-    async def run(self, spec: Any) -> AgentRunResult:
-        self.specs.append(spec)
-        await _triage(
-            spec, [_decision(["ev-001"], ["security"], focus="authentication state")]
-        )
-        return AgentRunResult(final_content="", messages=[], usage={})
-
-
 @pytest.mark.asyncio
 async def test_review_run_binds_the_fixed_window_and_reviewer_limits(
     tmp_path, prepared
 ) -> None:
-    """Planner and reviewers use the fixed review window and reviewer limits."""
+    """Reviewers use the fixed review window and reviewer limits."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security"), _evidence())
-    runner = _CapturingPlanRunner()
     subagents = _Subagents()
-    loop = _build_loop(tmp_path, runner=runner, subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     _register_run(loop)
 
     await loop.execute(_request())
 
-    assert runner.specs[0].context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
     limits = subagents.calls[0]["execution_limits"]
     assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
     assert limits.max_tokens == REVIEWER_MAX_OUTPUT_TOKENS
@@ -1421,7 +1331,7 @@ async def test_review_run_binds_the_fixed_window_and_reviewer_limits(
 
 def test_review_window_is_fixed_and_survives_a_model_switch(tmp_path) -> None:
     """The conversation-side model switch never widens the review window."""
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
 
     loop.set_runtime_model(None, "switched-model", 131_072)  # type: ignore[arg-type]
@@ -1432,7 +1342,6 @@ def test_review_window_is_fixed_and_survives_a_model_switch(tmp_path) -> None:
 def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
     assert review_budget_contract() == {
         "context_window_tokens": 200_000,
-        "planner_manifest_budget_tokens": 80_000,
         "reviewer_max_output_tokens": 8_192,
         "reviewer_model_request_limit": 30,
         "reviewer_timeout_seconds": 180,
@@ -1440,24 +1349,69 @@ def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_records_manifest_stats_on_state(tmp_path, prepared) -> None:
-    """The run's audit trail records what the planner actually saw."""
+async def test_run_records_evidence_and_assignment_stats_on_state(
+    tmp_path, prepared
+) -> None:
+    """The run's audit trail records the acceptance and the task split."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
-    prepared(
-        _plan("security", "bug"),
-        _evidence(),
-        manifest=build_evidence_manifest(_evidence()),
-    )
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    prepared(_plan("security", "bug"), _evidence())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     state = _register_run(loop)
 
     await loop.execute(_request())
 
-    assert state.manifest_stats["version"] == "evidence-manifest/2"
-    assert state.manifest_stats["input_mode"] == "direct"
-    assert state.manifest_stats["budget_tokens"] == 80_000
-    assert state.manifest_stats["retained"] == 1
-    assert state.manifest_stats["omitted"] == 0
+    assert state.evidence_stats["accepted_units"] == 1
+    assert state.evidence_stats["skipped_units"] == 0
+    assert state.evidence_stats["status"] == "ok"
+    assert state.assignment_stats == [
+        {"dimension": "security", "evidence_units": 1},
+        {"dimension": "bug", "evidence_units": 1},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_plan_snapshot_records_evidence_and_assignments(
+    tmp_path, prepared
+) -> None:
+    """The frozen audit record carries what was accepted and how it was split.
+
+    The snapshot is the run's only preserved input record, so the acceptance
+    counts, the authorized evidence IDs and the per-reviewer task split must be
+    readable there — not only on the in-memory run state, which is gone after a
+    restart.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(_plan("security", "bug"), _evidence())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
+    state = _register_run(loop)
+    loop._snapshots.write(
+        build_snapshot(
+            run_id=state.run_id,
+            session_key=SESSION_KEY,
+            action="diff",
+            target_type="local",
+            target=str(tmp_path),
+            input_fingerprint="fp",
+            net_diff={"app.py": "@@ -0,0 +1 @@\n+value = 1"},
+            changed_files=["app.py"],
+        )
+    )
+
+    await loop.execute(_request())
+
+    snapshot = loop._snapshots.read(state.run_id)
+    assert snapshot is not None
+    evidence = snapshot["evidence"]
+    assert evidence["accepted_units"] == 1
+    assert evidence["accepted_ids"] == ["ev-001"]
+    assert evidence["skipped_units"] == 0
+    assert snapshot["assignments"] == [
+        {"dimension": "security", "evidence_units": 1},
+        {"dimension": "bug", "evidence_units": 1},
+    ]
+    # The pre-Planner keys are gone rather than written empty.
+    assert "planner_manifest" not in snapshot
+    assert "planner_triage" not in snapshot
 
 
 @pytest.mark.asyncio
@@ -1473,7 +1427,7 @@ async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security", "bug"), _evidence())
     subagents = _Subagents()
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=subagents)
+    loop = _build_loop(tmp_path, subagents=subagents)
     state = _register_run(loop)
     loop._snapshots.write(
         build_snapshot(
@@ -1516,12 +1470,12 @@ async def test_review_reviews_the_frozen_snapshot_diff_not_the_worktree(
 
     async def _prepare(_messages, meta, progress_callback=None):
         captured.update(meta)
-        return ReviewPreparation(_plan("security"), "plan", _evidence())
+        return ReviewPreparation(_plan("security"), _evidence())
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
     )
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     state = _register_run(loop)
     ReviewSnapshotStore(tmp_path).write(
         build_snapshot(
@@ -1554,12 +1508,12 @@ async def test_prepare_rejects_a_run_without_a_plan(tmp_path, monkeypatch) -> No
     """PREPARE fails loudly when the persisted target resolves to nothing."""
 
     async def _no_plan(_messages, _meta, progress_callback=None):
-        return ReviewPreparation(None, "fallback")
+        return ReviewPreparation(None)
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _no_plan
     )
-    loop = _build_loop(tmp_path, runner=_PlanRunner(), subagents=_Subagents())
+    loop = _build_loop(tmp_path, subagents=_Subagents())
     state = _register_run(loop)
 
     with pytest.raises(ReviewPlanningError, match="no review plan"):
@@ -1577,13 +1531,13 @@ async def test_prepare_syncs_review_metadata_onto_the_session(
     async def _prepare(_messages, meta, progress_callback=None):
         meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = ["security"]
         meta[ReviewMetaKey.LOCAL_ROOT] = str(tmp_path)
-        return ReviewPreparation(plan, "prompt", _evidence())
+        return ReviewPreparation(plan, _evidence())
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
     )
     loop = _build_loop(
-        tmp_path, runner=_PlanRunner(), subagents=_Subagents(), sessions=sessions
+        tmp_path, subagents=_Subagents(), sessions=sessions
     )
     state = _register_run(loop)
     session = sessions.get_or_create(SESSION_KEY)
@@ -1592,7 +1546,5 @@ async def test_prepare_syncs_review_metadata_onto_the_session(
 
     assert session.metadata[ReviewMetaKey.ALLOWED_DIMENSIONS] == ["security"]
     assert session.metadata[ReviewMetaKey.LOCAL_ROOT] == str(tmp_path)
-    # The prompt belongs to the coordinator envelope, ahead of the turn messages.
-    assert inputs.coordinator_messages[0] == {"role": "system", "content": "prompt"}
     assert inputs.plan is plan
     assert inputs.validation_workspace == str(tmp_path)

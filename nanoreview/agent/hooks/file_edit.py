@@ -124,7 +124,7 @@ class FileEditActivityHook(AgentHook):
 def create_file_edit_activity_hook(context: AgentTurnHookContext) -> AgentHook | None:
     """Create the default file-edit observer for one agent turn.
 
-    Registered only in the Conversation Agent tool registry; review, planner
+    Registered only in the Conversation Agent tool registry; review
     and Judge paths never assemble it.
     """
     if not context.events.accepts(FileEditEvent):

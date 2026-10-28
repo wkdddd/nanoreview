@@ -34,7 +34,6 @@ if TYPE_CHECKING:
         ReviewAssignment,
         ReviewEvidenceBundle,
         ReviewPlan,
-        ReviewTriageSummary,
     )
 
 # Serialized artifact size limit, mirroring the shared media upload guard.
@@ -170,13 +169,13 @@ class ReviewRunState:
     changed_files: list[str] = field(default_factory=list)
     #: Files excluded from the diff evidence at admission time.
     skipped_files: list[str] = field(default_factory=list)
-    #: Budgeted planner manifest statistics (version/budget/retained/omitted).
-    manifest_stats: dict[str, Any] = field(default_factory=dict)
-    #: Planner triage audit: decisions, per-evidence coverage (assigned /
-    #: dismissed / unexamined) and each dimension's assigned scope. Persisted
-    #: for troubleshooting and evaluation only — it never becomes report
-    #: findings or a Judge input.
-    triage: "ReviewTriageSummary | None" = None
+    #: Preprocessing acceptance statistics: how many evidence units were
+    #: accepted, how many the budget skipped, and the evidence status.
+    evidence_stats: dict[str, Any] = field(default_factory=dict)
+    #: Program-generated task split: one entry per selected reviewer with the
+    #: number of accepted evidence units it received. Persisted for
+    #: troubleshooting only — it never becomes report findings or a Judge input.
+    assignment_stats: list[dict[str, Any]] = field(default_factory=list)
 
     def enter_phase(self, phase: ReviewPhase) -> None:
         if self.status is not ReviewRunStatus.RUNNING:
@@ -422,7 +421,7 @@ def build_report_artifact(
     ``status`` explicitly; the state's own value is only a fallback.
 
     The ``coverage`` block carries the run's review boundary and per-reviewer
-    execution/cost summary (manifest budget, changed/skipped files, duplicate
+    execution/cost summary (evidence budget, changed/skipped files, duplicate
     reads, incomplete dimensions) without copying any source or full session.
     """
     return {
@@ -465,8 +464,8 @@ def _coverage_payload(state: ReviewRunState) -> dict[str, Any]:
     return {
         "changed_files": list(state.changed_files),
         "skipped_files": list(state.skipped_files),
-        "manifest": dict(state.manifest_stats),
-        "triage": state.triage.snapshot_payload() if state.triage is not None else {},
+        "evidence": dict(state.evidence_stats),
+        "assignments": [dict(item) for item in state.assignment_stats],
         "reviewers": reviewers,
         "incomplete_dimensions": incomplete,
         "judge_batches": judge_batches,

@@ -280,7 +280,7 @@ class ReviewConfig(Base):
     # evidence budget.
     evidence_token_budget: int = Field(default=150_000, ge=10_000)
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
-    # Per-unit planner preview budget: soft target and absolute ceiling.
+    # Per-unit evidence preview budget: soft target and absolute ceiling.
     preview_target_chars: int = Field(default=600, ge=1)
     preview_hard_limit: int = Field(default=3_000, ge=1)
     subagent_reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = None

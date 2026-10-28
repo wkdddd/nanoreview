@@ -461,7 +461,7 @@ class ConversationLoop:
                     self, "_current_iteration", iteration
                 ),
                 # File-edit activity is a Conversation Agent concern: review,
-                # planner and Judge paths never assemble this factory.
+                # reviewer and Judge paths never assemble this factory.
                 registered_hook_factories=[create_file_edit_activity_hook],
                 registered_hooks=(
                     list(self._hooks_getter())

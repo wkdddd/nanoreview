@@ -139,7 +139,7 @@ def resolve_workspace_scope(
 
 
 def review_workspace_scope(project_path: Path) -> WorkspaceScope:
-    """Scope fixed for ReviewLoop, planner, reviewer and Judge.
+    """Scope fixed for ReviewLoop, reviewer and Judge.
 
     Review roles always run restricted against the target repository root. They
     never accept conversation metadata that would widen their access.

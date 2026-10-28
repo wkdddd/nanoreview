@@ -26,7 +26,7 @@ class ContextBuilder:
     _RUNTIME_CONTEXT_END = "[/Runtime Context]"
 
     #: Shared rule file read once per turn/run/batch for the conversation agent,
-    #: the review planner, each reviewer and each judge batch.
+    #: each reviewer and each judge batch.
     COMMON_RULES_FILE = "COMMON_RULES.md"
 
     def __init__(self, workspace: Path, timezone: str | None = None, disabled_skills: list[str] | None = None):

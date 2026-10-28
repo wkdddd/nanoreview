@@ -39,7 +39,6 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanoreview.agent.context import ContextBuilder
-from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanoreview.agent.review_state import (
     REVIEW_TERMINAL_STATUSES,
     JudgeBatchState,
@@ -52,19 +51,7 @@ from nanoreview.agent.review_state import (
     compute_review_input_fingerprint,
     serialize_finalizer_result,
 )
-from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
-from nanoreview.agent.tools.registry import ToolRegistry
-from nanoreview.agent.tools.review_plan import (
-    MAX_DIFF_READ_CHARS,
-    DecisionReceiverAdapter,
-    FinishReviewTriageTool,
-    ListReviewDiffTool,
-    ReadReviewDiffTool,
-    ReviewDiffReader,
-    ReviewDiffUnit,
-    SubmitReviewDecisionTool,
-)
 from nanoreview.bus.events import InboundMessage
 from nanoreview.events import NO_EVENTS, EventSink, ProgressEvent
 from nanoreview.review.admission import (
@@ -78,13 +65,11 @@ from nanoreview.review.output.finalizer import (
     reviewer_failure_reason,
 )
 from nanoreview.review.planning.evidence import ReviewEvidenceService
-from nanoreview.review.planning.manifest import PLANNER_MANIFEST_BUDGET_TOKENS
 from nanoreview.review.planning.planner import prepare_code_review_context
 from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceOptions,
     ProgrammaticEvidenceService,
 )
-from nanoreview.review.planning.triage import TriageReceiver
 from nanoreview.review.result import ReviewResult, result_from_run_state
 from nanoreview.review.types import (
     EvidenceReference,
@@ -92,33 +77,18 @@ from nanoreview.review.types import (
     ReviewEvidenceBundle,
     ReviewMetaKey,
     ReviewPlan,
-    ReviewTriageSummary,
 )
 
 if TYPE_CHECKING:
     from nanoreview.agent.subagent import SubagentManager
     from nanoreview.providers.base import LLMProvider
     from nanoreview.review.output.judge import ReviewJudge
-    from nanoreview.review.planning.manifest import EvidenceManifest
     from nanoreview.session.manager import Session, SessionManager
 
-# Terminal submission attempts allowed for the planner inside one AgentRun.
-_PLANNER_TERMINAL_RETRY_LIMIT = 5
-# Prose turns allowed before the planner is failed for never finishing. Triage is
-# a free-form run (read evidence → decide → finish), so narrating a turn is normal
-# progress rather than a failed submission; only genuine `finish_review_triage`
-# rejections count against ``_PLANNER_TERMINAL_RETRY_LIMIT``.
-_PLANNER_PROSE_RETRY_LIMIT = 8
-# Planner request allowance. Triage needs multiple bounded diff reads, several
-# decisions and one finish call inside a single AgentRun; the final iteration is
-# reserved for the terminal tool, so the budget must cover the reads plus the
-# correction retries a rejected decision may trigger.
-_PLANNER_MAX_ITERATIONS = 24
-
-#: Fixed context window for the whole review pipeline (Planner, reviewer,
-#: Judge). The review run does not follow the conversation agent's configured
-#: window and does not dynamically probe the provider: the project fixes it at
-#: 200k so evidence budgets and the planner manifest budget are deterministic.
+#: Fixed context window for the whole review pipeline (reviewer, Judge). The
+#: review run does not follow the conversation agent's configured window and
+#: does not dynamically probe the provider: the project fixes it at 200k so
+#: evidence budgets are deterministic.
 REVIEW_CONTEXT_WINDOW_TOKENS = 200_000
 #: Reviewer per-response output cap.
 REVIEWER_MAX_OUTPUT_TOKENS = 8_192
@@ -159,7 +129,6 @@ def review_budget_contract() -> dict[str, int]:
     """The fixed review-run budget contract, persisted for replay/audit."""
     return {
         "context_window_tokens": REVIEW_CONTEXT_WINDOW_TOKENS,
-        "planner_manifest_budget_tokens": PLANNER_MANIFEST_BUDGET_TOKENS,
         "reviewer_max_output_tokens": REVIEWER_MAX_OUTPUT_TOKENS,
         "reviewer_model_request_limit": REVIEWER_MODEL_REQUEST_LIMIT,
         "reviewer_timeout_seconds": REVIEWER_TIMEOUT_SECONDS,
@@ -229,7 +198,7 @@ def _expand_assignment_references(
     """Assigned main chunks plus one layer of related chunks.
 
     Related units are attached when their ``parent_id`` points at a chunk the
-    planner assigned to this dimension; they are supplementary context, never
+    assigned to this dimension; they are supplementary context, never
     standalone review scope.
     """
     selected: list[EvidenceReference] = []
@@ -352,14 +321,10 @@ class _ReviewInputs:
 
     plan: ReviewPlan
     evidence: ReviewEvidenceBundle
-    coordinator_messages: list[dict[str, Any]]
     validation_workspace: str
     changed_files: list[str]
     local_target: str | None
     execution_context: ReviewExecutionContext
-    #: The single budgeted planner manifest; its authorized IDs are the only
-    #: evidence IDs a reviewer assignment may reference.
-    manifest: "EvidenceManifest | None" = None
 
 
 class ReviewLoop:
@@ -370,7 +335,6 @@ class ReviewLoop:
         *,
         workspace: Path,
         sessions: "SessionManager",
-        runner: "AgentRunner",
         subagents: "SubagentManager",
         model: str,
         max_tool_result_chars: int,
@@ -384,7 +348,6 @@ class ReviewLoop:
     ) -> None:
         self._workspace = Path(workspace)
         self._sessions = sessions
-        self._runner = runner
         self._subagents = subagents
         self._model = model
         self._max_tool_result_chars = max_tool_result_chars
@@ -397,11 +360,12 @@ class ReviewLoop:
         self._judge_factory = judge_factory
         self._artifacts = artifact_store or ReviewArtifactStore(self._workspace)
         # Snapshots are written by the admission service; the loop augments the
-        # same run's snapshot after planning with the final planner manifest and
-        # budget contract so the frozen input record stays complete.
+        # same run's snapshot after planning with the accepted evidence, the
+        # task split and the budget contract so the frozen input record stays
+        # complete.
         self._snapshots = snapshot_store or ReviewSnapshotStore(self._workspace)
         # The review's evidence service is an internal dependency, not a tool
-        # wrapper: the planner manifest, prefetch and every reviewer frozen task
+        # wrapper: the evidence service, prefetch and every reviewer frozen task
         # read the same program-authorized evidence regardless of which model
         # tools happen to be registered.
         self._evidence_service = ReviewEvidenceService(
@@ -750,7 +714,7 @@ class ReviewLoop:
             )
 
         # The review turn's frozen/working context is built once here: the
-        # planner consumes it, and the reviewer agent's message list is derived
+        # review inputs are derived from it, and the reviewer agent's message list
         # from the same build so the user message is persisted exactly once.
         review_messages = self._review_messages(request, session)
         preparation = await prepare_code_review_context(
@@ -783,17 +747,9 @@ class ReviewLoop:
                 )
             },
         }
-        coordinator_messages = [dict(message) for message in review_messages]
-        if preparation.prompt:
-            # The reviewer system prompt belongs to the frozen envelope: it is
-            # part of the task definition and must never be summarized.
-            coordinator_messages.insert(
-                0, {"role": "system", "content": preparation.prompt}
-            )
         return _ReviewInputs(
             plan=preparation.plan,
             evidence=evidence,
-            coordinator_messages=coordinator_messages,
             validation_workspace=validation_workspace,
             changed_files=changed_files,
             local_target=local_target,
@@ -809,7 +765,6 @@ class ReviewLoop:
                 ),
                 result_callback=request.result_callback,
             ),
-            manifest=preparation.manifest,
         )
 
     @staticmethod
@@ -891,7 +846,14 @@ class ReviewLoop:
         run_state: ReviewRunState,
         inputs: _ReviewInputs,
     ) -> tuple[ReviewAssignment, ...]:
-        """Record the plan identity and collect the validated assignments."""
+        """Record the plan identity and generate the reviewer assignments.
+
+        The PLAN phase is programmatic: the user's reviewer selection is turned
+        into one task per selected reviewer, with no model call in between.
+        Every selected reviewer receives the whole accepted evidence set, so a
+        reviewer never runs because of a triage decision — it runs because the
+        user asked for it.
+        """
         run_state.enter_phase(ReviewPhase.PLAN)
         run_state.plan = inputs.plan
         run_state.input_fingerprint = compute_review_input_fingerprint(
@@ -904,26 +866,51 @@ class ReviewLoop:
             run_state.run_id,
             run_state.input_fingerprint[:12],
         )
-        assignments = await self._collect_plan(
-            coordinator_messages=inputs.coordinator_messages,
-            plan=inputs.plan,
-            evidence=inputs.evidence,
-            run_state=run_state,
-            manifest=inputs.manifest,
+        assignments = self._build_assignments(inputs.plan, inputs.evidence)
+        run_state.assignments = assignments
+        logger.info(
+            "review.plan.assignments run_id={} reviewers={} evidence_units={}",
+            run_state.run_id,
+            len(assignments),
+            len(inputs.evidence.references),
         )
-        self._record_plan_snapshot(run_state, inputs)
+        self._record_plan_snapshot(run_state, inputs, assignments)
         return assignments
 
-    def _record_plan_snapshot(
-        self, run_state: ReviewRunState, inputs: _ReviewInputs
-    ) -> None:
-        """Persist the planner manifest, triage audit and review boundary.
+    @staticmethod
+    def _build_assignments(
+        plan: ReviewPlan, evidence: ReviewEvidenceBundle
+    ) -> tuple[ReviewAssignment, ...]:
+        """Build one reviewer task per selected reviewer.
 
-        The manifest is the planner's sole structured input, so the run's audit
-        trail records its budget/version, what was retained and what was omitted
-        — never the reviewed source itself. The triage record answers the
-        separate question of what the planner did with that input: which
-        evidence was assigned, dismissed or left unexamined.
+        Each selected reviewer gets the full accepted evidence set: the
+        preprocessing stage already decided which units fit the review budget,
+        so there is no second filtering step here. The focus is the reviewer's
+        own scope description — no risk triage and no generated focus.
+        """
+        evidence_ids = tuple(reference.id for reference in evidence.references)
+        assignments: list[ReviewAssignment] = []
+        for role in plan.roles:
+            assignments.append(
+                ReviewAssignment(
+                    dimension=role.name,
+                    focus=role.description,
+                    evidence_ids=evidence_ids,
+                )
+            )
+        return tuple(assignments)
+
+    def _record_plan_snapshot(
+        self,
+        run_state: ReviewRunState,
+        inputs: _ReviewInputs,
+        assignments: tuple[ReviewAssignment, ...],
+    ) -> None:
+        """Persist the review boundary, evidence acceptance and task split.
+
+        The run's audit trail records what preprocessing accepted, what the
+        budget skipped, and how the accepted evidence was split across the
+        selected reviewers — never the reviewed source itself.
         """
         run_state.changed_files = list(inputs.changed_files)
         skipped_files = list(
@@ -932,211 +919,51 @@ class ReviewLoop:
             )
         )
         run_state.skipped_files = skipped_files
-        manifest = inputs.manifest
-        sections: dict[str, Any] = {"budget": review_budget_contract()}
-        if manifest is not None:
-            payload = manifest.snapshot_payload()
-            sections["planner_manifest"] = payload
-            run_state.manifest_stats = dict(manifest.stats())
-            logger.info(
-                "review.manifest run_id={} version={} input_mode={} budget_tokens={} "
-                "retained={} omitted={} used_tokens={} skipped={}",
-                run_state.run_id,
-                manifest.version,
-                manifest.input_mode,
-                manifest.budget_tokens,
-                manifest.retained_count,
-                manifest.omitted_count,
-                manifest.used_tokens,
-                len(manifest.skipped),
-            )
-        if run_state.triage is not None:
-            sections["planner_triage"] = run_state.triage.snapshot_payload()
+        accepted_ids = [reference.id for reference in inputs.evidence.references]
+        budget_skipped = [
+            {
+                "path": unit.path,
+                "reason": unit.reason,
+                "start_line": unit.start_line,
+                "end_line": unit.end_line,
+            }
+            for unit in inputs.evidence.skipped
+        ]
+        assignment_stats = [
+            {
+                "dimension": assignment.dimension,
+                "evidence_units": len(assignment.evidence_ids),
+            }
+            for assignment in assignments
+        ]
+        run_state.evidence_stats = {
+            "accepted_units": len(accepted_ids),
+            "skipped_units": len(budget_skipped),
+            "status": inputs.evidence.status,
+            "reason": inputs.evidence.reason,
+        }
+        run_state.assignment_stats = assignment_stats
+        sections: dict[str, Any] = {
+            "budget": review_budget_contract(),
+            "evidence": {
+                "accepted_units": len(accepted_ids),
+                "accepted_ids": accepted_ids,
+                "skipped_units": len(budget_skipped),
+                "skipped": budget_skipped,
+                "status": inputs.evidence.status,
+                "reason": inputs.evidence.reason,
+            },
+            "assignments": assignment_stats,
+        }
         ref = self._snapshots.augment(run_state.run_id, sections=sections)
         if ref is None:
             # The snapshot is an audit artifact written at admission; a failed
             # augment (e.g. a run restored without a snapshot) is logged by the
-            # store but never degrades the run's own manifest statistics, which
+            # store but never degrades the run's own evidence statistics, which
             # are already recorded on the run state and report.
             logger.warning(
-                "review.manifest.snapshot_skipped run_id={}", run_state.run_id
+                "review.plan.snapshot_skipped run_id={}", run_state.run_id
             )
-
-    async def _collect_plan(
-        self,
-        *,
-        coordinator_messages: list[dict[str, Any]],
-        plan: ReviewPlan,
-        evidence: ReviewEvidenceBundle,
-        run_state: ReviewRunState | None = None,
-        manifest: "EvidenceManifest | None" = None,
-    ) -> tuple[ReviewAssignment, ...]:
-        """Run one planner triage AgentRun and aggregate its assignments.
-
-        The planner does not submit assignments: it records risk decisions with
-        ``submit_review_decision`` and ends with ``finish_review_triage``. The
-        program aggregates the decisions into one assignment per chosen
-        dimension, so a reviewer can only run because a decision named it or
-        because the user pinned it in ``special`` mode.
-
-        Validation failures (unknown evidence IDs, an evidence unit triaged
-        twice, an illegal dimension, a non-low risk with no dimension) are
-        retried by ``AgentRunner`` inside the same run: the original messages,
-        manifest and tool definitions stay in context and the concrete error is
-        fed back to the model. Only when the terminal retry budget is exhausted,
-        or triage never finishes, does planning fail.
-        """
-        allowed = {role.name for role in plan.roles}
-        if manifest is not None:
-            evidence_ids = manifest.authorized_ids()
-        else:
-            evidence_ids = tuple(evidence.by_id())
-        reference_map = evidence.by_id()
-        receiver = TriageReceiver(
-            allowed_dimensions=allowed,
-            evidence_ids=set(evidence_ids),
-            mode=plan.mode,
-            evidence_paths={
-                reference_id: reference_map[reference_id].path
-                for reference_id in evidence_ids
-                if reference_id in reference_map
-            },
-            ordered_evidence_ids=evidence_ids,
-            required_dimensions=(
-                tuple(role.name for role in plan.roles)
-                if plan.mode in {"special", "general"}
-                else ()
-            ),
-        )
-        tools = ToolRegistry()
-        tools.register(SubmitReviewDecisionTool(DecisionReceiverAdapter(receiver)))
-        tools.register(FinishReviewTriageTool(receiver))
-        if manifest is None or manifest.input_mode != "direct":
-            # The evidence does not fit one prompt, so the planner reads it in
-            # bounded pages instead. The reader is built from the frozen
-            # evidence only; it has no filesystem access. Its page budget is the
-            # run's own tool-result budget, so a page the reader says it returned
-            # is never silently truncated afterwards by AgentRunner.
-            reader = ReviewDiffReader(
-                units=tuple(
-                    ReviewDiffUnit(
-                        id=reference_id,
-                        path=str(reference_map[reference_id].path),
-                        start_line=reference_map[reference_id].start_line,
-                        end_line=reference_map[reference_id].end_line,
-                        kind=str(reference_map[reference_id].kind),
-                        token_count=reference_map[reference_id].token_count,
-                        preview=reference_map[reference_id].preview,
-                        preview_coverage=reference_map[reference_id].preview_coverage,
-                        excerpt=reference_map[reference_id].excerpt,
-                    )
-                    for reference_id in evidence_ids
-                    if reference_id in reference_map
-                ),
-                max_result_chars=min(MAX_DIFF_READ_CHARS, self._max_tool_result_chars),
-            )
-            tools.register(ListReviewDiffTool(reader))
-            tools.register(ReadReviewDiffTool(reader))
-        result = await self._runner.run(
-            AgentRunSpec(
-                # The triage task + evidence input are a frozen envelope; the
-                # run has no inherited history.
-                frozen_messages=list(coordinator_messages),
-                working_messages=[],
-                tools=tools,
-                model=self._model,
-                max_iterations=_PLANNER_MAX_ITERATIONS,
-                max_tool_result_chars=self._max_tool_result_chars,
-                hook=build_agent_turn_hook(
-                    AgentTurnHookSpec(
-                        workspace=self._workspace,
-                        ephemeral=True,
-                    )
-                ),
-                # Triage is free-form: the model reads, decides, finishes. Only
-                # the terminal finish call is required, and the final iteration
-                # is reserved for it. A planner that narrates while working must
-                # not burn the submission budget, so prose turns get their own
-                # allowance; genuine finish rejections still count against
-                # ``terminal_retry_limit``.
-                terminal_tools=frozenset({"finish_review_triage"}),
-                terminal_retry_limit=_PLANNER_TERMINAL_RETRY_LIMIT,
-                prose_retry_limit=_PLANNER_PROSE_RETRY_LIMIT,
-                error_message=None,
-                concurrent_tools=False,
-                workspace=self._workspace,
-                session_key=None,
-                context_window_tokens=self._context_window_tokens,
-            )
-        )
-
-        if run_state is not None:
-            run_state.add_usage(result.usage)
-        if not receiver.finished:
-            failure = (
-                result.terminal_error
-                or result.error
-                or result.final_content
-                or "the planner did not call finish_review_triage"
-            )
-            receiver.error = bound_child_error(failure)
-            if run_state is not None:
-                run_state.triage = receiver.summary()
-            logger.warning(
-                "review.coordinator.triage.failed stop_reason={} decisions={} reason={}",
-                result.stop_reason,
-                len(receiver.decisions),
-                str(failure)[:300],
-            )
-            raise ReviewPlanningError(f"Review planning failed: {failure}")
-
-        assignments = receiver.assignments()
-        summary = receiver.summary()
-        if run_state is not None:
-            run_state.triage = summary
-        logger.info(
-            "review.coordinator.triage.accepted mode={} decisions={} assignments={} "
-            "assigned={} dismissed={} unexamined={}",
-            plan.mode,
-            len(receiver.decisions),
-            len(assignments),
-            len(summary.assigned_ids()),
-            len(summary.dismissed_ids),
-            len(summary.unexamined_ids),
-        )
-        if not assignments:
-            logger.warning(
-                "review.coordinator.triage.no_assignments mode={} evidence={}",
-                plan.mode,
-                len(evidence_ids),
-            )
-        return assignments
-
-    @staticmethod
-    def _planned_no_reviewer_summary(
-        run_state: ReviewRunState,
-        assignments: tuple[ReviewAssignment, ...],
-    ) -> str:
-        """Explain a run that deliberately dispatched no reviewer.
-
-        Returns an empty string whenever a reviewer did run (or was expected to),
-        so the finalizer only softens the "no dimension results" gap when
-        planning genuinely decided no dimension needed to run. The text reports
-        program coverage counts — dismissed/unexamined — never the planner's
-        risk level or rationale, which stay out of the report.
-        """
-        if assignments:
-            return ""
-        triage: ReviewTriageSummary | None = run_state.triage
-        if triage is None:
-            return ""
-        dismissed = len(triage.dismissed_ids)
-        unexamined = len(triage.unexamined_ids)
-        return (
-            "Planning dispatched no reviewer for this change: "
-            f"{dismissed} evidence unit(s) were explicitly judged low risk and "
-            f"{unexamined} were left unexamined."
-        )
 
     async def _run_review(
         self,
@@ -1150,10 +977,10 @@ class ReviewLoop:
         run_state.assignments = tuple(assignments)
         for assignment in assignments:
             run_state.reviewer_state(assignment.dimension)
-        # Every validated assignment is dispatched: dimensions are either
-        # explicit user intent or planner decisions, and neither may be
-        # silently dropped by a token-count gate. Evidence-side over-budget
-        # units are already recorded by the preprocessor as SkippedReviewUnit.
+        # Every validated assignment is dispatched: dimensions come from the
+        # explicit user selection, and they may not be silently dropped by a
+        # token-count gate. Evidence-side over-budget units are already
+        # recorded by the preprocessor as SkippedReviewUnit.
         limits_by_dimension = await self._derive_execution_limits(
             plan=inputs.plan,
             evidence=inputs.evidence,
@@ -1165,11 +992,9 @@ class ReviewLoop:
             inputs.validation_workspace,
             inputs.changed_files,
             allowed_dimensions=[assignment.dimension for assignment in assignments],
-            mode=inputs.plan.mode,
             selected_dimensions=[assignment.dimension for assignment in assignments],
             local_target=inputs.local_target,
             skipped_files=tuple(inputs.evidence.skipped_by_file().values()),
-            planner_summary=self._planned_no_reviewer_summary(run_state, assignments),
         )
         await self._dispatch_and_collect(
             plan=inputs.plan,
@@ -1286,16 +1111,25 @@ class ReviewLoop:
         """
         reference_map = evidence.by_id()
         limits: dict[str, SubagentExecutionLimits] = {}
+        # Every selected reviewer now receives the same accepted evidence set,
+        # so the estimate is memoised per evidence tuple: the tokenizer pass and
+        # the target-file read happen once per distinct set, not once per
+        # reviewer. Distinct sets still get their own estimate.
+        estimates: dict[tuple[str, ...], int] = {}
         for assignment in assignments:
             references = _expand_assignment_references(
                 reference_map, assignment.evidence_ids
             )
-            input_tokens = await self._estimate_input_tokens(
-                plan=plan,
-                references=references,
-                validation_workspace=validation_workspace,
-                local_target=local_target,
-            )
+            estimate_key = tuple(reference.id for reference in references)
+            input_tokens = estimates.get(estimate_key)
+            if input_tokens is None:
+                input_tokens = await self._estimate_input_tokens(
+                    plan=plan,
+                    references=references,
+                    validation_workspace=validation_workspace,
+                    local_target=local_target,
+                )
+                estimates[estimate_key] = input_tokens
             limits[assignment.dimension] = SubagentExecutionLimits(
                 max_iterations=REVIEWER_MODEL_REQUEST_LIMIT,
                 max_tokens=REVIEWER_MAX_OUTPUT_TOKENS,
@@ -1423,7 +1257,7 @@ class ReviewLoop:
                         **context.metadata,
                         "task_kind": "reviewer",
                         "profile_id": assignment.dimension,
-                        # The planner-injected evidence is proof the reviewer
+                        # The host-provided evidence is proof the reviewer
                         # had something to review; without it a valid
                         # ``findings: []`` submission is misread as incomplete
                         # because reviewers have no repository-reader tool.

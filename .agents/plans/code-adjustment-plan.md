@@ -33,8 +33,18 @@ prompt 文件固定包含范围约束与输出格式：
 ## 既有节点待验收与后续事项
 
 - diff-only 预处理清理（2026-10-22 追加：移除 `classify_path` 语言分类与 `unsupported_code_type` 跳过，任何路径的 diff 都按文本证据处理）、reviewer 三态/general、Planner diff 分诊均已实施，待验收。
-- Planner 节点的 golden diff replay 尚未补，属于原节点验证缺口。
+- 原 Planner 节点已整体移除（2026-10-28），其 golden diff replay 缺口随节点一并作废。
 - WebUI 的 reviewer mode 三态适配留待已确认的前端节点。
+
+## 已实施节点：移除 Planner，改为手动选择 Reviewer（2026-10-28）
+
+- Planner 的 LLM 分诊整体移除：用户在准入时用 `focus` 直接选 reviewer（缺省/`null`/空列表 → 只跑 `general`），五个 reviewer 可任意组合、含全选。`auto/special/general` 三态路由语义删除，显式 `auto` 视为非法 reviewer 名称。
+- 执行链路改为 `冻结 diff → 预处理 → 程序生成 assignments → Reviewer 并发审查 → 校验 → Judge → 报告`：每个选中的 reviewer 接收全部接纳证据（`evidence.references`），不经过 Planner manifest 二次筛选；assignment 数量上限（4）已移除，并发上限（默认 4）保留，全选五项时排队执行。
+- 删除仅服务 Planner 的模块：`review/planning/manifest.py`、`review/planning/triage.py`、`agent/tools/review_plan.py` 及对应测试。`plan` 进度阶段保留，含义改为程序生成 assignments；前端消费的阶段名、状态、报告引用与汇总 usage 不变。
+- 新 snapshot 与报告不再写 Planner 专属数据，改记预处理接纳、任务分配与预算跳过；报告去掉 `Mode:` 行与 `Triage Outcome` 段，只列所选 Reviewer。
+- **前端暂不修改**：现有 Auto 将启动 general，Custom 继续支持多选；Auto 文案暂时不准确，记录为后续前端事项。
+- 验收口径：新审查不再产生 Planner 模型调用；默认 general、五项自由组合生效；现有证据准备与审查能力保留，前端现有提交流程可继续使用。
+- 遗留：当前确认节点（run 黑板与结构化输出收敛）里对 Planner 角色的描述需按「无 Planner」重写，尚未实施。
 
 ## 当前确认节点：run 黑板与结构化输出收敛
 
@@ -85,9 +95,9 @@ Provider 原生 schema 支持不一致：OpenAI-compatible 设置格式参数可
 
 ```powershell
 pytest tests/agent/tools/test_runner_tool_errors.py tests/agent/test_runner_compression.py tests/providers/test_anthropic_provider.py tests/providers/test_modelscope_provider.py
-pytest tests/review/test_triage.py tests/review/test_reviewer_profiles.py tests/review/test_judge.py tests/review/test_finalizer.py tests/review/test_validator.py tests/review/test_report.py tests/review/test_quality.py
+pytest tests/review/test_reviewer_profiles.py tests/review/test_judge.py tests/review/test_finalizer.py tests/review/test_validator.py tests/review/test_report.py tests/review/test_quality.py
 pytest tests/agent/test_review_loop.py tests/agent/test_review_state.py tests/agent/test_loop_modes.py tests/agent/test_coordinator.py tests/agent/test_conversation_loop.py tests/agent/test_review_gate.py
-pytest tests/review/test_admission.py tests/review/test_snapshot_manifest.py tests/review/test_result.py tests/api/test_review_admission.py tests/channels/test_review_submission.py tests/webui/test_review_report_api.py tests/cli/test_review_chat.py
+pytest tests/review/test_admission.py tests/review/test_result.py tests/api/test_review_admission.py tests/channels/test_review_submission.py tests/webui/test_review_report_api.py tests/cli/test_review_chat.py
 ruff check nanoreview/
 pytest
 git diff --check
