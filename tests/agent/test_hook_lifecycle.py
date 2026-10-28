@@ -729,9 +729,10 @@ def test_every_runner_call_site_assembles_its_hook_through_the_builder() -> None
     ``AgentRunner.run`` must be built by the turn hook builder.
     """
     package = Path(hooks_module.__file__).resolve().parents[2]
+    # ``review_loop.py`` is not a call site any more: with the Planner gone it
+    # runs no agent of its own (only reviewer subagents and the Judge do).
     call_sites = (
         package / "agent" / "conversation_loop.py",
-        package / "agent" / "review_loop.py",
         package / "agent" / "subagent.py",
         package / "review" / "output" / "judge.py",
     )

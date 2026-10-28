@@ -173,7 +173,7 @@ class AgentRunSpec:
     #: Separate allowance for *prose* terminal misses — turns that answered with
     #: text and no tool call at all. They share ``terminal_retry_limit`` by
     #: default, which is right for a forced-tool run where any non-tool turn is
-    #: a missed submission. A free-form run (the review planner reads, decides
+    #: a missed submission. A free-form run (a reviewer reads, decides
     #: and only then finishes) narrates such turns while working normally, so it
     #: raises this instead of letting narration exhaust the submission budget
     #: and fail a run that never submitted anything malformed. ``None`` keeps the
@@ -429,7 +429,7 @@ class AgentRunner:
         # successful terminal submission; terminal_error keeps the last concrete
         # error. Prose answers while the terminal tool is still pending are
         # tracked separately so a run that declares ``prose_retry_limit`` (the
-        # review planner narrates while it works) is not failed by narration.
+        # reviewer narrates while it works) is not failed by narration.
         terminal_attempts = 0
         prose_attempts = 0
         terminal_error: str | None = None
@@ -1086,7 +1086,7 @@ class AgentRunner:
             )
             outcome.prose_attempts += 1
             # Prose misses have their own allowance when the caller declares one
-            # (a free-form run such as the review planner, which narrates while
+            # (a free-form run such as a reviewer, which narrates while
             # working). Otherwise they keep sharing the submission budget, which
             # is the correct strict reading for a forced-tool run.
             if spec.prose_retry_limit is None:

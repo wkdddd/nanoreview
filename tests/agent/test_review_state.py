@@ -286,7 +286,8 @@ def test_build_report_artifact_records_coverage_and_boundary() -> None:
     state.snapshot_ref = "review-snapshots/run-000111222333.json"
     state.changed_files = ["src/app.py", "src/db.py"]
     state.skipped_files = ["vendor/lib.py"]
-    state.manifest_stats = {"version": "evidence-manifest/1", "retained": 3, "omitted": 1}
+    state.evidence_stats = {"accepted_units": 3, "skipped_units": 1, "status": "ok"}
+    state.assignment_stats = [{"dimension": "security", "evidence_units": 3}]
     reviewer = state.reviewer_state("security")
     reviewer.status = "completed"
     reviewer.evidence_assigned = 2
@@ -303,7 +304,8 @@ def test_build_report_artifact_records_coverage_and_boundary() -> None:
     coverage = artifact["coverage"]
     assert coverage["changed_files"] == ["src/app.py", "src/db.py"]
     assert coverage["skipped_files"] == ["vendor/lib.py"]
-    assert coverage["manifest"] == state.manifest_stats
+    assert coverage["evidence"] == state.evidence_stats
+    assert coverage["assignments"] == state.assignment_stats
     assert coverage["incomplete_dimensions"] == ["performance"]
     reviewer_cov = coverage["reviewers"]["security"]
     assert reviewer_cov["status"] == "completed"

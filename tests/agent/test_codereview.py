@@ -13,11 +13,9 @@ from nanoreview.review import (
     SPECIAL_REVIEW_ROLE_NAMES,
     Finding,
     ReviewReport,
-    build_code_review_context,
     build_review_plan,
     normalize_requested_dimensions,
     normalize_review_action,
-    resolve_code_review_context,
 )
 
 
@@ -29,21 +27,18 @@ class DummyProvider(LLMProvider):
         return "dummy"
 
 
-def test_normalize_requested_dimensions_defaults_to_specialized_roles_in_auto_mode() -> None:
-    roles, mode = normalize_requested_dimensions(None)
+@pytest.mark.parametrize("raw", [None, "", [], ["", "  "]])
+def test_normalize_requested_dimensions_defaults_to_general(raw: object) -> None:
+    """A missing, null or empty selection dispatches the general reviewer."""
+    roles = normalize_requested_dimensions(raw)
 
-    # auto only offers the four specialized reviewers; general is never auto.
-    assert [role.name for role in roles] == [
-        name for name in ALL_REVIEW_ROLES if name != "general"
-    ]
-    assert mode == "auto"
+    assert [role.name for role in roles] == ["general"]
 
 
 def test_normalize_requested_dimensions_selects_requested_roles_and_deduplicates() -> None:
-    roles, mode = normalize_requested_dimensions("security, bug, security")
+    roles = normalize_requested_dimensions("security, bug, security")
 
     assert [role.name for role in roles] == ["security", "bug"]
-    assert mode == "special"
 
 
 def test_normalize_requested_dimensions_rejects_unknown_dimension() -> None:
@@ -51,16 +46,35 @@ def test_normalize_requested_dimensions_rejects_unknown_dimension() -> None:
         normalize_requested_dimensions("security,bogus")
 
 
-def test_normalize_requested_dimensions_routes_general_alone() -> None:
-    roles, mode = normalize_requested_dimensions("general")
+def test_normalize_requested_dimensions_allows_general_mixed_with_special() -> None:
+    """``general`` is a peer reviewer and may be combined with any specialist."""
+    roles = normalize_requested_dimensions("general,security")
 
-    assert [role.name for role in roles] == ["general"]
-    assert mode == "general"
+    assert [role.name for role in roles] == ["general", "security"]
 
 
-def test_normalize_requested_dimensions_rejects_general_mixed_with_special() -> None:
-    with pytest.raises(ValueError, match="cannot be combined"):
-        normalize_requested_dimensions("general,security")
+def test_normalize_requested_dimensions_supports_all_five_reviewers() -> None:
+    roles = normalize_requested_dimensions(
+        ["bug", "security", "performance", "maintainability", "general"]
+    )
+
+    assert [role.name for role in roles] == [
+        "bug",
+        "security",
+        "performance",
+        "maintainability",
+        "general",
+    ]
+
+
+def test_normalize_requested_dimensions_rejects_the_legacy_auto_literal() -> None:
+    """``auto`` was a routing mode, never a reviewer name."""
+    with pytest.raises(ValueError, match="Unknown review dimension 'auto'"):
+        normalize_requested_dimensions("auto")
+    # A web client that still sends the old mode inside its selection array
+    # must be rejected too, not silently mapped onto a reviewer.
+    with pytest.raises(ValueError, match="Unknown review dimension 'auto'"):
+        normalize_requested_dimensions(["bug", "auto"])
 
 
 def test_review_role_sets() -> None:
@@ -70,184 +84,16 @@ def test_review_role_sets() -> None:
     assert len(SPECIAL_REVIEW_ROLE_NAMES) == 4
 
 
-def test_build_code_review_context_mentions_all_severity_levels() -> None:
-    """Unified strategy: the prompt demands coverage of every severity."""
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        max_subagents=4,
-    )
-
-    assert "Cover all severity levels (critical, high, medium, low)" in prompt
-    assert "The AI judge is enabled" in prompt
-
-
-def test_build_code_review_context_includes_subagent_candidate_schema() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        max_subagents=4,
-    )
-    assert "Review Finding Schema" in prompt
-    assert "using `spawn`" in prompt
-    assert "review_submit" in prompt
-    assert '"severity"' in prompt
-    assert '"evidence"' in prompt
-
-
-def test_build_code_review_context_prohibits_coordinator_review_submit() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        max_subagents=4,
-    )
-    assert "must NEVER call `review_submit`" in prompt
-    assert "subagent-only tool" in prompt
-
-
-def test_build_code_review_context_spawn_task_requires_target_and_evidence() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        max_subagents=4,
-        focus="security",
-    )
-    assert "target path" in prompt.lower()
-    assert "line range" in prompt.lower()
-    assert "evidence source" in prompt.lower()
-    assert "subagent-only tool" in prompt
-
-
-def test_build_code_review_context_matches_system_finalizer_boundary() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        max_subagents=4,
-    )
-
-    assert "Do not write the final report yourself" in prompt
-    assert "Needs Confirmation" in prompt
-    assert "respond with accept/reject/uncertain" not in prompt
-
-
-def test_build_code_review_context_ignores_github_url_without_local_target() -> None:
-    """GitHub URLs are no longer a review input; they are treated as an opaque local target."""
-    prompt = build_code_review_context(
-        user_content="please review https://github.com/test/repo.",
-    )
-
-    assert "- Type: local" in prompt
-    assert "- Type: github" not in prompt
-    assert "github_review" not in prompt
-
-
-def test_build_code_review_context_uses_local_target_type() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo\src\app.py",
-        target_type="local",
-    )
-
-    assert "- Type: local" in prompt
-    assert "- URL/Path: C:\\work\\repo\\src\\app.py" in prompt
-    assert "Action diff" in prompt
-
-
-def test_build_code_review_context_extracts_local_path_inside_prompt() -> None:
-    prompt = build_code_review_context(
-        user_content=r"请审查 C:\work\repo\src\app.py 的登录逻辑",
-    )
-
-    assert "- URL/Path: C:\\work\\repo\\src\\app.py" in prompt
-    assert "- Type: local" in prompt
-
-
-def test_build_code_review_context_rejects_github_target_type() -> None:
-    """`github` is no longer a valid target type; the builder normalizes it away."""
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        target_type="github",
-    )
-
-    assert "- Type: local" in prompt
-    assert "- Type: github" not in prompt
-    assert "github_review" not in prompt
-    assert "repo_review" not in prompt
-    assert "github_repo_read" not in prompt
-
-
-def test_build_code_review_context_requires_reader_calls_without_prefetch() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo\src\app.py",
-        target_type="local",
-        action="diff",
-    )
-
-    assert "No prefetched evidence" in prompt
-    assert "use precise reader calls before spawning reviewers" in prompt
-    assert "Action diff: review current local git changes" in prompt
-    assert "repo_review" not in prompt
-
-
-@pytest.mark.asyncio
-async def test_resolved_local_prompt_does_not_refetch_after_empty_prefetch() -> None:
-    class EmptyEvidence:
-        async def dispatch(self, **kwargs: object) -> str:
-            return ""
-
-    prompt = await resolve_code_review_context(
-        [{"role": "user", "content": r"review C:\work\repo"}],
-        {
-            "review_target": r"C:\work\repo",
-            "review_target_type": "local",
-            "_review_evidence_service": EmptyEvidence(),
-        },
-    )
-
-    assert "submit_review_decision" in prompt
-    assert "finish_review_triage" in prompt
-    assert "no program-authorized evidence references" in prompt
-    assert "spawn" in prompt
-
-
-def test_build_code_review_context_uses_user_requirements() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        target_type="local",
-        user_content="重点检查鉴权和回归风险",
-    )
-
-    assert "User requirements: 重点检查鉴权和回归风险" in prompt
-
-
-def test_dimension_contract_uses_forced_focus_dimensions() -> None:
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        target_type="local",
-        focus="security,maintainability",
-    )
-
-    assert "Cover ONLY these dimensions" in prompt
-    assert "Security Reviewer" in prompt
-    assert "Maintainability Reviewer" in prompt
-    assert "Bug Reviewer" not in prompt
-    assert "Performance Reviewer" not in prompt
-
-
 def test_forced_performance_focus_keeps_performance_dimension() -> None:
+    """A single specialized selection produces exactly that one reviewer."""
     plan = build_review_plan(
-        target=r"C:\work\repo",
+        target=r"C://work//repo",
         target_type="local",
         focus="performance",
     )
 
     assert plan is not None
     assert [role.name for role in plan.roles] == ["performance"]
-
-    prompt = build_code_review_context(
-        target=r"C:\work\repo",
-        target_type="local",
-        focus="performance",
-    )
-
-    assert "Performance Reviewer" in prompt
-    assert "Security Reviewer" not in prompt
-    assert "Bug Reviewer" not in prompt
-    assert "Maintainability Reviewer" not in prompt
 
 
 def test_review_plan_treats_github_url_as_local_target() -> None:
@@ -275,12 +121,6 @@ def test_review_action_defaults_to_diff_and_rejects_repo() -> None:
     # The removed repo entry point is rejected with a dedicated message.
     with pytest.raises(ValueError, match="Repo-wide review is not supported"):
         normalize_review_action("repo")
-
-
-def test_build_code_review_context_returns_fallback_without_target() -> None:
-    prompt = build_code_review_context(user_content="how should I do a review?")
-
-    assert "Code review workflow is active" in prompt
 
 
 def test_max_severity_and_order() -> None:

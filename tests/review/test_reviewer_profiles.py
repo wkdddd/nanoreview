@@ -15,7 +15,6 @@ from nanoreview.agent.subagent_profiles import (
 from nanoreview.agent.tools.loader import ToolLoader
 from nanoreview.agent.tools.review_submit import review_submit
 from nanoreview.review.input.normalizers import normalize_requested_dimensions
-from nanoreview.review.planning.triage import TriageReceiver
 from nanoreview.review.profiles import (
     REVIEWER_PROFILES,
     public_reviewer_profiles,
@@ -69,82 +68,33 @@ def test_tool_loader_rejects_unknown_scope() -> None:
         raise AssertionError("unknown scope should fail validation")
 
 
-def test_empty_dimensions_are_auto_and_special_dimensions_are_special_mode() -> None:
-    _, auto_mode = normalize_requested_dimensions(None)
-    roles, special_mode = normalize_requested_dimensions("security,bug")
-    assert auto_mode == "auto"
-    assert special_mode == "special"
+def test_default_selection_is_general_and_explicit_selection_is_verbatim() -> None:
+    default_roles = normalize_requested_dimensions(None)
+    roles = normalize_requested_dimensions("security,bug")
+    assert [role.name for role in default_roles] == ["general"]
     assert [role.name for role in roles] == ["security", "bug"]
 
 
-def test_plan_allows_evidence_reuse_across_reviewers() -> None:
-    """One evidence unit may back several dimensions in a single decision."""
-    receiver = TriageReceiver(
-        allowed_dimensions={"bug", "security"},
-        evidence_ids={"ev-1"},
-        mode="special",
-        required_dimensions=("bug", "security"),
-    )
-    accepted, _ = receiver.submit(
-        evidence_ids=["ev-1"],
-        risk_level="high",
-        dimensions=["security", "bug"],
-        focus="trust boundary and exception path",
-    )
-    assert accepted
-    assignments = receiver.assignments()
-    assert [assignment.dimension for assignment in assignments] == ["bug", "security"]
-    assert all(assignment.evidence_ids == ("ev-1",) for assignment in assignments)
+def test_general_may_be_combined_with_specialized_reviewers() -> None:
+    """``general`` is a peer reviewer, not an exclusive mode."""
+    roles = normalize_requested_dimensions("general,security")
+
+    assert [role.name for role in roles] == ["general", "security"]
 
 
-def test_general_mode_runs_only_the_general_dimension() -> None:
-    receiver = TriageReceiver(
-        allowed_dimensions={"general"},
-        evidence_ids={"ev-1"},
-        mode="general",
-        required_dimensions=("general",),
+def test_all_five_reviewers_can_be_selected_at_once() -> None:
+    roles = normalize_requested_dimensions(
+        ["bug", "security", "performance", "maintainability", "general"]
     )
-    accepted, _ = receiver.submit(
-        evidence_ids=["ev-1"],
-        risk_level="medium",
-        dimensions=["general"],
-        focus="whole change",
-    )
-    assert accepted
-    assert [assignment.dimension for assignment in receiver.assignments()] == ["general"]
 
-    # A general-mode receiver never accepts a specialized dimension.
-    rejected = TriageReceiver(
-        allowed_dimensions={"general"}, evidence_ids={"ev-1"}, mode="general"
-    )
-    ok, detail = rejected.submit(
-        evidence_ids=["ev-1"],
-        risk_level="high",
-        dimensions=["bug"],
-        focus="x",
-    )
-    assert not ok
-    assert "disallowed dimension" in detail
-
-
-def test_auto_mode_accepts_a_subset_and_rejects_unknown_dimensions() -> None:
-    receiver = TriageReceiver(
-        allowed_dimensions={"bug", "security", "performance", "maintainability"},
-        evidence_ids={"ev-1"},
-        mode="auto",
-    )
-    ok, _ = receiver.submit(
-        evidence_ids=["ev-1"], risk_level="medium", dimensions=["bug"], focus="x"
-    )
-    assert ok
-    unknown = TriageReceiver(
-        allowed_dimensions={"bug"}, evidence_ids={"ev-1"}, mode="auto"
-    )
-    ok, detail = unknown.submit(
-        evidence_ids=["ev-1"], risk_level="medium", dimensions=["general"], focus="x"
-    )
-    assert not ok
-    assert "disallowed dimension" in detail
+    assert len(roles) == 5
+    assert {role.name for role in roles} == {
+        "bug",
+        "security",
+        "performance",
+        "maintainability",
+        "general",
+    }
 
 
 def test_reviewer_profiles_preserve_review_submit_result() -> None:
@@ -359,11 +309,11 @@ def test_general_profile_declares_its_own_contract(tmp_path) -> None:
     assert "Bug Reviewer Contract" not in prompt
 
 
-def test_general_profile_is_not_part_of_auto_roles() -> None:
+def test_general_is_a_peer_reviewer_not_a_specialized_one() -> None:
     from nanoreview.review.types import ALL_REVIEW_ROLES, SPECIAL_REVIEW_ROLE_NAMES
 
     assert "general" in ALL_REVIEW_ROLES
     assert "general" not in SPECIAL_REVIEW_ROLE_NAMES
-    roles, mode = normalize_requested_dimensions(None)
-    assert mode == "auto"
-    assert "general" not in {role.name for role in roles}
+    # It is dispatched like any other selected reviewer.
+    roles = normalize_requested_dimensions(None)
+    assert [role.name for role in roles] == ["general"]

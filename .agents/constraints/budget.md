@@ -5,7 +5,7 @@
 ## 预算边界
 
 - evidence budget、单次输出、上下文窗口、执行轮数、并发和超时分别约束不同资源；不能互相替代。
-- 当前没有按累计 token、金额或日/月周期实现的本地总配额。`prefetch_budget_chars` 仅约束 manifest 文本。
+- 当前没有按累计 token、金额或日/月周期实现的本地总配额。`prefetch_budget_chars` 仅约束预处理的上下文文本。
 - 预处理跳过原因必须进入报告覆盖说明；工具输出裁剪需保留足够诊断信息。
 - 上下文估算优先使用 Provider counter，其次 `tiktoken`，最后约 4 字符/token；估算不等于计费 usage。
 
@@ -32,12 +32,11 @@
 
 ## Review run 预算契约
 
-Review 管线（Planner / reviewer / Judge）使用固定 `200_000` tokens 上下文窗口，不随 Conversation Agent 配置或 provider 探测变化（`agent/review_loop.py::REVIEW_CONTEXT_WINDOW_TOKENS`）：
+Review 管线（reviewer / Judge）使用固定 `200_000` tokens 上下文窗口，不随 Conversation Agent 配置或 provider 探测变化（`agent/review_loop.py::REVIEW_CONTEXT_WINDOW_TOKENS`）：
 
 ```text
 context_window_tokens = 200_000
-planner_manifest_budget = 80_000（上下文窗口 40%）
-evidence_token_budget = 150_000（diff evidence 总额；direct_cap = 42_750 以上进入分页）
+evidence_token_budget = 150_000（diff evidence 总额；direct_cap = 42_750 以上触发预算裁剪）
 diff evidence 单文件阈值 = 8_000（`<threshold` 一个完整 unit；`>=threshold` 按 hunk 切分）
 reviewer_max_output_tokens = 8_192
 reviewer_model_request_limit = 30（最后一次请求用于 review_submit）
@@ -45,11 +44,9 @@ reviewer_timeout_seconds = 180
 ```
 
 - review 输入只有本地 diff：evidence 就是 changed hunk，预处理不枚举仓库、不读完整源码、不做语义切块，因此不存在 related 补充预算、`max_file_chars` 截断标记或按文件规模分级的三态决策；单个超大 hunk 无法安全切分时整块记为 skipped（`token_limit_exceeded`）。
-- Planner 只读一个结构化 manifest（`review/planning/manifest.py`），其 references 与 skipped/omitted 说明共享 80k 预算；超限时按 frozen 顺序保留前缀并记录被省略的 id/数量/原因，**不再按风险排序**。manifest 的 version、`input_mode` 与 token counter 随 `EvidenceManifest.snapshot_payload()` 持久化到 review snapshot。
-- Planner 输入分 `direct`/`paged`：`direct` 内联全部 evidence 全文；`paged` 只渲染索引，内容由 `list_review_diff`/`read_review_diff` 分页读取，单次响应预算对齐运行期 `max_tool_result_chars`，避免 reader 声称已读后被 `AgentRunner` 再截断。有界读取的三条硬规则：请求的 ID 不得被隐藏丢弃（超预算部分显式列出 ID）；单个 unit 超过页面预算时必须在正文内标注“未完整展示”，绝不返回无标记的半个 patch；reference excerpt 上限（40k 字符）不得低于单文件完整 diff unit 的最大规模（`DIFF_UNIT_TOKEN_THRESHOLD * 4`），否则 direct 模式会静默丢 unit 尾部。
-- Planner 请求上限 `24`（`_PLANNER_MAX_ITERATIONS`），分诊需要多次有界读取 + 多条 decision + finish；不强制 `tool_choice`，由 `finish_review_triage` 的 reserved terminal iteration 保证收尾。散文回合配额 `prose_retry_limit=8` 与 terminal 提交配额（5）分开计。reviewer 的 30 次不变。
+- **没有 Planner 模型调用**：review 的模型开销只有 reviewer 与 Judge 两段。证据预处理按 frozen 顺序保留，放不下的 unit 记为 skipped（`budget_exhausted`）并随 snapshot 与 report coverage 可见，**不再按风险排序**。每个选中的 reviewer 接收全部接纳 evidence；evidence 总量由 `evidence_token_budget` 控制，`_apply_main_budget` 是顺序贪心保留（放不下的 unit 跳过、后面仍放得下的小 unit 保留）。
 - reviewer frozen task（本次授权 diff evidence）是固定输入，不参与工作历史压缩；容量不足必须显式失败或记录 coverage 缺口，不得静默丢弃授权 evidence，也不得假定压缩能裁剪 frozen task。
-- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Judge（`submit_verdicts`）本就每轮强制；Planner 靠 terminal 保留轮收尾；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
+- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Judge（`submit_verdicts`）本就每轮强制；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
 - reviewer 内重复 `read_file`/`grep` 按单 run ledger 抑制（相同规范化范围 + 内容未变时返回短提示），`force` 不可绕过；这是上下文效率控制，不是累计 token 硬上限，也不跨 reviewer/review run 共享。
 
 ## 变更检查

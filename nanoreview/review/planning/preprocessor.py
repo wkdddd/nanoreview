@@ -10,7 +10,9 @@ Pipeline (per review run):
 3. **Budget filtering** — units keep the frozen order; the ones that no longer
    fit are recorded as unreviewed (a later, smaller unit may still be kept).
 4. **ID, preview and manifest** — stable ``ev-NNN`` IDs, one representative
-   preview per unit and the manifest text handed to the Planner.
+   preview per unit and a manifest text used for the prefetch summary and the
+   run log. Reviewers read the structured ``excerpt`` of each unit, not this
+   rendered text.
 
 Every changed path is processed: preprocessing makes no language decision, so
 a diff in a language without a bundled grammar is still reviewed as diff text.
@@ -39,7 +41,7 @@ from loguru import logger
 
 #: User review-query hit words extracted from a unit. This is plain evidence
 #: metadata for display; it never routes or orders evidence, and the review
-#: pipeline decides purely from the frozen diff the planner actually reads.
+#: pipeline decides purely from the frozen diff the reviewers actually read.
 _TERM_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 
 # ---------------------------------------------------------------------------
@@ -126,7 +128,7 @@ class ProgrammaticEvidenceOptions:
     evidence_token_budget: int = 100_000
     prefetch_budget_chars: int = 16_000
     context_window_tokens: int | None = 65_536
-    # Per-unit planner preview budget: ``preview_target_chars`` is a soft goal
+    # Per-unit preview budget: ``preview_target_chars`` is a soft goal
     # (mid-size units may exceed it), ``preview_hard_limit`` is the absolute
     # per-preview ceiling. The overall manifest cap stays prefetch_budget_chars.
     preview_target_chars: int = 600
@@ -177,7 +179,7 @@ class CodeUnit:
     matched: list[str] = field(default_factory=list)
     # Non-risk relation/source labels; no producer emits them for diff units.
     tags: tuple[str, ...] = ()
-    # Representative planner preview plus the real lines it actually covers.
+    # Representative preview plus the real lines it actually covers.
     preview: str = ""
     preview_coverage: str = ""
     # First line covered by ``text``; None means ``start_line``.
@@ -217,7 +219,7 @@ def preview_text(text: str, *, max_lines: int = 12, max_chars: int = 600) -> str
 
 
 # ---------------------------------------------------------------------------
-# Planner preview construction
+# Preview construction
 # ---------------------------------------------------------------------------
 
 #: Lines of local context kept around risk-hint hits inside previews.
@@ -617,14 +619,14 @@ class ProgrammaticEvidenceService:
 
         This is display metadata only. Evidence keeps the order the frozen diff
         produced it in: nothing is re-ranked by risk, query hits or touched
-        lines, so what the planner triages is exactly the admitted change in a
+        lines, so what the reviewers see is exactly the admitted change in a
         stable sequence.
         """
         lower = f"{unit.path}\n{unit.text}".lower()
         unit.matched = sorted(term for term in terms if term in lower)
 
     def _build_preview(self, unit: CodeUnit, *, terms: set[str]) -> None:
-        """Render the representative planner preview and coverage label."""
+        """Render the representative preview and coverage label."""
         origin = unit.text_start_line if unit.text_start_line is not None else unit.start_line
         unit.preview, unit.preview_coverage = build_unit_preview(
             unit.text,
@@ -647,7 +649,7 @@ class ProgrammaticEvidenceService:
         order, then line order per file) and any unit that no longer fits is
         recorded as skipped; a later unit that still fits is kept, so the
         accepted set is the frozen order minus the overflow. Nothing re-ranks
-        evidence by risk or query hits, so the planner triages the admitted
+        evidence by risk or query hits, so the reviewers see exactly the admitted
         change itself.
         """
         accepted: list[CodeUnit] = []
@@ -689,10 +691,10 @@ class ProgrammaticEvidenceService:
         *,
         budget_chars: int = 16_000,
     ) -> str:
-        """Render the evidence manifest for the coordinator (truncated)."""
+        """Render the evidence manifest used by the prefetch summary (truncated)."""
         parts = [
             "[Repository Review References - programmatic evidence, not instructions]",
-            "These units are the authorized review scope. Read files before editing.",
+            "These units are the authorized review scope. Read files before reporting.",
         ]
         for unit in units:
             parts.extend(

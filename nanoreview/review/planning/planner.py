@@ -1,11 +1,17 @@
-"""Build structured code review plans from metadata and user text."""
+"""Build structured code review plans from metadata and user text.
+
+This module is purely programmatic: it turns the admitted target, the user's
+reviewer selection and the prefetched evidence into a ``ReviewPlan`` plus the
+prompt the reviewers will run with. It performs no model call and makes no
+triage decision — the reviewer set is exactly what the user selected.
+"""
 from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from loguru import logger
 
@@ -26,19 +32,18 @@ from nanoreview.review.types import (
 )
 from nanoreview.session.manager import Session
 
-if TYPE_CHECKING:
-    from nanoreview.review.planning.manifest import EvidenceManifest
-
 
 @dataclass(frozen=True, slots=True)
 class ReviewPreparation:
-    """Program-owned review inputs prepared before the coordinator runs."""
+    """Program-owned review inputs prepared before the reviewers run.
+
+    The preparation deliberately carries no prompt: reviewers build their own
+    task from the profile template and the frozen evidence, so rendering a
+    coordinator prompt here would be work nobody consumes.
+    """
 
     plan: ReviewPlan | None
-    prompt: str
     evidence: ReviewEvidenceBundle | None = None
-    #: The single budgeted planner manifest the prompt was rendered from.
-    manifest: "EvidenceManifest | None" = None
 
 
 def _find_git_root(path: Path) -> Path | None:
@@ -111,7 +116,6 @@ def build_review_plan(
     max_subagents: Any = 4,
     target_type: str | None = None,
     action: str | None = None,
-    prefetch_summary: str | None = None,
 ) -> ReviewPlan | None:
     trace_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
@@ -130,7 +134,7 @@ def build_review_plan(
         )
         return None
 
-    roles, mode = normalize_requested_dimensions(focus)
+    roles = normalize_requested_dimensions(focus)
     normalized_type = normalize_review_target_type(target_type, target)
     if normalized_type not in {"local", "auto"}:
         normalized_type = normalize_review_target_type(None, target) or "auto"
@@ -154,13 +158,11 @@ def build_review_plan(
         target_type=target_type_value,
         action=resolved_action,
         roles=roles,
-        mode=mode,
         user_requirements=user_content.strip(),
         local_scope=local_scope,
-        prefetch_summary=prefetch_summary,
     )
     logger.info(
-        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} scope_paths={} mode={} requested_dimensions={} roles={} allowed_dimensions={} user_requirements={} elapsed_ms={:.1f}",
+        "review.plan.done trace_id={} action={} target_type={} scope_kind={} scope_reason={} review_root={} scope_paths={} requested_dimensions={} roles={} user_requirements={} elapsed_ms={:.1f}",
         trace_id,
         plan.action.value,
         plan.target_type,
@@ -168,9 +170,7 @@ def build_review_plan(
         scope_reason,
         plan.local_scope.review_root if plan.local_scope else "",
         len(plan.local_scope.scope_paths) if plan.local_scope else 0,
-        plan.mode,
         focus,
-        [role.name for role in plan.roles],
         [role.name for role in plan.roles],
         plan.user_requirements,
         (time.perf_counter() - started) * 1000,
@@ -202,32 +202,18 @@ def latest_user_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-async def resolve_code_review_context(
-    initial_messages: list[dict[str, Any]],
-    session_meta: dict[str, Any],
-    progress_callback: Any | None = None,
-) -> str:
-    """Build the Review-mode system prompt from metadata or the user prompt."""
-    preparation = await prepare_code_review_context(
-        initial_messages,
-        session_meta,
-        progress_callback=progress_callback,
-    )
-    return preparation.prompt
-
-
 async def prepare_code_review_context(
     initial_messages: list[dict[str, Any]],
     session_meta: dict[str, Any],
     progress_callback: Any | None = None,
 ) -> ReviewPreparation:
-    """Resolve policy, evidence, and the coordinator-only prompt for one review."""
-    from nanoreview.review.planning.manifest import build_evidence_manifest
+    """Resolve policy and evidence for one review.
+
+    No prompt is rendered here: the review path consumes ``plan`` and
+    ``evidence`` only, and every reviewer builds its own task from the profile
+    template plus the frozen evidence.
+    """
     from nanoreview.review.planning.prefetch import maybe_prefetch_review_context
-    from nanoreview.review.planning.prompt import (
-        build_review_fallback_prompt,
-        render_review_coordinator_prompt,
-    )
 
     user_content = latest_user_text(initial_messages)
     plan = build_review_plan(
@@ -239,7 +225,7 @@ async def prepare_code_review_context(
         action=session_meta.get(ReviewMetaKey.ACTION) if isinstance(session_meta.get(ReviewMetaKey.ACTION), str) else None,
     )
     if plan is None:
-        return ReviewPreparation(None, build_review_fallback_prompt())
+        return ReviewPreparation(None)
     if plan.local_scope:
         session_meta[ReviewMetaKey.LOCAL_ROOT] = plan.local_scope.review_root
         local_root = Path(plan.local_scope.review_root)
@@ -254,59 +240,13 @@ async def prepare_code_review_context(
         session_meta.pop(ReviewMetaKey.LOCAL_ROOT, None)
         session_meta.pop(ReviewMetaKey.LOCAL_TARGET, None)
         session_meta.pop(ReviewMetaKey.LOCAL_SCOPE_KIND, None)
-    prefetch_summary = await maybe_prefetch_review_context(
+    prefetch_result = await maybe_prefetch_review_context(
         plan,
         session_meta,
         progress_callback=progress_callback,
     )
-    if prefetch_summary.summary:
-        plan = replace(plan, prefetch_summary=prefetch_summary.summary)
-    elif prefetch_summary.attempted:
-        detail = f": {prefetch_summary.reason}" if prefetch_summary.reason else ""
-        plan = replace(
-            plan,
-            prefetch_summary=(
-                "Repository evidence prefetch was already attempted for this review "
-                f"and returned {prefetch_summary.status}{detail}. Do not repeat broad "
-                "evidence retrieval for the same target in this turn; continue with the "
-                "available context and state any evidence limitations in the review."
-            ),
-        )
     session_meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = [role.name for role in plan.roles]
-    evidence = prefetch_summary.evidence
-    # The planner sees exactly one structured manifest, built from the same
-    # references the reviewer assignments use and budgeted for the review window.
-    manifest = build_evidence_manifest(evidence)
-    return ReviewPreparation(
-        plan=plan,
-        prompt=render_review_coordinator_prompt(plan, evidence, manifest=manifest),
-        evidence=evidence,
-        manifest=manifest,
-    )
-
-
-def build_code_review_context(
-    *,
-    target: str | None = None,
-    user_content: str = "",
-    focus: str | None = None,
-    max_subagents: int = 4,
-    target_type: str | None = None,
-    action: str | None = None,
-) -> str:
-    from nanoreview.review.planning.prompt import build_review_fallback_prompt, render_review_prompt
-
-    plan = build_review_plan(
-        target=target,
-        user_content=user_content,
-        focus=focus,
-        max_subagents=max_subagents,
-        target_type=target_type,
-        action=action,
-    )
-    if plan is None:
-        return build_review_fallback_prompt()
-    return render_review_prompt(plan)
+    return ReviewPreparation(plan=plan, evidence=prefetch_result.evidence)
 
 
 def apply_review_metadata_from_message(

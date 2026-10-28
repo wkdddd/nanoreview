@@ -4,7 +4,7 @@ Restored from nanobot ``432421bceba6e50ec435924c7b21ef341ed69e55``
 (``nanobot/agent/tools/mcp.py``) and adapted to NanoReview:
 
 * Only the Conversation Agent uses MCP. The provider owns a dedicated registry
-  so MCP tools never leak into the review planner/reviewer/Judge registries.
+  so MCP tools never leak into the review reviewer/Judge registries.
 * OAuth is not supported; ``auth: "oauth"`` is reported as an error instead of
   silently connecting without credentials.
 * No hot reload: configuration changes take effect after restart, while broken

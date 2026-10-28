@@ -340,7 +340,7 @@ class SessionCoordinator:
         self.tools = ToolRegistry()
         # MCP belongs to the Conversation Agent only, so it owns a separate
         # registry and connection set. Registering these wrappers into
-        # ``self.tools`` would expose them to planner/reviewer/Judge.
+        # ``self.tools`` would expose them to reviewer/Judge.
         self.mcp = MCPProvider.from_config(_tc)
         # One file-read/write tracker per logical session. Each turn binds its
         # own registry to the session's state via a contextvar.
@@ -382,7 +382,6 @@ class SessionCoordinator:
         self.review_loop = ReviewLoop(
             workspace=workspace,
             sessions=self.sessions,
-            runner=self.runner,
             subagents=self.subagents,
             model=self.model,
             max_tool_result_chars=self.max_tool_result_chars,
@@ -1140,7 +1139,7 @@ class SessionCoordinator:
         result = await self.review_loop.finalize(session_key, status, warning=warning)
         if result is None:
             return None
-        # The run's total usage (reviewers + judge + planner) is returned once,
+        # The run's total usage (reviewers + judge) is returned once,
         # on its single terminal result — record it here, never per child.
         self._record_result_usage(result.usage)
         session = self.sessions.get_or_create(session_key)
@@ -1939,7 +1938,7 @@ class SessionCoordinator:
         Called exactly once per returned result — for a conversation turn with
         the ``AgentRunResult.usage`` the loop hands back, and for a review run
         with the ``ReviewResult.usage`` of its single terminal result (which
-        already totals its reviewers, judge and planner, so it must not be
+        already totals its reviewers and judge, so it must not be
         summed again per child). Recording happens as the result comes back, so
         a later persistence failure cannot wipe usage that was already produced.
         """

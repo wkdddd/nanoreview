@@ -8,7 +8,7 @@ This module deliberately holds only plain data and pure functions — the replay
 is driven by an explicit script of tool results (no provider, no runner, no
 disk) so two runs of the same case always produce the same score. It exists to
 compare quality and cost across configurations (model, reasoning effort,
-Planner/reviewer settings) while holding the case fixed.
+reviewer settings) while holding the case fixed.
 """
 
 from __future__ import annotations

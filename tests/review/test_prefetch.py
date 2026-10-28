@@ -104,7 +104,6 @@ async def test_prefetch_dispatches_to_evidence_service_for_diff() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
         user_requirements="review auth",
     )
 
@@ -141,7 +140,6 @@ async def test_prefetch_forwards_the_frozen_diff_to_the_evidence_service() -> No
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
         user_requirements="review auth",
     )
     frozen = {
@@ -169,7 +167,6 @@ async def test_prefetch_omits_frozen_diff_when_absent() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
 
     await maybe_prefetch_review_context(
@@ -196,7 +193,6 @@ async def test_prefetch_emits_progress_events() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
         user_requirements="review auth",
     )
 
@@ -218,7 +214,6 @@ async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
 
     result = await maybe_prefetch_review_context(
@@ -238,7 +233,6 @@ async def test_diff_prefetch_preserves_filtered_patch_body() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
     result = await maybe_prefetch_review_context(
         plan,
@@ -318,7 +312,6 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
 
     result = await maybe_prefetch_review_context(
@@ -333,11 +326,12 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
     main = bundle.references[0]
     assert (main.path, main.kind, main.token_count) == ("src/auth.py", "function", 8)
     assert main.preview.startswith("def login(token):")
-    # Structured prefetch carries the unit's reviewable text and coverage, and
-    # derives the planner input shape from the preprocessing mode.
+    # Structured prefetch carries the unit's reviewable text and coverage.
+    # There is no planner input mode any more: every accepted unit is inlined
+    # as its own excerpt for the reviewers.
     assert main.excerpt.startswith("def login(token):")
     assert main.preview_coverage == "full chunk lines 1-2"
-    assert bundle.input_mode == "paged"
+    assert all(reference.excerpt for reference in bundle.references)
     related = bundle.references[1]
     assert related.parent_id == "ev-1"
     assert related.is_related is True
@@ -350,7 +344,6 @@ async def test_direct_preprocessing_mode_yields_direct_planner_input() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
     result = _structured_result()
     result.mode = "direct"
@@ -361,7 +354,7 @@ async def test_direct_preprocessing_mode_yields_direct_planner_input() -> None:
     )
 
     assert prefetched.evidence is not None
-    assert prefetched.evidence.input_mode == "direct"
+    assert [reference.id for reference in prefetched.evidence.references] == ["ev-1", "ev-2"]
 
 
 async def test_legacy_provider_drops_risk_labels() -> None:
@@ -384,7 +377,6 @@ async def test_legacy_provider_drops_risk_labels() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
 
     result = await maybe_prefetch_review_context(
@@ -398,8 +390,9 @@ async def test_legacy_provider_drops_risk_labels() -> None:
     assert reference.matched == ("login",)
     assert not hasattr(reference, "risk_hints")
     # A legacy text provider has no authorized unit ordering to trust, so the
-    # planner gets the paged input instead of a fabricated inline set.
-    assert result.evidence.input_mode == "paged"
+    # preview is sampled from the provider snippet instead of a fabricated
+    # inline set.
+    assert result.evidence.references[0].id == "ev-001"
     # The preview is sampled from the provider snippet and its coverage is
     # explicitly marked instead of claiming full-chunk coverage.
     assert reference.preview
@@ -420,7 +413,6 @@ async def test_prefetch_aggregates_skipped_files_per_path() -> None:
         target_type="local",
         action=ReviewAction.DIFF,
         roles=[],
-        mode="auto",
     )
 
     result = await maybe_prefetch_review_context(

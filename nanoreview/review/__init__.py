@@ -11,10 +11,8 @@ from nanoreview.review.input import (
 from nanoreview.review.planning.evidence import ReviewEvidenceService
 from nanoreview.review.planning.planner import (
     apply_review_metadata_from_message,
-    build_code_review_context,
     build_review_plan,
     latest_user_text,
-    resolve_code_review_context,
 )
 from nanoreview.review.profiles import (
     REVIEWER_PROFILES,
@@ -72,7 +70,6 @@ __all__ = [
     "ReviewerProfile",
     "REVIEWER_PROFILES",
     "apply_review_metadata_from_message",
-    "build_code_review_context",
     "build_review_plan",
     "extract_review_target",
     "infer_review_target_type",
@@ -81,7 +78,6 @@ __all__ = [
     "normalize_review_dimension",
     "normalize_review_action",
     "normalize_review_target_type",
-    "resolve_code_review_context",
     "review_action_values",
     "get_reviewer_profile",
     "public_reviewer_profiles",
