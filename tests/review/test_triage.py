@@ -15,17 +15,17 @@ ReviewLoop depends on:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from nanoreview.agent.tools.review_plan import (
-    DecisionReceiverAdapter,
-    FinishReviewTriageTool,
     ListReviewDiffTool,
     ReadReviewDiffTool,
     ReviewDiffReader,
     ReviewDiffUnit,
-    SubmitReviewDecisionTool,
 )
+from nanoreview.review.contracts import planner_contract
 from nanoreview.review.planning.triage import TriageReceiver
 from nanoreview.review.types import TRIAGE_ASSIGNED, TRIAGE_DISMISSED
 
@@ -209,7 +209,7 @@ def test_finish_is_accepted_only_once() -> None:
 
     ok, detail = receiver.finish()
     assert not ok
-    assert "already called" in detail
+    assert "already finalized" in detail
 
 
 def test_submission_after_finish_is_rejected() -> None:
@@ -245,65 +245,136 @@ def test_decision_count_is_bounded() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tool adapters
+# Planner output contract
+#
+# The planner no longer calls a submission tool: it answers with one JSON object
+# holding every decision, and the contract validates that answer. These tests
+# pin the two layers the old tool adapter provided -- structural shape first,
+# then triage semantics -- plus the finish-state error surfaced to the model.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_tool_adapter_validates_shape_before_semantics() -> None:
-    receiver = _receiver()
-    tool = SubmitReviewDecisionTool(DecisionReceiverAdapter(receiver))
-
-    missing = await tool.execute(risk_level="high")
-    assert missing.startswith("Error:")
-    assert "evidence_ids" in missing
-
-    bad_level = await tool.execute(
-        evidence_ids=["ev-001"], risk_level="catastrophic"
-    )
-    assert bad_level.startswith("Error:")
-    assert "risk_level" in bad_level
-
-    accepted = await tool.execute(
-        evidence_ids=["ev-001"],
-        risk_level="high",
-        dimensions=["bug"],
-        focus="x",
-    )
-    assert not accepted.startswith("Error:")
-    assert len(receiver.decisions) == 1
+def _answer(*decisions: dict[str, object]) -> str:
+    return json.dumps({"decisions": list(decisions)})
 
 
-@pytest.mark.asyncio
-async def test_tool_adapter_rejects_extra_keys() -> None:
-    tool = SubmitReviewDecisionTool(DecisionReceiverAdapter(_receiver()))
-
-    result = await tool.execute(
-        evidence_ids=["ev-001"],
-        risk_level="high",
-        dimensions=["bug"],
-        focus="x",
-        assignments=[],
-    )
-
-    assert result.startswith("Error:")
-    assert "assignments" in result
-
-
-@pytest.mark.asyncio
-async def test_finish_tool_reports_the_rejection_reason() -> None:
+def _validate(
+    answer: str,
+    *,
+    mode: str = "auto",
+    allowed: set[str] | None = None,
+    evidence: tuple[str, ...] = ("ev-001", "ev-002"),
+    required: tuple[str, ...] = (),
+):
     receiver = _receiver(
-        mode="special", allowed={"bug", "security"}, required=("bug", "security")
+        mode=mode, allowed=allowed, evidence=evidence, required=required
     )
-    receiver.submit(
-        evidence_ids=["ev-001"], risk_level="high", dimensions=["bug"], focus="x"
+    contract = planner_contract(lambda: receiver)
+    return contract.validate(answer), receiver
+
+
+def test_contract_accepts_every_decision_in_one_answer() -> None:
+    (payload, error), receiver = _validate(
+        _answer(
+            {
+                "evidence_ids": ["ev-001"],
+                "risk_level": "high",
+                "dimensions": ["bug"],
+                "focus": "null deref",
+                "rationale": "changed branch",
+            },
+            {
+                "evidence_ids": ["ev-002"],
+                "risk_level": "low",
+                "dimensions": [],
+                "focus": "",
+                "rationale": "docs only",
+            },
+        )
     )
-    tool = FinishReviewTriageTool(receiver)
 
-    result = await tool.execute()
+    assert error is None
+    assert [item.dimension for item in payload.assignments] == ["bug"]
+    assert payload.summary.dismissed_ids == ("ev-002",)
+    assert payload.decisions[0].risk_level == "high"
+    # The receiver consumed by the contract is the one the loop reads back.
+    assert len(receiver.decisions) == 2
 
-    assert result.startswith("Error:")
-    assert "security" in result
+
+def test_contract_reports_a_missing_structural_field_before_semantics() -> None:
+    (payload, error), receiver = _validate(
+        json.dumps({"decisions": [{"risk_level": "high", "dimensions": ["bug"]}]})
+    )
+
+    assert payload is None
+    assert "evidence_ids" in error
+    # Shape rejection is total: no partially accepted decision survives.
+    assert receiver.decisions == []
+
+
+def test_contract_rejects_extra_keys() -> None:
+    (payload, error), _ = _validate(
+        _answer(
+            {
+                "evidence_ids": ["ev-001"],
+                "risk_level": "high",
+                "dimensions": ["bug"],
+                "focus": "x",
+                "assignments": [],
+            }
+        )
+    )
+
+    assert payload is None
+    assert "assignments" in error
+
+
+def test_contract_rejects_an_unknown_risk_level() -> None:
+    (payload, error), _ = _validate(
+        _answer(
+            {
+                "evidence_ids": ["ev-001"],
+                "risk_level": "catastrophic",
+                "dimensions": ["bug"],
+                "focus": "x",
+            }
+        )
+    )
+
+    assert payload is None
+    assert "risk_level" in error
+
+
+def test_contract_surfaces_the_finish_rejection_reason() -> None:
+    """An incomplete decision set is rejected with the missing dimension named."""
+    (payload, error), _ = _validate(
+        _answer(
+            {
+                "evidence_ids": ["ev-001"],
+                "risk_level": "high",
+                "dimensions": ["bug"],
+                "focus": "x",
+            }
+        ),
+        mode="special",
+        allowed={"bug", "security"},
+        required=("bug", "security"),
+    )
+
+    assert payload is None
+    assert "security" in error
+
+
+def test_contract_rejects_prose_and_truncated_answers() -> None:
+    prose = planner_contract(lambda: _receiver())
+    payload, error = prose.validate("I triaged everything; nothing to review.")
+    assert payload is None
+    assert "one JSON object" in error
+
+    truncated = planner_contract(lambda: _receiver())
+    payload, error = truncated.validate('{"decisions":[{"evidence_ids":["ev-001"]')
+    assert payload is None
+    assert "before the JSON object was complete" in error
 
 
 # ---------------------------------------------------------------------------

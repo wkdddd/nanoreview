@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,10 +17,11 @@ from nanoreview.agent.subagent_profiles import (
     SubagentCompletion,
     SubagentExecutionProfile,
 )
+from nanoreview.review.contracts import reviewer_contract
 from nanoreview.utils.prompt_templates import render_template
 
 _SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep"})
-_REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep", "review_submit"})
+_REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep"})
 #: Tools whose successful call proves the reviewer read target evidence.
 _REVIEWER_EVIDENCE_TOOLS = frozenset({"read_file", "grep"})
 
@@ -59,18 +59,18 @@ class ReviewerProfile:
             id=self.id,
             scope=_SCOPE_BY_PROFILE_ID[self.id],
             required_tools=_REVIEWER_REQUIRED_TOOLS,
-            terminal_tools=frozenset({"review_submit"}),
             soft_tool_error_tools=_SOFT_TOOLS,
-            # The reviewer protocol interprets the full structured submission,
-            # so its untruncated result must survive into tool_events.
-            preserve_tool_result_tools=frozenset({"review_submit"}),
+            # The reviewer returns its findings as the run's final structured
+            # output; the runner rejects anything else and lets the model fix it
+            # inside the same run.
+            output_contract_factory=lambda: reviewer_contract(self.id),
             prompt_builder=lambda metadata, workspace: _build_reviewer_prompt(
                 self, metadata, workspace
             ),
             workspace_resolver=_reviewer_workspace,
             result_handler=_handle_reviewer_result,
             max_iterations_message=(
-                "Review task completed but no structured findings were submitted."
+                "Review task ended without a final findings payload."
             ),
         )
 
@@ -227,68 +227,38 @@ def _build_reviewer_prompt(
     )
 
 
-def _canonical_review_submit(result: Any) -> str | None:
-    for event in reversed(result.tool_events or []):
-        if event.get("name") == "review_submit" and event.get("status") == "ok":
-            content = event.get("raw_result")
-            if isinstance(content, str):
-                try:
-                    data = json.loads(content)
-                except json.JSONDecodeError:
-                    continue
-                if data.get("submitted") is True and isinstance(data.get("findings"), list):
-                    return json.dumps(data, ensure_ascii=False)
-    for message in reversed(result.messages or []):
-        if message.get("role") != "tool" or message.get("name") != "review_submit":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            continue
-        if data.get("submitted") is True and isinstance(data.get("findings"), list):
-            return json.dumps(data, ensure_ascii=False)
-    return None
-
-
 async def _handle_reviewer_result(
     *,
     result: Any,
     metadata: dict[str, Any] | None = None,
 ) -> SubagentCompletion:
-    """Parse the final outcome of the reviewer's single AgentRun.
+    """Interpret the accepted structured output of the reviewer's AgentRun.
 
-    Terminal retries (failed review_submit calls, prose answers) already
-    happened inside ``AgentRunner``; this handler only interprets the final
-    result and never starts a compensation run.
+    The runner already parsed and accepted the final answer against the
+    reviewer's output contract, so this handler only decides what the accepted
+    payload *means*: an empty finding list still has to be backed by evidence,
+    and anything else is a bounded, explicit failure.
     """
-    content = _canonical_review_submit(result)
+    payload = result.structured_output
     stop_reason = result.stop_reason
-    if content is None:
-        if stop_reason == "terminal_tool_failed":
-            attempts = getattr(result, "terminal_attempts", 0)
-            terminal_error = getattr(result, "terminal_error", None) or "unknown error"
-            return SubagentCompletion(
-                "Error: Review incomplete - review_submit failed after "
-                f"{attempts} attempts: {terminal_error}",
-                status="error",
-                stop_reason=stop_reason,
-            )
+    if not isinstance(payload, dict):
         return SubagentCompletion(
-            "No structured findings submitted: the reviewer did not produce a review_submit result.",
+            "Error: Review incomplete - the reviewer produced no structured result.",
             status="error",
             stop_reason=stop_reason,
         )
-    data = json.loads(content)
-    if not data.get("findings"):
+    findings = payload.get("findings")
+    if not isinstance(findings, list):
+        return SubagentCompletion(
+            "Error: Review incomplete - the reviewer result carried no findings array.",
+            status="error",
+            stop_reason=stop_reason,
+        )
+    if not findings:
         # Evidence is provided two ways: the planner injects assigned excerpts
         # into the reviewer's frozen task, and the reviewer may read the target
         # directly with ``read_file``/``grep``. An empty finding list is only
-        # incomplete when neither channel supplied evidence — there is no
-        # repository-reader tool left to fall back on, so explicit reads are the
-        # only way to prove the reviewer looked.
+        # incomplete when neither channel supplied evidence.
         has_assigned_evidence = bool((metadata or {}).get("assigned_evidence"))
         has_read_evidence = any(
             event.get("name") in _REVIEWER_EVIDENCE_TOOLS
@@ -297,8 +267,14 @@ async def _handle_reviewer_result(
         )
         if not (has_assigned_evidence or has_read_evidence):
             return SubagentCompletion(
-                "Error: Review incomplete - no target evidence was successfully read before submitting empty findings.",
+                "Error: Review incomplete - no target evidence was successfully read before reporting no findings.",
                 status="error",
                 stop_reason=stop_reason,
+                payload=payload,
             )
-    return SubagentCompletion(content, stop_reason=stop_reason)
+    return SubagentCompletion(
+        f"reviewer {payload.get('dimension') or 'dimension'} reported "
+        f"{len(findings)} finding(s)",
+        stop_reason=stop_reason,
+        payload=payload,
+    )

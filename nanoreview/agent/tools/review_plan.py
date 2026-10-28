@@ -1,22 +1,15 @@
-"""Planner triage tools: evidence decisions in, one explicit finish.
+"""Planner evidence reader: the frozen diff, paged for one triage run.
 
-The planner never submits assignments. It reads the frozen diff evidence and
-records risk decisions with ``submit_review_decision``; the program aggregates
-those decisions into reviewer assignments (see
-:mod:`nanoreview.review.planning.triage`). ``finish_review_triage`` is the sole
-terminal tool, so a run that never finishes cannot be mistaken for a planner
-that decided no reviewer was needed.
-
-``list_review_diff``/``read_review_diff`` expose only the evidence the program
-already built from the frozen diff. They cannot reach an arbitrary path, create
-evidence, or read repository code outside the admitted change.
+The planner's decisions are its final structured answer, validated by
+:func:`nanoreview.review.contracts.planner_contract`; there is no submission
+tool. ``list_review_diff``/``read_review_diff`` expose only the evidence the
+program already built from the frozen diff. They cannot reach an arbitrary
+path, create evidence, or read repository code outside the admitted change.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nanoreview.agent.tools.base import Tool, tool_parameters
 from nanoreview.agent.tools.schema import (
@@ -25,8 +18,6 @@ from nanoreview.agent.tools.schema import (
     ObjectSchema,
     StringSchema,
 )
-from nanoreview.review.planning.triage import TriageReceiver
-from nanoreview.review.types import REVIEW_RISK_LEVELS
 
 #: Hard cap on evidence units returned by one ``list_review_diff`` call.
 MAX_DIFF_PAGE_ITEMS = 12
@@ -39,16 +30,6 @@ MAX_DIFF_READ_CHARS = 24_000
 #: Chars reserved for the trailing "these IDs were not shown" note so it can
 #: never push the assembled page over budget and trigger a blind clip.
 _DROPPED_NOTE_RESERVE = 400
-
-
-class _DecisionPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    evidence_ids: list[str] = Field(min_length=1, max_length=20)
-    risk_level: str = Field(min_length=1, max_length=16)
-    dimensions: list[str] = Field(default_factory=list, max_length=4)
-    focus: str = Field(default="", max_length=1_000)
-    rationale: str = Field(default="", max_length=600)
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,124 +193,6 @@ class ReviewDiffReader:
         return text[:budget].rstrip() + marker
 
 
-@dataclass(slots=True)
-class DecisionReceiverAdapter:
-    """Validates the planner's structured decision payload before the receiver.
-
-    Pydantic enforces the shape (list lengths, string bounds, no extra keys) and
-    :class:`TriageReceiver` enforces the review semantics (authorized IDs,
-    allowed dimensions, one decision per evidence unit). Separating them keeps
-    the error messages actionable inside the same AgentRun.
-    """
-
-    receiver: TriageReceiver
-
-    def submit(self, decision: dict) -> tuple[bool, str]:
-        try:
-            payload = _DecisionPayload.model_validate(decision)
-        except ValidationError as exc:
-            return False, f"invalid triage decision: {exc.errors(include_url=False)}"
-        return self.receiver.submit(
-            evidence_ids=list(payload.evidence_ids),
-            risk_level=payload.risk_level,
-            dimensions=list(payload.dimensions),
-            focus=payload.focus,
-            rationale=payload.rationale,
-        )
-
-
-_DECISION_SCHEMA = ObjectSchema(
-    {
-        "evidence_ids": ArraySchema(
-            StringSchema("Authorized evidence ID, such as ev-001.", min_length=1),
-            description=(
-                "One or more authorized evidence IDs this decision covers. Each "
-                "evidence unit may be triaged by exactly one decision."
-            ),
-            min_items=1,
-            max_items=20,
-        ),
-        "risk_level": StringSchema(
-            "Risk judgement for this evidence.",
-            enum=list(REVIEW_RISK_LEVELS),
-        ),
-        "dimensions": ArraySchema(
-            StringSchema("Reviewer dimension key to dispatch.", min_length=1),
-            description=(
-                "Reviewer dimensions that should inspect this evidence. Required "
-                "unless risk_level is 'low'; low risk with no dimensions records "
-                "the evidence as dismissed and starts no reviewer."
-            ),
-            max_items=4,
-        ),
-        "focus": StringSchema(
-            "Concrete risk or interaction the assigned reviewers should investigate.",
-            min_length=1,
-        ),
-        "rationale": StringSchema(
-            "Short reason for this risk judgement, for the run audit trail.",
-            min_length=1,
-        ),
-    },
-    required=["evidence_ids", "risk_level"],
-    additional_properties=False,
-)
-
-_FINISH_SCHEMA = ObjectSchema({}, required=[], additional_properties=False)
-
-
-@tool_parameters(_DECISION_SCHEMA.to_json_schema())
-class SubmitReviewDecisionTool(Tool):
-    """Record one planner triage decision over authorized diff evidence."""
-
-    _plugin_discoverable = False
-
-    def __init__(self, adapter: DecisionReceiverAdapter) -> None:
-        self._adapter = adapter
-
-    @property
-    def name(self) -> str:
-        return "submit_review_decision"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Record one triage decision: which authorized diff evidence to review, "
-            "its risk level, and the reviewer dimensions that should inspect it. "
-            "Call once per risk judgement, then call finish_review_triage."
-        )
-
-    async def execute(self, **kwargs: object) -> str:
-        accepted, detail = self._adapter.submit(dict(kwargs))
-        return detail if accepted else f"Error: {detail}"
-
-
-@tool_parameters(_FINISH_SCHEMA.to_json_schema())
-class FinishReviewTriageTool(Tool):
-    """Terminal planner tool: end triage with the decisions recorded so far."""
-
-    _plugin_discoverable = False
-
-    def __init__(self, receiver: TriageReceiver) -> None:
-        self._receiver = receiver
-
-    @property
-    def name(self) -> str:
-        return "finish_review_triage"
-
-    @property
-    def description(self) -> str:
-        return (
-            "Finish planner triage. Unread or unreported evidence stays unexamined "
-            "and no reviewer is added for it; call this only when the evidence you "
-            "want reviewed has been reported through submit_review_decision."
-        )
-
-    async def execute(self, **_: object) -> str:
-        accepted, detail = self._receiver.finish()
-        return detail if accepted else f"Error: {detail}"
-
-
 @tool_parameters(
     ObjectSchema(
         {
@@ -417,13 +280,10 @@ class ReadReviewDiffTool(Tool):
 
 
 __all__ = [
-    "DecisionReceiverAdapter",
-    "FinishReviewTriageTool",
     "ListReviewDiffTool",
     "MAX_DIFF_PAGE_ITEMS",
     "MAX_DIFF_READ_CHARS",
     "ReadReviewDiffTool",
     "ReviewDiffReader",
     "ReviewDiffUnit",
-    "SubmitReviewDecisionTool",
 ]

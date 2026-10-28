@@ -13,18 +13,26 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from nanoreview.agent.coordinator import SessionCoordinator
-from nanoreview.agent.review_loop import ReviewLoopOutcome
-from nanoreview.agent.review_state import (
-    JudgeBatchState,
-    ReviewPhase,
-    ReviewRunState,
-    ReviewRunStatus,
+from nanoreview.agent.coordinator import (
+    REVIEW_CONTEXT_EVENT,
+    REVIEW_HANDOFF_EVENT,
+    SessionCoordinator,
+    SessionRoute,
 )
+from nanoreview.agent.review_board import (
+    CHILD_COMPLETED,
+    CHILD_ERROR,
+    CHILD_STOPPED,
+    ReviewBoardView,
+    ReviewBoardWriter,
+)
+from nanoreview.agent.review_loop import ReviewLoopOutcome
+from nanoreview.agent.review_state import ReviewPhase, ReviewRunStatus
 from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.providers.base import LLMProvider, LLMResponse
@@ -33,12 +41,7 @@ from nanoreview.review.admission import (
     ReviewAdmissionError,
     ReviewAdmissionRequest,
 )
-from nanoreview.review.types import ReviewMetaKey
-from nanoreview.agent.coordinator import (
-    REVIEW_CONTEXT_EVENT,
-    REVIEW_HANDOFF_EVENT,
-    SessionRoute,
-)
+from nanoreview.review.types import ReviewAssignment, ReviewMetaKey
 from nanoreview.session.manager import SessionManager
 
 REVIEW_SESSION_KEY = "cli:gate-session"
@@ -97,6 +100,31 @@ def _ordinary_message() -> InboundMessage:
     )
 
 
+SNAPSHOT_REF = "review-snapshots/run.json"
+
+
+def _create_board(loop: SessionCoordinator, run_id: str) -> ReviewBoardWriter:
+    """Register one run's blackboard through the coordinator's store."""
+    loop._review_boards.create(  # noqa: SLF001 - the store is the only writer
+        SimpleNamespace(
+            run_id=run_id,
+            session_key=REVIEW_SESSION_KEY,
+            input_fingerprint="fp",
+            snapshot_ref=SNAPSHOT_REF,
+            plan=None,
+        )
+    )
+    writer = loop._review_boards.writer(REVIEW_SESSION_KEY)  # noqa: SLF001
+    assert writer is not None
+    return writer
+
+
+def _board(loop: SessionCoordinator) -> ReviewBoardView:
+    view = loop._review_boards.view(REVIEW_SESSION_KEY)  # noqa: SLF001
+    assert view is not None
+    return view
+
+
 async def _drain_outbound(loop: SessionCoordinator) -> list[Any]:
     events = []
     while loop.bus.outbound_size:
@@ -121,16 +149,10 @@ def _gate_codes(events: list[Any]) -> list[str]:
 async def test_running_review_rejects_follow_up_without_persisting(tmp_path) -> None:
     """While a review runs, ordinary messages are refused and write nothing."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    state = ReviewRunState(
-        run_id="run-live",
-        session_key=REVIEW_SESSION_KEY,
-        input_fingerprint="fp",
-        status=ReviewRunStatus.RUNNING,
-        phase=ReviewPhase.REVIEW,
-    )
-    loop.review_loop.runs[REVIEW_SESSION_KEY] = state
+    writer = _create_board(loop, "run-live")
+    await writer.advance(ReviewPhase.REVIEW)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
-    session.metadata[ReviewMetaKey.RUN_ID] = state.run_id
+    session.metadata[ReviewMetaKey.RUN_ID] = "run-live"
     session.metadata[ReviewMetaKey.STATUS] = "running"
     session.add_message("user", "review this repo")
     loop.sessions.save(session)
@@ -151,16 +173,12 @@ async def test_running_review_rejects_follow_up_without_persisting(tmp_path) -> 
     assert len(reloaded.messages) == messages_before
 
 
-def test_running_gate_passes_only_the_admitted_turn(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_running_gate_passes_only_the_admitted_turn(tmp_path) -> None:
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    state = ReviewRunState(
-        run_id="run-live",
-        session_key=REVIEW_SESSION_KEY,
-        input_fingerprint="fp",
-        status=ReviewRunStatus.RUNNING,
-        phase=ReviewPhase.REVIEW,
-    )
-    loop.review_loop.runs[REVIEW_SESSION_KEY] = state
+    writer = _create_board(loop, "run-live")
+    await writer.advance(ReviewPhase.REVIEW)
+    state = _board(loop)
 
     admitted = InboundMessage(
         channel="cli",
@@ -191,34 +209,26 @@ def test_running_gate_passes_only_the_admitted_turn(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _terminal_run(
+async def _terminal_run(
     loop: SessionCoordinator,
     *,
     status: ReviewRunStatus = ReviewRunStatus.COMPLETED,
-    report_ref: str | None = None,
-) -> ReviewRunState:
-    state = ReviewRunState(
-        run_id="run-done",
-        session_key=REVIEW_SESSION_KEY,
-        input_fingerprint="fp",
-        phase=ReviewPhase.DONE,
-        status=status,
-        report_ref=report_ref,
-    )
-    loop.review_loop.runs[REVIEW_SESSION_KEY] = state
+) -> ReviewBoardView:
+    """Drive one run to a persisted terminal state."""
+    writer = _create_board(loop, "run-done")
+    await writer.settle(status)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
-    session.metadata.update(state.metadata_payload())
     session.add_message("user", "review this repo")
     session.add_message("assistant", "## Code Review Report")
     loop.sessions.save(session)
-    return state
+    return _board(loop)
 
 
 @pytest.mark.asyncio
 async def test_terminal_review_opens_conversation_and_injects_handoff(tmp_path) -> None:
     """A finished review routes to conversation and injects its handoff."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    _terminal_run(loop)
+    await _terminal_run(loop)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     messages_before = len(session.messages)
 
@@ -256,7 +266,7 @@ async def test_terminal_review_opens_conversation_and_injects_handoff(tmp_path) 
 async def test_interrupted_run_is_normalized_and_session_reopens(tmp_path) -> None:
     """A restarted process has no live run: the run is closed as a failure."""
     loop = _review_session_loop(tmp_path, status="running")
-    assert loop.review_loop.get(REVIEW_SESSION_KEY) is None
+    assert loop._review_boards.view(REVIEW_SESSION_KEY) is None  # noqa: SLF001
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
 
     assert loop.route(session) is SessionRoute.CONVERSATION
@@ -274,7 +284,7 @@ async def test_interrupted_run_is_normalized_and_session_reopens(tmp_path) -> No
 async def test_second_review_turn_is_refused_after_terminal(tmp_path) -> None:
     """A review session never starts a second review, terminal or not."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    _terminal_run(loop)
+    await _terminal_run(loop)
     second = InboundMessage(
         channel="cli",
         sender_id="user",
@@ -326,15 +336,16 @@ async def test_unadmitted_review_turn_registers_no_run(tmp_path, monkeypatch) ->
     await loop.close_background_tasks()
 
     assert executed == []
-    assert loop.review_loop.get(REVIEW_SESSION_KEY) is None
+    assert loop._review_boards.view(REVIEW_SESSION_KEY) is None  # noqa: SLF001
     events = await _drain_outbound(loop)
     assert _gate_codes(events) == ["review_not_admitted"]
 
 
-def test_gate_leaves_internal_events_and_plain_sessions_alone(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_gate_leaves_internal_events_and_plain_sessions_alone(tmp_path) -> None:
     """The gate must stay conditional, or commands and subagent results break."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    _terminal_run(loop)
+    await _terminal_run(loop)
     session = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     msg = _ordinary_message()
 
@@ -363,39 +374,40 @@ def test_gate_leaves_internal_events_and_plain_sessions_alone(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _live_run(loop: SessionCoordinator) -> ReviewRunState:
-    state = ReviewRunState(
-        run_id="run-cancel",
-        session_key=REVIEW_SESSION_KEY,
-        input_fingerprint="fp",
-        status=ReviewRunStatus.RUNNING,
-        phase=ReviewPhase.REVIEW,
+async def _live_run(loop: SessionCoordinator) -> ReviewBoardView:
+    """A running review with one finished reviewer and one still in flight."""
+    writer = _create_board(loop, "run-cancel")
+    await writer.advance(ReviewPhase.REVIEW)
+    await writer.start_assignments(
+        (
+            ReviewAssignment(dimension="security", focus="x"),
+            ReviewAssignment(dimension="bug", focus="x"),
+        )
     )
     # A finished reviewer keeps its terminal state; work still in flight must not.
-    done_reviewer = state.reviewer_state("security")
-    done_reviewer.status = "completed"
-    state.reviewer_state("bug").status = "running"
-    batch = state.judge_batches.setdefault("judge", JudgeBatchState(batch_id="judge"))
-    batch.status = "running"
-    loop.review_loop.runs[REVIEW_SESSION_KEY] = state
-    return state
+    await writer.reviewer_started("security", evidence_assigned=1)
+    await writer.reviewer_settled("security", status=CHILD_COMPLETED)
+    await writer.reviewer_started("bug", evidence_assigned=1)
+    await writer.judge_started("judge")
+    return _board(loop)
 
 
 @pytest.mark.asyncio
 async def test_stopped_run_marks_inflight_reviewer_and_judge_stopped(tmp_path) -> None:
     """/stop finalizes the run; unfinished work is ``stopped``, never completed."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    state = _live_run(loop)
+    await _live_run(loop)
 
     await loop._finalize_review_run(REVIEW_SESSION_KEY, ReviewRunStatus.STOPPED)
 
+    state = _board(loop)
     assert state.status is ReviewRunStatus.STOPPED
     assert state.phase is ReviewPhase.DONE
-    assert state.reviewers["security"].status == "completed"
-    assert state.reviewers["security"].error == ""
-    assert state.reviewers["bug"].status == "stopped"
-    assert state.reviewers["bug"].error
-    assert state.judge_batches["judge"].status == "stopped"
+    assert state.reviewer("security").status == CHILD_COMPLETED
+    assert state.reviewer("security").error == ""
+    assert state.reviewer("bug").status == CHILD_STOPPED
+    assert state.reviewer("bug").error
+    assert state.judge_batches[0].status == CHILD_STOPPED
     # The terminal metadata is persisted for the session gate.
     persisted = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     assert persisted.metadata[ReviewMetaKey.STATUS] == "stopped"
@@ -407,7 +419,7 @@ async def test_stopped_run_marks_inflight_reviewer_and_judge_stopped(tmp_path) -
 async def test_error_run_marks_inflight_reviewer_and_judge_error(tmp_path) -> None:
     """A failed finalize (e.g. artifact write) records in-flight work as error."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    state = _live_run(loop)
+    await _live_run(loop)
 
     await loop._finalize_review_run(
         REVIEW_SESSION_KEY,
@@ -415,26 +427,46 @@ async def test_error_run_marks_inflight_reviewer_and_judge_error(tmp_path) -> No
         warning="Review turn failed with an unexpected error.",
     )
 
+    state = _board(loop)
     assert state.status is ReviewRunStatus.ERROR
-    assert state.reviewers["security"].status == "completed"
-    assert state.reviewers["bug"].status == "error"
-    assert state.judge_batches["judge"].status == "error"
-    assert state.judge_batches["judge"].error
+    assert state.reviewer("security").status == CHILD_COMPLETED
+    assert state.reviewer("bug").status == CHILD_ERROR
+    assert state.judge_batches[0].status == CHILD_ERROR
+    assert state.judge_batches[0].error
 
 
 @pytest.mark.asyncio
 async def test_unstarted_run_is_released_instead_of_finalized(tmp_path) -> None:
     """A run that never reached planning releases the gate instead of closing."""
     loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
-    state = ReviewRunState(
-        run_id="run-unstarted",
-        session_key=REVIEW_SESSION_KEY,
-        input_fingerprint="fp",
-    )
-    loop.review_loop.runs[REVIEW_SESSION_KEY] = state
+    _create_board(loop, "run-unstarted")
 
-    assert loop.review_loop.discard_unstarted(REVIEW_SESSION_KEY) is True
-    assert loop.review_loop.get(REVIEW_SESSION_KEY) is None
+    assert (  # noqa: SLF001
+        loop._review_boards.drop_unstarted(REVIEW_SESSION_KEY, run_id="run-unstarted")
+        is not None
+    )
+    assert loop._review_boards.view(REVIEW_SESSION_KEY) is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_direct_command_turn_releases_its_unstarted_run(tmp_path) -> None:
+    """A direct request answered by a command must not leave the gate closed.
+
+    The direct entry points let an allowed command (``/status``) answer a
+    message that also carries a review admission. That turn never reaches the
+    review pipeline, so without the turn-scoped release its ``PREPARE`` board
+    would keep gating the session for the life of the process.
+    """
+    loop = SessionCoordinator(MessageBus(), _DummyProvider(), tmp_path)
+    _create_board(loop, "run-direct-command")
+
+    await loop.process_direct(
+        "/status",
+        session_key=REVIEW_SESSION_KEY,
+        metadata={"_review_admitted": "run-direct-command"},
+    )
+
+    assert loop._review_boards.view(REVIEW_SESSION_KEY) is None  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +516,7 @@ def test_admit_review_registers_run_and_persists_metadata(tmp_path) -> None:
 
     admission = _admit(loop, target)
 
-    state = loop._review_runs[REVIEW_SESSION_KEY]
+    state = _board(loop)
     assert state.run_id == admission.run_id
     assert state.input_fingerprint == admission.input_fingerprint
     assert state.snapshot_ref == admission.snapshot_ref
@@ -503,7 +535,7 @@ def test_admit_review_rejects_duplicate_submission(tmp_path) -> None:
         _admit(loop, target)
 
     assert excinfo.value.code is ReviewAdmissionCode.DUPLICATE_REVIEW
-    assert loop._review_runs[REVIEW_SESSION_KEY].run_id == first.run_id
+    assert _board(loop).run_id == first.run_id
     assert loop.sessions.get_or_create(REVIEW_SESSION_KEY).metadata == original
 
 
@@ -515,7 +547,7 @@ def test_rejected_admission_creates_no_session_or_run(tmp_path) -> None:
             ReviewAdmissionRequest(target=str(tmp_path / "missing"), session_key=REVIEW_SESSION_KEY)
         )
 
-    assert REVIEW_SESSION_KEY not in loop._review_runs
+    assert loop._review_boards.view(REVIEW_SESSION_KEY) is None  # noqa: SLF001
     assert ReviewMetaKey.RUN_ID not in loop.sessions.get_or_create(REVIEW_SESSION_KEY).metadata
 
 
@@ -528,8 +560,8 @@ async def test_admitted_turn_reaches_processing_without_reregistering(
     executed: list[str | None] = []
 
     async def _fake_execute(request):
-        state = loop.review_loop.get(REVIEW_SESSION_KEY)
-        executed.append(state.run_id if state else None)
+        board = loop._review_boards.view(REVIEW_SESSION_KEY)  # noqa: SLF001
+        executed.append(board.run_id if board else None)
         return ReviewLoopOutcome(report_markdown="ok", produces_report=False)
 
     monkeypatch.setattr(loop.review_loop, "execute", _fake_execute)
@@ -622,14 +654,15 @@ async def test_stop_settles_a_leftover_run_without_an_active_turn(tmp_path) -> N
     loop, target = _admission_loop(tmp_path)
     admission = _admit(loop, target)
     # Simulate the unsettled outcome: the turn ended, the run stayed running.
-    state = loop.review_loop.get(REVIEW_SESSION_KEY)
-    state.phase = ReviewPhase.CLEANUP
+    writer = loop._review_boards.writer(REVIEW_SESSION_KEY)  # noqa: SLF001
+    assert writer is not None
+    await writer.advance(ReviewPhase.CLEANUP)
     loop.sessions.save(loop.sessions.get_or_create(REVIEW_SESSION_KEY))
 
     note = await loop._settle_review_run_after_stop(REVIEW_SESSION_KEY)
 
     assert note == f"Settled review run {admission.run_id} as stopped."
-    assert loop.review_loop.running(REVIEW_SESSION_KEY) is None
+    assert loop._review_boards.running(REVIEW_SESSION_KEY) is None  # noqa: SLF001
     persisted = loop.sessions.get_or_create(REVIEW_SESSION_KEY)
     assert persisted.metadata[ReviewMetaKey.STATUS] == "stopped"
     assert persisted.metadata[ReviewMetaKey.PHASE] == "done"
@@ -678,7 +711,7 @@ async def test_cancel_while_queued_on_the_lock_settles_instead_of_discarding(
     """
     loop, target = _admission_loop(tmp_path)
     admission = _admit(loop, target)
-    assert loop.review_loop.running(REVIEW_SESSION_KEY) is not None
+    assert loop._review_boards.running(REVIEW_SESSION_KEY) is not None  # noqa: SLF001
 
     # Hold the session lock so the dispatched turn parks on acquisition.
     lock = loop._session_locks.setdefault(REVIEW_SESSION_KEY, asyncio.Lock())
@@ -711,7 +744,7 @@ async def test_cancel_while_queued_on_the_lock_settles_instead_of_discarding(
         lock.release()
 
     # The admitted run survived as a settled (stopped) run, not discarded.
-    state = loop.review_loop.get(REVIEW_SESSION_KEY)
+    state = loop._review_boards.view(REVIEW_SESSION_KEY)  # noqa: SLF001
     assert state is not None
     assert state.status is ReviewRunStatus.STOPPED
     persisted = loop.sessions.get_or_create(REVIEW_SESSION_KEY)

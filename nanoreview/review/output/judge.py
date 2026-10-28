@@ -10,8 +10,8 @@ are explicitly marked as ``needs_confirmation`` rather than silently accepted.
 
 Each batch runs through the shared :class:`~nanoreview.agent.runner.AgentRunner`
 with the same provider/model as the coordinator/plan run, so the judge inherits
-provider retry, terminal retry, cancellation and usage accounting instead of
-calling the provider directly.
+provider retry, structured-output correction, cancellation and usage accounting
+instead of calling the provider directly.
 """
 from __future__ import annotations
 
@@ -30,12 +30,7 @@ from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_tur
 from nanoreview.agent.review_state import bound_child_error
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.registry import ToolRegistry
-from nanoreview.agent.tools.review_judge import (
-    VERDICT_TOOL_NAME,
-    VERDICT_TOOL_SCHEMA,
-    JudgeVerdictReceiver,
-    SubmitJudgeVerdictsTool,
-)
+from nanoreview.review.contracts import judge_contract
 from nanoreview.review.types import (
     FindingVerdict,
     ReviewDimensionResult,
@@ -58,10 +53,13 @@ _FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000
 _CHARS_PER_TOKEN = 4
 
 #: Reserved tokens for the model's response (matches ReviewJudgeConfig.max_tokens
-#: by default). Keeps room for the tool-call verdict payload.
+#: by default). Keeps room for the verdict payload.
 _DEFAULT_RESERVED_OUTPUT_TOKENS = 2048
 
 #: Fixed instruction text prepended to the candidate JSON in each user prompt.
+#: The batch runs tool-less, so this prompt — not a tool schema — is where the
+#: model learns the verdict shape; the payload contract is appended right after
+#: it by ``_build_prompt``.
 _PROMPT_INSTRUCTION = (
     "Judge these code review candidates. Use decision accept, reject, or "
     "needs_confirmation. Reject unsupported, vague, duplicate, or non-actionable "
@@ -73,15 +71,14 @@ _PROMPT_INSTRUCTION = (
     "manual verification."
 )
 
-#: Terminal submission attempts allowed for one judge batch inside one AgentRun.
-_JUDGE_TERMINAL_RETRY_LIMIT = 5
-#: Tool choice forces ``submit_verdicts`` each turn, so every iteration is one
-#: terminal attempt; a few spare iterations absorb empty/length recovery turns.
-_JUDGE_MAX_ITERATIONS = _JUDGE_TERMINAL_RETRY_LIMIT + 2
+#: Rejections of one batch's final answer allowed before the batch fails.
+_JUDGE_OUTPUT_RETRY_LIMIT = 3
+#: Request allowance per batch: the contract rejections above plus the
+#: empty/length recovery turns the runner may still need.
+_JUDGE_MAX_ITERATIONS = _JUDGE_OUTPUT_RETRY_LIMIT + 3
 
-#: Tool-result budget for the judge run. The judge registers a single terminal
-#: tool whose result is a short acknowledgement, so a small bound is enough and
-#: keeps a pathological payload from inflating the batch conversation.
+#: Tool-result budget for the judge run. The judge is tool-less, so this only
+#: bounds the runner's per-result normalization.
 _JUDGE_MAX_TOOL_RESULT_CHARS = 4_096
 
 
@@ -124,7 +121,7 @@ class JudgeExecutionResult:
 
     ``verdicts`` always covers every collected candidate (explicit
     ``needs_confirmation`` for anything unjudged); ``error`` is a bounded reason
-    for a batch/provider/terminal failure, and is non-empty only when at least
+    for a batch/provider/output-contract failure, and is non-empty only when at least
     one batch failed. ``usage`` aggregates every batch that reached the model,
     including failed and timed-out ones: a failure never hides tokens that were
     already consumed.
@@ -189,7 +186,8 @@ class ReviewJudge:
 
     The judge shares the coordinator/plan ``AgentRunner`` and model. It never
     creates its own provider, runner or model preset: batch execution differs
-    from the plan run only in the prompt, tool set and terminal tool.
+    from the plan run only in the prompt and tool set: the run has no tools at
+    all and its final answer is the structured verdict payload.
     """
 
     def __init__(
@@ -218,7 +216,7 @@ class ReviewJudge:
         Candidates that could not be judged (too large to fit a single batch,
         batch failure, timeout) receive an explicit ``needs_confirmation``
         verdict so they are never silently treated as accepted. Cancellation
-        propagates; ordinary provider/terminal/timeout errors become a bounded
+        propagates; ordinary provider/output-contract/timeout errors become a bounded
         ``error`` plus ``needs_confirmation`` candidates.
         """
         candidates = self._collect_candidates(dimensions)
@@ -255,17 +253,15 @@ class ReviewJudge:
 
         context_window = self._resolve_context_window()
         reserved_output = max(1, int(self._config.max_tokens or _DEFAULT_RESERVED_OUTPUT_TOKENS))
-        # Per-request fixed cost: system prompt, the verdict tool schema, the
-        # fixed instruction text of the user prompt, and the reserved output.
-        # Estimated with the shared tiktoken helper so judge budgeting matches
-        # the rest of the runtime.
+        # Per-request fixed cost: system prompt, the fixed instruction text of
+        # the user prompt, and the reserved output. Estimated with the shared
+        # tiktoken helper so judge budgeting matches the rest of the runtime.
         fixed_tokens = (
             self._estimate_tokens(
                 [
                     {"role": "system", "content": self._system_prompt()},
                     {"role": "user", "content": _PROMPT_INSTRUCTION},
                 ],
-                [VERDICT_TOOL_SCHEMA],
             )
             + reserved_output
         )
@@ -393,7 +389,7 @@ class ReviewJudge:
     ) -> tuple[dict[str, ReviewJudgeVerdict], ReviewJudgeStats, dict[str, int], str | None]:
         """Execute every batch and fold in per-candidate needs_confirmation.
 
-        A provider error, terminal failure or timeout on one batch marks the
+        A provider error, rejected output or timeout on one batch marks the
         affected candidates ``needs_confirmation`` and records a bounded reason
         in the returned error (so the caller records an ``error`` batch) but
         does not abort the remaining batches. Whatever the failed batch already
@@ -609,15 +605,12 @@ class ReviewJudge:
         """Run one batch through the shared ``AgentRunner``.
 
         Returns ``(verdicts, usage)``. The batch is only successful when the run
-        completed *and* the receiver captured a legal ``submit_verdicts``
-        submission; every other outcome raises a :class:`_JudgeBatchError`
-        carrying the usage the batch already consumed, so ``_run_batches`` marks
-        the candidates ``needs_confirmation``, records a bounded error and still
-        accounts for the spend.
+        completed *and* its final answer satisfied the verdict contract; every
+        other outcome raises a :class:`_JudgeBatchError` carrying the usage the
+        batch already consumed, so ``_run_batches`` marks the candidates
+        ``needs_confirmation``, records a bounded error and still accounts for
+        the spend.
         """
-        receiver = JudgeVerdictReceiver()
-        tools = ToolRegistry()
-        tools.register(SubmitJudgeVerdictsTool(receiver))
         # Observes per-iteration usage so a batch cancelled by the timeout below
         # still reports the tokens it burned; harmless on the success path,
         # where ``AgentRunResult.usage`` is authoritative.
@@ -628,18 +621,16 @@ class ReviewJudge:
                 {"role": "user", "content": self._build_prompt(batch)},
             ],
             working_messages=[],
-            tools=tools,
+            # The judge is a pure decision step: it needs no tools, only the
+            # candidate batch and its output contract.
+            tools=ToolRegistry(),
             model=self._model,
             max_iterations=_JUDGE_MAX_ITERATIONS,
             max_tool_result_chars=_JUDGE_MAX_TOOL_RESULT_CHARS,
             temperature=0,
             max_tokens=self._config.max_tokens,
-            tool_choice={
-                "type": "function",
-                "function": {"name": VERDICT_TOOL_NAME},
-            },
-            terminal_tools=frozenset({VERDICT_TOOL_NAME}),
-            terminal_retry_limit=_JUDGE_TERMINAL_RETRY_LIMIT,
+            output_contract=judge_contract(),
+            output_retry_limit=_JUDGE_OUTPUT_RETRY_LIMIT,
             context_window_tokens=self._config.context_window_tokens,
             error_message=None,
             concurrent_tools=False,
@@ -682,9 +673,12 @@ class ReviewJudge:
                 usage=usage_observer.usage,
             ) from exc
         if result.stop_reason != "completed":
+            # ``error`` is the cause the batch actually stopped for, and for a
+            # contract rejection it is the rejection reason itself; reading it
+            # first keeps an earlier rejection from masking the real failure.
             reason = (
-                result.terminal_error
-                or result.error
+                result.error
+                or result.output_error
                 or result.final_content
                 or f"judge batch stopped with {result.stop_reason}"
             )
@@ -698,17 +692,31 @@ class ReviewJudge:
                 f"AI judge batch failed ({result.stop_reason}): {reason}",
                 usage=dict(result.usage),
             )
-        if receiver.submission is None:
+        payload = result.structured_output
+        verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
+        if not isinstance(verdicts, dict):
             raise _JudgeBatchError(
-                "AI judge batch failed: submit_verdicts was not called",
+                "AI judge batch failed: no verdicts were returned",
                 usage=dict(result.usage),
             )
-        return receiver.submission, dict(result.usage)
+        # An empty verdict map is a legitimate outcome: the judge declined to
+        # decide, and every candidate degrades to ``needs_confirmation``. A
+        # non-empty map whose ids match nothing is not — it means the model
+        # invented ids, so no candidate would ever be judged.
+        batch_ids = {candidate_id for candidate_id, _candidate, _hard in batch}
+        if verdicts and not batch_ids.intersection(verdicts):
+            raise _JudgeBatchError(
+                "AI judge batch failed: no verdict id matched any candidate in "
+                "the batch (verdict ids must be copied verbatim)",
+                usage=dict(result.usage),
+            )
+        return verdicts, dict(result.usage)
 
     def _system_prompt(self) -> str:
         base = (
             "You are a strict code-review judge. Decide whether each candidate is "
-            "actionable and supported. Call submit_verdicts with your decisions."
+            "actionable and supported. Reply with one JSON object holding the "
+            "verdicts for the candidates."
         )
         if self._common_rules_workspace is None:
             return base
@@ -754,32 +762,15 @@ class ReviewJudge:
             cls._candidate_payload_entry(candidate_id, candidate, verdict)
             for candidate_id, candidate, verdict in candidates
         ]
-        return _PROMPT_INSTRUCTION + "\n\n" + json.dumps(payload, ensure_ascii=False)
-
-
-#: Conservative fallback context window (tokens) when the runtime cannot
-#: supply a usable value. Logged when used so operators can correct the
-#: configuration. Chosen to be small enough to fit most judge models while
-#: still allowing a meaningful single batch.
-_FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000
-
-#: Rough chars-per-token estimate used ONLY when tiktoken is unavailable
-#: (estimate_prompt_tokens returns 0). 4 chars/token is a conservative upper
-#: bound for mixed ASCII/CJK content that avoids underestimating cost.
-_CHARS_PER_TOKEN = 4
-
-#: Reserved tokens for the model's response (matches ReviewJudgeConfig.max_tokens
-#: by default). Keeps room for the tool-call verdict payload.
-_DEFAULT_RESERVED_OUTPUT_TOKENS = 2048
-
-#: Fixed instruction text prepended to the candidate JSON in each user prompt.
-_PROMPT_INSTRUCTION = (
-    "Judge these code review candidates. Use decision accept, reject, or "
-    "needs_confirmation. Reject unsupported, vague, duplicate, or non-actionable "
-    "items. Keep true high-risk issues. A hard_reason such as evidence not "
-    "found in file can be caused by evidence formatting; if the candidate has "
-    "a concrete file, line, and code-like evidence, do not reject solely for "
-    "that hard_reason. Use accept when the claim is supported by the supplied "
-    "evidence, or needs_confirmation when it is plausible but still requires "
-    "manual verification."
-)
+        # The batch has no tools, so the expected answer shape has to travel in
+        # the prompt itself: without it the model guesses (a bare array, a dict
+        # of id -> decision) and every batch burns its first answer on a
+        # rejection.
+        shape = judge_contract().shape
+        return (
+            f"{_PROMPT_INSTRUCTION}\n\n"
+            f"Answer with one JSON object and nothing else. Expected shape: {shape}\n"
+            "Return exactly one verdict per candidate, reusing each candidate's "
+            '"id" value verbatim.\n\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )

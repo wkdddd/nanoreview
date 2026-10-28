@@ -3,8 +3,8 @@
 These tests pin the judge contract directly (without the finalizer):
 - every accepted/uncertain candidate enters the judge scope (no fixed cap);
 - candidates are batched greedily within the runtime context window;
-- each batch executes through the shared ``AgentRunner`` and the
-  ``submit_verdicts`` terminal tool, with the same model as the plan run;
+- each batch executes through the shared ``AgentRunner``; the run has no tools
+  at all and its final answer must be the structured verdict payload;
 - any candidate without a valid verdict is explicitly needs_confirmation;
 - ``JudgeExecutionResult`` carries verdicts, stats, usage and a bounded error;
 - a failed or timed-out batch still reports the tokens it already consumed.
@@ -12,6 +12,7 @@ These tests pin the judge contract directly (without the finalizer):
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from nanoreview.config.schema import (
     ReviewConfig,
     ReviewJudgeSettings,
 )
-from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanoreview.providers.base import LLMProvider, LLMResponse
 from nanoreview.review.output.judge import JudgeExecutionResult, ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.types import (
     FindingVerdict,
@@ -39,13 +40,13 @@ from nanoreview.review.types import (
 #: Window large enough that normal fixtures always fit in one batch.
 _LARGE_WINDOW = 200_000
 
-#: Sentinel reply meaning "the model answered with prose instead of the tool".
+#: Sentinel reply meaning "the model answered with prose instead of the payload".
 _PROSE = object()
 
 
 @dataclass(frozen=True, slots=True)
 class _RawArgs:
-    """Reply that calls ``submit_verdicts`` with unchecked raw arguments."""
+    """Reply carrying a structurally wrong verdict payload."""
 
     arguments: dict[str, Any]
 
@@ -87,20 +88,10 @@ class FakeJudgeProvider:
         usage = dict(self._usage) if self._usage else {}
         if reply is _PROSE:
             return LLMResponse(content="All candidates look fine to me.", usage=usage)
-        arguments = (
+        payload = (
             reply.arguments if isinstance(reply, _RawArgs) else {"verdicts": reply}
         )
-        return LLMResponse(
-            content=None,
-            tool_calls=[
-                ToolCallRequest(
-                    id=f"call-{index + 1}",
-                    name="submit_verdicts",
-                    arguments=arguments,
-                )
-            ],
-            usage=usage,
-        )
+        return LLMResponse(content=json.dumps(payload), usage=usage)
 
 
 class RecordingRunner:
@@ -749,7 +740,7 @@ async def test_judge_usage_resets_between_runs() -> None:
     assert second.usage == {}
 
 
-async def test_judge_batch_runs_through_shared_runner_with_terminal_spec() -> None:
+async def test_judge_batch_runs_through_shared_runner_with_structured_output() -> None:
     """The batch uses the injected runner and a fully configured AgentRunSpec."""
     provider = FakeJudgeProvider([[]])
     runner = RecordingRunner(provider)
@@ -765,22 +756,21 @@ async def test_judge_batch_runs_through_shared_runner_with_terminal_spec() -> No
     assert spec.max_tokens == 128
     assert spec.context_window_tokens == _LARGE_WINDOW
     assert spec.error_message is None
-    assert spec.tool_choice == {
-        "type": "function",
-        "function": {"name": "submit_verdicts"},
-    }
-    assert spec.terminal_tools == frozenset({"submit_verdicts"})
-    assert spec.terminal_retry_limit == 5
-    assert spec.max_iterations > spec.terminal_retry_limit
-    # Only the judge terminal tool is exposed, and the batch shares no session,
-    # workspace, checkpoint or injection state with the plan run.
-    assert spec.tools.tool_names == ["submit_verdicts"]
+    # The judge has no tools at all: its final answer *is* the verdict payload.
+    assert spec.tool_choice is None
+    assert spec.tools.tool_names == []
+    assert spec.output_contract is not None
+    assert spec.output_contract.name == "judge_verdicts"
+    assert spec.output_retry_limit == 3
+    assert spec.max_iterations == spec.output_retry_limit + 3
+    # The batch shares no session, workspace, checkpoint or injection state.
     assert spec.workspace is None
     assert spec.session_key is None
     assert spec.checkpoint_callback is None
     assert spec.injection_callback is None
-    assert [message["role"] for message in [*spec.frozen_messages, *spec.working_messages]] == ["system", "user"]
-    assert "S1" in [*spec.frozen_messages, *spec.working_messages][1]["content"]
+    messages = [*spec.frozen_messages, *spec.working_messages]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "S1" in messages[1]["content"]
 
 
 async def test_judge_prose_response_marks_candidates_needs_confirmation() -> None:
@@ -790,15 +780,15 @@ async def test_judge_prose_response_marks_candidates_needs_confirmation() -> Non
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
-    assert len(provider.calls) > 1  # terminal retry re-asks for the tool
+    assert len(provider.calls) > 1  # the contract retry re-asks for the JSON
     assert result.error is not None
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
     assert "batch failed" in verdict.reason
 
 
-async def test_judge_invalid_tool_arguments_are_retried_then_succeed() -> None:
-    """Bad terminal arguments are fed back and a corrected submission wins."""
+async def test_judge_malformed_verdicts_are_retried_then_succeed() -> None:
+    """A structurally wrong payload is fed back and a corrected answer wins."""
     candidate_id = "security:src/app.py:1:s1"
     provider = FakeJudgeProvider(
         [_RawArgs({"verdicts": "not-an-array"}), [_accept_verdict(candidate_id)]]
@@ -812,8 +802,8 @@ async def test_judge_invalid_tool_arguments_are_retried_then_succeed() -> None:
     assert result.verdicts[candidate_id].decision == ReviewJudgeDecision.ACCEPT
 
 
-async def test_judge_permanently_invalid_arguments_fail_the_batch() -> None:
-    """Invalid arguments repeated to the retry limit fail with a bounded error."""
+async def test_judge_permanently_malformed_verdicts_fail_the_batch() -> None:
+    """A payload rejected to the retry limit fails with a bounded error."""
     provider = FakeJudgeProvider([_RawArgs({"verdicts": "not-an-array"})])
     judge = _judge(provider, timeout_seconds=5)
 
@@ -823,6 +813,19 @@ async def test_judge_permanently_invalid_arguments_fail_the_batch() -> None:
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
     assert "batch failed" in verdict.reason
+
+
+async def test_judge_verdicts_matching_no_candidate_fail_the_batch() -> None:
+    """Invented verdict ids judge nothing, so the batch must not look clean."""
+    provider = FakeJudgeProvider([[_accept_verdict("security:src/app.py:99:ghost")]])
+    judge = _judge(provider, timeout_seconds=5)
+
+    result = await judge.judge_dimensions([_dimension("security", ["S1"])])
+
+    assert result.error is not None
+    assert "no verdict id matched" in result.error
+    verdict = next(iter(result.verdicts.values()))
+    assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
 
 
 async def test_judge_ignores_configured_model_preset(tmp_path: Path) -> None:

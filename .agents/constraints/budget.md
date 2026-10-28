@@ -40,16 +40,18 @@ planner_manifest_budget = 80_000（上下文窗口 40%）
 evidence_token_budget = 150_000（diff evidence 总额；direct_cap = 42_750 以上进入分页）
 diff evidence 单文件阈值 = 8_000（`<threshold` 一个完整 unit；`>=threshold` 按 hunk 切分）
 reviewer_max_output_tokens = 8_192
-reviewer_model_request_limit = 30（最后一次请求用于 review_submit）
+reviewer_model_request_limit = 30（最后若干次仍属 reviewer，最终答案必须是结构化 findings）
+reviewer/planner/judge 输出纠正配额 = 3 / 5 / 3（`output_retry_limit`）
 reviewer_timeout_seconds = 180
 ```
 
 - review 输入只有本地 diff：evidence 就是 changed hunk，预处理不枚举仓库、不读完整源码、不做语义切块，因此不存在 related 补充预算、`max_file_chars` 截断标记或按文件规模分级的三态决策；单个超大 hunk 无法安全切分时整块记为 skipped（`token_limit_exceeded`）。
 - Planner 只读一个结构化 manifest（`review/planning/manifest.py`），其 references 与 skipped/omitted 说明共享 80k 预算；超限时按 frozen 顺序保留前缀并记录被省略的 id/数量/原因，**不再按风险排序**。manifest 的 version、`input_mode` 与 token counter 随 `EvidenceManifest.snapshot_payload()` 持久化到 review snapshot。
 - Planner 输入分 `direct`/`paged`：`direct` 内联全部 evidence 全文；`paged` 只渲染索引，内容由 `list_review_diff`/`read_review_diff` 分页读取，单次响应预算对齐运行期 `max_tool_result_chars`，避免 reader 声称已读后被 `AgentRunner` 再截断。有界读取的三条硬规则：请求的 ID 不得被隐藏丢弃（超预算部分显式列出 ID）；单个 unit 超过页面预算时必须在正文内标注“未完整展示”，绝不返回无标记的半个 patch；reference excerpt 上限（40k 字符）不得低于单文件完整 diff unit 的最大规模（`DIFF_UNIT_TOKEN_THRESHOLD * 4`），否则 direct 模式会静默丢 unit 尾部。
-- Planner 请求上限 `24`（`_PLANNER_MAX_ITERATIONS`），分诊需要多次有界读取 + 多条 decision + finish；不强制 `tool_choice`，由 `finish_review_triage` 的 reserved terminal iteration 保证收尾。散文回合配额 `prose_retry_limit=8` 与 terminal 提交配额（5）分开计。reviewer 的 30 次不变。
+- Planner 请求上限 `24`（`_PLANNER_MAX_ITERATIONS`），分诊需要多次有界读取 + 一次完整 decision set；没有 `tool_choice` 强制。输出契约被拒时在同一 run 内追加纠正提示，配额 `_PLANNER_OUTPUT_RETRY_LIMIT=5`；耗尽后 `stop_reason="invalid_output"` 并让 planning 失败。reviewer 的 30 次不变，Judge `_JUDGE_MAX_ITERATIONS = 3 + 3`。
 - reviewer frozen task（本次授权 diff evidence）是固定输入，不参与工作历史压缩；容量不足必须显式失败或记录 coverage 缺口，不得静默丢弃授权 evidence，也不得假定压缩能裁剪 frozen task。
-- 「最后一次请求用于 review_submit」由 `AgentRunner` 的 reserved terminal iteration 强制执行：终局迭代（`iteration == max_iterations - 1`）只暴露 terminal tool，单一 terminal tool 再经 `tool_choice` 强制，仍在同一 request 预算内。Judge（`submit_verdicts`）本就每轮强制；Planner 靠 terminal 保留轮收尾；其他 terminal-tool run 同样获得一次保证提交。可用 `AgentRunSpec.reserve_terminal_iteration=False` 关闭。
+- **不再有保留的 terminal 提交轮**：review 全链路移除 terminal tool 协议后，`reserve_terminal_iteration` / `terminal_retry_limit` / `prose_retry_limit` 一并删除。结构正确性改由 `AgentRunSpec.output_contract` + `output_retry_limit` 保证：被拒的答案不进 `final_content`、不置 `structured_output`，只追加一条带具体原因的纠正消息继续同一 run；配额耗尽以 `invalid_output` 收场。因此「预算内一定提交成功」不再是保证，取而代之的是「被拒绝不能冒充成功」。
+- **但最后一次请求不再开放工具**：结构化 run 的 `iteration == max_iterations - 1` 由 `_is_final_structured_turn()` 判定，该轮不给工具并明确要求直接给答案，避免预算被一次无法回收的工具调用耗尽后停在与内容无关的 `max_iterations`。该轮被拒同样是 `invalid_output`，不会获得额外纠正轮。
 - reviewer 内重复 `read_file`/`grep` 按单 run ledger 抑制（相同规范化范围 + 内容未变时返回短提示），`force` 不可绕过；这是上下文效率控制，不是累计 token 硬上限，也不跨 reviewer/review run 共享。
 
 ## 变更检查

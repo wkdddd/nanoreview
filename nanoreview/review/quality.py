@@ -315,8 +315,8 @@ class ReplayStep:
 
 
 @dataclass(frozen=True, slots=True)
-class SubmitStep:
-    """The recorded terminal ``review_submit`` payload."""
+class FinalAnswerStep:
+    """The recorded final structured answer of one reviewer run."""
 
     findings: tuple[ActualFinding, ...]
     duration_ms: float = 0.0
@@ -341,7 +341,7 @@ class ReplayOutcome:
 
 def replay_case(
     case: GoldenCase,
-    script: Sequence[ReplayStep | SubmitStep],
+    script: Sequence[ReplayStep | FinalAnswerStep],
     *,
     usage: Mapping[str, int] | None = None,
     dimension_statuses: Mapping[str, str] | None = None,
@@ -349,7 +349,7 @@ def replay_case(
     """Replay a scripted run and collect its findings, cost and coverage."""
     outcome = ReplayOutcome(findings=[], usage=dict(usage or {}))
     for step in script:
-        if isinstance(step, SubmitStep):
+        if isinstance(step, FinalAnswerStep):
             outcome.findings.extend(step.findings)
             outcome.elapsed_ms += step.duration_ms
             if step.dimension:

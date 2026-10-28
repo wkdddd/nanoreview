@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from nanoreview.agent.runner import AgentRunResult
@@ -13,7 +11,6 @@ from nanoreview.agent.subagent_profiles import (
     SECURITY_REVIEWER_SCOPE,
 )
 from nanoreview.agent.tools.loader import ToolLoader
-from nanoreview.agent.tools.review_submit import review_submit
 from nanoreview.review.input.normalizers import normalize_requested_dimensions
 from nanoreview.review.planning.triage import TriageReceiver
 from nanoreview.review.profiles import (
@@ -41,9 +38,7 @@ def test_execution_profiles_use_dedicated_scopes_and_require_shared_tools() -> N
     assert profiles["performance"].scope == PERFORMANCE_REVIEWER_SCOPE
     assert profiles["maintainability"].scope == MAINTAINABILITY_REVIEWER_SCOPE
     assert profiles["general"].scope == GENERAL_REVIEWER_SCOPE
-    assert profiles["bug"].required_tools == frozenset(
-        {"read_file", "list_dir", "grep", "review_submit"}
-    )
+    assert profiles["bug"].required_tools == frozenset({"read_file", "list_dir", "grep"})
 
 
 def test_execution_profiles_use_independent_scopes_and_required_tools() -> None:
@@ -55,7 +50,7 @@ def test_execution_profiles_use_independent_scopes_and_required_tools() -> None:
         MAINTAINABILITY_REVIEWER_SCOPE,
         GENERAL_REVIEWER_SCOPE,
     }
-    expected_required = frozenset({"read_file", "list_dir", "grep", "review_submit"})
+    expected_required = frozenset({"read_file", "list_dir", "grep"})
     assert all(profile.required_tools == expected_required for profile in profiles.values())
 
 
@@ -147,165 +142,122 @@ def test_auto_mode_accepts_a_subset_and_rejects_unknown_dimensions() -> None:
     assert "disallowed dimension" in detail
 
 
-def test_reviewer_profiles_preserve_review_submit_result() -> None:
-    """Reviewer profiles declare the accepted submission as a preserved result."""
-    profiles = reviewer_execution_profiles()
-    assert all(
-        profile.preserve_tool_result_tools == frozenset({"review_submit"})
-        for profile in profiles.values()
-    )
-
-
-def test_reviewer_profiles_declare_their_own_terminal_contract() -> None:
-    """Every registered reviewer profile declares its tools explicitly.
+def test_reviewer_profiles_declare_their_own_output_contract() -> None:
+    """Every registered reviewer profile declares its own output contract.
 
     The manager has no built-in default profile (the generic fallback was
-    removed), so each profile must carry its own terminal/preserved contract;
-    a profile that forgot to would otherwise run with the wrong boundary.
+    removed), so a profile that forgot to declare its contract would otherwise
+    run with no structured result to hand back to the review loop.
     """
     profiles = reviewer_execution_profiles()
+    assert all(profile.output_contract_factory is not None for profile in profiles.values())
     assert all(
-        profile.terminal_tools == frozenset({"review_submit"})
+        profile.output_contract_factory().name == f"reviewer.{profile.id}"
         for profile in profiles.values()
     )
+    # No review tool exists any more, so no profile preserves a tool result.
     assert all(
-        profile.preserve_tool_result_tools == frozenset({"review_submit"})
+        profile.preserve_tool_result_tools == frozenset()
         for profile in profiles.values()
     )
 
 
-def _submit_payload(*, marker: str) -> str:
-    return json.dumps(
-        {
-            "submitted": True,
-            "findings": [
-                {
-                    "severity": "high",
-                    "file": "src/app.py",
-                    "line": 1,
-                    "title": marker,
-                    "evidence": "x" * 400,
-                    "impact": "bad",
-                    "recommendation": "fix",
-                }
-            ],
-            "errors": [],
-        }
-    )
+def _finding(marker: str) -> dict[str, object]:
+    return {
+        "severity": "high",
+        "file": "src/app.py",
+        "line": 1,
+        "title": marker,
+        "evidence": "x" * 400,
+        "impact": "bad",
+        "recommendation": "fix",
+        "details": {"trigger": "input", "expected_behavior": "a", "actual_behavior": "b"},
+    }
 
 
-@pytest.mark.asyncio
-async def test_reviewer_handler_parses_full_submission() -> None:
-    handler = reviewer_execution_profiles()["bug"].result_handler
-    assert handler is not None
-    raw_result = _submit_payload(marker="Issue")
-    result = AgentRunResult(
-        final_content=None,
+def _completed_result(findings: list[dict[str, object]], **extra: object) -> AgentRunResult:
+    """An AgentRunResult whose final answer already passed the output contract."""
+    payload: dict[str, object] = {"dimension": "bug", "findings": findings}
+    payload.update(extra)
+    return AgentRunResult(
+        final_content="reviewer finished",
         messages=[
             {"role": "tool", "name": "read_file", "content": "evidence"},
-            {"role": "tool", "name": "review_submit", "content": raw_result},
+            {"role": "assistant", "content": "reviewer finished"},
         ],
         tool_events=[
             {"name": "read_file", "status": "ok", "detail": "evidence"},
-            {
-                "name": "review_submit",
-                "status": "ok",
-                "detail": raw_result[:120] + "...",
-                "raw_result": raw_result,
-            },
         ],
+        structured_output=payload,
+        stop_reason="completed",
     )
 
-    completion = await handler(result=result)
+
+@pytest.mark.asyncio
+async def test_reviewer_handler_accepts_the_structured_findings() -> None:
+    handler = reviewer_execution_profiles()["bug"].result_handler
+    assert handler is not None
+
+    completion = await handler(result=_completed_result([_finding("Issue")]))
 
     assert completion.status == "ok"
-    assert json.loads(completion.content)["findings"][0]["title"] == "Issue"
+    assert completion.payload["findings"][0]["title"] == "Issue"
+    assert completion.payload["findings"][0]["evidence"] == "x" * 400
     assert completion.stop_reason == "completed"
+    assert "1 finding(s)" in completion.content
 
 
 @pytest.mark.asyncio
-async def test_reviewer_handler_truncated_tool_message_uses_raw_result() -> None:
-    """The bounded tool message must not shadow the untruncated raw result."""
+async def test_reviewer_handler_accepts_no_findings_when_evidence_was_assigned() -> None:
+    """An empty list is a legitimate "nothing found" answer when evidence existed."""
     handler = reviewer_execution_profiles()["bug"].result_handler
     assert handler is not None
-    raw_result = _submit_payload(marker="FullFinding")
-    truncated = raw_result[:60] + "\n... (truncated)"
-    result = AgentRunResult(
-        final_content=None,
-        messages=[
-            {"role": "tool", "name": "review_submit", "content": truncated},
-        ],
-        tool_events=[
-            {
-                "name": "review_submit",
-                "status": "ok",
-                "detail": raw_result[:120] + "...",
-                "raw_result": raw_result,
-            },
-        ],
+
+    completion = await handler(
+        result=_completed_result([]), metadata={"assigned_evidence": 2}
     )
 
-    completion = await handler(result=result)
-
     assert completion.status == "ok"
-    parsed = json.loads(completion.content)
-    assert parsed["findings"][0]["title"] == "FullFinding"
-    assert parsed["findings"][0]["evidence"] == "x" * 400
+    assert completion.payload["findings"] == []
 
 
 @pytest.mark.asyncio
-async def test_reviewer_handler_rejects_unprocessed_submission() -> None:
-    """A review_submit call without a processed result is not a valid submission."""
+async def test_reviewer_handler_rejects_no_findings_without_any_evidence() -> None:
+    """Reporting no findings without reading anything is not a completed review."""
     handler = reviewer_execution_profiles()["bug"].result_handler
     assert handler is not None
+    result = _completed_result([])
     result = AgentRunResult(
-        final_content=None,
-        messages=[
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "review_submit",
-                            "arguments": _submit_payload(marker="Issue"),
-                        },
-                    }
-                ],
-            }
-        ],
-        tool_events=[
-            {"name": "review_submit", "status": "error", "detail": "failed"},
-        ],
+        final_content=result.final_content,
+        messages=result.messages,
+        tool_events=[],
+        structured_output=result.structured_output,
+        stop_reason=result.stop_reason,
     )
 
     completion = await handler(result=result)
 
     assert completion.status == "error"
-    assert "No structured findings submitted" in completion.content
+    assert "no target evidence" in completion.content
 
 
-def test_review_submit_preserves_details() -> None:
-    result = review_submit([
-        {
-            "severity": "high",
-            "file": "src/app.py",
-            "line": 4,
-            "title": "Unsafe path",
-            "evidence": "`path = request.path`",
-            "impact": "Traversal",
-            "recommendation": "Validate the path",
-            "details": {
-                "trust_boundary": "HTTP request to filesystem",
-                "attack_preconditions": "Attacker controls path",
-                "attack_path": "request -> path join -> read",
-            },
-        }
-    ])
-    assert result.submitted
-    assert result.findings[0]["details"]["trust_boundary"].startswith("HTTP")
+@pytest.mark.asyncio
+async def test_reviewer_handler_rejects_a_run_without_structured_output() -> None:
+    """A run whose answer never satisfied the contract cannot be read as success."""
+    handler = reviewer_execution_profiles()["bug"].result_handler
+    assert handler is not None
+    result = AgentRunResult(
+        final_content="I could not decide.",
+        messages=[{"role": "assistant", "content": "I could not decide."}],
+        tool_events=[],
+        stop_reason="invalid_output",
+    )
+
+    completion = await handler(result=result)
+
+    assert completion.status == "error"
+    assert "no structured result" in completion.content
+    assert completion.stop_reason == "invalid_output"
 
 
 def _reviewer_prompt(profile_id: str, metadata: dict, workspace) -> str:

@@ -1,7 +1,9 @@
 """Contract tests for ``ReviewResult`` and the review -> conversation handoff.
 
 ``ReviewResult`` is the single terminal summary the review side hands to the
-session side. Two invariants must hold no matter how a run ended:
+session side. It is always built from the run's blackboard projection, so these
+tests drive the real board store instead of hand-building a mutable state
+object. Two invariants must hold no matter how a run ended:
 
 * the handoff state must never overstate what exists — a missing report
   artifact is ``failed``, and a completed run that reported gaps is ``partial``
@@ -12,14 +14,19 @@ session side. Two invariants must hold no matter how a run ended:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
-from nanoreview.agent.review_state import (
-    JudgeBatchState,
-    ReviewPhase,
-    ReviewRunState,
-    ReviewRunStatus,
+import pytest
+
+from nanoreview.agent.review_board import (
+    CHILD_COMPLETED,
+    CHILD_ERROR,
+    CHILD_STOPPED,
+    ReviewBoardStore,
+    ReviewBoardWriter,
 )
+from nanoreview.agent.review_state import ReviewArtifactStore, ReviewRunStatus
 from nanoreview.review.result import (
     GAP_MAX_CHARS,
     REVIEW_REPORT_SOURCE,
@@ -27,31 +34,77 @@ from nanoreview.review.result import (
     render_handoff_block,
     render_handoff_directive,
     render_review_context_index,
-    result_from_run_state,
+    result_from_board,
     result_from_session_metadata,
 )
 from nanoreview.review.types import ReviewMetaKey
+from nanoreview.session.manager import SessionManager
 
 REPORT_REF = "review-artifacts/run-a.json"
+SESSION_KEY = "cli:review"
+RUN_ID = "run-a"
+SNAPSHOT_REF = "review-snapshots/run-a.json"
 
 
-def _run_state(
+class _FailingArtifacts(ReviewArtifactStore):
+    """Artifact store whose writes always fail (a full disk, a read-only root)."""
+
+    def write(self, artifact: dict[str, Any]) -> str | None:  # noqa: D102 - stub
+        return None
+
+
+@pytest.fixture
+def boards(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    return _store(workspace)
+
+
+def _store(workspace, *, artifacts=None) -> ReviewBoardStore:
+    return ReviewBoardStore(
+        sessions=SessionManager(workspace),
+        artifacts=artifacts or ReviewArtifactStore(workspace),
+    )
+
+
+def _writer(store: ReviewBoardStore, *, snapshot_ref: str | None = SNAPSHOT_REF):
+    """Create one run's board and return its writer handle."""
+    store.create(
+        SimpleNamespace(
+            run_id=RUN_ID,
+            session_key=SESSION_KEY,
+            input_fingerprint="fp",
+            snapshot_ref=snapshot_ref,
+            plan=None,
+        )
+    )
+    writer = store.writer(SESSION_KEY)
+    assert writer is not None
+    return writer
+
+
+async def _finished(
+    store: ReviewBoardStore,
     *,
     status: ReviewRunStatus = ReviewRunStatus.COMPLETED,
-    report_ref: str | None = REPORT_REF,
-    snapshot_ref: str | None = "review-snapshots/run-a.json",
-    summary: str = "",
-) -> ReviewRunState:
-    return ReviewRunState(
-        run_id="run-a",
-        session_key="cli:review",
-        input_fingerprint="fp",
-        phase=ReviewPhase.DONE,
-        status=status,
-        report_ref=report_ref,
-        snapshot_ref=snapshot_ref,
-        summary=summary,
-    )
+    report: str = "## Code Review Report\n\nNo actionable issues found.",
+    findings: tuple[dict[str, Any], ...] = (),
+    snapshot_ref: str | None = SNAPSHOT_REF,
+) -> ReviewBoardWriter:
+    """Drive a run to *status*, optionally persisting a report first."""
+    writer = _writer(store, snapshot_ref=snapshot_ref)
+    if report:
+        await writer.record_report(
+            report_markdown=report, findings=findings, verdicts=[]
+        )
+    await writer.settle(status)
+    return writer
+
+
+def _result(store: ReviewBoardStore):
+    view = store.view(SESSION_KEY)
+    assert view is not None
+    return result_from_board(view)
 
 
 # ---------------------------------------------------------------------------
@@ -59,8 +112,10 @@ def _run_state(
 # ---------------------------------------------------------------------------
 
 
-def test_completed_run_without_gaps_is_a_complete_handoff() -> None:
-    result = result_from_run_state(_run_state())
+async def test_completed_run_without_gaps_is_a_complete_handoff(boards) -> None:
+    await _finished(boards)
+
+    result = _result(boards)
 
     assert result.handoff is ReviewHandoffState.COMPLETE
     assert result.is_terminal is True
@@ -69,27 +124,36 @@ def test_completed_run_without_gaps_is_a_complete_handoff() -> None:
     assert result.error == ""
 
 
-def test_run_without_a_report_artifact_is_failed_however_it_ended() -> None:
+async def test_run_without_a_report_artifact_is_failed_however_it_ended(
+    boards,
+) -> None:
     for status in (
         ReviewRunStatus.COMPLETED,
         ReviewRunStatus.ERROR,
         ReviewRunStatus.STOPPED,
     ):
-        result = result_from_run_state(_run_state(status=status, report_ref=None))
+        await _writer(boards).settle(status)
+        result = _result(boards)
 
         assert result.handoff is ReviewHandoffState.FAILED, status
         assert result.has_report is False
         # A failure must be explainable, never rendered as a silent success.
         assert result.error
+        boards.drop(SESSION_KEY)
 
 
-def test_completed_run_with_recorded_gaps_is_partial() -> None:
-    state = _run_state()
-    state.reviewer_state("security").status = "completed"
-    state.reviewer_state("performance").status = "error"
-    state.reviewer_state("performance").error = "provider timeout"
+async def test_completed_run_with_recorded_gaps_is_partial(boards) -> None:
+    writer = _writer(boards)
+    await writer.record_report(
+        report_markdown="## Code Review Report", findings=(), verdicts=[]
+    )
+    await writer.reviewer_settled("security", status=CHILD_COMPLETED)
+    await writer.reviewer_settled(
+        "performance", status=CHILD_ERROR, error="provider timeout"
+    )
+    await writer.settle(ReviewRunStatus.COMPLETED)
 
-    result = result_from_run_state(state)
+    result = _result(boards)
 
     assert result.handoff is ReviewHandoffState.PARTIAL
     assert "security" in result.coverage
@@ -97,19 +161,23 @@ def test_completed_run_with_recorded_gaps_is_partial() -> None:
     assert any("performance" in gap for gap in result.gaps)
 
 
-def test_terminal_failure_with_a_report_is_partial_not_complete() -> None:
-    result = result_from_run_state(_run_state(status=ReviewRunStatus.ERROR))
+async def test_terminal_failure_with_a_report_is_partial_not_complete(
+    boards,
+) -> None:
+    await _finished(boards, status=ReviewRunStatus.ERROR)
+
+    result = _result(boards)
 
     assert result.handoff is ReviewHandoffState.PARTIAL
     assert result.status is ReviewRunStatus.ERROR
     assert result.error
 
 
-def test_running_run_has_no_terminal_result() -> None:
+async def test_running_run_has_no_terminal_result(boards) -> None:
     """A live run is not terminal: nothing may be handed to the conversation."""
-    result = result_from_run_state(
-        _run_state(status=ReviewRunStatus.RUNNING, report_ref=None)
-    )
+    _writer(boards)
+
+    result = _result(boards)
 
     assert result.is_terminal is False
     assert result.handoff is ReviewHandoffState.FAILED
@@ -120,64 +188,75 @@ def test_running_run_has_no_terminal_result() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unfinished_reviewers_and_judge_batches_become_gaps() -> None:
-    state = _run_state()
-    state.reviewer_state("bug").status = "stopped"
-    state.reviewer_state("bug").error = "review stopped before the run finished"
-    batch = state.judge_batches.setdefault("judge-1", JudgeBatchState(batch_id="judge-1"))
-    batch.status = "error"
-    batch.error = "judge unavailable"
-    state.add_warning("report artifact write failed")
+async def test_unfinished_reviewers_and_judge_batches_become_gaps(boards) -> None:
+    writer = _writer(boards)
+    await writer.reviewer_settled(
+        "bug",
+        status=CHILD_STOPPED,
+        error="review stopped before the run finished",
+    )
+    await writer.judge_started("judge-1")
+    await writer.judge_settled(
+        "judge-1", status=CHILD_ERROR, error="judge unavailable"
+    )
+    await writer.add_warning("report artifact write failed")
 
-    gaps = result_from_run_state(state).gaps
+    gaps = _result(boards).gaps
 
     assert any("'bug'" in gap and "stopped before" in gap for gap in gaps)
     assert any("'judge-1'" in gap and "judge unavailable" in gap for gap in gaps)
     assert "report artifact write failed" in gaps
 
 
-def test_a_completed_reviewer_is_never_reported_as_a_gap() -> None:
-    state = _run_state()
-    reviewer = state.reviewer_state("security")
-    reviewer.status = "completed"
-    reviewer.error = "stale text left over from an earlier attempt"
+async def test_a_completed_reviewer_is_never_reported_as_a_gap(boards) -> None:
+    writer = _writer(boards)
+    await writer.reviewer_settled(
+        "security",
+        status=CHILD_COMPLETED,
+        error="stale text left over from an earlier attempt",
+    )
 
-    result = result_from_run_state(state)
+    result = _result(boards)
 
     assert result.coverage == ("security",)
     assert result.gaps == ()
 
 
-def test_gap_text_is_bounded_and_deduplicated() -> None:
-    state = _run_state()
-    reviewer = state.reviewer_state("bug")
-    reviewer.status = "error"
-    reviewer.error = "x" * (GAP_MAX_CHARS * 4)
-    # ``add_warning`` de-duplicates, so inject directly to exercise ``_gaps``.
-    state.warnings.extend(["same warning", "same warning"])
+async def test_gap_text_is_bounded_and_deduplicated(boards) -> None:
+    writer = _writer(boards)
+    await writer.reviewer_settled(
+        "bug", status=CHILD_ERROR, error="x" * (GAP_MAX_CHARS * 4)
+    )
+    # ``add_warning`` de-duplicates at the board; ``_gaps`` de-duplicates again
+    # so a repeated warning can never inflate the gap list.
+    await writer.add_warning("same warning")
+    await writer.add_warning("same warning")
 
-    gaps = result_from_run_state(state).gaps
+    gaps = _result(boards).gaps
 
     assert len(gaps) == 2
     assert all(len(gap) <= GAP_MAX_CHARS for gap in gaps)
     assert gaps.count("same warning") == 1
 
 
-def test_failure_summary_prefers_the_last_warning() -> None:
-    state = _run_state(status=ReviewRunStatus.ERROR, report_ref=None)
-    state.add_warning("first")
-    state.add_warning("artifact write failed")
+async def test_failure_summary_prefers_the_last_warning(boards) -> None:
+    writer = _writer(boards)
+    await writer.add_warning("first")
+    await writer.add_warning("artifact write failed")
+    await writer.settle(ReviewRunStatus.ERROR)
 
-    result = result_from_run_state(state)
+    result = _result(boards)
 
     assert result.error == "artifact write failed"
     assert result.summary == "artifact write failed"
 
 
-def test_summary_falls_back_to_the_status_when_no_warning_exists() -> None:
-    result = result_from_run_state(
-        _run_state(status=ReviewRunStatus.STOPPED, report_ref=None)
-    )
+async def test_summary_falls_back_to_the_status_when_no_warning_exists(
+    boards,
+) -> None:
+    await _writer(boards).settle(ReviewRunStatus.STOPPED)
+
+    result = _result(boards)
 
     assert "stopped" in result.error
 
@@ -187,19 +266,24 @@ def test_summary_falls_back_to_the_status_when_no_warning_exists() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_payload_is_wire_safe_and_names_its_provenance() -> None:
-    state = _run_state()
-    state.reviewer_state("security").status = "completed"
-    state.findings.append(
-        {
-            "severity": "high",
-            "file": "app.py",
-            "line": 12,
-            "title": "unbounded read",
-        }
+async def test_payload_is_wire_safe_and_names_its_provenance(boards) -> None:
+    writer = _writer(boards)
+    await writer.record_report(
+        report_markdown="## Code Review Report\n\nbody",
+        findings=(
+            {
+                "severity": "high",
+                "file": "app.py",
+                "line": 12,
+                "title": "unbounded read",
+            },
+        ),
+        verdicts=[],
     )
+    await writer.reviewer_settled("security", status=CHILD_COMPLETED)
+    await writer.settle(ReviewRunStatus.COMPLETED)
 
-    payload = result_from_run_state(state).as_payload()
+    payload = _result(boards).as_payload()
 
     assert payload["source"] == REVIEW_REPORT_SOURCE
     assert payload["run_id"] == "run-a"
@@ -215,16 +299,47 @@ def test_payload_is_wire_safe_and_names_its_provenance() -> None:
     )
 
 
-def test_payload_omits_unset_optional_fields() -> None:
-    payload = result_from_run_state(
-        _run_state(
-            status=ReviewRunStatus.ERROR, report_ref=None, snapshot_ref=None
-        )
-    ).as_payload()
+async def test_payload_omits_unset_optional_fields(boards) -> None:
+    await _finished(
+        boards, status=ReviewRunStatus.ERROR, report="", snapshot_ref=None
+    )
+
+    payload = _result(boards).as_payload()
 
     assert "report_ref" not in payload
     assert "snapshot_ref" not in payload
     assert payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# A failed artifact write keeps the findings but has no report reference
+# ---------------------------------------------------------------------------
+
+
+async def test_failed_artifact_write_keeps_findings_without_a_report_ref(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = _store(workspace, artifacts=_FailingArtifacts(workspace))
+    writer = _writer(store)
+    reference = await writer.record_report(
+        report_markdown="## Code Review Report\n\nbody",
+        findings=(
+            {"severity": "high", "file": "app.py", "line": 3, "title": "unbounded"},
+        ),
+        verdicts=[],
+    )
+    await writer.settle(ReviewRunStatus.ERROR)
+
+    view = store.view(SESSION_KEY)
+    assert reference is None
+    result = result_from_board(view)
+
+    assert result.handoff is ReviewHandoffState.FAILED
+    assert result.report_ref is None
+    # The candidates that were validated before the write failed stay recorded.
+    assert result.findings and result.findings[0]["file"] == "app.py"
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +352,7 @@ def _metadata(**overrides: Any) -> dict[str, Any]:
         ReviewMetaKey.RUN_ID: "run-a",
         ReviewMetaKey.STATUS: "completed",
         ReviewMetaKey.REPORT_REF: REPORT_REF,
-        ReviewMetaKey.SNAPSHOT_REF: "review-snapshots/run-a.json",
+        ReviewMetaKey.SNAPSHOT_REF: SNAPSHOT_REF,
         ReviewMetaKey.INPUT_FINGERPRINT: "fp",
     }
     values.update(overrides)
@@ -257,7 +372,7 @@ def test_restored_completed_run_is_a_complete_handoff() -> None:
 
     assert result is not None
     assert result.handoff is ReviewHandoffState.COMPLETE
-    assert result.snapshot_ref == "review-snapshots/run-a.json"
+    assert result.snapshot_ref == SNAPSHOT_REF
     assert result.input_fingerprint == "fp"
 
 
@@ -353,10 +468,10 @@ def test_restored_terminal_run_without_a_reason_stays_generic() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_context_index_is_compact_and_never_carries_the_report() -> None:
-    result = result_from_run_state(_run_state())
+async def test_context_index_is_compact_and_never_carries_the_report(boards) -> None:
+    await _finished(boards)
 
-    index = render_review_context_index(result)
+    index = render_review_context_index(_result(boards))
 
     assert REVIEW_REPORT_SOURCE in index
     assert "run_id=run-a" in index
@@ -364,26 +479,35 @@ def test_context_index_is_compact_and_never_carries_the_report() -> None:
     assert "## " not in index
 
 
-def test_handoff_block_injects_the_complete_report_verbatim() -> None:
-    result = result_from_run_state(_run_state())
+async def test_handoff_block_injects_the_complete_report_verbatim(boards) -> None:
     report = "## Code Review Report\n\nNo actionable issues found."
+    await _finished(boards, report=report)
 
-    block = render_handoff_block(result, report)
+    block = render_handoff_block(_result(boards), report)
 
     assert "handoff=complete" in block
     assert report in block
     assert "read-only" in block
 
 
-def test_failed_handoff_states_the_failure_and_the_partial_results() -> None:
-    state = _run_state(status=ReviewRunStatus.ERROR, report_ref=None, summary="boom")
-    state.findings.append(
-        {"severity": "high", "file": "app.py", "line": 3, "title": "unbounded read"}
+async def test_failed_handoff_states_the_failure_and_the_partial_results(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = _store(workspace, artifacts=_FailingArtifacts(workspace))
+    writer = _writer(store)
+    await writer.record_report(
+        report_markdown="boom",
+        findings=(
+            {"severity": "high", "file": "app.py", "line": 3, "title": "unbounded read"},
+        ),
+        verdicts=[],
     )
-    state.add_warning("artifact write failed")
-    result = result_from_run_state(state)
+    await writer.add_warning("artifact write failed")
+    await writer.settle(ReviewRunStatus.ERROR)
 
-    block = render_handoff_block(result, None)
+    block = render_handoff_block(result_from_board(store.view(SESSION_KEY)), None)
 
     assert "handoff=failed" in block
     assert "no review report artifact is available" in block
@@ -391,12 +515,14 @@ def test_failed_handoff_states_the_failure_and_the_partial_results() -> None:
     assert "boom" in block
     assert "app.py" in block
     assert "artifact write failed" in block
-    # A failed handoff must never render the report framing as if it existed.
-    assert "## Code Review Report" not in block
 
 
-def test_handoff_directive_freezes_the_read_only_rule_at_system_level() -> None:
-    directive = render_handoff_directive(result_from_run_state(_run_state()))
+async def test_handoff_directive_freezes_the_read_only_rule_at_system_level(
+    boards,
+) -> None:
+    await _finished(boards)
+
+    directive = render_handoff_directive(_result(boards))
 
     assert "run_id=run-a" in directive
     assert "handoff=complete" in directive

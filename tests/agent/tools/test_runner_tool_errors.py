@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -9,10 +10,12 @@ from nanoreview.agent.hooks.lifecycle import (
     AgentHookContext,
     FinalizeContentResult,
 )
+from nanoreview.agent.output_contract import OutputContract
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.base import Tool
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanoreview.review.contracts import StructuredOutputError, parse_json_object
 
 
 class DummyProvider(LLMProvider):
@@ -111,28 +114,6 @@ class LongResultTool(Tool):
         return "X" * 300
 
 
-class TerminalTool(Tool):
-    def __init__(self, *, fail: bool = False) -> None:
-        self._fail = fail
-
-    @property
-    def name(self) -> str:
-        return "terminal_tool"
-
-    @property
-    def description(self) -> str:
-        return "Terminal submission tool."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
-
-    async def execute(self, **kwargs: Any) -> Any:
-        if self._fail:
-            raise ValueError("bad submission")
-        return '{"submitted": true}'
-
-
 class ScriptedProvider(LLMProvider):
     """Returns scripted responses; the last reply repeats once exhausted."""
 
@@ -140,6 +121,7 @@ class ScriptedProvider(LLMProvider):
         super().__init__()
         self.responses = list(responses)
         self.calls = 0
+        self.requests: list[list[dict[str, Any]]] = []
 
     async def chat(
         self,
@@ -154,21 +136,19 @@ class ScriptedProvider(LLMProvider):
     ) -> LLMResponse:
         index = self.calls
         self.calls += 1
+        self.requests.append([dict(message) for message in messages])
         return self.responses[min(index, len(self.responses) - 1)]
 
     def get_default_model(self) -> str:
         return "dummy"
 
 
-def _terminal_call_response(name: str = "terminal_tool") -> LLMResponse:
-    return LLMResponse(
-        content=None,
-        tool_calls=[ToolCallRequest(id="call_1", name=name, arguments={})],
-    )
-
-
 def _prose_response(text: str = "all done") -> LLMResponse:
     return LLMResponse(content=text)
+
+
+def _payload_response(payload: dict[str, Any] | None = None) -> LLMResponse:
+    return LLMResponse(content=json.dumps(payload if payload is not None else {"ok": True}))
 
 
 class ResponseFormatRejectingProvider(LLMProvider):
@@ -442,291 +422,178 @@ async def test_run_tool_preserves_declared_tool_result_untruncated() -> None:
     assert error is None
 
 
+# ---------------------------------------------------------------------------
+# Structured output contract
+#
+# A profile whose result is machine-consumed declares an ``OutputContract``
+# instead of a terminal submission tool. Only a final answer the contract
+# accepts completes the run; a rejected answer is fed back so the model can
+# correct itself inside the same run, bounded by ``output_retry_limit``.
+# ---------------------------------------------------------------------------
+
+
+def _payload_contract() -> OutputContract:
+    def _parse(text: str) -> tuple[dict[str, Any] | None, str | None]:
+        try:
+            payload = parse_json_object(text)
+        except StructuredOutputError as exc:
+            return None, str(exc)
+        if "ok" not in payload:
+            return None, "the payload must carry an 'ok' field"
+        return payload, None
+
+    return OutputContract(name="test_payload", parse=_parse, shape='{"ok":true}')
+
+
 @pytest.mark.asyncio
-async def test_terminal_tool_success_ends_the_run() -> None:
-    tools = ToolRegistry()
-    tools.register(TerminalTool())
-    provider = ScriptedProvider([_terminal_call_response()])
+async def test_accepted_output_completes_the_run() -> None:
+    provider = ScriptedProvider([_payload_response()])
     runner = AgentRunner(provider)
 
     result = await runner.run(
-        make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            max_iterations=3,
-        )
+        make_spec(output_contract=_payload_contract(), max_iterations=3)
     )
 
     assert result.stop_reason == "completed"
-    assert result.terminal_attempts == 1
-    # Success breaks immediately instead of giving the model another turn.
+    assert result.structured_output == {"ok": True}
+    assert result.output_attempts == 0
+    assert result.output_error is None
+    # Success ends immediately instead of giving the model another turn.
     assert provider.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_terminal_tool_failure_retries_then_fails_at_limit() -> None:
-    tools = ToolRegistry()
-    tools.register(TerminalTool(fail=True))
-    provider = ScriptedProvider([_terminal_call_response()])
-    runner = AgentRunner(provider)
-
-    result = await runner.run(
-        make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            terminal_retry_limit=2,
-            max_iterations=5,
-        )
-    )
-
-    assert result.stop_reason == "terminal_tool_failed"
-    assert result.terminal_attempts == 2
-    assert result.terminal_error is not None
-    assert "bad submission" in result.terminal_error
-
-
-@pytest.mark.asyncio
-async def test_terminal_tool_failure_then_success_completes_the_run() -> None:
-    """A failed submission is retried inside the same run and can succeed."""
-
-    class FlakyTerminalTool(TerminalTool):
-        def __init__(self) -> None:
-            super().__init__(fail=False)
-            self.calls = 0
-
-        async def execute(self, **kwargs: Any) -> Any:
-            self.calls += 1
-            if self.calls == 1:
-                raise ValueError("bad submission")
-            return '{"submitted": true}'
-
-    tools = ToolRegistry()
-    tools.register(FlakyTerminalTool())
-    provider = ScriptedProvider([_terminal_call_response()])
-    runner = AgentRunner(provider)
-
-    result = await runner.run(
-        make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            terminal_retry_limit=3,
-            max_iterations=5,
-        )
-    )
-
-    assert result.stop_reason == "completed"
-    assert result.terminal_attempts == 2
-    assert provider.calls == 2
-
-
-@pytest.mark.asyncio
-async def test_terminal_tool_prose_answer_counts_as_attempt_and_fails_at_limit() -> None:
-    tools = ToolRegistry()
-    tools.register(TerminalTool())
+async def test_rejected_output_retries_then_fails_at_limit() -> None:
     provider = ScriptedProvider([_prose_response()])
     runner = AgentRunner(provider)
 
     result = await runner.run(
         make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            terminal_retry_limit=2,
+            output_contract=_payload_contract(),
+            output_retry_limit=2,
             max_iterations=5,
         )
     )
 
-    assert result.stop_reason == "terminal_tool_failed"
-    assert result.terminal_attempts == 2
+    assert result.stop_reason == "invalid_output"
+    assert result.output_attempts == 2
+    assert result.output_error is not None
+    assert "one JSON object" in result.output_error
+    # A rejected answer never yields a structured result.
+    assert result.structured_output is None
     assert provider.calls == 2
 
 
 @pytest.mark.asyncio
-async def test_prose_retry_limit_does_not_consume_the_submission_budget() -> None:
-    """A free-form run may narrate without exhausting its terminal budget.
-
-    The review planner reads evidence, decides and only then finishes, so a
-    prose turn is normal progress. When the caller declares ``prose_retry_limit``
-    those turns get their own allowance: four narration turns must not fail a run
-    whose terminal submission was never malformed.
-    """
-    tools = ToolRegistry()
-    tools.register(TerminalTool())
+async def test_rejected_output_then_accepted_answer_completes_the_run() -> None:
+    """A rejected answer is retried inside the same run and can still succeed."""
     provider = ScriptedProvider(
-        [
-            _prose_response("reviewed ev-001"),
-            _prose_response("reviewed ev-002"),
-            _prose_response("reviewed ev-003"),
-            _prose_response("reviewed ev-004"),
-            _terminal_call_response(),
-        ]
+        [_prose_response("I reviewed the change."), _payload_response()]
     )
     runner = AgentRunner(provider)
 
     result = await runner.run(
         make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            terminal_retry_limit=2,
-            prose_retry_limit=8,
-            max_iterations=8,
+            output_contract=_payload_contract(),
+            output_retry_limit=3,
+            max_iterations=5,
         )
     )
 
     assert result.stop_reason == "completed"
-    # Only the accepted submission counted as a terminal attempt.
-    assert result.terminal_attempts == 1
-    assert provider.calls == 5
-
-
-@pytest.mark.asyncio
-async def test_prose_retry_limit_still_fails_a_run_that_never_submits() -> None:
-    """The separate allowance is bounded, not unbounded."""
-    tools = ToolRegistry()
-    tools.register(TerminalTool())
-    provider = ScriptedProvider([_prose_response()])
-    runner = AgentRunner(provider)
-
-    result = await runner.run(
-        make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            terminal_retry_limit=5,
-            prose_retry_limit=2,
-            max_iterations=6,
-        )
-    )
-
-    assert result.stop_reason == "terminal_tool_failed"
+    assert result.output_attempts == 1
+    assert result.structured_output == {"ok": True}
     assert provider.calls == 2
 
 
-class ExploreTool(Tool):
-    """Non-terminal tool used to spend iterations without submitting."""
+@pytest.mark.asyncio
+async def test_the_rejection_reason_is_fed_back_to_the_model() -> None:
+    provider = ScriptedProvider([_prose_response(), _payload_response()])
+    runner = AgentRunner(provider)
 
-    @property
-    def name(self) -> str:
-        return "explore_tool"
-
-    @property
-    def description(self) -> str:
-        return "Explore the workspace."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {"type": "object", "properties": {}}
-
-    async def execute(self, **kwargs: Any) -> Any:
-        return "nothing here"
-
-
-class ToolChoiceAwareProvider(LLMProvider):
-    """Explores every turn, but honours a forced ``tool_choice``.
-
-    Models what a real provider does on the reserved final turn: a forced
-    function choice produces that call instead of another exploratory one.
-    """
-
-    def __init__(self, terminal_name: str = "terminal_tool") -> None:
-        super().__init__()
-        self.terminal_name = terminal_name
-        self.requests: list[dict[str, Any]] = []
-
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        model: str | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        reasoning_effort: str | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        response_format: dict[str, Any] | None = None,
-    ) -> LLMResponse:
-        self.requests.append({"tools": tools or [], "tool_choice": tool_choice})
-        forced: str | None = None
-        if isinstance(tool_choice, dict):
-            function = tool_choice.get("function")
-            if isinstance(function, dict):
-                name = function.get("name")
-                forced = name if isinstance(name, str) else None
-        name = forced or "explore_tool"
-        return LLMResponse(
-            content=None,
-            tool_calls=[
-                ToolCallRequest(
-                    id=f"call_{len(self.requests)}",
-                    name=name,
-                    arguments={},
-                )
-            ],
-        )
-
-    def get_default_model(self) -> str:
-        return "dummy"
-
-
-def _exposed_tool_names(tools: list[dict[str, Any]]) -> list[str]:
-    return sorted(
-        schema["function"]["name"]
-        for schema in tools
-        if isinstance(schema.get("function"), dict)
+    await runner.run(
+        make_spec(output_contract=_payload_contract(), max_iterations=3)
     )
+
+    # The second request carries a correction prompt naming the concrete problem,
+    # so the model can fix the answer instead of guessing.
+    repair = provider.requests[1][-1]
+    assert repair["role"] == "user"
+    assert "one JSON object" in repair["content"]
 
 
 @pytest.mark.asyncio
-async def test_reserved_final_iteration_forces_the_terminal_submission() -> None:
-    """A run that explores every turn still submits on its last iteration."""
-    tools = ToolRegistry()
-    tools.register(TerminalTool())
-    tools.register(ExploreTool())
-    provider = ToolChoiceAwareProvider()
+async def test_the_final_turn_tells_the_model_to_answer_without_tools() -> None:
+    """The reserved answer turn is announced in the request the model receives."""
+    provider = ScriptedProvider([_payload_response()])
     runner = AgentRunner(provider)
 
     result = await runner.run(
-        make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            max_iterations=3,
-        )
+        make_spec(output_contract=_payload_contract(), max_iterations=1)
     )
 
     assert result.stop_reason == "completed"
-    assert result.terminal_attempts == 1
-    assert len(provider.requests) == 3
-
-    # Exploratory turns see the whole surface and no forced choice.
-    first = provider.requests[0]
-    assert _exposed_tool_names(first["tools"]) == ["explore_tool", "terminal_tool"]
-    assert first["tool_choice"] is None
-
-    # The reserved final turn exposes only the terminal tool and forces it.
-    last = provider.requests[-1]
-    assert _exposed_tool_names(last["tools"]) == ["terminal_tool"]
-    assert last["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "terminal_tool"},
-    }
+    # The model finds out its tools are gone only from what is actually sent.
+    assert "final available turn" in provider.requests[0][-1]["content"]
 
 
 @pytest.mark.asyncio
-async def test_reserved_terminal_iteration_can_be_disabled() -> None:
-    """Without the reservation the run still collapses into max_iterations."""
-    tools = ToolRegistry()
-    tools.register(TerminalTool())
-    tools.register(ExploreTool())
-    provider = ToolChoiceAwareProvider()
+async def test_a_rejection_on_the_final_turn_reports_the_real_reason() -> None:
+    """The reserved turn has no correction round, so it must not read as a cap."""
+    provider = ScriptedProvider([_prose_response(), _prose_response()])
     runner = AgentRunner(provider)
 
     result = await runner.run(
         make_spec(
-            tools,
-            terminal_tools=frozenset({"terminal_tool"}),
-            max_iterations=3,
-            reserve_terminal_iteration=False,
+            output_contract=_payload_contract(),
+            output_retry_limit=5,
+            max_iterations=2,
         )
     )
 
-    assert result.stop_reason == "max_iterations"
-    assert result.terminal_attempts == 0
-    assert len(provider.requests) == 3
-    assert all(request["tool_choice"] is None for request in provider.requests)
+    assert result.stop_reason == "invalid_output"
+    assert result.structured_output is None
+    assert result.output_error is not None
+    assert result.output_attempts == 2
+    # No prompt is appended for a round the budget cannot afford.
+    assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_a_contract_completes_on_free_text() -> None:
+    """Conversation keeps a free-form final answer; only contracted runs parse."""
+    provider = ScriptedProvider([_prose_response("anything goes")])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(make_spec(max_iterations=2))
+
+    assert result.stop_reason == "completed"
+    assert result.final_content == "anything goes"
+    assert result.structured_output is None
+
+
+@pytest.mark.asyncio
+async def test_a_blank_answer_is_reported_before_the_contract() -> None:
+    """An empty answer is its own failure, not a contract rejection."""
+    provider = ScriptedProvider([LLMResponse(content="   ")])
+    runner = AgentRunner(provider)
+
+    result = await runner.run(
+        make_spec(output_contract=_payload_contract(), max_iterations=3)
+    )
+
+    assert result.stop_reason == "empty_final_response"
+    assert result.output_attempts == 0
+
+
+def test_the_terminal_submission_protocol_is_gone() -> None:
+    """No run may declare a terminal tool or a reserved terminal iteration."""
+    from dataclasses import fields
+
+    names = {field.name for field in fields(AgentRunSpec)}
+    assert "terminal_tools" not in names
+    assert "terminal_retry_limit" not in names
+    assert "prose_retry_limit" not in names
+    assert "reserve_terminal_iteration" not in names
+    assert "output_contract" in names
+    assert "output_retry_limit" in names

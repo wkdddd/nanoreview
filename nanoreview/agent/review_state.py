@@ -1,12 +1,9 @@
-"""In-process ReviewAgent run state, input fingerprint, and report artifacts.
+"""Review run phases, input fingerprint, and report artifacts.
 
-One review session executes at most one review run. ``ReviewRunState`` tracks
-that run inside the agent process; the final report is persisted as an
-independent JSON artifact under ``review-artifacts/`` in the workspace and
-referenced from session metadata via ``review_report_ref``.
-
-This module intentionally stores only plain data — no asyncio tasks, provider
-clients, callbacks, locks, or in-flight coroutines.
+One review session executes at most one review run. The run's *live* state is
+the coordinator-owned blackboard (``agent/review_board.py``); this module keeps
+only what outlives an individual in-process board: the phase/status vocabulary,
+the input fingerprint, and the persisted report artifact.
 """
 
 from __future__ import annotations
@@ -16,8 +13,6 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -25,17 +20,12 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanoreview.review.types import ReviewMetaKey
-from nanoreview.utils.helpers import merge_token_usage, safe_filename
+from nanoreview.utils.helpers import safe_filename
 
 if TYPE_CHECKING:
+    from nanoreview.agent.review_board import ReviewBoardView
     from nanoreview.review.output.finalizer import ReviewFinalizerResult
-    from nanoreview.review.types import (
-        ReviewAssignment,
-        ReviewEvidenceBundle,
-        ReviewPlan,
-        ReviewTriageSummary,
-    )
+    from nanoreview.review.types import ReviewEvidenceBundle, ReviewPlan
 
 # Serialized artifact size limit, mirroring the shared media upload guard.
 REVIEW_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024
@@ -43,7 +33,7 @@ REVIEW_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024
 # Directory (relative to the workspace) that stores review report artifacts.
 REVIEW_ARTIFACTS_DIR_NAME = "review-artifacts"
 
-#: Bound on ``ReviewRunState.summary`` — a digest is carried in the structured
+#: Bound on the persisted run summary — a digest is carried in the structured
 #: result so transports and the handoff context can describe a finished review
 #: without loading the full report artifact.
 REVIEW_SUMMARY_MAX_CHARS = 1200
@@ -86,8 +76,8 @@ REVIEW_TERMINAL_STATUSES = frozenset(
 )
 
 #: Child (reviewer/judge) error/failure reason length cap. Error text stored on
-#: run state must be bounded so a huge subagent transcript or provider trace
-#: cannot bloat the in-process audit trail.
+#: the board must be bounded so a huge subagent transcript or provider trace
+#: cannot inflate the in-process audit trail.
 CHILD_ERROR_MAX_CHARS = 300
 
 
@@ -97,147 +87,6 @@ def bound_child_error(reason: Any) -> str:
         return ""
     text = " ".join(str(reason).split())
     return text[:CHILD_ERROR_MAX_CHARS]
-
-
-@dataclass(slots=True)
-class ReviewerRunState:
-    """Per-reviewer (dimension) execution state.
-
-    ``status`` is one of ``pending | running | completed | error | stopped``.
-    ``stopped`` records a reviewer cancelled before it finished (e.g. a
-    ``/stop``), never a successful completion.
-    """
-
-    dimension: str
-    status: str = "pending"
-    error: str = ""
-    usage: dict[str, int] = field(default_factory=dict)
-    #: Number of authorized evidence references injected into this reviewer's
-    #: frozen task (evidence assignment, for duplicate-work diagnosis).
-    evidence_assigned: int = 0
-    #: Reviewer-run duplicate read/search suppression counters.
-    duplicate_reads: int = 0
-    duplicate_searches: int = 0
-
-    def add_usage(self, usage: Mapping[str, Any] | None) -> None:
-        """Accumulate this reviewer's token usage for the run audit trail."""
-        merge_token_usage(self.usage, usage)
-
-
-@dataclass(slots=True)
-class JudgeBatchState:
-    """Per-batch judge execution state.
-
-    A batch moves through ``pending -> running -> completed`` on success, or to
-    ``error``/``stopped`` on failure or cancellation. ``error`` carries a
-    bounded ``reason`` so a provider trace never inflates the audit trail.
-    """
-
-    batch_id: str
-    status: str = "pending"
-    error: str = ""
-    stats: dict[str, int] = field(default_factory=dict)
-    usage: dict[str, int] = field(default_factory=dict)
-
-    def add_usage(self, usage: Mapping[str, Any] | None) -> None:
-        """Accumulate this judge batch's token usage."""
-        merge_token_usage(self.usage, usage)
-
-
-@dataclass(slots=True)
-class ReviewRunState:
-    """In-process state of one review run owned by ``ReviewLoop``."""
-
-    run_id: str
-    session_key: str
-    input_fingerprint: str
-    phase: ReviewPhase = ReviewPhase.PREPARE
-    status: ReviewRunStatus = ReviewRunStatus.RUNNING
-    plan: "ReviewPlan | None" = None
-    assignments: tuple["ReviewAssignment", ...] = ()
-    reviewers: dict[str, ReviewerRunState] = field(default_factory=dict)
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    judge_batches: dict[str, JudgeBatchState] = field(default_factory=dict)
-    report_ref: str | None = None
-    #: Wire-safe reference to the immutable input snapshot captured at admission.
-    snapshot_ref: str | None = None
-    #: Bounded digest of the produced report, or the failure reason when no
-    #: report exists. Feeds ``ReviewResult.summary``.
-    summary: str = ""
-    usage: dict[str, int] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
-    #: Changed-file boundary enforced for accepted findings (diff review).
-    changed_files: list[str] = field(default_factory=list)
-    #: Files excluded from the diff evidence at admission time.
-    skipped_files: list[str] = field(default_factory=list)
-    #: Budgeted planner manifest statistics (version/budget/retained/omitted).
-    manifest_stats: dict[str, Any] = field(default_factory=dict)
-    #: Planner triage audit: decisions, per-evidence coverage (assigned /
-    #: dismissed / unexamined) and each dimension's assigned scope. Persisted
-    #: for troubleshooting and evaluation only — it never becomes report
-    #: findings or a Judge input.
-    triage: "ReviewTriageSummary | None" = None
-
-    def enter_phase(self, phase: ReviewPhase) -> None:
-        if self.status is not ReviewRunStatus.RUNNING:
-            return
-        self.phase = phase
-
-    def set_summary(self, text: str, *, limit: int = REVIEW_SUMMARY_MAX_CHARS) -> None:
-        """Record a bounded digest of the produced report or the failure reason."""
-        self.summary = " ".join(str(text or "").split())[:limit]
-
-    def add_warning(self, message: str) -> None:
-        text = str(message).strip()
-        if text and text not in self.warnings:
-            self.warnings.append(text)
-
-    def add_usage(self, usage: Mapping[str, Any] | None) -> None:
-        """Accumulate one agent run's token usage into this review run."""
-        merge_token_usage(self.usage, usage)
-
-    def reviewer_state(self, dimension: str) -> ReviewerRunState:
-        state = self.reviewers.get(dimension)
-        if state is None:
-            state = ReviewerRunState(dimension=dimension)
-            self.reviewers[dimension] = state
-        return state
-
-    def metadata_payload(
-        self,
-        *,
-        status: ReviewRunStatus | None = None,
-        phase: ReviewPhase | None = None,
-    ) -> dict[str, Any]:
-        """Stable session metadata fields describing this run.
-
-        Only the artifact reference, run id, status and phase cross the wire —
-        never the full report or any absolute server path. ``status``/``phase``
-        override the in-memory values so the terminal payload can be persisted
-        *before* the run itself turns terminal: a successful save is what
-        publishes the live ``DONE``.
-
-        The bounded summary (report digest or failure reason) and, for a
-        non-completed run, the bounded failure reason are persisted too, so a
-        restart can explain the outcome without the in-process state.
-        """
-        effective_status = status or self.status
-        payload: dict[str, Any] = {
-            ReviewMetaKey.RUN_ID: self.run_id,
-            ReviewMetaKey.STATUS: effective_status.value,
-            ReviewMetaKey.PHASE: (phase or self.phase).value,
-            ReviewMetaKey.INPUT_FINGERPRINT: self.input_fingerprint,
-        }
-        if self.report_ref is not None:
-            payload[ReviewMetaKey.REPORT_REF] = self.report_ref
-        if self.summary:
-            payload[ReviewMetaKey.SUMMARY] = self.summary[:REVIEW_SUMMARY_MAX_CHARS]
-        if (
-            effective_status in (ReviewRunStatus.ERROR, ReviewRunStatus.STOPPED)
-            and self.warnings
-        ):
-            payload[ReviewMetaKey.ERROR] = bound_child_error(self.warnings[-1])
-        return payload
 
 
 def new_review_run_id() -> str:
@@ -287,8 +136,8 @@ def compute_input_fingerprint(
 ) -> str:
     """SHA-256 over the canonical JSON of the normalized review input.
 
-    The same fingerprint value must be carried by ``ReviewRunState``, the
-    report artifact, and session metadata so the report API can verify that an
+    The same fingerprint value must be carried by the run's board, the report
+    artifact, and session metadata so the report API can verify that an
     artifact belongs to the requested session and run.
     """
     payload: dict[str, Any] = {
@@ -377,7 +226,7 @@ def _serialize_verdict(judged: Any) -> dict[str, Any]:
 
 def serialize_finalizer_result(
     result: "ReviewFinalizerResult",
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[tuple[dict[str, Any], ...], list[dict[str, Any]]]:
     """Extract (findings, verdicts) wire payloads from a finalizer result.
 
     Confirmed findings carry their stable report-local ID (``F001``) so the
@@ -403,11 +252,11 @@ def serialize_finalizer_result(
                 )
             )
             verdicts.append(_serialize_verdict(judged))
-    return findings, verdicts
+    return tuple(findings), verdicts
 
 
 def build_report_artifact(
-    state: ReviewRunState,
+    view: "ReviewBoardView",
     *,
     report_markdown: str,
     verdicts: list[dict[str, Any]] | None = None,
@@ -416,60 +265,28 @@ def build_report_artifact(
     """Assemble the JSON artifact payload for a finished review run.
 
     An artifact describes a finished run, so the caller must decide the
-    terminal status *before* serialization: ``ReviewRunState.status`` can
-    still be ``running`` while the artifact is being written, and baking
-    that in would leave a permanently "running" report on disk. Pass
-    ``status`` explicitly; the state's own value is only a fallback.
+    terminal status *before* serialization: the board's status can still be
+    ``running`` while the artifact is being written, and baking that in would
+    leave a permanently "running" report on disk. Pass ``status`` explicitly;
+    the board's own value is only a fallback.
 
     The ``coverage`` block carries the run's review boundary and per-reviewer
     execution/cost summary (manifest budget, changed/skipped files, duplicate
     reads, incomplete dimensions) without copying any source or full session.
     """
     return {
-        "run_id": state.run_id,
-        "session_key": state.session_key,
-        "status": (status or state.status).value,
-        "input_fingerprint": state.input_fingerprint,
-        "snapshot_ref": state.snapshot_ref,
+        "run_id": view.run_id,
+        "session_key": view.session_key,
+        "status": (status or view.status).value,
+        "input_fingerprint": view.input_fingerprint,
+        "snapshot_ref": view.snapshot_ref,
         "report_markdown": report_markdown,
-        "findings": state.findings,
+        "findings": list(view.findings),
         "verdicts": list(verdicts or []),
-        "usage": dict(state.usage),
-        "warnings": list(state.warnings),
-        "coverage": _coverage_payload(state),
+        "usage": dict(view.usage),
+        "warnings": list(view.warnings),
+        "coverage": view.coverage_payload(),
         "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def _coverage_payload(state: ReviewRunState) -> dict[str, Any]:
-    """Compact review-boundary and per-reviewer summary for the report."""
-    reviewers = {
-        dimension: {
-            "status": reviewer.status,
-            "evidence_assigned": reviewer.evidence_assigned,
-            "duplicate_reads": reviewer.duplicate_reads,
-            "duplicate_searches": reviewer.duplicate_searches,
-            "usage": dict(reviewer.usage),
-        }
-        for dimension, reviewer in state.reviewers.items()
-    }
-    incomplete = sorted(
-        dimension
-        for dimension, reviewer in state.reviewers.items()
-        if reviewer.status != "completed"
-    )
-    judge_batches = {
-        batch_id: {"status": batch.status, "error": batch.error}
-        for batch_id, batch in state.judge_batches.items()
-    }
-    return {
-        "changed_files": list(state.changed_files),
-        "skipped_files": list(state.skipped_files),
-        "manifest": dict(state.manifest_stats),
-        "triage": state.triage.snapshot_payload() if state.triage is not None else {},
-        "reviewers": reviewers,
-        "incomplete_dimensions": incomplete,
-        "judge_batches": judge_batches,
     }
 
 

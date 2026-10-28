@@ -99,8 +99,10 @@ def test_triage_prompt_never_mentions_risk_hints_or_assignment_submission() -> N
     assert "units without hints" not in prompt
     # The planner reports decisions; it does not submit assignments.
     assert "submit_review_plan" not in prompt
-    assert "submit_review_decision" in prompt
-    assert "finish_review_triage" in prompt
+    # Decisions are one final JSON payload, not an incremental submission tool.
+    assert '"decisions"' in prompt
+    assert "review_submit" not in prompt
+    assert "finish_review_triage" not in prompt
 
 
 def test_triage_prompt_states_auto_minimum_sufficient_set() -> None:

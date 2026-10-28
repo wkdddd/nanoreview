@@ -88,7 +88,7 @@ def test_build_code_review_context_includes_subagent_candidate_schema() -> None:
     )
     assert "Review Finding Schema" in prompt
     assert "using `spawn`" in prompt
-    assert "review_submit" in prompt
+    assert "one JSON object holding a `findings` array" in prompt
     assert '"severity"' in prompt
     assert '"evidence"' in prompt
 
@@ -98,8 +98,10 @@ def test_build_code_review_context_prohibits_coordinator_review_submit() -> None
         target=r"C:\work\repo",
         max_subagents=4,
     )
-    assert "must NEVER call `review_submit`" in prompt
-    assert "subagent-only tool" in prompt
+    # No submission tool survives the structured-output migration: the
+    # coordinator is told it never produces the findings payload itself.
+    assert "review_submit" not in prompt
+    assert "subagent-only deliverable" in prompt
 
 
 def test_build_code_review_context_spawn_task_requires_target_and_evidence() -> None:
@@ -111,7 +113,7 @@ def test_build_code_review_context_spawn_task_requires_target_and_evidence() -> 
     assert "target path" in prompt.lower()
     assert "line range" in prompt.lower()
     assert "evidence source" in prompt.lower()
-    assert "subagent-only tool" in prompt
+    assert "subagent-only deliverable" in prompt
 
 
 def test_build_code_review_context_matches_system_finalizer_boundary() -> None:
@@ -198,8 +200,8 @@ async def test_resolved_local_prompt_does_not_refetch_after_empty_prefetch() -> 
         },
     )
 
-    assert "submit_review_decision" in prompt
-    assert "finish_review_triage" in prompt
+    assert '"decisions"' in prompt
+    assert "review_submit" not in prompt
     assert "no program-authorized evidence references" in prompt
     assert "spawn" in prompt
 

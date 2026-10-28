@@ -1,21 +1,39 @@
-"""Tests for in-process ReviewRunState, input fingerprint, and report artifacts."""
+"""Tests for the review blackboard, input fingerprint, and report artifacts.
+
+The run's live state is the coordinator-owned blackboard (``review_board.py``)
+plus the durable pieces kept in ``review_state.py`` (phase/status vocabulary,
+fingerprint, artifact store). These tests drive the real board store rather than
+hand-building a mutable state object, because the invariant under test is that
+*only* the store writes a board and that every write is serialized per run.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from nanoreview.agent.review_board import (
+    CHILD_COMPLETED,
+    CHILD_ERROR,
+    CHILD_PENDING,
+    CHILD_RUNNING,
+    CHILD_STOPPED,
+    ReviewBoardError,
+    ReviewBoardPersistenceError,
+    ReviewBoardStore,
+    ReviewerRunState,
+)
 from nanoreview.agent.review_state import (
     CHILD_ERROR_MAX_CHARS,
     REVIEW_ARTIFACTS_DIR_NAME,
-    JudgeBatchState,
     ReviewArtifactError,
     ReviewArtifactStore,
-    ReviewerRunState,
     ReviewPhase,
-    ReviewRunState,
     ReviewRunStatus,
     bound_child_error,
     build_report_artifact,
@@ -25,9 +43,9 @@ from nanoreview.agent.review_state import (
     serialize_finalizer_result,
 )
 from nanoreview.review.output.finalizer import ReviewFinalizerResult
-from nanoreview.review.result import result_from_run_state
 from nanoreview.review.types import (
     FindingVerdict,
+    ReviewAssignment,
     ReviewDimensionResult,
     ReviewFindingCandidate,
     ReviewFindingVerdict,
@@ -36,6 +54,69 @@ from nanoreview.review.types import (
     ReviewJudgeVerdict,
     ReviewMetaKey,
 )
+from nanoreview.session.manager import SessionManager
+
+RUN_ID = "run-000111222333"
+SESSION_KEY = "websocket:chat-1"
+SNAPSHOT_REF = "review-snapshots/run-000111222333.json"
+
+
+# ---------------------------------------------------------------------------
+# Fixtures and helpers
+# ---------------------------------------------------------------------------
+
+
+def _store(workspace: Path, *, artifacts: ReviewArtifactStore | None = None) -> ReviewBoardStore:
+    return ReviewBoardStore(
+        sessions=SessionManager(workspace),
+        artifacts=artifacts or ReviewArtifactStore(workspace),
+    )
+
+
+@pytest.fixture
+def boards(tmp_path: Path) -> ReviewBoardStore:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    return _store(workspace)
+
+
+def _create(
+    store: ReviewBoardStore,
+    *,
+    snapshot_ref: str | None = SNAPSHOT_REF,
+    run_id: str = RUN_ID,
+    session_key: str = SESSION_KEY,
+):
+    """Register one run's board and return its write handle."""
+    store.create(
+        SimpleNamespace(
+            run_id=run_id,
+            session_key=session_key,
+            input_fingerprint="fp-1",
+            snapshot_ref=snapshot_ref,
+            plan=None,
+        )
+    )
+    writer = store.writer(session_key)
+    assert writer is not None
+    return writer
+
+
+def _view(store: ReviewBoardStore):
+    view = store.view(SESSION_KEY)
+    assert view is not None
+    return view
+
+
+def _assignment(dimension: str, *, evidence: tuple[str, ...] = ()) -> ReviewAssignment:
+    return ReviewAssignment(dimension=dimension, focus="x", evidence_ids=evidence)
+
+
+class _FailingSessions(SessionManager):
+    """Session manager whose durable save always fails."""
+
+    def save(self, session):  # noqa: D102 - stub
+        raise OSError("disk full")
 
 
 def _candidate(
@@ -77,124 +158,727 @@ def _uncertain(title: str, **kw) -> ReviewJudgedFinding:
             verdict=FindingVerdict.UNCERTAIN, reason="unclear evidence"
         ),
         judge_verdict=ReviewJudgeVerdict(
-            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION, reason="unclear", confidence="low"
+            decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
+            reason="unclear",
+            confidence="low",
         ),
     )
 
 
-def _run_state(**overrides) -> ReviewRunState:
-    params: dict = {
-        "run_id": "run-000111222333",
-        "session_key": "websocket:chat-1",
-        "input_fingerprint": "fp-1",
-    }
-    params.update(overrides)
-    return ReviewRunState(**params)
+# ---------------------------------------------------------------------------
+# Board lifecycle
+# ---------------------------------------------------------------------------
 
 
-def test_review_run_state_tracks_phase_and_warnings() -> None:
-    state = _run_state()
-    assert state.phase is ReviewPhase.PREPARE
-    assert state.status is ReviewRunStatus.RUNNING
+def test_create_registers_a_running_prepare_board(boards: ReviewBoardStore) -> None:
+    view = boards.create(
+        SimpleNamespace(
+            run_id=RUN_ID,
+            session_key=SESSION_KEY,
+            input_fingerprint="fp-1",
+            snapshot_ref=SNAPSHOT_REF,
+            plan=None,
+        )
+    )
 
-    state.enter_phase(ReviewPhase.PLAN)
-    state.enter_phase(ReviewPhase.REVIEW)
-    assert state.phase is ReviewPhase.REVIEW
-
-    state.add_warning("w-1")
-    state.add_warning("w-1")  # duplicate warnings are deduplicated
-    state.add_warning("  ")  # blank warnings are ignored
-    assert state.warnings == ["w-1"]
-
-
-def test_review_run_state_enter_phase_ignored_after_terminal_status() -> None:
-    state = _run_state(status=ReviewRunStatus.STOPPED)
-    state.enter_phase(ReviewPhase.CLEANUP)
-    assert state.phase is ReviewPhase.PREPARE
+    assert view.run_id == RUN_ID
+    assert view.session_key == SESSION_KEY
+    assert view.snapshot_ref == SNAPSHOT_REF
+    assert view.phase is ReviewPhase.PREPARE
+    assert view.status is ReviewRunStatus.RUNNING
+    assert view.is_running and not view.is_terminal and not view.is_done
 
 
-def test_review_run_state_metadata_payload_shape() -> None:
-    state = _run_state()
-    payload = state.metadata_payload()
+def test_view_and_running_read_the_same_board(boards: ReviewBoardStore) -> None:
+    _create(boards)
+
+    assert boards.view(SESSION_KEY) is not None
+    assert boards.running(SESSION_KEY) is not None
+    assert boards.view("websocket:other") is None
+
+
+def test_running_returns_none_once_the_run_is_terminal(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.settle(ReviewRunStatus.ERROR)
+
+        assert boards.view(SESSION_KEY) is not None
+        assert boards.running(SESSION_KEY) is None
+
+    asyncio.run(_run())
+
+
+def test_drop_removes_the_board_and_returns_its_last_view(
+    boards: ReviewBoardStore,
+) -> None:
+    _create(boards)
+
+    dropped = boards.drop(SESSION_KEY)
+
+    assert dropped is not None and dropped.run_id == RUN_ID
+    assert boards.view(SESSION_KEY) is None
+    assert boards.writer(SESSION_KEY) is None
+    assert boards.drop(SESSION_KEY) is None
+
+
+def test_drop_unstarted_only_removes_a_prepare_run(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        _create(boards)
+        assert boards.drop_unstarted(SESSION_KEY, run_id=RUN_ID) is not None
+        assert boards.view(SESSION_KEY) is None
+
+        started = _create(boards)
+        await started.advance(ReviewPhase.PLAN)
+        # A run that already left PREPARE may still produce work, so it is kept.
+        assert boards.drop_unstarted(SESSION_KEY, run_id=RUN_ID) is None
+        assert boards.view(SESSION_KEY) is not None
+
+    asyncio.run(_run())
+
+
+def test_drop_unstarted_ignores_a_run_this_turn_does_not_own(
+    boards: ReviewBoardStore,
+) -> None:
+    """Only the ending turn's own run is released, never a queued admission."""
+
+    async def _run() -> None:
+        _create(boards)
+        assert boards.drop_unstarted(SESSION_KEY, run_id="run-other") is None
+        view = boards.view(SESSION_KEY)
+        assert view is not None and view.run_id == RUN_ID
+
+    asyncio.run(_run())
+
+
+def test_drop_unstarted_clears_the_persisted_run_identity(tmp_path: Path) -> None:
+    """A released run must not linger on the session as an unfinished duplicate."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sessions = SessionManager(workspace)
+    store = ReviewBoardStore(
+        sessions=sessions, artifacts=ReviewArtifactStore(workspace)
+    )
+
+    async def _run() -> None:
+        _create(store)
+        session = sessions.get_or_create(SESSION_KEY)
+        session.metadata[ReviewMetaKey.RUN_ID] = RUN_ID
+        session.metadata[ReviewMetaKey.STATUS] = ReviewRunStatus.RUNNING.value
+        sessions.save(session)
+
+        assert store.drop_unstarted(SESSION_KEY, run_id=RUN_ID) is not None
+
+        released = sessions.get_or_create(SESSION_KEY)
+        assert ReviewMetaKey.RUN_ID not in released.metadata
+        assert ReviewMetaKey.STATUS not in released.metadata
+
+    asyncio.run(_run())
+
+
+def test_writes_after_drop_raise_the_board_error(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        boards.drop(SESSION_KEY)
+
+        with pytest.raises(ReviewBoardError):
+            await writer.add_warning("late")
+
+    asyncio.run(_run())
+
+
+def test_a_writer_for_another_run_id_is_rejected(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        stale = _create(boards)
+        boards.drop(SESSION_KEY)
+        # A new run replaces the old board under the same session key.
+        _create(boards, run_id="run-ffffffffffff")
+
+        with pytest.raises(ReviewBoardError, match="run mismatch"):
+            await stale.add_warning("belongs to the dropped run")
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Phase and metadata
+# ---------------------------------------------------------------------------
+
+
+def test_advance_moves_through_the_phases(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        for phase in (ReviewPhase.PLAN, ReviewPhase.REVIEW, ReviewPhase.FINALIZE):
+            await writer.advance(phase)
+            assert _view(boards).phase is phase
+
+    asyncio.run(_run())
+
+
+def test_advance_is_ignored_once_the_run_is_terminal(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.advance(ReviewPhase.REVIEW)
+        await writer.settle(ReviewRunStatus.COMPLETED)
+
+        await writer.advance(ReviewPhase.PREPARE)
+
+        assert _view(boards).phase is ReviewPhase.DONE
+
+    asyncio.run(_run())
+
+
+def test_running_metadata_payload_shape(boards: ReviewBoardStore) -> None:
+    _create(boards)
+
+    payload = _view(boards).metadata_payload()
+
     assert payload == {
-        ReviewMetaKey.RUN_ID: "run-000111222333",
+        ReviewMetaKey.RUN_ID: RUN_ID,
         ReviewMetaKey.STATUS: "running",
         ReviewMetaKey.PHASE: "prepare",
         ReviewMetaKey.INPUT_FINGERPRINT: "fp-1",
     }
     assert ReviewMetaKey.REPORT_REF not in payload
-
-    state.report_ref = f"{REVIEW_ARTIFACTS_DIR_NAME}/run-000111222333.json"
-    payload = state.metadata_payload()
-    assert payload[ReviewMetaKey.REPORT_REF] == state.report_ref
+    assert ReviewMetaKey.SUMMARY not in payload
+    assert ReviewMetaKey.ERROR not in payload
 
 
-def test_metadata_payload_persists_bounded_summary_and_failure_reason() -> None:
+def test_warnings_are_deduplicated_and_blank_ones_ignored(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.add_warning("w-1")
+        await writer.add_warning("w-1")
+        await writer.add_warning("  ")
+
+        assert _view(boards).warnings == ("w-1",)
+
+    asyncio.run(_run())
+
+
+def test_terminal_payload_persists_the_bounded_summary_and_reason(
+    boards: ReviewBoardStore,
+) -> None:
     """A restart must be able to read *why* a run ended, not just that it did."""
-    state = _run_state()
-    state.set_summary("report digest")
-    state.add_warning("plan failed: no reviewer profile for 'security'")
 
-    payload = state.metadata_payload(
-        status=ReviewRunStatus.ERROR, phase=ReviewPhase.DONE
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.add_warning("plan failed: no reviewer profile for 'security'")
+        await writer.settle(ReviewRunStatus.ERROR)
+
+        payload = _view(boards).metadata_payload()
+
+        assert payload[ReviewMetaKey.STATUS] == "error"
+        assert payload[ReviewMetaKey.PHASE] == "done"
+        assert payload[ReviewMetaKey.ERROR] == (
+            "plan failed: no reviewer profile for 'security'"
+        )
+
+    asyncio.run(_run())
+
+
+def test_terminal_payload_bounds_the_persisted_reason(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.add_warning("x" * (CHILD_ERROR_MAX_CHARS + 50))
+        await writer.settle(ReviewRunStatus.STOPPED)
+
+        assert len(_view(boards).metadata_payload()[ReviewMetaKey.ERROR]) == (
+            CHILD_ERROR_MAX_CHARS
+        )
+
+    asyncio.run(_run())
+
+
+def test_completed_payload_carries_no_failure_reason(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.add_warning("reviewer warning")
+        await writer.settle(ReviewRunStatus.COMPLETED)
+
+        payload = _view(boards).metadata_payload()
+
+        assert payload[ReviewMetaKey.STATUS] == "completed"
+        assert ReviewMetaKey.ERROR not in payload
+
+    asyncio.run(_run())
+
+
+def test_persist_metadata_mirrors_the_board_onto_the_session(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.advance(ReviewPhase.REVIEW)
+        await writer.persist_metadata()
+
+        session = boards._sessions.get_or_create(SESSION_KEY)  # noqa: SLF001
+        assert session.metadata[ReviewMetaKey.RUN_ID] == RUN_ID
+        assert session.metadata[ReviewMetaKey.PHASE] == "review"
+        assert session.metadata[ReviewMetaKey.STATUS] == "running"
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Reviewer / judge child state
+# ---------------------------------------------------------------------------
+
+
+def test_start_assignments_opens_one_slot_per_dimension(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments(
+            (_assignment("bug"), _assignment("security"))
+        )
+
+        view = _view(boards)
+        assert {reviewer.dimension: reviewer.status for reviewer in view.reviewers} == {
+            "bug": CHILD_PENDING,
+            "security": CHILD_PENDING,
+        }
+        assert view.reviewer("bug") is not None
+        assert view.reviewer("performance") is None
+
+    asyncio.run(_run())
+
+
+def test_reviewer_started_records_its_evidence_count(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        await writer.reviewer_started("bug", evidence_assigned=3)
+
+        reviewer = _view(boards).reviewer("bug")
+        assert reviewer is not None
+        assert reviewer.status == CHILD_RUNNING
+        assert reviewer.evidence_assigned == 3
+
+    asyncio.run(_run())
+
+
+def test_reviewer_settled_records_status_usage_and_counters(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        await writer.reviewer_started("bug", evidence_assigned=2)
+        await writer.reviewer_settled(
+            "bug",
+            status=CHILD_COMPLETED,
+            usage={"input_tokens": 10, "total_tokens": 12},
+            duplicate_reads=1,
+            duplicate_searches=4,
+        )
+
+        reviewer = _view(boards).reviewer("bug")
+        assert reviewer is not None
+        assert reviewer.status == CHILD_COMPLETED
+        assert reviewer.error == ""
+        assert reviewer.evidence_assigned == 2
+        assert dict(reviewer.usage) == {"input_tokens": 10, "total_tokens": 12}
+        assert reviewer.duplicate_reads == 1
+        assert reviewer.duplicate_searches == 4
+
+    asyncio.run(_run())
+
+
+def test_completed_is_terminal_for_a_reviewer_slot(boards: ReviewBoardStore) -> None:
+    """A late failure can never downgrade a reviewer that already completed."""
+
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        await writer.reviewer_settled("bug", status=CHILD_COMPLETED)
+        await writer.reviewer_settled("bug", status=CHILD_ERROR, error="late")
+
+        reviewer = _view(boards).reviewer("bug")
+        assert reviewer is not None
+        assert reviewer.status == CHILD_COMPLETED
+        assert reviewer.error == ""
+
+    asyncio.run(_run())
+
+
+def test_a_failed_reviewer_keeps_a_bounded_reason(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        await writer.reviewer_settled(
+            "bug", status=CHILD_ERROR, error="x" * (CHILD_ERROR_MAX_CHARS + 50)
+        )
+
+        reviewer = _view(boards).reviewer("bug")
+        assert reviewer is not None
+        assert reviewer.status == CHILD_ERROR
+        assert len(reviewer.error) == CHILD_ERROR_MAX_CHARS
+
+    asyncio.run(_run())
+
+
+def test_stopped_is_distinct_from_completed(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        await writer.reviewer_settled(
+            "bug", status=CHILD_STOPPED, error="review stopped"
+        )
+
+        reviewer = _view(boards).reviewer("bug")
+        assert reviewer is not None
+        assert reviewer.status == CHILD_STOPPED
+        assert reviewer.status != CHILD_COMPLETED
+        assert reviewer.error == "review stopped"
+
+    asyncio.run(_run())
+
+
+def test_record_dimension_replaces_by_dimension(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.record_dimension(
+            ReviewDimensionResult(dimension="bug", status="validated")
+        )
+        await writer.record_dimension(
+            ReviewDimensionResult(dimension="security", status="validated")
+        )
+        await writer.record_dimension(
+            ReviewDimensionResult(dimension="bug", status="failed")
+        )
+
+        dimensions = {item.dimension: item.status for item in _view(boards).dimensions}
+        assert dimensions == {"bug": "failed", "security": "validated"}
+
+    asyncio.run(_run())
+
+
+def test_judge_batch_lifecycle(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.judge_started("judge")
+        assert _view(boards).judge_batches[0].status == CHILD_RUNNING
+
+        await writer.judge_settled(
+            "judge",
+            status=CHILD_COMPLETED,
+            stats={"total": 2},
+            usage={"total_tokens": 7},
+        )
+
+        batch = _view(boards).judge_batches[0]
+        assert batch.status == CHILD_COMPLETED
+        assert batch.error == ""
+        assert dict(batch.stats) == {"total": 2}
+        assert dict(batch.usage) == {"total_tokens": 7}
+
+    asyncio.run(_run())
+
+
+def test_judge_failure_keeps_a_bounded_reason(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.judge_started("judge")
+        await writer.judge_settled(
+            "judge", status=CHILD_ERROR, error="y" * (CHILD_ERROR_MAX_CHARS + 50)
+        )
+
+        batch = _view(boards).judge_batches[0]
+        assert batch.status == CHILD_ERROR
+        assert len(batch.error) == CHILD_ERROR_MAX_CHARS
+
+    asyncio.run(_run())
+
+
+def test_record_judged_replaces_the_candidate_sets(boards: ReviewBoardStore) -> None:
+    """Judge verdicts and the report must read the same candidate version."""
+
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.record_dimension(
+            ReviewDimensionResult(dimension="security", status="validated")
+        )
+        judged = (
+            ReviewDimensionResult(
+                dimension="security", status="validated", judged=[_accepted("Real bug")]
+            ),
+        )
+        await writer.record_judged(judged, {"accepted": 1})
+
+        view = _view(boards)
+        assert view.dimensions == judged
+        assert view.judge_stats == {"accepted": 1}
+
+    asyncio.run(_run())
+
+
+def test_board_usage_accumulates_across_agent_runs(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.add_usage(
+            {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+        )
+        await writer.add_usage(
+            {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+        )
+        assert dict(_view(boards).usage) == {
+            "prompt_tokens": 150,
+            "completion_tokens": 30,
+            "total_tokens": 180,
+        }
+
+        # Empty, non-numeric, negative and None payloads are ignored.
+        await writer.add_usage(None)
+        await writer.add_usage({})
+        await writer.add_usage({"total_tokens": "not-a-number"})
+        await writer.add_usage({"total_tokens": -5})
+        assert _view(boards).usage["total_tokens"] == 180
+
+    asyncio.run(_run())
+
+
+def test_reviewer_state_usage_accumulates() -> None:
+    reviewer = ReviewerRunState(dimension="security")
+    reviewer.add_usage({"total_tokens": 11})
+    reviewer.add_usage({"prompt_tokens": 4, "total_tokens": 9})
+    assert reviewer.usage == {"prompt_tokens": 4, "total_tokens": 20}
+
+
+def test_a_view_is_a_frozen_snapshot(boards: ReviewBoardStore) -> None:
+    """A view taken before a write must not observe that write."""
+
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        before = _view(boards)
+
+        await writer.reviewer_started("bug", evidence_assigned=1)
+
+        assert before.reviewer("bug") is not None
+        assert before.reviewer("bug").status == CHILD_PENDING
+        assert _view(boards).reviewer("bug").status == CHILD_RUNNING
+
+    asyncio.run(_run())
+
+
+def test_concurrent_reviewer_completions_are_serialized(
+    boards: ReviewBoardStore,
+) -> None:
+    """Two reviewers settling at once must both land (no lost update)."""
+
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments(
+            (_assignment("bug"), _assignment("security"), _assignment("performance"))
+        )
+        await asyncio.gather(
+            writer.reviewer_settled("bug", status=CHILD_COMPLETED, usage={"total_tokens": 5}),
+            writer.reviewer_settled(
+                "security", status=CHILD_COMPLETED, usage={"total_tokens": 7}
+            ),
+            writer.reviewer_settled(
+                "performance", status=CHILD_ERROR, error="boom"
+            ),
+            writer.add_usage({"total_tokens": 11}),
+        )
+
+        view = _view(boards)
+        assert {
+            reviewer.dimension: reviewer.status for reviewer in view.reviewers
+        } == {
+            "bug": CHILD_COMPLETED,
+            "security": CHILD_COMPLETED,
+            "performance": CHILD_ERROR,
+        }
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Report artifact recording
+# ---------------------------------------------------------------------------
+
+
+def test_record_report_persists_the_artifact_and_records_its_ref(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        findings = ({"id": "F001", "title": "Real bug"},)
+        ref = await writer.record_report(
+            report_markdown="# report", findings=findings, verdicts=[]
+        )
+
+        assert ref == f"{REVIEW_ARTIFACTS_DIR_NAME}/{RUN_ID}.json"
+        view = _view(boards)
+        assert view.report_ref == ref
+        assert view.findings == findings
+        assert view.summary == "# report"
+
+    asyncio.run(_run())
+
+
+def test_a_failed_artifact_write_records_a_warning_and_no_ref(
+    tmp_path: Path,
+) -> None:
+    class _FailingArtifacts(ReviewArtifactStore):
+        def write(self, artifact: dict[str, Any]) -> str | None:  # noqa: D102 - stub
+            return None
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = _store(workspace, artifacts=_FailingArtifacts(workspace))
+
+    async def _run() -> None:
+        writer = _create(store)
+        ref = await writer.record_report(
+            report_markdown="# report", findings=(), verdicts=[]
+        )
+
+        assert ref is None
+        view = _view(store)
+        assert view.report_ref is None
+        assert "Failed to persist the review report artifact." in view.warnings
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Settle
+# ---------------------------------------------------------------------------
+
+
+def test_settle_publishes_done_after_persisting(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        view = await writer.settle(ReviewRunStatus.COMPLETED)
+
+        assert view.status is ReviewRunStatus.COMPLETED
+        assert view.phase is ReviewPhase.DONE
+        assert view.is_terminal and view.is_done
+        session = boards._sessions.get_or_create(SESSION_KEY)  # noqa: SLF001
+        assert session.metadata[ReviewMetaKey.STATUS] == "completed"
+        assert session.metadata[ReviewMetaKey.PHASE] == "done"
+
+    asyncio.run(_run())
+
+
+def test_settle_is_idempotent(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.settle(ReviewRunStatus.COMPLETED)
+        again = await writer.settle(ReviewRunStatus.ERROR)
+
+        assert again.status is ReviewRunStatus.COMPLETED
+
+    asyncio.run(_run())
+
+
+def test_settle_as_error_or_stopped_fails_unfinished_children(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"), _assignment("security")))
+        await writer.reviewer_started("bug", evidence_assigned=1)
+        await writer.reviewer_settled("security", status=CHILD_COMPLETED)
+        await writer.judge_started("judge")
+
+        view = await writer.settle(ReviewRunStatus.STOPPED)
+
+        assert view.reviewer("bug").status == CHILD_STOPPED
+        assert view.reviewer("bug").error == "review stopped before the run finished"
+        # A completed reviewer is left alone.
+        assert view.reviewer("security").status == CHILD_COMPLETED
+        assert view.judge_batches[0].status == CHILD_STOPPED
+
+    asyncio.run(_run())
+
+
+def test_settle_as_completed_does_not_rewrite_children(
+    boards: ReviewBoardStore,
+) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.start_assignments((_assignment("bug"),))
+        # A completed run with a pending slot is an inconsistency the board
+        # reports (``incomplete_dimensions``) instead of silently "fixing".
+        view = await writer.settle(ReviewRunStatus.COMPLETED)
+
+        assert view.reviewer("bug").status == CHILD_PENDING
+        assert view.coverage_payload()["incomplete_dimensions"] == ["bug"]
+
+    asyncio.run(_run())
+
+
+def test_a_failed_terminal_save_keeps_the_run_running(tmp_path: Path) -> None:
+    """The conversation gate must never open over a state it cannot prove."""
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = ReviewBoardStore(
+        sessions=_FailingSessions(workspace),
+        artifacts=ReviewArtifactStore(workspace),
     )
 
-    assert payload[ReviewMetaKey.STATUS] == "error"
-    assert payload[ReviewMetaKey.PHASE] == "done"
-    assert payload[ReviewMetaKey.SUMMARY] == "report digest"
-    assert payload[ReviewMetaKey.ERROR] == "plan failed: no reviewer profile for 'security'"
+    async def _run() -> None:
+        writer = _create(store)
+        with pytest.raises(ReviewBoardPersistenceError):
+            await writer.settle(ReviewRunStatus.COMPLETED)
+
+        view = _view(store)
+        assert view.status is ReviewRunStatus.RUNNING
+        assert view.phase is not ReviewPhase.DONE
+        assert any("could not be persisted" in item for item in view.warnings)
+
+    asyncio.run(_run())
 
 
-def test_metadata_payload_bounds_the_persisted_reason() -> None:
-    state = _run_state()
-    state.add_warning("x" * (CHILD_ERROR_MAX_CHARS + 50))
+def test_a_failed_terminal_save_restores_the_previous_metadata(
+    tmp_path: Path,
+) -> None:
+    class _Sessions(SessionManager):
+        """First save succeeds, the terminal save fails."""
 
-    payload = state.metadata_payload(
-        status=ReviewRunStatus.STOPPED, phase=ReviewPhase.DONE
+        def __init__(self, workspace: Path) -> None:
+            super().__init__(workspace)
+            self.calls = 0
+
+        def save(self, session):  # noqa: D102 - stub
+            self.calls += 1
+            if self.calls > 1:
+                raise OSError("disk full")
+            super().save(session)
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sessions = _Sessions(workspace)
+    store = ReviewBoardStore(
+        sessions=sessions, artifacts=ReviewArtifactStore(workspace)
     )
 
-    assert len(payload[ReviewMetaKey.ERROR]) == CHILD_ERROR_MAX_CHARS
+    async def _run() -> None:
+        writer = _create(store)
+        await writer.persist_metadata()  # first save succeeds
+        with pytest.raises(ReviewBoardPersistenceError):
+            await writer.settle(ReviewRunStatus.ERROR)
+
+        session = sessions.get_or_create(SESSION_KEY)
+        # The failed terminal write was rolled back to the pre-settle values.
+        assert session.metadata[ReviewMetaKey.STATUS] == "running"
+        assert session.metadata[ReviewMetaKey.PHASE] == "prepare"
+
+    asyncio.run(_run())
 
 
-def test_running_payload_never_persists_a_failure_reason() -> None:
-    """Warnings during a live run stay in-process; only a terminal run has a reason."""
-    state = _run_state()
-    state.set_summary("partial digest")
-    state.add_warning("reviewer warning")
-
-    payload = state.metadata_payload()
-
-    assert payload[ReviewMetaKey.STATUS] == "running"
-    assert payload[ReviewMetaKey.SUMMARY] == "partial digest"
-    assert ReviewMetaKey.ERROR not in payload
-
-
-def test_completed_payload_carries_no_failure_reason() -> None:
-    state = _run_state()
-    state.add_warning("reviewer warning")
-
-    payload = state.metadata_payload(
-        status=ReviewRunStatus.COMPLETED, phase=ReviewPhase.DONE
-    )
-
-    assert payload[ReviewMetaKey.STATUS] == "completed"
-    assert ReviewMetaKey.ERROR not in payload
-
-
-def test_review_run_state_child_states() -> None:
-    state = _run_state()
-    reviewer = state.reviewer_state("security")
-    assert reviewer is state.reviewer_state("security")
-    assert reviewer.status == "pending"
-
-    state.judge_batches["b-1"] = JudgeBatchState(batch_id="b-1")
-    state.judge_batches["b-1"].stats["total"] = 2
-    assert state.judge_batches["b-1"].stats == {"total": 2}
-
-    reviewer.status = "completed"
-    assert state.reviewers["security"] == ReviewerRunState(
-        dimension="security", status="completed"
-    )
+# ---------------------------------------------------------------------------
+# Fingerprint
+# ---------------------------------------------------------------------------
 
 
 def test_new_review_run_id_is_filesystem_safe() -> None:
@@ -214,7 +898,9 @@ def test_input_fingerprint_is_stable_and_input_sensitive() -> None:
     }
     first = compute_input_fingerprint(**kwargs)
     # Role order and duplicate roles must not change the fingerprint.
-    second = compute_input_fingerprint(**{**kwargs, "roles": ["tests", "security", "tests"]})
+    second = compute_input_fingerprint(
+        **{**kwargs, "roles": ["tests", "security", "tests"]}
+    )
     assert first == second
     assert len(first) == 64
 
@@ -237,87 +923,130 @@ def test_input_fingerprint_normalizes_defaults() -> None:
 
 def test_compute_review_input_fingerprint_with_empty_inputs() -> None:
     assert compute_review_input_fingerprint(None, None) == compute_input_fingerprint(
-        target=None, target_type=None, action=None, roles=None, scope=None,
-        evidence_manifest=None, extra_metadata=None,
+        target=None,
+        target_type=None,
+        action=None,
+        roles=None,
+        scope=None,
+        evidence_manifest=None,
+        extra_metadata=None,
     )
 
 
-def test_build_report_artifact_uses_run_state_fields() -> None:
-    state = _run_state(status=ReviewRunStatus.COMPLETED)
-    state.findings.append({"title": "finding-1"})
-    state.usage["total_tokens"] = 42
-    state.warnings.append("w-1")
-    artifact = build_report_artifact(
-        state, report_markdown="# report", verdicts=[{"final_verdict": "accepted"}]
-    )
-    assert artifact["run_id"] == state.run_id
-    assert artifact["session_key"] == state.session_key
-    assert artifact["status"] == "completed"
-    assert artifact["input_fingerprint"] == state.input_fingerprint
-    assert artifact["report_markdown"] == "# report"
-    assert artifact["findings"] == [{"title": "finding-1"}]
-    assert artifact["verdicts"] == [{"final_verdict": "accepted"}]
-    assert artifact["usage"] == {"total_tokens": 42}
-    assert artifact["warnings"] == ["w-1"]
-    assert artifact["created_at"]
+# ---------------------------------------------------------------------------
+# Report artifact serialization
+# ---------------------------------------------------------------------------
 
 
-def test_build_report_artifact_status_overrides_running_state() -> None:
+def test_build_report_artifact_uses_board_fields(boards: ReviewBoardStore) -> None:
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.add_usage({"total_tokens": 42})
+        await writer.add_warning("w-1")
+        await writer.record_report(
+            report_markdown="# report",
+            findings=({"title": "finding-1"},),
+            verdicts=[{"final_verdict": "accepted"}],
+        )
+        await writer.settle(ReviewRunStatus.COMPLETED)
+        view = _view(boards)
+
+        artifact = build_report_artifact(
+            view, report_markdown="# report", verdicts=[{"final_verdict": "accepted"}]
+        )
+
+        assert artifact["run_id"] == RUN_ID
+        assert artifact["session_key"] == SESSION_KEY
+        assert artifact["status"] == "completed"
+        assert artifact["input_fingerprint"] == "fp-1"
+        assert artifact["report_markdown"] == "# report"
+        assert artifact["findings"] == [{"title": "finding-1"}]
+        assert artifact["verdicts"] == [{"final_verdict": "accepted"}]
+        assert artifact["usage"] == {"total_tokens": 42}
+        assert artifact["warnings"] == ["w-1"]
+        assert artifact["created_at"]
+
+    asyncio.run(_run())
+
+
+def test_build_report_artifact_status_overrides_a_running_board(
+    boards: ReviewBoardStore,
+) -> None:
     """The artifact is persisted before the run status flips to terminal.
 
-    ``ReviewLoop`` must therefore pass the decided terminal status, otherwise
-    a completed report would be written with ``status: running`` and later
+    ``ReviewLoop`` must therefore pass the decided terminal status, otherwise a
+    completed report would be written with ``status: running`` and later
     consumers would treat a finished report as still in flight.
     """
-    state = _run_state(status=ReviewRunStatus.RUNNING)
+    _create(boards)
+    view = _view(boards)
+
     artifact = build_report_artifact(
-        state,
-        report_markdown="# report",
-        status=ReviewRunStatus.COMPLETED,
+        view, report_markdown="# report", status=ReviewRunStatus.COMPLETED
     )
+
     assert artifact["status"] == "completed"
-    # Writing the artifact never mutates the in-process run state.
-    assert state.status is ReviewRunStatus.RUNNING
+    # Serializing never mutates the board.
+    assert _view(boards).status is ReviewRunStatus.RUNNING
 
 
-def test_build_report_artifact_records_coverage_and_boundary() -> None:
+def test_build_report_artifact_records_coverage_and_boundary(
+    boards: ReviewBoardStore,
+) -> None:
     """The artifact carries the review boundary and per-reviewer summary."""
-    state = _run_state(status=ReviewRunStatus.COMPLETED)
-    state.snapshot_ref = "review-snapshots/run-000111222333.json"
-    state.changed_files = ["src/app.py", "src/db.py"]
-    state.skipped_files = ["vendor/lib.py"]
-    state.manifest_stats = {"version": "evidence-manifest/1", "retained": 3, "omitted": 1}
-    reviewer = state.reviewer_state("security")
-    reviewer.status = "completed"
-    reviewer.evidence_assigned = 2
-    reviewer.duplicate_reads = 1
-    reviewer.duplicate_searches = 4
-    reviewer.add_usage({"input_tokens": 10})
-    incomplete = state.reviewer_state("performance")
-    incomplete.status = "error"
-    incomplete.error = "reviewer timed out"
 
-    artifact = build_report_artifact(state, report_markdown="# report")
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.record_accepted_input(
+            plan=None,
+            input_fingerprint="fp-1",
+            changed_files=["src/app.py", "src/db.py"],
+            skipped_files=["vendor/lib.py"],
+            manifest_stats={"version": "evidence-manifest/1", "retained": 3, "omitted": 1},
+            triage=None,
+        )
+        await writer.start_assignments(
+            (_assignment("security"), _assignment("performance"))
+        )
+        await writer.reviewer_started("security", evidence_assigned=2)
+        await writer.reviewer_settled(
+            "security",
+            status=CHILD_COMPLETED,
+            usage={"input_tokens": 10},
+            duplicate_reads=1,
+            duplicate_searches=4,
+        )
+        await writer.reviewer_settled(
+            "performance", status=CHILD_ERROR, error="reviewer timed out"
+        )
 
-    assert artifact["snapshot_ref"] == state.snapshot_ref
-    coverage = artifact["coverage"]
-    assert coverage["changed_files"] == ["src/app.py", "src/db.py"]
-    assert coverage["skipped_files"] == ["vendor/lib.py"]
-    assert coverage["manifest"] == state.manifest_stats
-    assert coverage["incomplete_dimensions"] == ["performance"]
-    reviewer_cov = coverage["reviewers"]["security"]
-    assert reviewer_cov["status"] == "completed"
-    assert reviewer_cov["evidence_assigned"] == 2
-    assert reviewer_cov["duplicate_reads"] == 1
-    assert reviewer_cov["duplicate_searches"] == 4
-    assert reviewer_cov["usage"] == {"input_tokens": 10}
+        artifact = build_report_artifact(_view(boards), report_markdown="# report")
+
+        assert artifact["snapshot_ref"] == SNAPSHOT_REF
+        coverage = artifact["coverage"]
+        assert coverage["changed_files"] == ["src/app.py", "src/db.py"]
+        assert coverage["skipped_files"] == ["vendor/lib.py"]
+        assert coverage["manifest"]["retained"] == 3
+        assert coverage["incomplete_dimensions"] == ["performance"]
+        reviewer_cov = coverage["reviewers"]["security"]
+        assert reviewer_cov["status"] == "completed"
+        assert reviewer_cov["evidence_assigned"] == 2
+        assert reviewer_cov["duplicate_reads"] == 1
+        assert reviewer_cov["duplicate_searches"] == 4
+        assert reviewer_cov["usage"] == {"input_tokens": 10}
+
+    asyncio.run(_run())
 
 
-def test_build_report_artifact_can_record_a_failed_run() -> None:
-    state = _run_state(status=ReviewRunStatus.RUNNING)
+def test_build_report_artifact_can_record_a_failed_run(
+    boards: ReviewBoardStore,
+) -> None:
+    _create(boards)
+
     artifact = build_report_artifact(
-        state, report_markdown="", status=ReviewRunStatus.ERROR
+        _view(boards), report_markdown="", status=ReviewRunStatus.ERROR
     )
+
     assert artifact["status"] == "error"
 
 
@@ -339,64 +1068,22 @@ def test_serialize_finalizer_result_ids_confirmed_findings_only() -> None:
     assert len(verdicts) == 2
 
 
-def test_finding_ids_reach_the_artifact_and_the_result() -> None:
-    """The artifact and ``ReviewResult.findings`` mirror the Markdown IDs."""
-    state = _run_state(status=ReviewRunStatus.COMPLETED)
-    state.findings = [{"id": "F001", "title": "Real bug"}]
+def test_finding_ids_reach_the_artifact(boards: ReviewBoardStore) -> None:
+    """The artifact mirrors the Markdown finding IDs."""
 
-    artifact = build_report_artifact(state, report_markdown="# report")
+    async def _run() -> None:
+        writer = _create(boards)
+        await writer.record_report(
+            report_markdown="# report",
+            findings=({"id": "F001", "title": "Real bug"},),
+            verdicts=[],
+        )
 
-    assert artifact["findings"][0]["id"] == "F001"
-    assert result_from_run_state(state).findings[0]["id"] == "F001"
+        artifact = build_report_artifact(_view(boards), report_markdown="# report")
 
+        assert artifact["findings"][0]["id"] == "F001"
 
-def test_review_run_state_add_usage_accumulates_counters() -> None:
-    state = _run_state()
-    state.add_usage({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})
-    state.add_usage({"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60})
-    assert state.usage == {
-        "prompt_tokens": 150,
-        "completion_tokens": 30,
-        "total_tokens": 180,
-    }
-    # Empty, non-numeric, negative and None payloads are ignored.
-    state.add_usage(None)
-    state.add_usage({})
-    state.add_usage({"total_tokens": "not-a-number"})
-    state.add_usage({"total_tokens": -5})
-    assert state.usage["total_tokens"] == 180
-
-
-def test_reviewer_and_judge_state_accumulate_usage() -> None:
-    reviewer = ReviewerRunState(dimension="security")
-    reviewer.add_usage({"total_tokens": 11})
-    reviewer.add_usage({"prompt_tokens": 4, "total_tokens": 9})
-    assert reviewer.usage == {"prompt_tokens": 4, "total_tokens": 20}
-
-    batch = JudgeBatchState(batch_id="judge")
-    batch.add_usage({"total_tokens": 7})
-    assert batch.usage == {"total_tokens": 7}
-
-
-def test_judge_batch_state_transition_and_bounded_error() -> None:
-    """A judge batch moves pending -> running -> completed/error with a bounded reason."""
-    batch = JudgeBatchState(batch_id="judge")
-    assert batch.status == "pending"
-    assert batch.error == ""
-    assert batch.stats == {}
-
-    batch.status = "running"
-    batch.status = "completed"
-    batch.stats = {"total_candidates": 3}
-    assert batch.status == "completed"
-
-    failing = JudgeBatchState(batch_id="judge")
-    failing.status = "running"
-    failing.status = "error"
-    # The error reason is stored bounded so a huge provider trace (even if the
-    # caller passes a raw exception) cannot bloat the run state.
-    failing.error = bound_child_error("x" * 500)
-    assert len(failing.error) == CHILD_ERROR_MAX_CHARS
+    asyncio.run(_run())
 
 
 def test_bound_child_error_collapses_and_bounds_reason() -> None:
@@ -406,31 +1093,9 @@ def test_bound_child_error_collapses_and_bounds_reason() -> None:
     assert len(bound_child_error(long_reason)) == CHILD_ERROR_MAX_CHARS
 
 
-def test_reviewer_stopped_status_distinct_from_completed() -> None:
-    """``stopped`` records a cancelled reviewer, never a successful completion."""
-    stopped = ReviewerRunState(dimension="security", status="stopped")
-    stopped.error = "review stopped before the run finished"
-    assert stopped.status == "stopped"
-    assert stopped.status != "completed"
-    assert stopped.error
-
-
-def test_run_state_terminal_locks_phase_and_metadata() -> None:
-    """After a terminal status the phase stops changing and metadata matches."""
-    state = _run_state()
-    state.enter_phase(ReviewPhase.REVIEW)
-    state.status = ReviewRunStatus.COMPLETED
-    state.enter_phase(ReviewPhase.DONE)
-    assert state.phase is ReviewPhase.REVIEW
-    assert state.metadata_payload()["review_status"] == "completed"
-    assert state.metadata_payload()["review_phase"] == "review"
-    # Terminal run keeps a stable metadata payload: only status/phase/fp/ref.
-    assert set(state.metadata_payload()) == {
-        "review_run_id",
-        "review_status",
-        "review_phase",
-        "review_input_fingerprint",
-    }
+# ---------------------------------------------------------------------------
+# Artifact store
+# ---------------------------------------------------------------------------
 
 
 class TestReviewArtifactStore:

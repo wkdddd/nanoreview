@@ -17,20 +17,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from nanoreview.agent.review_loop import ReviewLoop
-from nanoreview.agent.review_state import (
-    ReviewPhase,
-    ReviewRunState,
-    ReviewRunStatus,
-    build_report_artifact,
-)
-from nanoreview.bus.events import InboundMessage
-from nanoreview.review.result import ReviewHandoffState
-from nanoreview.review.types import ReviewMetaKey
 from nanoreview.agent.coordinator import (
     INTERRUPTED_RUN_REASON,
     REVIEW_CONTEXT_EVENT,
@@ -38,9 +29,19 @@ from nanoreview.agent.coordinator import (
     SessionCoordinator,
     SessionRoute,
 )
+from nanoreview.agent.review_board import (
+    CHILD_ERROR,
+    ReviewBoardView,
+    ReviewBoardWriter,
+)
+from nanoreview.agent.review_loop import ReviewLoop
+from nanoreview.agent.review_state import ReviewPhase, ReviewRunStatus
 from nanoreview.agent.runner import AgentRunResult, AgentRunSpec
+from nanoreview.bus.events import InboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.providers.base import LLMProvider, LLMResponse
+from nanoreview.review.result import ReviewHandoffState
+from nanoreview.review.types import ReviewAssignment, ReviewMetaKey
 from nanoreview.session.manager import SessionManager
 
 SESSION_KEY = "cli:review"
@@ -94,47 +95,51 @@ def env(tmp_path: Path) -> _Env:
     )
 
 
-def _register(env: _Env, state: ReviewRunState, *, persist: bool = True) -> ReviewRunState:
-    env.review_loop.runs[state.session_key] = state
-    session = env.sessions.get_or_create(state.session_key)
-    session.metadata.update(state.metadata_payload())
-    if persist:
-        env.sessions.save(session)
-    return state
+SNAPSHOT_REF = "review-snapshots/run-a.json"
 
 
-def _live_run(
-    env: _Env,
-    *,
-    phase: ReviewPhase = ReviewPhase.REVIEW,
-    status: ReviewRunStatus = ReviewRunStatus.RUNNING,
-) -> ReviewRunState:
-    return _register(
-        env,
-        ReviewRunState(
-            run_id="run-a",
+def _create(env: _Env, *, run_id: str = "run-a") -> ReviewBoardWriter:
+    """Register one run's blackboard through the coordinator's store."""
+    env.coordinator._review_boards.create(  # noqa: SLF001 - store is the writer
+        SimpleNamespace(
+            run_id=run_id,
             session_key=SESSION_KEY,
             input_fingerprint="fp",
-            status=status,
-            phase=phase,
-        ),
-    )
-
-
-def _persist_report(env: _Env, state: ReviewRunState) -> str:
-    reference = env.review_loop.artifacts.write(
-        build_report_artifact(
-            state,
-            report_markdown=REPORT_MARKDOWN,
-            status=state.status,
+            snapshot_ref=SNAPSHOT_REF,
+            plan=None,
         )
     )
-    assert reference is not None
-    state.report_ref = reference
-    session = env.sessions.get_or_create(state.session_key)
-    session.metadata[ReviewMetaKey.REPORT_REF] = reference
-    env.sessions.save(session)
-    return reference
+    writer = env.coordinator._review_boards.writer(SESSION_KEY)  # noqa: SLF001
+    assert writer is not None
+    return writer
+
+
+def _board(env: _Env) -> ReviewBoardView:
+    view = env.coordinator._review_boards.view(SESSION_KEY)  # noqa: SLF001
+    assert view is not None
+    return view
+
+
+async def _live_run(
+    env: _Env, *, phase: ReviewPhase = ReviewPhase.REVIEW
+) -> ReviewBoardWriter:
+    """A running run at *phase* whose metadata is already persisted."""
+    writer = _create(env)
+    if phase is not ReviewPhase.PREPARE:
+        await writer.advance(phase)
+    await writer.persist_metadata()
+    return writer
+
+
+async def _terminal_completed(env: _Env) -> ReviewBoardWriter:
+    """A completed run with its report artifact persisted."""
+    writer = _create(env)
+    await writer.advance(ReviewPhase.CLEANUP)
+    await writer.record_report(
+        report_markdown=REPORT_MARKDOWN, findings=(), verdicts=[]
+    )
+    await writer.settle(ReviewRunStatus.COMPLETED)
+    return writer
 
 
 def _message() -> InboundMessage:
@@ -152,16 +157,16 @@ def _message() -> InboundMessage:
 # ---------------------------------------------------------------------------
 
 
-def test_a_live_running_run_keeps_the_session_in_review(env: _Env) -> None:
-    _live_run(env)
+async def test_a_live_running_run_keeps_the_session_in_review(env: _Env) -> None:
+    await _live_run(env)
     session = env.sessions.get_or_create(SESSION_KEY)
 
     assert env.coordinator.route(session) is SessionRoute.REVIEW
 
 
-def test_a_terminal_run_opens_the_conversation(env: _Env) -> None:
-    state = _live_run(env, status=ReviewRunStatus.COMPLETED, phase=ReviewPhase.DONE)
-    _register(env, state)
+async def test_a_terminal_run_opens_the_conversation(env: _Env) -> None:
+    writer = _create(env)
+    await writer.settle(ReviewRunStatus.COMPLETED)
     session = env.sessions.get_or_create(SESSION_KEY)
 
     assert env.coordinator.route(session) is SessionRoute.CONVERSATION
@@ -176,7 +181,7 @@ def test_an_orphaned_running_run_is_repaired_once_and_reopens_the_session(
     session.metadata[ReviewMetaKey.STATUS] = "running"
     session.metadata[ReviewMetaKey.PHASE] = "review"
     env.sessions.save(session)
-    assert env.review_loop.get(SESSION_KEY) is None
+    assert env.coordinator._review_boards.view(SESSION_KEY) is None  # noqa: SLF001
 
     # The repairing read returns the precise cause...
     result = env.coordinator.result(session)
@@ -218,7 +223,7 @@ def test_pending_handoff_repairs_an_orphan_without_a_manual_result_call(
     session.metadata[ReviewMetaKey.STATUS] = "running"
     session.metadata[ReviewMetaKey.PHASE] = "cleanup"
     env.sessions.save(session)
-    assert env.review_loop.get(SESSION_KEY) is None
+    assert env.coordinator._review_boards.view(SESSION_KEY) is None  # noqa: SLF001
 
     handoff = env.coordinator.pending_handoff(session)
 
@@ -243,7 +248,7 @@ def test_a_failed_orphan_repair_does_not_publish_done_in_cache(env: _Env) -> Non
     session.metadata[ReviewMetaKey.STATUS] = "running"
     session.metadata[ReviewMetaKey.PHASE] = "review"
     env.sessions.save(session)
-    assert env.review_loop.get(SESSION_KEY) is None
+    assert env.coordinator._review_boards.view(SESSION_KEY) is None  # noqa: SLF001
 
     original_save = env.sessions.save
 
@@ -266,13 +271,13 @@ def test_a_failed_orphan_repair_does_not_publish_done_in_cache(env: _Env) -> Non
     assert env.coordinator.result(session).status is ReviewRunStatus.ERROR
 
 
-def test_a_live_run_is_never_mistaken_for_an_orphan(env: _Env) -> None:
+async def test_a_live_run_is_never_mistaken_for_an_orphan(env: _Env) -> None:
     """The live run is authoritative; stale ``running`` metadata is not repair.
 
     Normalizing here would corrupt a perfectly healthy run: the persisted
     status is mid-flight, not abandoned.
     """
-    _live_run(env)
+    await _live_run(env)
     session = env.sessions.get_or_create(SESSION_KEY)
 
     assert env.coordinator.result(session) is None
@@ -295,15 +300,8 @@ def test_a_plain_session_has_no_review_route_or_result(env: _Env) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _terminal_completed(env: _Env) -> ReviewRunState:
-    state = _live_run(env, status=ReviewRunStatus.COMPLETED, phase=ReviewPhase.DONE)
-    _persist_report(env, state)
-    _register(env, state)
-    return state
-
-
-def test_a_complete_handoff_injects_the_report_verbatim(env: _Env) -> None:
-    _terminal_completed(env)
+async def test_a_complete_handoff_injects_the_report_verbatim(env: _Env) -> None:
+    await _terminal_completed(env)
     session = env.sessions.get_or_create(SESSION_KEY)
 
     handoff = env.coordinator.pending_handoff(session)
@@ -315,10 +313,17 @@ def test_a_complete_handoff_injects_the_report_verbatim(env: _Env) -> None:
     assert handoff.result.run_id in handoff.directive
 
 
-def test_a_run_with_gaps_hands_over_a_partial_report(env: _Env) -> None:
-    state = _terminal_completed(env)
-    state.reviewer_state("performance").status = "error"
-    state.reviewer_state("performance").error = "provider timeout"
+async def test_a_run_with_gaps_hands_over_a_partial_report(env: _Env) -> None:
+    writer = _create(env)
+    await writer.advance(ReviewPhase.CLEANUP)
+    await writer.start_assignments((ReviewAssignment(dimension="performance", focus="x"),))
+    await writer.reviewer_settled(
+        "performance", status=CHILD_ERROR, error="provider timeout"
+    )
+    await writer.record_report(
+        report_markdown=REPORT_MARKDOWN, findings=(), verdicts=[]
+    )
+    await writer.settle(ReviewRunStatus.COMPLETED)
     session = env.sessions.get_or_create(SESSION_KEY)
 
     handoff = env.coordinator.pending_handoff(session)
@@ -330,10 +335,10 @@ def test_a_run_with_gaps_hands_over_a_partial_report(env: _Env) -> None:
     assert REPORT_MARKDOWN in handoff.block
 
 
-def test_a_missing_artifact_hands_over_an_explicit_failure(env: _Env) -> None:
-    state = _live_run(env, status=ReviewRunStatus.COMPLETED, phase=ReviewPhase.DONE)
-    state.report_ref = "review-artifacts/run-a.json"  # never written
-    _register(env, state)
+async def test_a_missing_artifact_hands_over_an_explicit_failure(env: _Env) -> None:
+    await _terminal_completed(env)
+    # The artifact was written, then lost (a pruned workspace, a failed disk).
+    env.coordinator._review_artifacts.path_for("run-a").unlink()  # noqa: SLF001
     session = env.sessions.get_or_create(SESSION_KEY)
 
     handoff = env.coordinator.pending_handoff(session)
@@ -344,8 +349,8 @@ def test_a_missing_artifact_hands_over_an_explicit_failure(env: _Env) -> None:
     assert REPORT_MARKDOWN not in handoff.block
 
 
-def test_the_handoff_is_consumed_exactly_once(env: _Env) -> None:
-    _terminal_completed(env)
+async def test_the_handoff_is_consumed_exactly_once(env: _Env) -> None:
+    await _terminal_completed(env)
     session = env.sessions.get_or_create(SESSION_KEY)
     handoff = env.coordinator.pending_handoff(session)
     assert handoff is not None
@@ -371,17 +376,13 @@ def test_the_handoff_is_consumed_exactly_once(env: _Env) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_an_oversized_report_rejects_the_first_turn(env: _Env) -> None:
-    state = _live_run(env, status=ReviewRunStatus.COMPLETED, phase=ReviewPhase.DONE)
-    env.review_loop.artifacts.write(
-        build_report_artifact(
-            state,
-            report_markdown="line of report\n" * 20_000,
-            status=ReviewRunStatus.COMPLETED,
-        )
+async def test_an_oversized_report_rejects_the_first_turn(env: _Env) -> None:
+    writer = _create(env)
+    await writer.advance(ReviewPhase.CLEANUP)
+    await writer.record_report(
+        report_markdown="line of report\n" * 20_000, findings=(), verdicts=[]
     )
-    state.report_ref = env.review_loop.artifacts.reference_for(state.run_id)
-    _register(env, state)
+    await writer.settle(ReviewRunStatus.COMPLETED)
     session = env.sessions.get_or_create(SESSION_KEY)
     coordinator = SessionCoordinator(
         MessageBus(),
@@ -406,8 +407,8 @@ def test_an_oversized_report_rejects_the_first_turn(env: _Env) -> None:
     assert REPORT_MARKDOWN not in response.content
 
 
-def test_an_unknown_context_window_never_blocks_a_handoff(env: _Env) -> None:
-    _terminal_completed(env)
+async def test_an_unknown_context_window_never_blocks_a_handoff(env: _Env) -> None:
+    await _terminal_completed(env)
     session = env.sessions.get_or_create(SESSION_KEY)
     coordinator = SessionCoordinator(
         MessageBus(),
@@ -428,8 +429,8 @@ def test_an_unknown_context_window_never_blocks_a_handoff(env: _Env) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_context_index_is_written_once_and_stays_compact(env: _Env) -> None:
-    _terminal_completed(env)
+async def test_context_index_is_written_once_and_stays_compact(env: _Env) -> None:
+    await _terminal_completed(env)
     session = env.sessions.get_or_create(SESSION_KEY)
 
     assert env.coordinator.write_context_index(session) is True
@@ -442,8 +443,8 @@ def test_context_index_is_written_once_and_stays_compact(env: _Env) -> None:
     ]
     assert len(index) == 1
     assert index[0]["review_run_id"] == "run-a"
-    assert index[0]["review_report_ref"] == env.review_loop.artifacts.reference_for(
-        "run-a"
+    assert index[0]["review_report_ref"] == (
+        env.coordinator._review_artifacts.reference_for("run-a")  # noqa: SLF001
     )
     assert REPORT_MARKDOWN not in index[0]["content"]
 
@@ -453,16 +454,18 @@ def test_context_index_is_written_once_and_stays_compact(env: _Env) -> None:
 
 @pytest.mark.asyncio
 async def test_finalize_settles_the_run_and_indexes_the_result(env: _Env) -> None:
-    state = _live_run(env)
-    state.reviewer_state("security").status = "running"
+    writer = _create(env)
+    await writer.advance(ReviewPhase.REVIEW)
+    await writer.start_assignments((ReviewAssignment(dimension="security", focus="x"),))
+    await writer.reviewer_started("security", evidence_assigned=1)
 
     result = await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.STOPPED)
 
     assert result is not None
     assert result.status is ReviewRunStatus.STOPPED
     assert result.handoff is ReviewHandoffState.FAILED
-    assert state.reviewers["security"].status == "stopped"
-    assert env.review_loop.running(SESSION_KEY) is None
+    assert _board(env).reviewer("security").status == "stopped"
+    assert env.coordinator._review_boards.running(SESSION_KEY) is None  # noqa: SLF001
 
     session = env.sessions.get_or_create(SESSION_KEY)
     assert session.metadata[ReviewMetaKey.STATUS] == "stopped"
@@ -481,7 +484,7 @@ async def test_finalize_settles_a_run_that_never_started(env: _Env) -> None:
     run would leave a claim no process can explain: the run is closed as the
     requested terminal status with a bounded reason and the index is written.
     """
-    _live_run(env, phase=ReviewPhase.PREPARE)
+    _create(env)
 
     result = await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.ERROR)
 
@@ -489,8 +492,8 @@ async def test_finalize_settles_a_run_that_never_started(env: _Env) -> None:
     assert result.status is ReviewRunStatus.ERROR
     assert result.error
     session = env.sessions.get_or_create(SESSION_KEY)
-    assert env.review_loop.running(SESSION_KEY) is None
-    assert env.review_loop.get(SESSION_KEY) is not None
+    assert env.coordinator._review_boards.running(SESSION_KEY) is None  # noqa: SLF001
+    assert env.coordinator._review_boards.view(SESSION_KEY) is not None  # noqa: SLF001
     assert session.metadata[ReviewMetaKey.STATUS] == "error"
     assert session.metadata[ReviewMetaKey.PHASE] == "done"
     assert session.metadata[ReviewMetaKey.SUMMARY] == result.error
@@ -609,8 +612,10 @@ async def test_a_failed_turn_save_keeps_the_returned_usage(env: _Env) -> None:
 @pytest.mark.asyncio
 async def test_a_review_runs_usage_is_recorded_once(env: _Env) -> None:
     """The run's single terminal result carries reviewers + judge + planner."""
-    state = _live_run(env)
-    state.add_usage({"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40})
+    writer = await _live_run(env)
+    await writer.add_usage(
+        {"prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40}
+    )
 
     result = await env.coordinator.finalize(SESSION_KEY, ReviewRunStatus.STOPPED)
 

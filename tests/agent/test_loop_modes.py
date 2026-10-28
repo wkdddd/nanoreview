@@ -4,6 +4,7 @@ import asyncio
 import json
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,7 +14,7 @@ from nanoreview.agent.event_sink import build_callback_event_sink
 from nanoreview.agent.hooks import AgentHookContext
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanoreview.agent.review_loop import ReviewLoopOutcome, ReviewTurnRequest
-from nanoreview.agent.review_state import ReviewPhase, ReviewRunState, ReviewRunStatus
+from nanoreview.agent.review_state import ReviewPhase, ReviewRunStatus
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent import SubagentManager
 from nanoreview.agent.subagent_profiles import (
@@ -134,11 +135,11 @@ class InjectionRunner:
 
 
 class ReviewSubmitRunner:
-    """Runner whose single run ends with a successful review_submit.
+    """Runner whose single run returns the reviewer's accepted findings payload.
 
-    Terminal-tool forcing (prose answers, failed submissions) is handled inside
-    ``AgentRunner`` via ``terminal_retry_limit``; the manager itself never
-    starts a compensation run.
+    Correction of prose answers and rejected payloads is handled inside
+    ``AgentRunner`` through the run's output contract and ``output_retry_limit``;
+    the manager itself never starts a compensation run.
     """
 
     def __init__(self) -> None:
@@ -151,13 +152,8 @@ class ReviewSubmitRunner:
             messages=[*spec.frozen_messages, *spec.working_messages],
             tool_events=[
                 {"name": "read_file", "status": "ok", "detail": "file content"},
-                {
-                    "name": "review_submit",
-                    "status": "ok",
-                    "detail": '{"submitted": true, "findings": [], "errors": []}',
-                    "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                },
             ],
+            structured_output={"dimension": "security", "findings": []},
         )
 
 
@@ -174,13 +170,8 @@ class BlockingSubmitRunner:
             messages=[*spec.frozen_messages, *spec.working_messages],
             tool_events=[
                 {"name": "read_file", "status": "ok", "detail": "file content"},
-                {
-                    "name": "review_submit",
-                    "status": "ok",
-                    "detail": '{"submitted": true, "findings": [], "errors": []}',
-                    "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                },
             ],
+            structured_output={"dimension": "security", "findings": []},
         )
 
 
@@ -222,7 +213,37 @@ class OrdinaryUserDrainRunner:
 REVIEW_TURN_RUN_ID = "run-test-review"
 
 
-def _admit_review_run(
+async def _live_review_run(
+    coordinator: SessionCoordinator,
+    session_key: str,
+    *,
+    run_id: str = REVIEW_TURN_RUN_ID,
+    phase: ReviewPhase = ReviewPhase.REVIEW,
+) -> Any:
+    """Create the coordinator-owned blackboard for one already-admitted run.
+
+    Bypassing admission is deliberate: these tests exercise the turn-time
+    behaviour of the review pipeline, not the admission boundary, which has its
+    own coverage in ``tests/review/test_admission.py``. The board is advanced
+    past ``PREPARE`` for the same reason — a run that never started is dropped
+    by the turn's ``finally``, which would erase the state under test.
+    """
+    coordinator._review_boards.create(  # noqa: SLF001 - the store owns the run
+        SimpleNamespace(
+            run_id=run_id,
+            session_key=session_key,
+            input_fingerprint="fp",
+            snapshot_ref=None,
+            plan=None,
+        )
+    )
+    writer = coordinator._review_boards.writer(session_key)  # noqa: SLF001
+    assert writer is not None
+    await writer.advance(phase)
+    return writer
+
+
+async def _admit_review_run(
     coordinator: SessionCoordinator,
     session_key: str,
     *,
@@ -234,18 +255,8 @@ def _admit_review_run(
     session keeps its ``review_target`` metadata after the review ends, so the
     persisted target alone must never be enough (a later conversation turn
     would otherwise silently re-run the review it is meant to discuss).
-
-    Bypassing admission is deliberate here — these tests exercise the turn-time
-    behaviour of the review pipeline, not the admission boundary, which has its
-    own coverage in ``tests/review/test_admission.py``.
     """
-    coordinator.review_loop.runs[session_key] = ReviewRunState(
-        run_id=run_id,
-        session_key=session_key,
-        input_fingerprint="fp",
-        status=ReviewRunStatus.RUNNING,
-        phase=ReviewPhase.REVIEW,
-    )
+    await _live_review_run(coordinator, session_key, run_id=run_id)
     return {"_review_admitted": run_id}
 
 
@@ -365,7 +376,7 @@ async def test_admitted_review_turn_is_delegated_to_review_loop(tmp_path) -> Non
         coordinator, report_markdown="## Code Review Report\n\nNo actionable issues found."
     )
     session_key = "cli:review"
-    admitted = _admit_review_run(coordinator, session_key)
+    admitted = await _admit_review_run(coordinator, session_key)
     session = coordinator.sessions.get_or_create(session_key)
     session.add_message("user", "hello")
     session.add_message("assistant", "prior reply")
@@ -491,7 +502,7 @@ def test_sanitize_persisted_blocks_converts_non_dict_blocks() -> None:
 
 
 def test_session_history_preserves_subagent_result_metadata() -> None:
-    raw_result = '{"submitted":true,"findings":[],"errors":[]}'
+    raw_result = "reviewer security reported 0 finding(s)"
     session = Session(key="test:review")
     session.add_message(
         "assistant",
@@ -554,11 +565,11 @@ def test_subagent_profiles_authorize_tools_by_scope(tmp_path) -> None:
 
     # Reviewers have no repository-reader tool: authorized evidence is injected
     # into their frozen task, and they read more context with read_file/grep.
+    # There is no submission tool either — findings are the run's final answer.
     assert reviewer.tool_names == [
         "grep",
         "list_dir",
         "read_file",
-        "review_submit",
     ]
     assert not reviewer.has("local_review")
     assert not reviewer.has("github_review")
@@ -853,9 +864,13 @@ async def test_subagent_hook_uses_streaming_request_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_subagent_run_uses_terminal_submit_contract(tmp_path) -> None:
-    """Single reviewer run: forcing review_submit is the runner's terminal-tool
-    contract, and a canonical submission completes the dimension."""
+async def test_review_subagent_run_binds_its_output_contract(tmp_path) -> None:
+    """Single reviewer run: the accepted findings payload is the run's contract.
+
+    There is no submission tool: the reviewer's *final answer* must be the
+    structured findings object, and the runner corrects a rejected answer inside
+    the same run before giving up.
+    """
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -884,17 +899,18 @@ async def test_review_subagent_run_uses_terminal_submit_contract(tmp_path) -> No
     assert len(runner.specs) == 1
     assert runner.specs[0].tool_choice is None
     assert "read_file" in runner.specs[0].soft_tool_error_tools
-    assert "review_submit" not in runner.specs[0].soft_tool_error_tools
-    assert runner.specs[0].terminal_tools == frozenset({"review_submit"})
-    assert runner.specs[0].preserve_tool_result_tools == frozenset({"review_submit"})
-    assert runner.specs[0].terminal_retry_limit >= 1
+    contract = runner.specs[0].output_contract
+    assert contract is not None
+    assert contract.name == "reviewer.security"
+    assert runner.specs[0].preserve_tool_result_tools == frozenset()
+    assert runner.specs[0].output_retry_limit >= 1
     assert status.phase == "done"
     assert status.stop_reason == "completed"
     assert manager._dimension_state("cli:direct", "security") == "completed"
 
 
 @pytest.mark.asyncio
-async def test_review_subagent_submit_result_is_announced_as_canonical_json(tmp_path) -> None:
+async def test_review_subagent_announces_its_structured_payload(tmp_path) -> None:
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -926,13 +942,14 @@ async def test_review_subagent_submit_result_is_announced_as_canonical_json(tmp_
     assert status.stop_reason == "completed"
     assert manager._dimension_state("cli:direct", "security") == "completed"
 
-    # The announced subagent_result should be canonical JSON
+    # The announced line stays bounded human-readable text; the accepted
+    # findings travel as the structured payload the loop consumes.
     results = manager.drain_session_results("cli:direct", limit=1)
     assert len(results) == 1
     msg = results[0]
     assert msg.metadata["subagent_status"] == "ok"
-    result_json = json.loads(msg.metadata["subagent_result"])
-    assert result_json == {"submitted": True, "findings": [], "errors": []}
+    assert msg.metadata["subagent_result"] == "reviewer security reported 0 finding(s)"
+    assert msg.metadata["subagent_payload"] == {"dimension": "security", "findings": []}
 
 
 class ScopeRecordingReviewerRunner(ReviewSubmitRunner):
@@ -998,7 +1015,7 @@ async def test_reviewer_run_binds_a_restricted_scope(tmp_path) -> None:
 
 
 class AlwaysNoSubmitRunner:
-    """Runner whose single run never produces a review_submit result."""
+    """Runner whose single run never produces a structured findings answer."""
 
     def __init__(self) -> None:
         self.specs: list[AgentRunSpec] = []
@@ -1013,7 +1030,7 @@ class AlwaysNoSubmitRunner:
 
 
 @pytest.mark.asyncio
-async def test_review_subagent_without_submit_announces_error_not_success(tmp_path) -> None:
+async def test_review_subagent_without_a_payload_announces_error_not_success(tmp_path) -> None:
     manager = SubagentManager(
         DummyProvider(),
         tmp_path,
@@ -1040,15 +1057,16 @@ async def test_review_subagent_without_submit_announces_error_not_success(tmp_pa
     )
 
     assert len(runner.specs) == 1
-    # Should NOT be announced as "completed successfully"
-    assert status.phase == "done"
+    # A run that never produced the structured answer is a failed reviewer, not
+    # a completed dimension announced as "completed successfully".
+    assert status.phase == "error"
     assert manager._dimension_state("cli:direct", "security") == "failed"
 
     results = manager.drain_session_results("cli:direct", limit=1)
     assert len(results) == 1
     msg = results[0]
     assert msg.metadata["subagent_status"] == "error"
-    assert "no structured findings submitted" in msg.metadata["subagent_result"].lower()
+    assert "no structured result" in msg.metadata["subagent_result"].lower()
 
 
 @pytest.mark.asyncio
@@ -1133,13 +1151,8 @@ async def test_subagent_workspace_uses_local_root(tmp_path) -> None:
                 messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
                     {"name": "read_file", "status": "ok", "detail": "content"},
-                    {
-                        "name": "review_submit",
-                        "status": "ok",
-                        "detail": '{"submitted": true, "findings": [], "errors": []}',
-                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                    },
                 ],
+                structured_output={"dimension": "security", "findings": []},
             )
 
     manager.runner = WorkspaceCaptureRunner()  # type: ignore[assignment]
@@ -1268,14 +1281,7 @@ async def test_empty_findings_without_evidence_is_incomplete(tmp_path) -> None:
             return AgentRunResult(
                 final_content=None,
                 messages=[*spec.frozen_messages, *spec.working_messages],
-                tool_events=[
-                    {
-                        "name": "review_submit",
-                        "status": "ok",
-                        "detail": '{"submitted": true, "findings": [], "errors": []}',
-                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                    },
-                ],
+                structured_output={"dimension": "security", "findings": []},
             )
 
     manager.runner = NoEvidenceSubmitRunner()  # type: ignore[assignment]
@@ -1320,13 +1326,8 @@ async def test_empty_findings_with_local_evidence_allows_no_findings(tmp_path) -
                 messages=[*spec.frozen_messages, *spec.working_messages],
                 tool_events=[
                     {"name": "read_file", "status": "ok", "detail": "content"},
-                    {
-                        "name": "review_submit",
-                        "status": "ok",
-                        "detail": '{"submitted": true, "findings": [], "errors": []}',
-                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                    },
                 ],
+                structured_output={"dimension": "security", "findings": []},
             )
 
     manager.runner = EvidenceSubmitRunner()  # type: ignore[assignment]
@@ -1373,14 +1374,7 @@ async def test_empty_findings_with_assigned_evidence_allows_no_findings(tmp_path
             return AgentRunResult(
                 final_content=None,
                 messages=[*spec.frozen_messages, *spec.working_messages],
-                tool_events=[
-                    {
-                        "name": "review_submit",
-                        "status": "ok",
-                        "detail": '{"submitted": true, "findings": [], "errors": []}',
-                        "raw_result": '{"submitted":true,"findings":[],"errors":[]}',
-                    },
-                ],
+                structured_output={"dimension": "security", "findings": []},
             )
 
     manager.runner = PlainRunner()  # type: ignore[assignment]
@@ -1428,7 +1422,7 @@ async def test_review_turn_delegates_review_metadata_same_turn(tmp_path) -> None
         "review_target": str(tmp_path),
         "review_target_type": "local",
         "review_focus": ["dependency"],
-        **_admit_review_run(coordinator, session_key),
+        **(await _admit_review_run(coordinator, session_key)),
     }
 
     await coordinator.process_direct(
@@ -1455,7 +1449,7 @@ async def test_programmatic_review_report_is_sent_as_review_stream(tmp_path) -> 
     coordinator = SessionCoordinator(bus, DummyProvider(), tmp_path)
     requests = _stub_review_execution(coordinator, report_markdown=report_markdown)
     session_key = "websocket:review-report"
-    admitted = _admit_review_run(coordinator, session_key)
+    admitted = await _admit_review_run(coordinator, session_key)
 
     await coordinator.process_direct(
         "审查",
@@ -1545,7 +1539,7 @@ async def test_unsettled_review_report_appends_the_settlement_failure(
         error="the terminal review state could not be persisted (OSError)",
     )
     session_key = "websocket:review"
-    admitted = _admit_review_run(coordinator, session_key)
+    admitted = await _admit_review_run(coordinator, session_key)
 
     response = await coordinator.process_direct(
         "审查",
@@ -1706,7 +1700,7 @@ async def test_direct_uses_passed_session_key_for_review_lookup(tmp_path) -> Non
     coordinator = SessionCoordinator(MessageBus(), DummyProvider(), tmp_path)
     requests = _stub_review_execution(coordinator)
     session_key = "review:abc123def456"
-    admitted = _admit_review_run(coordinator, session_key)
+    admitted = await _admit_review_run(coordinator, session_key)
 
     await coordinator.process_direct(
         "请审查登录逻辑",
@@ -1740,7 +1734,7 @@ async def test_a_review_turn_records_its_result_usage(tmp_path) -> None:
             usage=usage,
         ),
     )
-    admitted = _admit_review_run(coordinator, session_key)
+    admitted = await _admit_review_run(coordinator, session_key)
 
     await coordinator.process_direct(
         "审查",
@@ -2308,13 +2302,7 @@ async def test_bus_drops_leftover_internal_event_before_dispatch(
     runner = SpecCapturingRunner()
     coordinator.conversation_loop._runner = runner
     session_key = "cli:internal"
-    coordinator.review_loop.runs[session_key] = ReviewRunState(
-        run_id="run-live",
-        session_key=session_key,
-        input_fingerprint="fp",
-        status=ReviewRunStatus.RUNNING,
-        phase=ReviewPhase.REVIEW,
-    )
+    await _live_review_run(coordinator, session_key, run_id="run-live")
     drops: list[str] = []
     monkeypatch.setattr(
         coordinator_module.logger,
@@ -2394,13 +2382,10 @@ async def test_bus_internal_event_leaves_the_review_handoff_unconsumed(
     coordinator.conversation_loop._runner = runner
 
     # A settled review whose handoff is still waiting for the next turn.
-    coordinator.review_loop.runs[session_key] = ReviewRunState(
-        run_id="run-handoff",
-        session_key=session_key,
-        input_fingerprint="fp",
-        status=ReviewRunStatus.COMPLETED,
-        phase=ReviewPhase.DONE,
+    handoff_writer = await _live_review_run(
+        coordinator, session_key, run_id="run-handoff"
     )
+    await handoff_writer.settle(ReviewRunStatus.COMPLETED)
     session.metadata[ReviewMetaKey.RUN_ID] = "run-handoff"
     assert coordinator.pending_handoff(session) is not None
 

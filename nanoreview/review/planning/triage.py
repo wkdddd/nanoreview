@@ -43,11 +43,12 @@ _MAX_RATIONALE_CHARS = 600
 class TriageReceiver:
     """Accumulates planner triage decisions for one review run.
 
-    The planner may call ``submit_review_decision`` any number of times (bounded
-    by ``max_decisions``) and must then call ``finish_review_triage``. Every
-    rejected submission returns a concrete reason the model can correct inside
-    the same AgentRun: unknown evidence IDs, duplicate coverage, an illegal
-    dimension for the mode, or a non-low risk level with no dimensions.
+    The planner answers with the complete decision set in one payload, so the
+    contract feeds every decision through :meth:`submit` (bounded by
+    ``max_decisions``) and then calls :meth:`finish` once. Every rejected
+    decision returns a concrete reason the model can correct inside the same
+    AgentRun: unknown evidence IDs, duplicate coverage, an illegal dimension for
+    the mode, or a non-low risk level with no dimensions.
     """
 
     allowed_dimensions: set[str]
@@ -167,7 +168,7 @@ class TriageReceiver:
         must triage evidence for every dimension the user asked for.
         """
         if self.finished:
-            return False, "invalid triage: finish_review_triage was already called"
+            return False, "invalid triage: the decision set was already finalized"
         reported = {
             dimension
             for decision in self.decisions

@@ -66,6 +66,10 @@ from nanoreview.agent.conversation_loop import (
 from nanoreview.agent.event_sink import build_bus_event_sink, event_text, metadata_for_event
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.memory import Consolidator
+from nanoreview.agent.review_board import (
+    ReviewBoardStore,
+    ReviewBoardView,
+)
 from nanoreview.agent.review_loop import (
     REVIEW_CONTEXT_WINDOW_TOKENS,
     ReviewLoop,
@@ -74,8 +78,8 @@ from nanoreview.agent.review_loop import (
 )
 from nanoreview.agent.review_state import (
     ReviewArtifactError,
+    ReviewArtifactStore,
     ReviewPhase,
-    ReviewRunState,
     ReviewRunStatus,
 )
 from nanoreview.agent.runner import AgentRunner
@@ -113,6 +117,7 @@ from nanoreview.review.result import (
     render_handoff_block,
     render_handoff_directive,
     render_review_context_index,
+    result_from_board,
     result_from_session_metadata,
 )
 from nanoreview.review.types import ReviewMetaKey
@@ -377,13 +382,19 @@ class SessionCoordinator:
         # Per-session pending queues for mid-turn message injection.
         self._pending_queues: dict[str, asyncio.Queue] = {}
 
-        # Review side: ReviewLoop owns the one-shot run state, its lifecycle,
-        # its persistence, and the review turn's own context.
+        # Review side: the coordinator owns every run's blackboard (the single
+        # mutable authority); ReviewLoop only receives a writer handle and a
+        # read-only view of it.
+        self._review_artifacts = ReviewArtifactStore(workspace)
+        self._review_boards = ReviewBoardStore(
+            sessions=self.sessions, artifacts=self._review_artifacts
+        )
         self.review_loop = ReviewLoop(
             workspace=workspace,
             sessions=self.sessions,
             runner=self.runner,
             subagents=self.subagents,
+            boards=self._review_boards,
             model=self.model,
             max_tool_result_chars=self.max_tool_result_chars,
             context_builder=self.context,
@@ -394,8 +405,6 @@ class SessionCoordinator:
             review_config=self.review_config,
             judge_factory=self._build_review_judge,
         )
-        #: Authoritative in-process review runs, owned by ``ReviewLoop``.
-        self._review_runs: dict[str, ReviewRunState] = self.review_loop.runs
         #: Authoritative admission/domain service for every review entry point.
         self._admission_service: ReviewAdmissionService | None = None
 
@@ -808,7 +817,7 @@ class SessionCoordinator:
 
     def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
         """Validate, snapshot, and register one review run before delivery."""
-        live = self.review_loop.get(request.session_key or "")
+        live = self._review_boards.view(request.session_key or "")
         if live is not None:
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.DUPLICATE_REVIEW,
@@ -818,7 +827,9 @@ class SessionCoordinator:
                 ),
             )
         admission = self.admissions().admit(request)
-        self.review_loop.register(admission)
+        # The coordinator creates the run's blackboard: from here on it is the
+        # only writer, and the loop only receives a narrow writer handle.
+        self._review_boards.create(admission)
         return admission
 
     def review_admissions(self) -> ReviewAdmissionService:
@@ -835,25 +846,37 @@ class SessionCoordinator:
         return self.admit(request)
 
     def reset_review_run(self, session_key: str) -> None:
-        """Drop the one-shot review gate for a session (used by /new)."""
-        self.review_loop.reset(session_key)
+        """Drop the review run *and* its persisted metadata (used by ``/new``).
+
+        The gate is opened by clearing the run's identity from the session, not
+        by forgetting the board alone: a leftover ``RUN_ID``/``PHASE`` would
+        make the next admission look like a duplicate and let a finished run's
+        report be replayed into a chat that started over.
+        """
+        self._review_boards.reset(session_key)
 
     # -- routing ------------------------------------------------------------
 
     def route(self, session: Session) -> SessionRoute:
         """Decide which phase owns *session*."""
-        live = self.review_loop.get(session.key)
-        if live is not None:
-            if live.status is ReviewRunStatus.RUNNING:
-                return SessionRoute.REVIEW
-            return SessionRoute.CONVERSATION
+        live = self._review_boards.view(session.key)
+        if live is not None and live.status is ReviewRunStatus.RUNNING:
+            return SessionRoute.REVIEW
         self.result(session)
         return SessionRoute.CONVERSATION
 
     def result(self, session: Session) -> ReviewResult | None:
-        """Structured review result for *session*, or ``None`` if it has none."""
-        if self.review_loop.get(session.key) is not None:
-            return self.review_loop.result(session.key)
+        """Structured review result for *session*, or ``None`` if it has none.
+
+        A live run that is still ``running`` has no result to hand over: only a
+        terminal run does. Returning the in-flight projection here would let a
+        caller read a finished-looking result out of an unfinished review.
+        """
+        live = self._review_boards.view(session.key)
+        if live is not None:
+            if not live.is_terminal:
+                return None
+            return result_from_board(live, session_metadata=session.metadata)
         result = result_from_session_metadata(session.key, session.metadata)
         if result is None:
             return None
@@ -908,7 +931,7 @@ class SessionCoordinator:
     def gate_message(
         self,
         msg: InboundMessage,
-        live_run: ReviewRunState | None,
+        live_run: ReviewBoardView | None,
         raw: str,
     ) -> OutboundMessage | None:
         """Refuse an ordinary message that reaches a running review."""
@@ -943,7 +966,7 @@ class SessionCoordinator:
     def _review_gate_blocks(
         self,
         msg: InboundMessage,
-        review_state: ReviewRunState | None,
+        review_state: ReviewBoardView | None,
         raw: str,
     ) -> bool:
         """Whether an inbound message must be rejected by the review gate."""
@@ -956,7 +979,7 @@ class SessionCoordinator:
         if _is_internal_event(msg):
             return None
         command = raw.strip().split(maxsplit=1)[0].lower()
-        live = self.review_loop.get(session.key)
+        live = self._review_boards.view(session.key)
         owns_review = live is not None or bool(
             session.metadata.get(ReviewMetaKey.RUN_ID)
         )
@@ -1001,7 +1024,7 @@ class SessionCoordinator:
         return self.gate_command(session, msg, raw)
 
     def gate_review_turn(
-        self, session_key: str, msg: InboundMessage, live_run: ReviewRunState | None
+        self, session_key: str, msg: InboundMessage, live_run: ReviewBoardView | None
     ) -> OutboundMessage | None:
         """Refuse a second review turn for a session that already owns one."""
         if _is_internal_event(msg) or msg.content.strip().startswith("/"):
@@ -1055,7 +1078,7 @@ class SessionCoordinator:
         run_id = (metadata or {}).get("_review_admitted")
         if not isinstance(run_id, str) or not run_id:
             return False
-        run = self.review_loop.get(session_key)
+        run = self._review_boards.view(session_key)
         return (
             run is not None
             and run.run_id == run_id
@@ -1124,7 +1147,7 @@ class SessionCoordinator:
 
     def _review_settled(self, session: Session) -> bool:
         """Whether the session's review run reached its final ``DONE`` phase."""
-        live = self.review_loop.get(session.key)
+        live = self._review_boards.view(session.key)
         if live is not None:
             return live.phase is ReviewPhase.DONE
         return session.metadata.get(ReviewMetaKey.PHASE) == ReviewPhase.DONE.value
@@ -1244,7 +1267,7 @@ class SessionCoordinator:
         if not result.report_ref:
             return None
         try:
-            artifact = self.review_loop.artifacts.read(
+            artifact = self._review_artifacts.read(
                 run_id=result.run_id,
                 session_key=result.session_key,
                 input_fingerprint=result.input_fingerprint,
@@ -1388,7 +1411,7 @@ class SessionCoordinator:
         stays unsettled, so the failure is reported instead of the gate
         silently staying closed.
         """
-        state = self.review_loop.get(session_key)
+        state = self._review_boards.view(session_key)
         if state is None or state.status is not ReviewRunStatus.RUNNING:
             return None
         try:
@@ -1441,7 +1464,7 @@ class SessionCoordinator:
         # available and are gated by their own handlers below.
         if not raw.startswith("/") and not _is_internal_event(msg):
             gate_response = self.gate_message(
-                msg, self.review_loop.get(session_key), raw
+                msg, self._review_boards.view(session_key), raw
             )
             if gate_response is not None:
                 return gate_response
@@ -1563,7 +1586,7 @@ class SessionCoordinator:
                 )
                 continue
             effective_key = self._effective_session_key(msg)
-            review_state = self.review_loop.get(effective_key)
+            review_state = self._review_boards.view(effective_key)
             gate_response = self.gate_message(msg, review_state, raw)
             if gate_response is not None:
                 await self._publish_review_gate_response(msg, gate_response)
@@ -1632,7 +1655,7 @@ class SessionCoordinator:
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
         admission_rejection = self.gate_review_turn(
-            session_key, msg, self.review_loop.get(session_key)
+            session_key, msg, self._review_boards.view(session_key)
         )
         if admission_rejection is not None:
             await self._publish_review_gate_response(msg, admission_rejection)
@@ -1835,7 +1858,7 @@ class SessionCoordinator:
                 await self._finalize_review_run(session_key, ReviewRunStatus.STOPPED)
             raise
         finally:
-            self.review_loop.discard_unstarted(session_key)
+            self._release_unstarted_run(session_key, msg)
             # Only drain the queue this turn owns: ``/stop`` pops it first so a
             # stopped turn re-publishes nothing, and a queue registered by a
             # fresh turn for the same key must not be drained here.
@@ -1861,6 +1884,24 @@ class SessionCoordinator:
                     )
             await publish_turn_run_status(self.bus, msg, "idle")
             self._cleanup_session_lock(session_key, lock)
+
+    def _release_unstarted_run(
+        self, session_key: str, msg: InboundMessage
+    ) -> None:
+        """Release the run this turn was admitted for, if it never started.
+
+        A turn that ends without entering the review pipeline (cancelled while
+        queued, rerouted to a command) would otherwise leave a ``PREPARE`` board
+        that closes the gate forever. It is scoped to the turn's own run id: a
+        review admitted for the same session while this turn was running is
+        still queued, and dropping *that* board would make the retried turn a
+        duplicate of a run that no longer exists.
+        """
+        admitted_run_id = msg.metadata.get("_review_admitted")
+        if isinstance(admitted_run_id, str) and admitted_run_id:
+            self._review_boards.drop_unstarted(
+                session_key, run_id=admitted_run_id
+            )
 
     def _cleanup_session_lock(self, session_key: str, lock: asyncio.Lock) -> None:
         if lock.locked():
@@ -2045,9 +2086,15 @@ class SessionCoordinator:
 
         if self.commands.is_priority(raw):
             # Control commands must run even while this session's lock is held.
-            return await self.commands.dispatch_priority(
-                CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
-            )
+            try:
+                return await self.commands.dispatch_priority(
+                    CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
+                )
+            finally:
+                # An admitted message answered by ``/status`` (or ``/stop``)
+                # never reaches the review pipeline, so its run has to be
+                # released here or the gate stays closed for good.
+                self._release_unstarted_run(key, msg)
 
         # The sink is resolved before the lock so a request cancelled while
         # still queued (``/stop``) can still close its stream.
@@ -2061,11 +2108,11 @@ class SessionCoordinator:
         gate = self._concurrency_gate or nullcontext()
         try:
             async with lock, gate:
-                gate_response = self.gate_message(msg, self.review_loop.get(key), raw)
+                gate_response = self.gate_message(msg, self._review_boards.view(key), raw)
                 if gate_response is not None:
                     return gate_response
                 admission_rejection = self.gate_review_turn(
-                    key, msg, self.review_loop.get(key)
+                    key, msg, self._review_boards.view(key)
                 )
                 if admission_rejection is not None:
                     return admission_rejection
@@ -2089,6 +2136,10 @@ class SessionCoordinator:
         finally:
             if task is not None:
                 self._remove_active_task(key, task)
+            # Same release as the bus path: a direct request that returns before
+            # the review pipeline (an allowed command such as ``/status``) must
+            # not leave its admitted run closing the gate.
+            self._release_unstarted_run(key, msg)
 
     async def _stopped_direct_reply(
         self,
