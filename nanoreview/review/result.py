@@ -136,11 +136,11 @@ def _gaps(view: "ReviewBoardView") -> tuple[str, ...]:
             continue
         detail = reviewer.error or f"status={reviewer.status}"
         gaps.append(_bounded(f"dimension '{reviewer.dimension}' not reviewed ({detail})"))
-    for batch in sorted(view.judge_batches, key=lambda item: item.batch_id):
-        if batch.status == CHILD_COMPLETED:
+    for judge_pass in sorted(view.judge_batches, key=lambda item: item.batch_id):
+        if judge_pass.status == CHILD_COMPLETED:
             continue
-        detail = batch.error or f"status={batch.status}"
-        gaps.append(_bounded(f"judge batch '{batch.batch_id}' incomplete ({detail})"))
+        detail = judge_pass.error or f"status={judge_pass.status}"
+        gaps.append(_bounded(f"judge pass '{judge_pass.batch_id}' incomplete ({detail})"))
     gaps.extend(_bounded(warning) for warning in view.warnings)
     seen: set[str] = set()
     ordered: list[str] = []

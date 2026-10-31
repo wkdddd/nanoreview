@@ -27,9 +27,9 @@ NanoReview 是以代码审查为入口的个人多智能体系统。用户明确
 - coordinator 创建并持有每 run 黑板，独占写入；ReviewLoop 通过窄接口请求更新。必要运行状态迁入黑板后删除旧 `ReviewRunState` 可变容器，不维护第二套同步状态机。API、CLI、WebUI 读取领域投影，不从展示文本推断终态。
 - reviewer 不读写黑板，只接收 assignment 冻结输入；Planner、Judge 可只读当前 run 的授权视图。review 各角色完成后返回结构化结果，经校验后由 coordinator 写入，不提供中途共享草稿。Conversation Agent 不访问黑板，仅获取最终 report。
 - 保留 reviewer 结果全部完成写入、validator、Judge、清理及终态持久化的阶段与门禁。移除 terminal tool 提交协议，保留输出业务校验、有界纠正与收尾预算；对话继续自由文本输出。
-- Review 与 Conversation 共用 Runner、Provider、工具实现、压缩、usage 和取消能力，独立 prompt、消息上下文、ToolRegistry、tool context、执行 profile 与权限。review 的 planning、evidence、validation、Judge batching、finalizer 留在领域层，Runner 不承担 session 路由或 WebUI 协议。
+- Review 与 Conversation 共用 Runner、Provider、工具实现、压缩、usage 和取消能力，独立 prompt、消息上下文、ToolRegistry、tool context、执行 profile 与权限。review 的 planning、evidence、validation、Judge 裁决、finalizer 留在领域层，Runner 不承担 session 路由或 WebUI 协议。
 - 权限在工具层执行：每 turn 解析 WorkspaceScope，review 固定 restricted；保留角色工具隔离、路径限制、命令 guard、sandbox 和通用联网边界，不引入逐工具 approval 或风险分级授权。应用层 guard 不等于操作系统隔离。
-- 共同规则在 conversation turn、planner/reviewer run、Judge batch 开始时读取，内部迭代保持快照。单 run 使用 Runner compression，跨轮对话使用 Consolidator，不复制第二套 Runner 或恢复 AutoCompact 产品路径。
+- 共同规则在 conversation turn、reviewer run、Judge 裁决开始时读取，内部迭代保持快照。单 run 使用 Runner compression，跨轮对话使用 Consolidator，不复制第二套 Runner 或恢复 AutoCompact 产品路径。
 - API、CLI、WebUI 共用领域流程；transport 只负责协议解析、交付与状态读取。不持久化 task、provider、lock、callback、future 或用于恢复执行的 runtime checkpoint。
 
 ## 报告与对话交接

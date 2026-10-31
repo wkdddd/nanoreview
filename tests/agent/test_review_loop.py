@@ -42,8 +42,6 @@ from nanoreview.agent.review_board import (
     ReviewerSnapshot,
 )
 from nanoreview.agent.review_loop import (
-    REVIEW_CONTEXT_WINDOW_TOKENS,
-    REVIEWER_MAX_OUTPUT_TOKENS,
     REVIEWER_MODEL_REQUEST_LIMIT,
     REVIEWER_TIMEOUT_SECONDS,
     ReviewLoop,
@@ -59,7 +57,9 @@ from nanoreview.agent.review_state import (
 )
 from nanoreview.agent.runner import AgentRunner
 from nanoreview.bus.events import InboundMessage
+from nanoreview.config.schema import ReviewConfig
 from nanoreview.providers.base import LLMResponse
+from nanoreview.review.budget import REVIEWER_TOOL_SCHEMA_TOKENS, ReviewBudget
 from nanoreview.review.input.snapshot import build_snapshot
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.planning.planner import ReviewPreparation
@@ -144,8 +144,7 @@ def _build_judge(provider: _FakeJudgeProvider) -> ReviewJudge:
         runner=AgentRunner(provider),
         model="test-model",
         config=ReviewJudgeConfig(
-            context_window_tokens=200_000,
-            max_tokens=128,
+            budget=ReviewBudget(context_window_tokens=200_000, judge_output_tokens=128),
             timeout_seconds=5,
         ),
     )
@@ -349,6 +348,7 @@ def _build_loop(
     judge: ReviewJudge | None = None,
     sessions: SessionManager | None = None,
     artifact_store: ReviewArtifactStore | None = None,
+    review_config: ReviewConfig | None = None,
 ) -> ReviewLoop:
     session_manager = sessions or SessionManager(tmp_path)
     boards = ReviewBoardStore(
@@ -363,6 +363,7 @@ def _build_loop(
         model="test",
         max_concurrent_subagents=max_concurrent_subagents,
         max_tool_result_chars=1000,
+        review_config=review_config,
         judge_factory=(lambda: judge) if judge is not None else None,
     )
 
@@ -537,7 +538,7 @@ async def test_local_diff_without_evidence_explains_how_to_continue(
 @pytest.mark.asyncio
 async def test_diff_without_evidence_reports_skipped_units(tmp_path, prepared) -> None:
     evidence = ReviewEvidenceBundle(
-        skipped=(SkippedReviewUnit(path="src/big.py", reason="token_limit_exceeded"),)
+        skipped=(SkippedReviewUnit(path="src/big.py", reason="binary_file"),)
     )
     prepared(_plan("security"), evidence)
     loop = _build_loop(tmp_path, subagents=_Subagents())
@@ -549,7 +550,7 @@ async def test_diff_without_evidence_reports_skipped_units(tmp_path, prepared) -
     # message names the unreviewed units so the coverage gap is visible.
     assert "Diff review cannot start" in (outcome.error or "")
     assert "src/big.py" in (outcome.error or "")
-    assert "token_limit_exceeded" in (outcome.error or "")
+    assert "binary_file" in (outcome.error or "")
 
 
 # ---------------------------------------------------------------------------
@@ -694,10 +695,10 @@ async def test_assignments_cover_every_accepted_evidence_unit(
 
 
 @pytest.mark.asyncio
-async def test_budget_skipped_units_are_visible_in_the_run_state(
+async def test_unreviewable_units_are_visible_in_the_run_state(
     tmp_path, prepared
 ) -> None:
-    """Budget-skipped units stay in the audit trail instead of vanishing."""
+    """Units the collector could not turn into a diff stay in the audit trail."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     evidence = ReviewEvidenceBundle(
         references=(
@@ -712,7 +713,7 @@ async def test_budget_skipped_units_are_visible_in_the_run_state(
         skipped=(
             SkippedReviewUnit(
                 path="src/big.py",
-                reason="budget_exhausted",
+                reason="empty_patch",
                 start_line=10,
                 end_line=20,
             ),
@@ -1356,47 +1357,310 @@ def test_review_planning_error_is_the_module_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_run_binds_the_fixed_window_and_reviewer_limits(
+async def test_review_run_binds_the_configured_window_and_reviewer_limits(
     tmp_path, prepared
 ) -> None:
-    """Reviewers use the fixed review window and reviewer limits."""
+    """Reviewers use the configured review window and reviewer limits."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security"), _evidence())
+    subagents = _Subagents()
+    loop = _build_loop(
+        tmp_path,
+        subagents=subagents,
+        review_config=ReviewConfig(
+            context_window_tokens=128_000,
+            reviewer_max_output_tokens=4_096,
+        ),
+    )
+    writer = _register_run(loop)
+    loop._snapshots.write(  # noqa: SLF001 - the store is the only snapshot writer
+        build_snapshot(
+            run_id=writer.run_id,
+            session_key=SESSION_KEY,
+            action="diff",
+            target_type="local",
+            target=str(tmp_path),
+            input_fingerprint="fp",
+            net_diff={"app.py": "@@ -0,0 +1 @@\n+value = 1"},
+            changed_files=["app.py"],
+        )
+    )
+
+    await loop.execute(_request())
+
+    limits = subagents.calls[0]["execution_limits"]
+    assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
+    # Both numbers come from the config, not from the module defaults.
+    assert limits.max_tokens == 4_096
+    assert limits.timeout_seconds == REVIEWER_TIMEOUT_SECONDS
+    assert limits.context_window_tokens == 128_000
+    # The audit record keeps the budget the run actually used, not the defaults.
+    snapshot = loop._snapshots.read(writer.run_id)  # noqa: SLF001
+    assert snapshot is not None
+    assert snapshot["budget"]["context_window_tokens"] == 128_000
+    assert snapshot["budget"]["reviewer_output_tokens"] == 4_096
+
+
+def test_review_window_comes_from_config_and_survives_a_model_switch(tmp_path) -> None:
+    """The conversation-side model switch never changes the review window."""
+    loop = _build_loop(
+        tmp_path,
+        subagents=_Subagents(),
+        review_config=ReviewConfig(context_window_tokens=131_072),
+    )
+    assert loop._context_window_tokens == 131_072
+
+    loop.set_runtime_model(None, "switched-model", 32_768)  # type: ignore[arg-type]
+
+    assert loop._context_window_tokens == 131_072
+
+
+def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
+    assert review_budget_contract() == {
+        "context_window_tokens": 200_000,
+        "reviewer_output_tokens": 8_192,
+        "reviewer_context_read_reserve_tokens": 32_000,
+        "judge_output_tokens": 8_192,
+        "safety_margin_tokens": 4_000,
+        "reviewer_model_request_limit": 30,
+        "reviewer_timeout_seconds": 180,
+    }
+
+
+#: Window that a reviewer's fixed overhead (output cap + context-read reserve +
+#: safety margin = 44_192) easily fits, so only the diff itself can push a
+#: request over. A window below that overhead would reject any payload, which is
+#: exactly the assertion gap this constant removes.
+_PAYLOAD_LIMITED_WINDOW = 60_000
+
+
+def _bundle_with_excerpt(text: str) -> ReviewEvidenceBundle:
+    return ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(
+                id="ev-001",
+                path="app.py",
+                start_line=1,
+                end_line=1,
+                excerpt=text,
+            ),
+        ),
+        summary="## app.py:1-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_over_budget_reviewer_rejects_the_run_before_any_starts(
+    tmp_path, prepared
+) -> None:
+    """A reviewer that cannot hold the complete diff stops the whole run.
+
+    Reviewing the remaining dimensions would report a subset of the change as a
+    finished review, so the run is rejected with an explicit reason and no
+    reviewer is ever dispatched. The window fits the fixed overhead, so it is
+    the admitted diff — not a misconfiguration — that trips the check.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(_plan("security"), _bundle_with_excerpt("## app.py:1-1\n" + ("x" * 120_000)))
+    subagents = _Subagents()
+    loop = _build_loop(
+        tmp_path,
+        subagents=subagents,
+        review_config=ReviewConfig(context_window_tokens=_PAYLOAD_LIMITED_WINDOW),
+    )
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert subagents.calls == []
+    assert outcome.stop_reason == "error"
+    assert outcome.produces_report is False
+    assert "No reviewer was started" in (outcome.error or "")
+    assert "reviewer 'security'" in (outcome.error or "")
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.ERROR
+    assert view.reviewer("security") is None
+    assert view.report_ref is None
+
+
+@pytest.mark.asyncio
+async def test_a_reviewer_request_that_fits_is_dispatched(tmp_path, prepared) -> None:
+    """Control case for the rejection above: same window, small diff, runs."""
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(_plan("security"), _bundle_with_excerpt("## app.py:1-1\nvalue = 1"))
+    subagents = _Subagents()
+    loop = _build_loop(
+        tmp_path,
+        subagents=subagents,
+        review_config=ReviewConfig(context_window_tokens=_PAYLOAD_LIMITED_WINDOW),
+    )
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert [call["label"] for call in subagents.calls] == ["security"]
+    assert outcome.stop_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_a_cjk_diff_without_a_tokenizer_still_rejects(
+    tmp_path, prepared, monkeypatch
+) -> None:
+    """The tokenizer-free fallback must not under-count Chinese diffs.
+
+    With ``tiktoken`` unavailable the estimate falls back to an upper bound.
+    A flat four-characters-per-token heuristic would score this 40k-character
+    Chinese diff at ~10k tokens, let it through the 60k window, and let every
+    reviewer die at the provider instead. The fallback has to reject it here.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(
+        _plan("security"),
+        _bundle_with_excerpt("## app.py:1-1\n" + ("数据库连接池已耗尽\n" * 4_000)),
+    )
+    monkeypatch.setattr(
+        "nanoreview.utils.helpers.estimate_prompt_tokens", lambda *_a, **_kw: 0
+    )
+    subagents = _Subagents()
+    loop = _build_loop(
+        tmp_path,
+        subagents=subagents,
+        review_config=ReviewConfig(context_window_tokens=_PAYLOAD_LIMITED_WINDOW),
+    )
+    _register_run(loop)
+
+    outcome = await loop.execute(_request())
+
+    assert subagents.calls == []
+    assert outcome.stop_reason == "error"
+    assert "No reviewer was started" in (outcome.error or "")
+
+
+def test_the_reviewer_request_accounts_for_the_tool_schemas(tmp_path) -> None:
+    """The pre-flight prompt includes the reviewer scope's tool schemas."""
+    from nanoreview.utils.helpers import estimate_prompt_tokens
+
+    loop = _build_loop(tmp_path, subagents=_Subagents())
+    plan = _plan("security")
+    assignment = ReviewAssignment(
+        dimension="security", focus="security", evidence_ids=("ev-001",)
+    )
+    references = list(_evidence().references)
+
+    claimed = loop._reviewer_request_prompt_tokens(  # noqa: SLF001
+        plan=plan, assignment=assignment, references=references
+    )
+    system_prompt = loop._reviewer_system_prompt(plan, "security")  # noqa: SLF001
+    task = loop._build_subagent_task(  # noqa: SLF001
+        plan=plan, assignment=assignment, references=references
+    )
+    measured = estimate_prompt_tokens(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+        ]
+    )
+
+    assert measured > 0
+    # Without the schema reserve an uncounted ~1k of tool definitions would
+    # slip past the window check on every reviewer request.
+    assert claimed == measured + REVIEWER_TOOL_SCHEMA_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_every_reviewer_receives_the_whole_diff_untouched(
+    tmp_path, prepared
+) -> None:
+    """A large multi-hunk diff reaches every selected reviewer in full.
+
+    No reviewer request is trimmed to fit: the admitted patch is what each
+    reviewer reads, and the last hunk is as present as the first.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    patch = (
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n"
+        + "@@ -1,2 +1,2 @@\n-old\n+new\n context\n"
+        + "@@ -40,2 +40,3 @@\n" + "+" + ("y" * 30_000) + "\n"
+        + "@@ -90,1 +90,2 @@\n-tail_marker = 1\n+tail_marker = 2\n"
+    )
+    bundle = ReviewEvidenceBundle(
+        references=(
+            EvidenceReference(
+                id="ev-001",
+                path="app.py",
+                start_line=1,
+                end_line=90,
+                excerpt=patch,
+            ),
+        ),
+        summary="## app.py:1-90",
+    )
+    prepared(_plan("security", "bug"), bundle)
     subagents = _Subagents()
     loop = _build_loop(tmp_path, subagents=subagents)
     _register_run(loop)
 
     await loop.execute(_request())
 
-    limits = subagents.calls[0]["execution_limits"]
-    assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
-    assert limits.max_tokens == REVIEWER_MAX_OUTPUT_TOKENS
-    assert limits.timeout_seconds == REVIEWER_TIMEOUT_SECONDS
-    assert limits.context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
-    # Review navigation metadata carries the same fixed window for evidence.
-    assert (
-        subagents.calls[0]["origin_metadata"][ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS]
-        == REVIEW_CONTEXT_WINDOW_TOKENS
+    assert [call["label"] for call in subagents.calls] == ["security", "bug"]
+    for call in subagents.calls:
+        task = call["task"]
+        assert patch in task
+        assert "+tail_marker = 2" in task
+        assert "y" * 30_000 in task
+
+
+@pytest.mark.asyncio
+async def test_an_unserviceable_judge_settles_the_run_as_a_draft(
+    tmp_path, prepared
+) -> None:
+    """A candidate set no judge request can carry keeps the run a draft.
+
+    The judge model is never called: the reviewer and validator results stay
+    readable in a persisted report that is explicitly marked as unadjudicated,
+    and the run settles as ``error`` rather than as a completed review. The
+    payload-driven input/output rejection itself is pinned in ``test_judge``;
+    this case pins the delivery chain — board, artifact and outcome.
+    """
+    provider = _FakeJudgeProvider()
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subagents = _Subagents()
+    subagents.payload_by_label = {"security": _security_findings()}
+    prepared(_plan("security"), _evidence())
+    judge = ReviewJudge(
+        runner=AgentRunner(provider),
+        model="test-model",
+        # A window below the judge's own output cap: the request can never be
+        # served, which is the cheapest way to reach the draft delivery chain.
+        config=ReviewJudgeConfig(
+            budget=ReviewBudget(
+                context_window_tokens=1_000, judge_output_tokens=2_048, safety_margin_tokens=0
+            )
+        ),
     )
+    loop = _build_loop(tmp_path, subagents=subagents, judge=judge)
+    _register_run(loop)
 
+    outcome = await loop.execute(_request())
 
-def test_review_window_is_fixed_and_survives_a_model_switch(tmp_path) -> None:
-    """The conversation-side model switch never widens the review window."""
-    loop = _build_loop(tmp_path, subagents=_Subagents())
-    assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
-
-    loop.set_runtime_model(None, "switched-model", 131_072)  # type: ignore[arg-type]
-
-    assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
-
-
-def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
-    assert review_budget_contract() == {
-        "context_window_tokens": 200_000,
-        "reviewer_max_output_tokens": 8_192,
-        "reviewer_model_request_limit": 30,
-        "reviewer_timeout_seconds": 180,
-    }
+    assert provider.calls == []
+    assert outcome.stop_reason == "error"
+    assert "AI judge was not run" in (outcome.error or "")
+    view = _board(loop)
+    assert view.status is ReviewRunStatus.ERROR
+    assert view.report_ref is not None
+    assert _judge_batch(view).status == CHILD_ERROR
+    report = outcome.report_markdown or ""
+    assert "DRAFT - Not Adjudicated" in report
+    # The reviewer's candidate is still readable in the draft.
+    assert "Hardcoded secret" in report
+    # The artifact is the durable record of the run, so it must not claim a
+    # completed review and must carry the reason it is a draft.
+    artifact = json.loads(
+        ReviewArtifactStore(tmp_path).path_for(RUN_ID).read_text(encoding="utf-8")
+    )
+    assert artifact["status"] == ReviewRunStatus.ERROR.value
+    assert any("AI judge was not run" in warning for warning in artifact["warnings"])
 
 
 @pytest.mark.asyncio

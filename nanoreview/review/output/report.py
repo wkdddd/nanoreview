@@ -93,8 +93,14 @@ def render_review_report(
     selected_dimensions: tuple[str, ...] | list[str] = (),
     skipped_files: tuple[FileSkipSummary, ...] | list[FileSkipSummary] = (),
     judge_stats: ReviewJudgeStats | None = None,
+    draft_reason: str = "",
 ) -> str:
-    """Render final Markdown report from validated dimension results."""
+    """Render the Markdown report from validated dimension results.
+
+    ``draft_reason`` marks a run that stopped before the judge adjudicated the
+    candidate set: the report still shows the reviewer/validator results, but it
+    is labelled a draft so nothing in it reads as a finished review.
+    """
     confirmed = collect_confirmed_findings(dimensions)
     all_accepted = [finding for _, finding in confirmed]
     all_uncertain = _collect_uncertain(dimensions)
@@ -102,16 +108,23 @@ def render_review_report(
 
     stats = _severity_stats(all_accepted)
     incomplete = bool(skipped_files) or _has_incomplete_checks(dimensions)
-    summary = _build_summary(
-        stats,
-        dimensions,
-        uncertain_count=len(all_uncertain),
-        rejected_count=len(all_rejected),
-        incomplete=incomplete,
+    summary = (
+        "Draft review: the candidate set was not adjudicated, so no finding below "
+        "is confirmed or dismissed."
+        if draft_reason
+        else _build_summary(
+            stats,
+            dimensions,
+            uncertain_count=len(all_uncertain),
+            rejected_count=len(all_rejected),
+            incomplete=incomplete,
+        )
     )
 
     sections: list[str] = []
     sections.append(f"## Code Review Report: {_escape_markdown_inline(target_name)}\n")
+    if draft_reason:
+        sections.append(_render_draft_status(draft_reason))
     sections.append(f"### Executive Summary\n\n{summary}\n")
     sections.append(_render_selected_reviewers(selected_dimensions))
     if skipped_files:
@@ -284,6 +297,16 @@ def _render_findings(
     return "\n".join(lines)
 
 
+def _render_draft_status(draft_reason: str) -> str:
+    """Prominent banner for a run that stopped before the judge ran."""
+    return (
+        "### DRAFT - Not Adjudicated\n\n"
+        f"> {_escape_markdown_inline(draft_reason)}\n>\n"
+        "> Reviewer results and hard validation are kept below for inspection. "
+        "No AI judge verdict was applied, so this report is not a finished review.\n"
+    )
+
+
 def _render_selected_reviewers(
     selected_dimensions: tuple[str, ...] | list[str],
 ) -> str:
@@ -302,7 +325,7 @@ def _render_skipped_files(skipped: tuple[FileSkipSummary, ...] | list[FileSkipSu
     lines = ["### Scope Not Reviewed\n"]
     lines.append(
         "The following files or line ranges were excluded from the review scope by preprocessing "
-        "(filtered files, unavailable patches, oversized hunk units, or budget limits):\n"
+        "(filtered files, unavailable patches, or changed paths carrying no diff text):\n"
     )
     for summary in skipped:
         # describe() renders the path plus unreviewed line ranges and reasons.
@@ -345,7 +368,6 @@ def _render_judge_stats(stats: ReviewJudgeStats) -> str:
     lines.append(f"- Sent to judge: {stats.sent_candidates}")
     lines.append(f"- Verdicts returned: {stats.returned_verdicts}")
     lines.append(f"- Needs confirmation: {stats.needs_confirmation}")
-    lines.append(f"- Batches: {stats.batches}")
     lines.append("")
     return "\n".join(lines)
 

@@ -71,7 +71,6 @@ from nanoreview.agent.review_board import (
     ReviewBoardView,
 )
 from nanoreview.agent.review_loop import (
-    REVIEW_CONTEXT_WINDOW_TOKENS,
     ReviewLoop,
     ReviewTurnRequest,
     persist_review_subagent_result,
@@ -94,7 +93,7 @@ from nanoreview.command import (
     CommandRouter,
     register_builtin_commands,
 )
-from nanoreview.config.schema import AgentDefaults, ModelPresetConfig
+from nanoreview.config.schema import AgentDefaults, ModelPresetConfig, ReviewConfig
 from nanoreview.events import (
     EventSink,
     StreamDeltaEvent,
@@ -109,6 +108,7 @@ from nanoreview.review.admission import (
     ReviewAdmissionRequest,
     ReviewAdmissionService,
 )
+from nanoreview.review.budget import ReviewBudget
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.result import (
@@ -272,7 +272,7 @@ class SessionCoordinator:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: "ToolsConfig | None" = None,
-        review_config: Any | None = None,
+        review_config: ReviewConfig | None = None,
         provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
         model_presets: dict[str, ModelPresetConfig] | None = None,
@@ -322,7 +322,9 @@ class SessionCoordinator:
             else defaults.tool_hint_max_length
         )
         self.tools_config = _tc
-        self.review_config = review_config
+        # Normalised once so every consumer reads real fields instead of
+        # getattr-with-default on a possibly missing config.
+        self.review_config = review_config or ReviewConfig()
         self.exec_config = _tc.exec
         self._default_reasoning_effort = default_reasoning_effort
         self._reserved_output_tokens = int(
@@ -398,9 +400,7 @@ class SessionCoordinator:
             max_tool_result_chars=self.max_tool_result_chars,
             context_builder=self.context,
             max_messages=self._max_messages,
-            max_concurrent_subagents=int(
-                getattr(self.review_config, "max_concurrent_subagents", 4) or 4
-            ),
+            max_concurrent_subagents=self.review_config.max_concurrent_subagents,
             review_config=self.review_config,
             judge_factory=self._build_review_judge,
         )
@@ -521,7 +521,7 @@ class SessionCoordinator:
     # -- provider / model ---------------------------------------------------
 
     def _resolve_subagent_reasoning_effort(self) -> str | None:
-        subagent_effort = getattr(self.review_config, "subagent_reasoning_effort", None)
+        subagent_effort = self.review_config.subagent_reasoning_effort
         if subagent_effort is not None:
             return subagent_effort
         return self._default_reasoning_effort
@@ -658,17 +658,18 @@ class SessionCoordinator:
     def _build_review_judge(self) -> ReviewJudge | None:
         """Build the judge on the coordinator/plan runner and model.
 
-        The judge shares the fixed review context window rather than the
+        The judge shares the review window and reserves rather than the
         conversation agent's window, so review budgeting stays deterministic.
         """
-        judge_settings = getattr(self.review_config, "judge", None)
-        if judge_settings is not None and not getattr(judge_settings, "enabled", True):
+        judge_settings = self.review_config.judge
+        if not judge_settings.enabled:
             return None
+        # One budget object built here and handed to the judge: the numbers the
+        # judge checks against are the numbers the run then executes in.
         config = ReviewJudgeConfig(
-            enabled=bool(getattr(judge_settings, "enabled", True)),
-            timeout_seconds=int(getattr(judge_settings, "timeout_seconds", 60)),
-            max_tokens=int(getattr(judge_settings, "max_tokens", 2048)),
-            context_window_tokens=REVIEW_CONTEXT_WINDOW_TOKENS,
+            enabled=judge_settings.enabled,
+            timeout_seconds=judge_settings.timeout_seconds,
+            budget=ReviewBudget.from_review_config(self.review_config),
         )
         return ReviewJudge(
             runner=self.runner,

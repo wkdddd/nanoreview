@@ -489,12 +489,16 @@ class ReviewBoardWriter:
         report_markdown: str,
         findings: tuple[dict[str, Any], ...],
         verdicts: list[dict[str, Any]],
+        status: ReviewRunStatus = ReviewRunStatus.COMPLETED,
     ) -> str | None:
         """Persist the report artifact and record its reference.
 
-        Returns the wire reference, or ``None`` when the artifact could not be
-        written; the caller must then settle the run as ``error`` instead of
-        claiming a complete review with no report on disk.
+        ``status`` is the terminal status the run will settle to. It is written
+        into the artifact because the artifact is the durable record of the run:
+        a draft report that settles as ``error`` must not be stored as a
+        completed review. Returns the wire reference, or ``None`` when the
+        artifact could not be written; the caller must then settle the run as
+        ``error`` instead of claiming a complete review with no report on disk.
         """
         return await self._store._record_report(
             self._session_key,
@@ -502,6 +506,7 @@ class ReviewBoardWriter:
             report_markdown=report_markdown,
             findings=findings,
             verdicts=verdicts,
+            status=status,
         )
 
     async def persist_metadata(self) -> None:
@@ -827,6 +832,7 @@ class ReviewBoardStore:
         report_markdown: str,
         findings: tuple[dict[str, Any], ...],
         verdicts: list[dict[str, Any]],
+        status: ReviewRunStatus = ReviewRunStatus.COMPLETED,
     ) -> str | None:
         async with self._lock_for(session_key):
             board = self._require(session_key, run_id)
@@ -837,7 +843,7 @@ class ReviewBoardStore:
                     _project(board),
                     report_markdown=report_markdown,
                     verdicts=verdicts,
-                    status=ReviewRunStatus.COMPLETED,
+                    status=status,
                 )
             )
             if report_ref is None:

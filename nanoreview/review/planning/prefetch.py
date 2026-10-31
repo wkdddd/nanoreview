@@ -31,15 +31,6 @@ _PREFETCH_ACTIONS = {
 
 ReviewProgressCallback = Callable[..., Awaitable[None]]
 
-#: Inline excerpt bound per reference (approx. one chunk cap in chars).
-#: A complete single-file diff unit can reach ``DIFF_UNIT_TOKEN_THRESHOLD``
-#: tokens (~32k chars), and the excerpt is inlined as the unit's whole content,
-#: so the bound must not sit below the largest unit the program is willing to
-#: keep whole — otherwise a unit the program treats as complete would silently
-#: lose its tail. The evidence budget is the real limit; it trims a single
-#: oversized unit explicitly and marks it.
-_EXCERPT_CHAR_LIMIT = 40_000
-
 #: Maximum skipped-file descriptions embedded in one progress event.
 _EVENT_SKIPPED_LIMIT = 50
 
@@ -68,7 +59,12 @@ def _bundle_from_result(
     *,
     action: ReviewAction,
 ) -> ReviewEvidenceBundle:
-    """Build the evidence bundle from accepted units and skipped records."""
+    """Build the evidence bundle from accepted units and skipped records.
+
+    A unit's ``excerpt`` is its complete diff text: the reviewer reads this, so
+    truncating it here would silently hand the reviewer a partial change. The
+    request-budget check in the review loop rejects an over-budget run instead.
+    """
     references = tuple(
         EvidenceReference(
             id=unit.unit_id,
@@ -77,7 +73,7 @@ def _bundle_from_result(
             end_line=unit.end_line,
             source="diff" if action == ReviewAction.DIFF else "programmatic",
             tags=unit.tags,
-            excerpt=unit.text[:_EXCERPT_CHAR_LIMIT],
+            excerpt=unit.text,
             kind=unit.kind,
             parent_id=unit.parent_id,
             token_count=unit.token_count,
@@ -322,7 +318,6 @@ async def maybe_prefetch_review_context(
             include_tests=True,
             local_scope=plan.local_scope,
             trace_id=trace_id,
-            context_window_tokens=session_meta.get(ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS),
             frozen_diff=frozen_diff if isinstance(frozen_diff, dict) else None,
         )
     except Exception as exc:

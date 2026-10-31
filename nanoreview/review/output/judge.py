@@ -1,17 +1,18 @@
 """AI judge for review finding candidates.
 
-The judge collects ALL accepted/uncertain candidates (no fixed max_candidates
-truncation), estimates the token cost of each judge request (system prompt +
-candidate JSON + reserved output tokens), and splits the candidate list into
-batches that fit within the model's available context window. Batches are
-executed sequentially and their verdicts are merged; each candidate is judged
-at most once. Candidates that cannot fit into a single batch even on their own
-are explicitly marked as ``needs_confirmation`` rather than silently accepted.
+The judge receives *every* accepted/uncertain candidate in one request and
+returns one verdict per candidate. Before any model call it checks the complete
+request against the configured window: the prompt, the output the whole
+candidate set needs for its verdicts, and the safety margin. A candidate set
+that does not fit is never judged — the run becomes an ``error`` and the review
+stays a draft, because adjudicating a subset would present an incomplete review
+as a finished one.
 
-Each batch runs through the shared :class:`~nanoreview.agent.runner.AgentRunner`
-with the same provider/model as the coordinator/plan run, so the judge inherits
-provider retry, structured-output correction, cancellation and usage accounting
-instead of calling the provider directly.
+The single request runs through the shared
+:class:`~nanoreview.agent.runner.AgentRunner` with the same provider/model as
+the coordinator/plan run, so the judge inherits provider retry, structured
+output correction (a correction is not a second adjudication), cancellation and
+usage accounting instead of calling the provider directly.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import asyncio
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_tur
 from nanoreview.agent.review_state import bound_child_error
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.review.budget import RequestBudget, ReviewBudget
 from nanoreview.review.contracts import judge_contract
 from nanoreview.review.types import (
     FindingVerdict,
@@ -39,27 +41,19 @@ from nanoreview.review.types import (
     ReviewJudgeDecision,
     ReviewJudgeVerdict,
 )
-from nanoreview.utils.helpers import estimate_prompt_tokens, merge_token_usage
+from nanoreview.utils.helpers import (
+    estimate_prompt_tokens_with_fallback,
+    merge_token_usage,
+)
 
-#: Conservative fallback context window (tokens) when the runtime cannot
-#: supply a usable value. Logged when used so operators can correct the
-#: configuration. Chosen to be small enough to fit most judge models while
-#: still allowing a meaningful single batch.
-_FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000
+#: Output tokens reserved per candidate on top of its verdict skeleton, so the
+#: reserve covers the free-text ``reason`` the model writes for each verdict.
+_VERDICT_REASON_RESERVE_TOKENS = 48
 
-#: Rough chars-per-token estimate used ONLY when tiktoken is unavailable
-#: (estimate_prompt_tokens returns 0). 4 chars/token is a conservative upper
-#: bound for mixed ASCII/CJK content that avoids underestimating cost.
-_CHARS_PER_TOKEN = 4
-
-#: Reserved tokens for the model's response (matches ReviewJudgeConfig.max_tokens
-#: by default). Keeps room for the verdict payload.
-_DEFAULT_RESERVED_OUTPUT_TOKENS = 2048
-
-#: Fixed instruction text prepended to the candidate JSON in each user prompt.
-#: The batch runs tool-less, so this prompt — not a tool schema — is where the
-#: model learns the verdict shape; the payload contract is appended right after
-#: it by ``_build_prompt``.
+#: Fixed instruction text prepended to the candidate JSON in the user prompt.
+#: The run is tool-less, so this prompt — not a tool schema — is where the model
+#: learns the verdict shape; the payload contract is appended right after it by
+#: ``_build_prompt``.
 _PROMPT_INSTRUCTION = (
     "Judge these code review candidates. Use decision accept, reject, or "
     "needs_confirmation. Reject unsupported, vague, duplicate, or non-actionable "
@@ -71,10 +65,10 @@ _PROMPT_INSTRUCTION = (
     "manual verification."
 )
 
-#: Rejections of one batch's final answer allowed before the batch fails.
+#: Rejections of the final answer allowed before the judge run fails.
 _JUDGE_OUTPUT_RETRY_LIMIT = 3
-#: Request allowance per batch: the contract rejections above plus the
-#: empty/length recovery turns the runner may still need.
+#: Request allowance: the contract rejections above plus the empty/length
+#: recovery turns the runner may still need.
 _JUDGE_MAX_ITERATIONS = _JUDGE_OUTPUT_RETRY_LIMIT + 3
 
 #: Tool-result budget for the judge run. The judge is tool-less, so this only
@@ -86,55 +80,55 @@ _JUDGE_MAX_TOOL_RESULT_CHARS = 4_096
 class ReviewJudgeStats:
     """Explicit statistics for one judge run.
 
-    ``sent_candidates`` counts candidates actually submitted in batches
-    (including batches whose request later failed); ``returned_verdicts``
-    counts verdicts the model returned. Candidates that could never be sent
-    (unbatchable) or that received no verdict are marked needs_confirmation
-    and counted in ``needs_confirmation``.
+    ``sent_candidates`` counts candidates submitted in the single request
+    (including a request that later failed); ``returned_verdicts`` counts
+    verdicts the model returned for a real candidate. Candidates without a
+    verdict are marked needs_confirmation and counted in ``needs_confirmation``.
     """
 
     total_candidates: int = 0
     sent_candidates: int = 0
     returned_verdicts: int = 0
     needs_confirmation: int = 0
-    batches: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class ReviewJudgeConfig:
     enabled: bool = True
     timeout_seconds: int = 60
-    max_tokens: int = 2048
-    #: Model context window (tokens) used to split candidates into batches.
-    #: When 0/None the judge falls back to a conservative default and logs it.
-    context_window_tokens: int | None = None
+    #: Window, output cap and margin of the judge request. Built once from
+    #: ``ReviewConfig`` (``ReviewBudget.from_review_config``) so the judge never
+    #: re-derives the numbers it is checked against.
+    budget: ReviewBudget = field(default_factory=ReviewBudget)
 
 
 @dataclass(frozen=True, slots=True)
 class JudgeExecutionResult:
     """Immutable outcome of one ``judge_dimensions`` call.
 
-    Replaces the previous mutable ``last_usage`` / ``last_stats`` /
-    ``last_error`` cross-call interface: the caller (finalizer, supervisor)
-    reads everything it needs from the returned value, so concurrent or
-    repeated judge runs can never inherit another run's state.
+    The caller (finalizer, supervisor) reads everything it needs from the
+    returned value, so concurrent or repeated judge runs can never inherit
+    another run's state.
 
-    ``verdicts`` always covers every collected candidate (explicit
-    ``needs_confirmation`` for anything unjudged); ``error`` is a bounded reason
-    for a batch/provider/output-contract failure, and is non-empty only when at least
-    one batch failed. ``usage`` aggregates every batch that reached the model,
-    including failed and timed-out ones: a failure never hides tokens that were
-    already consumed.
+    ``verdicts`` covers every collected candidate whenever the judge actually
+    ran (explicit ``needs_confirmation`` for anything unjudged). ``error`` is a
+    bounded reason for a provider/output-contract/timeout failure. A run
+    rejected before any model call sets ``budget_rejected`` and returns no
+    verdicts: nothing was adjudicated, so the caller must not present the review
+    as judged.
     """
 
     verdicts: dict[str, ReviewJudgeVerdict]
     stats: ReviewJudgeStats | None
     usage: dict[str, int]
     error: str | None = None
+    #: True when the complete candidate set did not fit one judge request, so
+    #: the model was never called.
+    budget_rejected: bool = False
 
 
 class _JudgeUsageObserver(AgentHook):
-    """Snapshot per-iteration usage so a timed-out batch keeps its spend.
+    """Snapshot per-iteration usage so a timed-out run keeps its spend.
 
     ``AgentRunner`` reports usage only through ``AgentRunResult``, which a run
     cancelled by its own ``asyncio.wait_for`` timeout never produces. This hook
@@ -160,18 +154,18 @@ class _JudgeUsageObserver(AgentHook):
         Run-level compression calls the provider outside the iteration loop, so
         ``after_iteration`` never sees that spend. The runner invokes this
         callback the moment each compression request's usage is billed, which
-        keeps it visible even when the batch is cancelled by the outer timeout.
+        keeps it visible even when the run is cancelled by the outer timeout.
         """
         merge_token_usage(self.usage, usage)
 
 
-class _JudgeBatchError(RuntimeError):
-    """A failed judge batch that may still have consumed tokens.
+class _JudgeRunError(RuntimeError):
+    """A failed judge run that may still have consumed tokens.
 
-    ``usage`` carries whatever the batch managed to spend — the run's reported
-    usage, or the observer snapshot when the run was cancelled by the batch
-    timeout — so the caller folds it into the judge total instead of dropping
-    already-billed tokens.
+    ``usage`` carries whatever the run managed to spend — the run's reported
+    usage, or the observer snapshot when the run was cancelled by the timeout —
+    so the caller folds it into the judge total instead of dropping already
+    billed tokens.
     """
 
     __slots__ = ("usage",)
@@ -185,9 +179,9 @@ class ReviewJudge:
     """Use an LLM to judge whether subagent candidates are review-worthy.
 
     The judge shares the coordinator/plan ``AgentRunner`` and model. It never
-    creates its own provider, runner or model preset: batch execution differs
-    from the plan run only in the prompt and tool set: the run has no tools at
-    all and its final answer is the structured verdict payload.
+    creates its own provider, runner or model preset: the run differs from the
+    plan run only in the prompt and tool set — it has no tools at all and its
+    final answer is the structured verdict payload.
     """
 
     def __init__(
@@ -201,7 +195,10 @@ class ReviewJudge:
         self._runner = runner
         self._model = model
         self._config = config or ReviewJudgeConfig()
-        #: NanoReview workspace whose ``COMMON_RULES.md`` is read once per batch.
+        #: One budget object for the check *and* the run, so the window that
+        #: decided "it fits" is the window the run then executes in.
+        self._budget = self._config.budget
+        #: NanoReview workspace whose ``COMMON_RULES.md`` is read once per run.
         self._common_rules_workspace = common_rules_workspace
         #: Emits the tokenizer-fallback warning at most once per judge.
         self._tokenizer_fallback_warned = False
@@ -210,14 +207,15 @@ class ReviewJudge:
         self,
         dimensions: list[ReviewDimensionResult],
     ) -> JudgeExecutionResult:
-        """Judge all accepted/uncertain candidates, batching by context window.
+        """Judge all accepted/uncertain candidates in one request.
 
-        Returns a :class:`JudgeExecutionResult` covering every candidate.
-        Candidates that could not be judged (too large to fit a single batch,
-        batch failure, timeout) receive an explicit ``needs_confirmation``
-        verdict so they are never silently treated as accepted. Cancellation
-        propagates; ordinary provider/output-contract/timeout errors become a bounded
-        ``error`` plus ``needs_confirmation`` candidates.
+        Returns a :class:`JudgeExecutionResult` covering every candidate when
+        the judge ran; candidates without a verdict (run failure, timeout,
+        missing id) receive an explicit ``needs_confirmation`` verdict so they
+        are never silently treated as accepted. Cancellation propagates;
+        ordinary provider/output-contract/timeout errors become a bounded
+        ``error`` plus ``needs_confirmation`` candidates; a candidate set that
+        does not fit one request is rejected before the model is called.
         """
         candidates = self._collect_candidates(dimensions)
         total_candidates = len(candidates)
@@ -229,16 +227,8 @@ class ReviewJudge:
             # Disabled judge is an ops switch, not a pass-through: candidates
             # get an explicit needs_confirmation verdict so the report never
             # presents them as judge-accepted.
-            stats = ReviewJudgeStats(
-                total_candidates=total_candidates,
-                sent_candidates=0,
-                returned_verdicts=0,
-                needs_confirmation=total_candidates,
-                batches=0,
-            )
             logger.info(
-                "review.judge.skip reason=disabled total={} needs_confirmation={}",
-                total_candidates,
+                "review.judge.skip reason=disabled total={}",
                 total_candidates,
             )
             return JudgeExecutionResult(
@@ -246,120 +236,91 @@ class ReviewJudge:
                     candidates,
                     "AI judge is disabled; manual verification required",
                 ),
-                stats=stats,
+                stats=ReviewJudgeStats(
+                    total_candidates=total_candidates,
+                    needs_confirmation=total_candidates,
+                ),
                 usage={},
                 error=None,
             )
 
-        context_window = self._resolve_context_window()
-        reserved_output = max(1, int(self._config.max_tokens or _DEFAULT_RESERVED_OUTPUT_TOKENS))
-        # Per-request fixed cost: system prompt, the fixed instruction text of
-        # the user prompt, and the reserved output. Estimated with the shared
-        # tiktoken helper so judge budgeting matches the rest of the runtime.
-        fixed_tokens = (
-            self._estimate_tokens(
-                [
-                    {"role": "system", "content": self._system_prompt()},
-                    {"role": "user", "content": _PROMPT_INSTRUCTION},
-                ],
-            )
-            + reserved_output
-        )
-        # No minimum-batch floor: never let a batch exceed the real window.
-        available_per_batch = context_window - fixed_tokens
-        if available_per_batch <= 0:
-            # Fixed overhead alone exceeds the context window: no request can
-            # ever fit. Mark every candidate as needs_confirmation without
-            # calling the provider, so nothing is silently accepted.
+        verdict_tokens = self._verdict_tokens(candidates)
+        budget = self._request_budget(candidates)
+        rejection = self._budget_failure(budget, verdict_tokens, total_candidates)
+        if rejection is not None:
+            # Nothing is adjudicated: the caller turns this into a run error and
+            # a draft review, so no candidate may carry a judge verdict.
             logger.warning(
-                "review.judge.window_exhausted_by_overhead fixed_tokens={} window={} candidates={}",
-                fixed_tokens,
-                context_window,
+                "review.judge.rejected reason=budget candidates={} required={} window={} {}",
                 total_candidates,
-            )
-            stats = ReviewJudgeStats(
-                total_candidates=total_candidates,
-                sent_candidates=0,
-                returned_verdicts=0,
-                needs_confirmation=total_candidates,
-                batches=0,
-            )
-            logger.info(
-                "review.judge.done trace_id=window status=exhausted total={} sent=0 verdicts=0 needs_confirmation={} batches=0",
-                total_candidates,
-                total_candidates,
+                budget.required_tokens,
+                budget.context_window_tokens,
+                rejection,
             )
             return JudgeExecutionResult(
-                verdicts=self._needs_confirmation_verdicts(
-                    candidates,
-                    "Judge context window is smaller than the fixed request overhead; "
-                    "manual verification required",
+                verdicts={},
+                stats=ReviewJudgeStats(
+                    total_candidates=total_candidates,
+                    needs_confirmation=total_candidates,
                 ),
-                stats=stats,
                 usage={},
-                error=None,
+                error=rejection,
+                budget_rejected=True,
             )
 
-        batches, unbatchable = self._split_batches(candidates, available_per_batch)
         trace_id = uuid.uuid4().hex[:8]
         started = time.perf_counter()
         logger.info(
-            "review.judge.start trace_id={} total_candidates={} batches={} unbatchable={} model={} context_window={}",
+            "review.judge.start trace_id={} candidates={} model={} window={} required_tokens={}",
             trace_id,
             total_candidates,
-            len(batches),
-            len(unbatchable),
             self._model,
-            context_window,
+            budget.context_window_tokens,
+            budget.required_tokens,
         )
 
+        verdicts: dict[str, ReviewJudgeVerdict] = {}
+        usage: dict[str, int] = {}
+        error: str | None = None
         try:
-            verdicts, stats, usage, error = await self._run_batches(
-                batches,
-                unbatchable,
-                total_candidates,
-                trace_id,
-            )
+            verdicts, usage = await self._judge_once(candidates, trace_id)
         except Exception as exc:
-            # An escaping failure (unlikely beyond provider/timeout, which the
-            # batch loop already pins) is surfaced as a bounded judge error so
-            # the run's judge batch is never left as ``pending``/``running``.
-            error = bound_child_error(exc)
+            # An escaping failure is surfaced as a bounded judge error so the
+            # run's judge child is never left as ``pending``/``running``. A
+            # failed run is still billed, so recover the usage it reported (or
+            # the observer snapshotted before its timeout).
+            usage = dict(getattr(exc, "usage", None) or {})
+            error = bound_child_error(exc) or f"AI judge failed ({type(exc).__name__})"
             logger.warning(
-                "review.judge.failed reason={} total={}",
+                "review.judge.failed trace_id={} reason={} candidates={} usage={}",
+                trace_id,
                 error,
                 total_candidates,
-            )
-            return JudgeExecutionResult(
-                verdicts=self._needs_confirmation_verdicts(
-                    candidates,
-                    "AI judge failed; manual verification required",
-                ),
-                stats=ReviewJudgeStats(
-                    total_candidates=total_candidates,
-                    sent_candidates=0,
-                    returned_verdicts=0,
-                    needs_confirmation=total_candidates,
-                    batches=0,
-                ),
-                usage={},
-                error=error,
+                usage,
             )
 
+        resolved, matched = self._resolve_verdicts(candidates, verdicts, failed=bool(error))
+        stats = ReviewJudgeStats(
+            total_candidates=total_candidates,
+            sent_candidates=total_candidates,
+            returned_verdicts=matched,
+            needs_confirmation=sum(
+                1
+                for verdict in resolved.values()
+                if verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
+            ),
+        )
         logger.info(
-            "review.judge.done trace_id={} status={} total={} sent={} verdicts={} needs_confirmation={} batches={} elapsed_ms={:.1f}",
+            "review.judge.done trace_id={} status={} total={} sent={} verdicts={} needs_confirmation={} elapsed_ms={:.1f}",
             trace_id,
-            "partial_error" if error else "ok",
+            "error" if error else "ok",
             stats.total_candidates,
             stats.sent_candidates,
             stats.returned_verdicts,
             stats.needs_confirmation,
-            stats.batches,
             (time.perf_counter() - started) * 1000,
         )
-        return JudgeExecutionResult(
-            verdicts=verdicts, stats=stats, usage=usage, error=error
-        )
+        return JudgeExecutionResult(verdicts=resolved, stats=stats, usage=usage, error=error)
 
     @staticmethod
     def candidate_id(candidate: ReviewFindingCandidate) -> str:
@@ -380,134 +341,102 @@ class ReviewJudge:
             for candidate_id, candidate, _hard in candidates
         }
 
-    async def _run_batches(
+    def _resolve_verdicts(
         self,
-        batches: list[list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]]],
-        unbatchable: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
-        total_candidates: int,
-        trace_id: str,
-    ) -> tuple[dict[str, ReviewJudgeVerdict], ReviewJudgeStats, dict[str, int], str | None]:
-        """Execute every batch and fold in per-candidate needs_confirmation.
+        candidates: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
+        verdicts: dict[str, ReviewJudgeVerdict],
+        *,
+        failed: bool,
+    ) -> tuple[dict[str, ReviewJudgeVerdict], int]:
+        """Map the model's verdicts onto the candidate set.
 
-        A provider error, rejected output or timeout on one batch marks the
-        affected candidates ``needs_confirmation`` and records a bounded reason
-        in the returned error (so the caller records an ``error`` batch) but
-        does not abort the remaining batches. Whatever the failed batch already
-        consumed is folded into ``usage`` — a failure must not make the run's
-        token total understate real spend.
+        Only verdicts naming a real candidate count; whatever is left over is
+        marked needs_confirmation so a candidate is never presented as having
+        passed the judge without a verdict for it.
         """
-        verdicts: dict[str, ReviewJudgeVerdict] = {}
-        usage: dict[str, int] = {}
-        sent_count = 0
-        returned_count = 0
-        error: str | None = None
-        for index, batch in enumerate(batches):
-            batch_trace = f"{trace_id}:b{index + 1}"
-            batch_started = time.perf_counter()
-            batch_failed = False
-            try:
-                batch_verdicts, batch_usage = await self._judge_batch(batch, batch_trace)
-            except Exception as exc:
-                batch_verdicts = {}
-                # A failed batch is still billed: recover the usage the batch
-                # reported (or the observer snapshotted before its timeout)
-                # instead of dropping it from the run total.
-                batch_usage = dict(getattr(exc, "usage", None) or {})
-                batch_failed = True
-                logger.warning(
-                    "review.judge.batch.done trace_id={} status=error reason={} batch_size={} usage={} elapsed_ms={:.1f}",
-                    batch_trace,
-                    exc,
-                    len(batch),
-                    batch_usage,
-                    (time.perf_counter() - batch_started) * 1000,
-                )
-                # A failed/timeout batch is a judge-level failure, not a clean
-                # completion: record a bounded reason so the run's judge batch
-                # is surfaced as ``error`` while the finalizer still marks the
-                # affected candidates as needs_confirmation. The first failure
-                # wins so the reported reason stays the root cause. The
-                # fallback guarantees a non-empty signal even for exceptions
-                # whose ``str()`` is empty (e.g. a bare timeout), because the
-                # caller treats an empty error as "completed".
-                if error is None:
-                    error = bound_child_error(exc) or (
-                        f"AI judge batch failed ({type(exc).__name__})"
-                    )
-            merge_token_usage(usage, batch_usage)
-            sent_count += len(batch)
-            # Count only verdicts that actually match a candidate in this
-            # batch; unknown or duplicated model IDs must not inflate stats.
-            batch_ids = {candidate_id for candidate_id, _candidate, _hard in batch}
-            matched = {
-                candidate_id: verdict
-                for candidate_id, verdict in batch_verdicts.items()
-                if candidate_id in batch_ids
-            }
-            returned_count += len(matched)
-            covered = 0
-            for candidate_id, candidate, _hard in batch:
-                verdict = matched.get(candidate_id)
-                if verdict is not None:
-                    verdicts[candidate_id] = verdict
-                    covered += 1
-                else:
-                    # Batch failure or missing verdict: mark explicitly as
-                    # needs_confirmation so the candidate is surfaced for
-                    # manual verification rather than silently accepted.
-                    verdicts[candidate_id] = ReviewJudgeVerdict(
-                        decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                        reason=(
-                            "AI judge batch failed; manual verification required"
-                            if batch_failed
-                            else "AI judge returned no verdict for this candidate"
-                        ),
-                        confidence="low",
-                        severity=candidate.severity,
-                    )
-            if not batch_failed:
-                logger.info(
-                    "review.judge.batch.done trace_id={} status=ok batch_size={} verdicts={} covered={} usage={} elapsed_ms={:.1f}",
-                    batch_trace,
-                    len(batch),
-                    len(matched),
-                    covered,
-                    batch_usage,
-                    (time.perf_counter() - batch_started) * 1000,
-                )
-
-        # Candidates too large for any single batch: explicit needs_confirmation.
-        for candidate_id, candidate, _hard in unbatchable:
-            verdicts[candidate_id] = ReviewJudgeVerdict(
+        known_ids = {candidate_id for candidate_id, _candidate, _hard in candidates}
+        matched = {
+            candidate_id: verdict
+            for candidate_id, verdict in verdicts.items()
+            if candidate_id in known_ids
+        }
+        resolved: dict[str, ReviewJudgeVerdict] = {}
+        for candidate_id, candidate, _hard in candidates:
+            verdict = matched.get(candidate_id)
+            if verdict is not None:
+                resolved[candidate_id] = verdict
+                continue
+            resolved[candidate_id] = ReviewJudgeVerdict(
                 decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                reason="Candidate too large to fit a single judge batch; manual verification required",
+                reason=(
+                    "AI judge failed; manual verification required"
+                    if failed
+                    else "AI judge returned no verdict for this candidate"
+                ),
                 confidence="low",
                 severity=candidate.severity,
             )
+        return resolved, len(matched)
 
-        needs_confirmation_count = sum(
-            1
-            for verdict in verdicts.values()
-            if verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-        )
-        stats = ReviewJudgeStats(
-            total_candidates=total_candidates,
-            sent_candidates=sent_count,
-            returned_verdicts=returned_count,
-            needs_confirmation=needs_confirmation_count,
-            batches=len(batches),
-        )
-        return verdicts, stats, usage, error
+    # -- budget -------------------------------------------------------------
 
-    def _resolve_context_window(self) -> int:
-        value = self._config.context_window_tokens
-        if isinstance(value, int) and value > 0:
-            return value
-        logger.warning(
-            "review.judge.context_window_unavailable fallback={}",
-            _FALLBACK_CONTEXT_WINDOW_TOKENS,
+    def _request_budget(
+        self,
+        candidates: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
+    ) -> RequestBudget:
+        """Account the complete request: prompt plus the verdicts it must return."""
+        prompt_tokens, _source = estimate_prompt_tokens_with_fallback(
+            [
+                {"role": "system", "content": self._system_prompt()},
+                {"role": "user", "content": self._build_prompt(candidates)},
+            ]
         )
-        return _FALLBACK_CONTEXT_WINDOW_TOKENS
+        return self._budget.judge_request(prompt_tokens=prompt_tokens)
+
+    def _verdict_tokens(
+        self,
+        candidates: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
+    ) -> int:
+        """Output tokens a verdict for every candidate needs.
+
+        The verdict skeleton (ids, decisions, severities) is measured on the
+        real candidate ids; each verdict additionally reserves a bounded
+        allowance for its free-text reason.
+        """
+        skeleton = json.dumps(
+            {
+                candidate_id: {
+                    "decision": "needs_confirmation",
+                    "reason": "",
+                    "confidence": "medium",
+                    "severity": "medium",
+                }
+                for candidate_id, _candidate, _hard in candidates
+            },
+            ensure_ascii=False,
+        )
+        return self._estimate_tokens(
+            [{"role": "user", "content": skeleton}]
+        ) + _VERDICT_REASON_RESERVE_TOKENS * len(candidates)
+
+    def _budget_failure(
+        self, budget: RequestBudget, verdict_tokens: int, candidate_count: int
+    ) -> str | None:
+        """Bounded reason when the complete request cannot be served, else None."""
+        if not self._budget.judge_output_covers(verdict_tokens):
+            return (
+                f"AI judge was not run: adjudicating {candidate_count} candidates needs "
+                f"about {verdict_tokens} output tokens, above the configured judge output "
+                f"cap of {self._budget.judge_output_tokens} tokens"
+            )
+        if not budget.fits:
+            return (
+                "AI judge was not run: the complete candidate set does not fit one judge "
+                f"request ({budget.describe()})"
+            )
+        return None
+
+    # -- collected candidates ----------------------------------------------
 
     @classmethod
     def _collect_candidates(
@@ -532,111 +461,57 @@ class ReviewJudge:
             )
         return items
 
-    def _estimate_tokens(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> int:
-        """Estimate prompt tokens via the shared tiktoken helper.
-
-        Falls back to a conservative chars-per-token heuristic (with a single
-        warning) only when tiktoken is unavailable, so batch budgeting keeps
-        working instead of crashing.
-        """
-        estimated = estimate_prompt_tokens(messages, tools)
-        if estimated > 0:
-            return estimated
-        if not self._tokenizer_fallback_warned:
+    def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
+        """Tokens of one prompt via the shared counting policy."""
+        tokens, source = estimate_prompt_tokens_with_fallback(messages)
+        if source == "upper_bound" and not self._tokenizer_fallback_warned:
             logger.warning(
-                "review.judge.tokenizer_unavailable fallback_chars_per_token={}",
-                _CHARS_PER_TOKEN,
+                "review.judge.tokenizer_unavailable fallback=upper_bound_per_character"
             )
             self._tokenizer_fallback_warned = True
-        parts = [
-            message.get("content")
-            for message in messages
-            if isinstance(message.get("content"), str)
-        ]
-        if tools:
-            parts.append(json.dumps(tools, ensure_ascii=False))
-        text = "\n".join(part for part in parts if part)
-        return max(1, len(text) // _CHARS_PER_TOKEN) + 4 * len(messages)
+        return tokens
 
-    def _split_batches(
+    # -- single run ---------------------------------------------------------
+
+    async def _judge_once(
         self,
         candidates: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
-        available_per_batch: int,
-    ) -> tuple[list[list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]]], list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]]]:
-        """Greedily pack candidates into batches that fit the token budget.
-
-        Returns (batches, unbatchable). A candidate is unbatchable when its own
-        token cost already exceeds the per-batch budget — it can never be sent
-        and is returned for explicit ``needs_confirmation`` marking.
-        """
-        batches: list[list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]]] = []
-        unbatchable: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]] = []
-        current: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]] = []
-        current_tokens = 0
-        for candidate_id, candidate, hard in candidates:
-            payload_entry = self._candidate_payload_entry(candidate_id, candidate, hard)
-            entry_tokens = self._estimate_tokens(
-                [{"role": "user", "content": json.dumps(payload_entry, ensure_ascii=False)}]
-            )
-            # Slack for the surrounding JSON array/structure framing.
-            entry_tokens = entry_tokens + 8
-            if entry_tokens > available_per_batch:
-                unbatchable.append((candidate_id, candidate, hard))
-                continue
-            if current and current_tokens + entry_tokens > available_per_batch:
-                batches.append(current)
-                current = []
-                current_tokens = 0
-            current.append((candidate_id, candidate, hard))
-            current_tokens += entry_tokens
-        if current:
-            batches.append(current)
-        return batches, unbatchable
-
-    async def _judge_batch(
-        self,
-        batch: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
         trace_id: str,
     ) -> tuple[dict[str, ReviewJudgeVerdict], dict[str, int]]:
-        """Run one batch through the shared ``AgentRunner``.
+        """Run the complete candidate set through the shared ``AgentRunner``.
 
-        Returns ``(verdicts, usage)``. The batch is only successful when the run
+        Returns ``(verdicts, usage)``. The run is only successful when it
         completed *and* its final answer satisfied the verdict contract; every
-        other outcome raises a :class:`_JudgeBatchError` carrying the usage the
-        batch already consumed, so ``_run_batches`` marks the candidates
+        other outcome raises a :class:`_JudgeRunError` carrying the usage the
+        run already consumed, so the caller marks the candidates
         ``needs_confirmation``, records a bounded error and still accounts for
         the spend.
         """
-        # Observes per-iteration usage so a batch cancelled by the timeout below
+        # Observes per-iteration usage so a run cancelled by the timeout below
         # still reports the tokens it burned; harmless on the success path,
         # where ``AgentRunResult.usage`` is authoritative.
         usage_observer = _JudgeUsageObserver()
         spec = AgentRunSpec(
             frozen_messages=[
                 {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": self._build_prompt(batch)},
+                {"role": "user", "content": self._build_prompt(candidates)},
             ],
             working_messages=[],
             # The judge is a pure decision step: it needs no tools, only the
-            # candidate batch and its output contract.
+            # candidate set and its output contract.
             tools=ToolRegistry(),
             model=self._model,
             max_iterations=_JUDGE_MAX_ITERATIONS,
             max_tool_result_chars=_JUDGE_MAX_TOOL_RESULT_CHARS,
             temperature=0,
-            max_tokens=self._config.max_tokens,
+            max_tokens=self._budget.judge_output_tokens,
             output_contract=judge_contract(),
             output_retry_limit=_JUDGE_OUTPUT_RETRY_LIMIT,
-            context_window_tokens=self._config.context_window_tokens,
+            context_window_tokens=self._budget.context_window_tokens,
             error_message=None,
             concurrent_tools=False,
-            # The judge batch is a self-contained execution: no persisted
-            # session, checkpoint, injection or workspace is shared with the
-            # coordinator run.
+            # The judge run is self-contained: no persisted session, checkpoint,
+            # injection or workspace is shared with the coordinator run.
             workspace=None,
             session_key=None,
             # Judging is self-contained: no file-edit observer and no
@@ -646,7 +521,7 @@ class ReviewJudge:
             hook=build_agent_turn_hook(
                 AgentTurnHookSpec(turn_hooks=[usage_observer])
             ),
-            # Bank compression usage the instant it is billed, so a batch that
+            # Bank compression usage the instant it is billed, so a run that
             # is cancelled by the timeout below still reports that spend.
             compression_usage_callback=usage_observer.record_compression_usage,
         )
@@ -659,55 +534,55 @@ class ReviewJudge:
         except TimeoutError as exc:
             # ``wait_for`` cancels the run mid-flight, so there is no
             # ``AgentRunResult``: the observer snapshot is the only record of
-            # what this batch already spent. Cancellation of the judge itself
+            # what this run already spent. Cancellation of the judge itself
             # (``/stop``) stays a ``CancelledError`` and still propagates.
             detail = str(exc) or f"exceeded {self._config.timeout_seconds}s"
             logger.warning(
-                "review.judge.batch.rejected trace_id={} stop_reason=timeout reason={} observed_usage={}",
+                "review.judge.run.rejected trace_id={} stop_reason=timeout reason={} observed_usage={}",
                 trace_id,
                 detail,
                 usage_observer.usage,
             )
-            raise _JudgeBatchError(
-                f"AI judge batch failed (timeout): {detail}",
+            raise _JudgeRunError(
+                f"AI judge failed (timeout): {detail}",
                 usage=usage_observer.usage,
             ) from exc
         if result.stop_reason != "completed":
-            # ``error`` is the cause the batch actually stopped for, and for a
+            # ``error`` is the cause the run actually stopped for, and for a
             # contract rejection it is the rejection reason itself; reading it
             # first keeps an earlier rejection from masking the real failure.
             reason = (
                 result.error
                 or result.output_error
                 or result.final_content
-                or f"judge batch stopped with {result.stop_reason}"
+                or f"judge run stopped with {result.stop_reason}"
             )
             logger.warning(
-                "review.judge.batch.rejected trace_id={} stop_reason={} reason={}",
+                "review.judge.run.rejected trace_id={} stop_reason={} reason={}",
                 trace_id,
                 result.stop_reason,
                 str(reason)[:200],
             )
-            raise _JudgeBatchError(
-                f"AI judge batch failed ({result.stop_reason}): {reason}",
+            raise _JudgeRunError(
+                f"AI judge failed ({result.stop_reason}): {reason}",
                 usage=dict(result.usage),
             )
         payload = result.structured_output
         verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
         if not isinstance(verdicts, dict):
-            raise _JudgeBatchError(
-                "AI judge batch failed: no verdicts were returned",
+            raise _JudgeRunError(
+                "AI judge failed: no verdicts were returned",
                 usage=dict(result.usage),
             )
         # An empty verdict map is a legitimate outcome: the judge declined to
         # decide, and every candidate degrades to ``needs_confirmation``. A
         # non-empty map whose ids match nothing is not — it means the model
         # invented ids, so no candidate would ever be judged.
-        batch_ids = {candidate_id for candidate_id, _candidate, _hard in batch}
-        if verdicts and not batch_ids.intersection(verdicts):
-            raise _JudgeBatchError(
-                "AI judge batch failed: no verdict id matched any candidate in "
-                "the batch (verdict ids must be copied verbatim)",
+        known_ids = {candidate_id for candidate_id, _candidate, _hard in candidates}
+        if verdicts and not known_ids.intersection(verdicts):
+            raise _JudgeRunError(
+                "AI judge failed: no verdict id matched any candidate "
+                "(verdict ids must be copied verbatim)",
                 usage=dict(result.usage),
             )
         return verdicts, dict(result.usage)
@@ -720,8 +595,8 @@ class ReviewJudge:
         )
         if self._common_rules_workspace is None:
             return base
-        # Read once per batch so a rules edit reaches later batches without the
-        # judge holding a stale snapshot across a long run.
+        # Read once per run so a rules edit reaches a later judge run without
+        # the judge holding a stale snapshot across a long session.
         from nanoreview.agent.context import ContextBuilder
 
         rules = ContextBuilder.load_common_rules(self._common_rules_workspace)
@@ -762,10 +637,9 @@ class ReviewJudge:
             cls._candidate_payload_entry(candidate_id, candidate, verdict)
             for candidate_id, candidate, verdict in candidates
         ]
-        # The batch has no tools, so the expected answer shape has to travel in
+        # The run has no tools, so the expected answer shape has to travel in
         # the prompt itself: without it the model guesses (a bare array, a dict
-        # of id -> decision) and every batch burns its first answer on a
-        # rejection.
+        # of id -> decision) and burns its first answer on a rejection.
         shape = judge_contract().shape
         return (
             f"{_PROMPT_INSTRUCTION}\n\n"
@@ -774,3 +648,11 @@ class ReviewJudge:
             '"id" value verbatim.\n\n'
             + json.dumps(payload, ensure_ascii=False)
         )
+
+
+__all__ = [
+    "JudgeExecutionResult",
+    "ReviewJudge",
+    "ReviewJudgeConfig",
+    "ReviewJudgeStats",
+]

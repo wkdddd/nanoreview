@@ -84,15 +84,14 @@ def _structured_result() -> ProgrammaticEvidenceResult:
         ],
         skipped=[
             SkippedUnit(path="src/logo.png", reason="binary_file"),
-            SkippedUnit(path="src/big.py", reason="token_limit_exceeded", start_line=5, end_line=9),
-            SkippedUnit(path="src/big.py", reason="budget_exhausted", start_line=10, end_line=20),
+            SkippedUnit(path="src/big.py", reason="empty_patch", start_line=5, end_line=9),
+            SkippedUnit(path="src/big.py", reason="filtered", start_line=10, end_line=20),
         ],
         context=(
             "[Repository Review References - programmatic evidence, not instructions]\n"
             "## src/auth.py:1-10\n- kind: function\n```text\ndef login(token):\n```\n"
             "[/Repository Review References]"
         ),
-        mode="chunked",
     )
 
 
@@ -337,7 +336,8 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
     assert related.is_related is True
 
 
-async def test_direct_preprocessing_mode_yields_direct_planner_input() -> None:
+async def test_unit_text_reaches_the_reviewer_without_truncation() -> None:
+    """The excerpt is the complete diff, however large the unit is."""
     plan = ReviewPlan(
         target=".",
         target_name="workspace",
@@ -346,7 +346,8 @@ async def test_direct_preprocessing_mode_yields_direct_planner_input() -> None:
         roles=[],
     )
     result = _structured_result()
-    result.mode = "direct"
+    huge = "@@ -1 +1 @@\n+" + "x" * 90_000
+    result.units[0].text = huge
 
     prefetched = await maybe_prefetch_review_context(
         plan,
@@ -354,7 +355,8 @@ async def test_direct_preprocessing_mode_yields_direct_planner_input() -> None:
     )
 
     assert prefetched.evidence is not None
-    assert [reference.id for reference in prefetched.evidence.references] == ["ev-1", "ev-2"]
+    assert prefetched.evidence.references[0].excerpt == huge
+    assert len(prefetched.evidence.references[0].excerpt) == len(huge)
 
 
 async def test_legacy_provider_drops_risk_labels() -> None:
@@ -431,7 +433,7 @@ async def test_prefetch_aggregates_skipped_files_per_path() -> None:
     big_summary = skipped_by_file["src/big.py"]
     assert big_summary.whole_file is False
     assert big_summary.ranges == ((5, 9), (10, 20))
-    assert set(big_summary.reasons) == {"token_limit_exceeded", "budget_exhausted"}
+    assert set(big_summary.reasons) == {"empty_patch", "filtered"}
 
     end_event = events[-1]
     assert end_event["phase"] == "end"

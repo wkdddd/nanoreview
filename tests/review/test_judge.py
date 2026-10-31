@@ -1,13 +1,15 @@
-"""Tests for the AI judge: AgentRunner-backed batches, failure handling, stats.
+"""Tests for the AI judge: one complete adjudication, budget rejection, stats.
 
 These tests pin the judge contract directly (without the finalizer):
 - every accepted/uncertain candidate enters the judge scope (no fixed cap);
-- candidates are batched greedily within the runtime context window;
-- each batch executes through the shared ``AgentRunner``; the run has no tools
-  at all and its final answer must be the structured verdict payload;
+- the whole candidate set is adjudicated in exactly one request — there is no
+  batching, and a set that does not fit is rejected before the model is called;
+- the request budget covers the input *and* the output the verdicts need;
+- the run executes through the shared ``AgentRunner``; it has no tools at all
+  and its final answer must be the structured verdict payload;
 - any candidate without a valid verdict is explicitly needs_confirmation;
 - ``JudgeExecutionResult`` carries verdicts, stats, usage and a bounded error;
-- a failed or timed-out batch still reports the tokens it already consumed.
+- a failed or timed-out run still reports the tokens it already consumed.
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ from nanoreview.config.schema import (
     ReviewJudgeSettings,
 )
 from nanoreview.providers.base import LLMProvider, LLMResponse
+from nanoreview.review.budget import ReviewBudget
 from nanoreview.review.output.judge import JudgeExecutionResult, ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.types import (
     FindingVerdict,
@@ -37,7 +40,7 @@ from nanoreview.review.types import (
     ReviewJudgeDecision,
 )
 
-#: Window large enough that normal fixtures always fit in one batch.
+#: Window large enough that normal fixtures always fit in one request.
 _LARGE_WINDOW = 200_000
 
 #: Sentinel reply meaning "the model answered with prose instead of the payload".
@@ -172,31 +175,51 @@ def _dimension(
     )
 
 
+def _budget(
+    window: int = _LARGE_WINDOW,
+    *,
+    output: int = 8_192,
+    margin: int = 4_000,
+) -> ReviewBudget:
+    """Budget of the judge under test; one object, no scalar round trip."""
+    return ReviewBudget(
+        context_window_tokens=window,
+        judge_output_tokens=output,
+        safety_margin_tokens=margin,
+    )
+
+
 def _judge(
     provider: FakeJudgeProvider,
     *,
     model: str = "test-model",
     runner: RecordingRunner | None = None,
+    budget: ReviewBudget | None = None,
     **config: Any,
 ) -> ReviewJudge:
     """Build a judge whose runner is a real ``AgentRunner`` over ``provider``."""
     return ReviewJudge(
         runner=runner or RecordingRunner(provider),
         model=model,
-        config=ReviewJudgeConfig(context_window_tokens=_LARGE_WINDOW, **config),
+        config=ReviewJudgeConfig(budget=budget or _budget(), **config),
     )
 
 
+#: Window that a judge's fixed overhead (output cap 512 + no safety margin)
+#: easily fits, so only the candidate payload can push the request over. A
+#: window below that overhead would reject every payload, which would leave the
+#: "the complete set must fit" rule untested.
 _SMALL_WINDOW_CONFIG = ReviewJudgeConfig(
-    context_window_tokens=1_200,
-    max_tokens=128,
+    budget=_budget(8_000, output=512, margin=0),
     timeout_seconds=5,
 )
 
 
-def _small_window_judge(provider: FakeJudgeProvider) -> ReviewJudge:
+def _small_window_judge(
+    provider: FakeJudgeProvider, runner: RecordingRunner | None = None
+) -> ReviewJudge:
     return ReviewJudge(
-        runner=RecordingRunner(provider),
+        runner=runner or RecordingRunner(provider),
         model="test-model",
         config=_SMALL_WINDOW_CONFIG,
     )
@@ -236,7 +259,7 @@ async def test_judge_collects_all_candidates_from_all_dimensions() -> None:
     assert result.error is None
 
 
-async def test_judge_single_batch_fits_large_window() -> None:
+async def test_judge_one_request_carries_the_whole_candidate_set() -> None:
     """A window that fits everything issues exactly one request."""
     provider = FakeJudgeProvider(
         [[_accept_verdict("security:src/app.py:1:s1"), _accept_verdict("security:src/app.py:1:s2")]]
@@ -250,130 +273,133 @@ async def test_judge_single_batch_fits_large_window() -> None:
     assert all(
         verdict.decision == ReviewJudgeDecision.ACCEPT for verdict in result.verdicts.values()
     )
+    assert result.budget_rejected is False
     assert result.stats is not None
-    assert result.stats.batches == 1
     assert result.stats.sent_candidates == 2
     assert result.stats.returned_verdicts == 2
 
 
-async def test_judge_splits_multiple_batches_under_small_window() -> None:
-    """A small window forces sequential greedy batches; all candidates sent."""
-    provider = FakeJudgeProvider([[], [], []])
-    judge = _small_window_judge(provider)
-    big_evidence = "lorem ipsum dolor sit amet " * 80  # ~700 tokens
-    dimensions = [_dimension("security", ["S1", "S2", "S3"], evidence=big_evidence)]
-
-    result = await judge.judge_dimensions(dimensions)
-
-    assert len(provider.calls) >= 2
-    assert result.stats is not None
-    assert result.stats.batches == len(provider.calls)
-    assert result.stats.sent_candidates == 3
-    assert result.stats.returned_verdicts == 0
-    # Model returned no verdicts: all candidates explicitly needs_confirmation.
-    assert len(result.verdicts) == 3
-    assert all(
-        verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-        for verdict in result.verdicts.values()
-    )
-
-
-async def test_judge_single_batch_failure_does_not_block_other_batches() -> None:
-    """One failing batch must not abort the remaining batches."""
-    first_id = "security:src/app.py:1:s1"
-    provider = FakeJudgeProvider(
-        replies=[
-            [],  # batch 1 fails before returning anything
-            [_accept_verdict("security:src/app.py:1:s2")],
-            [],
-        ],
-        errors=[RuntimeError("batch one down"), None, None],
-    )
-    judge = _small_window_judge(provider)
-    big_evidence = "lorem ipsum dolor sit amet " * 80
-    dimensions = [_dimension("security", ["S1", "S2", "S3"], evidence=big_evidence)]
-
-    result = await judge.judge_dimensions(dimensions)
-
-    assert len(provider.calls) >= 2
-    assert result.error is not None and "batch one down" in result.error
-    assert result.verdicts[first_id].decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-    assert "batch failed" in result.verdicts[first_id].reason
-    # The surviving batches still produced real verdicts.
-    assert any(
-        verdict.decision == ReviewJudgeDecision.ACCEPT
-        for verdict in result.verdicts.values()
-    )
-    assert result.stats is not None
-    assert result.stats.batches == len(provider.calls)
-
-
-async def test_judge_candidate_larger_than_window_is_needs_confirmation() -> None:
-    """A candidate that cannot fit any batch is never sent to the model."""
+async def test_judge_rejects_a_set_that_does_not_fit_instead_of_splitting() -> None:
+    """The complete set is served in one request or not adjudicated at all."""
     provider = FakeJudgeProvider()
     runner = RecordingRunner(provider)
-    judge = ReviewJudge(
-        runner=runner,
-        model="test-model",
-        config=ReviewJudgeConfig(
-            context_window_tokens=2_000,
-            max_tokens=128,
-            timeout_seconds=5,
-        ),
-    )
-    huge = "x" * 20_000
-    dimensions = [_dimension("security", ["Huge"], evidence=huge)]
+    judge = _small_window_judge(provider, runner=runner)
+    # One candidate carrying a large evidence body is enough to overflow the
+    # window; the fixed reserve alone would still fit.
+    big_evidence = "lorem ipsum dolor sit amet " * 2_000
+    dimensions = [_dimension("security", ["S1"], evidence=big_evidence)]
 
     result = await judge.judge_dimensions(dimensions)
 
-    assert provider.calls == []  # nothing was ever sent
-    assert runner.specs == []  # and no AgentRun was started
-    assert len(result.verdicts) == 1
-    verdict = next(iter(result.verdicts.values()))
-    assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-    assert "too large" in verdict.reason
+    # Zero model calls and no AgentRun at all: the set never reached the judge.
+    assert provider.calls == []
+    assert runner.specs == []
+    assert result.budget_rejected is True
+    assert result.verdicts == {}
+    assert result.error is not None
+    assert "does not fit one judge request" in result.error
     stats = result.stats
     assert stats is not None
     assert stats.total_candidates == 1
     assert stats.sent_candidates == 0
     assert stats.returned_verdicts == 0
     assert stats.needs_confirmation == 1
-    assert stats.batches == 0
 
 
-async def test_judge_fixed_overhead_exceeding_window_marks_all() -> None:
-    """Window smaller than fixed request overhead: nothing sent, all pending."""
+async def test_judge_runs_when_the_candidate_set_fits_the_same_window() -> None:
+    """Control case: the rejection above is caused by the payload, not the cap."""
     provider = FakeJudgeProvider()
     runner = RecordingRunner(provider)
-    judge = ReviewJudge(
-        runner=runner,
-        model="test-model",
-        # Reserved output alone (2048) exceeds the window.
-        config=ReviewJudgeConfig(context_window_tokens=1_000),
+    judge = _small_window_judge(provider, runner=runner)
+    dimensions = [_dimension("security", ["S1", "S2"], evidence="value = 1")]
+
+    result = await judge.judge_dimensions(dimensions)
+
+    assert len(provider.calls) == 1
+    assert len(runner.specs) == 1
+    assert result.budget_rejected is False
+    assert result.error is None
+
+
+async def test_judge_rejects_a_cjk_candidate_set_without_a_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tokenizer-free fallback must not under-count a Chinese prompt.
+
+    Four characters per token would score this 10k-character Chinese evidence
+    at ~2.5k tokens and let the request through; the fallback has to stay an
+    upper bound so the rejection happens here instead of at the provider.
+    """
+    monkeypatch.setattr(
+        "nanoreview.utils.helpers.estimate_prompt_tokens",
+        lambda *_args, **_kwargs: 0,
     )
-    dimensions = [_dimension("security", ["S1", "S2"])]
+    provider = FakeJudgeProvider()
+    runner = RecordingRunner(provider)
+    judge = _small_window_judge(provider, runner=runner)
+    dimensions = [_dimension("security", ["S1"], evidence="连接池已耗尽请检查配置" * 1_000)]
 
     result = await judge.judge_dimensions(dimensions)
 
     assert provider.calls == []
     assert runner.specs == []
-    assert len(result.verdicts) == 2
-    assert all(
-        verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-        for verdict in result.verdicts.values()
+    assert result.budget_rejected is True
+    assert result.error is not None
+    assert "does not fit one judge request" in result.error
+
+
+async def test_judge_rejects_a_window_below_its_own_reserve() -> None:
+    """A window smaller than the output cap plus margin can never be served.
+
+    This is the misconfiguration branch: the request is refused before any model
+    call instead of being sent and failing at the provider.
+    """
+    provider = FakeJudgeProvider()
+    runner = RecordingRunner(provider)
+    judge = ReviewJudge(
+        runner=runner,
+        model="test-model",
+        config=ReviewJudgeConfig(budget=_budget(2_000, output=128), timeout_seconds=5),
     )
-    assert all("context window" in verdict.reason for verdict in result.verdicts.values())
+    dimensions = [_dimension("security", ["S1"], evidence="value = 1")]
+
+    result = await judge.judge_dimensions(dimensions)
+
+    assert provider.calls == []  # nothing was ever sent
+    assert runner.specs == []  # and no AgentRun was started
+    assert result.budget_rejected is True
+    assert result.verdicts == {}
+    assert result.error is not None and "does not fit" in result.error
     stats = result.stats
     assert stats is not None
-    assert stats.total_candidates == 2
+    assert stats.total_candidates == 1
     assert stats.sent_candidates == 0
-    assert stats.returned_verdicts == 0
-    assert stats.needs_confirmation == 2
-    assert stats.batches == 0
+    assert stats.needs_confirmation == 1
 
 
-async def test_judge_batch_exception_marks_batch_needs_confirmation() -> None:
-    """A provider failure never silently accepts the batch's candidates."""
+async def test_judge_rejects_when_the_output_reserve_cannot_hold_every_verdict() -> None:
+    """Input fitting is not enough: the verdict payload must fit the output cap."""
+    provider = FakeJudgeProvider()
+    runner = RecordingRunner(provider)
+    judge = _judge(provider, runner=runner, budget=_budget(output=256))
+    dimensions = [_dimension("security", [f"S{index}" for index in range(60)])]
+
+    result = await judge.judge_dimensions(dimensions)
+
+    assert provider.calls == []
+    assert runner.specs == []
+    assert result.budget_rejected is True
+    assert result.error is not None and "output tokens" in result.error
+    assert "256" in result.error
+    stats = result.stats
+    assert stats is not None
+    assert stats.total_candidates == 60
+    assert stats.sent_candidates == 0
+    assert stats.needs_confirmation == 60
+
+
+async def test_judge_provider_failure_marks_candidates_needs_confirmation() -> None:
+    """A provider failure never silently accepts the candidate set."""
     provider = FakeJudgeProvider(error=RuntimeError("provider down"))
     judge = _judge(provider)
     dimensions = [_dimension("security", ["S1", "S2"])]
@@ -385,14 +411,13 @@ async def test_judge_batch_exception_marks_batch_needs_confirmation() -> None:
         verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
         for verdict in result.verdicts.values()
     )
-    assert all("batch failed" in verdict.reason for verdict in result.verdicts.values())
+    assert all("AI judge failed" in verdict.reason for verdict in result.verdicts.values())
     stats = result.stats
     assert stats is not None
-    # The batch was attempted (sent) but returned nothing.
+    # The request was attempted (sent) but returned nothing.
     assert stats.sent_candidates == 2
     assert stats.returned_verdicts == 0
     assert stats.needs_confirmation == 2
-    assert stats.batches == 1
     # A provider failure is a judge-level error, not a clean completion.
     assert result.error is not None
     assert "provider down" in result.error
@@ -405,16 +430,12 @@ class _NeverReturningProvider:
         await asyncio.sleep(30)
 
 
-async def test_judge_batch_timeout_sets_error() -> None:
+async def test_judge_timeout_sets_error() -> None:
     """A judge request that exceeds the timeout is an error, not a completion."""
     judge = ReviewJudge(
         runner=AgentRunner(_NeverReturningProvider()),
         model="test-model",
-        config=ReviewJudgeConfig(
-            context_window_tokens=_LARGE_WINDOW,
-            max_tokens=128,
-            timeout_seconds=0.05,
-        ),
+        config=ReviewJudgeConfig(budget=_budget(output=128), timeout_seconds=0.05),
     )
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
@@ -422,9 +443,9 @@ async def test_judge_batch_timeout_sets_error() -> None:
     assert len(result.verdicts) == 1
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-    assert "batch failed" in verdict.reason
+    assert "AI judge failed" in verdict.reason
     # The bounded reason must be non-empty: the orchestrator treats an empty
-    # error as a clean completion and would mark a timed-out batch completed.
+    # error as a clean completion and would mark a timed-out run completed.
     assert result.error and "timeout" in result.error
 
 
@@ -451,11 +472,7 @@ async def test_judge_timeout_keeps_usage_from_completed_iterations() -> None:
     judge = ReviewJudge(
         runner=AgentRunner(provider),
         model="test-model",
-        config=ReviewJudgeConfig(
-            context_window_tokens=_LARGE_WINDOW,
-            max_tokens=128,
-            timeout_seconds=0.05,
-        ),
+        config=ReviewJudgeConfig(budget=_budget(output=128), timeout_seconds=0.05),
     )
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
@@ -471,11 +488,11 @@ async def test_judge_timeout_keeps_usage_from_completed_iterations() -> None:
     }
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-    assert "batch failed" in verdict.reason
+    assert "AI judge failed" in verdict.reason
 
 
-async def test_judge_failed_batch_keeps_consumed_usage() -> None:
-    """A batch that fails after real model calls still reports their tokens."""
+async def test_judge_failed_run_keeps_consumed_usage() -> None:
+    """A run that fails after real model calls still reports their tokens."""
     provider = FakeJudgeProvider(
         [_PROSE],  # never calls submit_verdicts -> terminal_tool_failed
         usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
@@ -496,7 +513,7 @@ async def test_judge_failed_batch_keeps_consumed_usage() -> None:
 
 
 class _CompressionStopRunner:
-    """Judge runner stub whose batch is stopped by run-level compression."""
+    """Judge runner stub whose run is stopped by run-level compression."""
 
     def __init__(self, stop_reason: str, usage: dict[str, int]) -> None:
         self.stop_reason = stop_reason
@@ -512,13 +529,13 @@ class _CompressionStopRunner:
         )
 
 
-async def test_judge_compression_stop_is_a_failed_batch_with_usage() -> None:
-    """A compression-stopped batch fails but still reports the tokens it spent."""
+async def test_judge_compression_stop_is_a_failed_run_with_usage() -> None:
+    """A compression-stopped run fails but still reports the tokens it spent."""
     usage = {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50}
     judge = ReviewJudge(
         runner=_CompressionStopRunner("compression_failed", usage),  # type: ignore[arg-type]
         model="test-model",
-        config=ReviewJudgeConfig(context_window_tokens=_LARGE_WINDOW, timeout_seconds=5),
+        config=ReviewJudgeConfig(budget=_budget(), timeout_seconds=5),
     )
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
@@ -546,11 +563,7 @@ async def test_judge_cancellation_propagates() -> None:
     judge = ReviewJudge(
         runner=AgentRunner(_NeverReturningProvider()),
         model="test-model",
-        config=ReviewJudgeConfig(
-            context_window_tokens=_LARGE_WINDOW,
-            max_tokens=128,
-            timeout_seconds=30,
-        ),
+        config=ReviewJudgeConfig(budget=_budget(output=128), timeout_seconds=30),
     )
 
     task = asyncio.create_task(judge.judge_dimensions([_dimension("security", ["S1"])]))
@@ -571,14 +584,6 @@ async def test_judge_error_resets_between_runs() -> None:
     assert second.error is None
     assert second.stats is None
     assert second.usage == {}
-
-
-async def test_judge_disabled_leaves_no_error() -> None:
-    """Disabled/overhead/unbatchable are normal no-request paths, not errors."""
-    provider = FakeJudgeProvider()
-    judge = _judge(provider, enabled=False)
-    result = await judge.judge_dimensions([_dimension("security", ["S1"])])
-    assert result.error is None
 
 
 async def test_judge_partial_and_unknown_verdicts() -> None:
@@ -647,7 +652,6 @@ async def test_judge_disabled_marks_all_needs_confirmation() -> None:
     assert stats.sent_candidates == 0
     assert stats.returned_verdicts == 0
     assert stats.needs_confirmation == 2
-    assert stats.batches == 0
 
 
 async def test_judge_stats_reflect_exact_send_and_return_counts() -> None:
@@ -688,7 +692,6 @@ async def test_judge_stats_reflect_exact_send_and_return_counts() -> None:
     assert stats.sent_candidates == 3
     assert stats.returned_verdicts == 3
     assert stats.needs_confirmation == 1
-    assert stats.batches == 1
     verdicts = result.verdicts
     assert len(verdicts) == 3
     assert verdicts[ids[0]].decision == ReviewJudgeDecision.ACCEPT
@@ -709,24 +712,40 @@ async def test_judge_no_candidates_leaves_stats_none() -> None:
     assert result.usage == {}
 
 
-async def test_judge_usage_aggregates_every_batch() -> None:
-    """Judge tokens are summed across batches so the run can report them."""
+async def test_judge_usage_sums_every_request_of_the_single_run() -> None:
+    """Output-correction retries are billed too, so the run total includes them."""
     provider = FakeJudgeProvider(
-        [[], [], []],
+        [_PROSE, [_accept_verdict("security:src/app.py:1:s1")]],
         usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
     )
-    big_evidence = "lorem ipsum dolor sit amet " * 80  # ~700 tokens
-    dimensions = [_dimension("security", ["S1", "S2", "S3"], evidence=big_evidence)]
-    judge = _small_window_judge(provider)
+    judge = _judge(provider, timeout_seconds=5)
 
-    result = await judge.judge_dimensions(dimensions)
+    result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
     calls = len(provider.calls)
-    assert calls >= 2, "expected the fixtures to split into batches"
-    # One batch would return 150 here; multi-batch runs multiply it.
+    assert calls == 2, "the prose answer is rejected once, then corrected"
     assert result.usage["total_tokens"] == 150 * calls
     assert result.usage["prompt_tokens"] == 120 * calls
     assert result.usage["completion_tokens"] == 30 * calls
+
+
+async def test_judge_correction_retry_is_not_a_second_adjudication() -> None:
+    """A corrected answer still belongs to the same single judge run."""
+    provider = FakeJudgeProvider(
+        [_RawArgs({"verdicts": "not-an-array"}), [_accept_verdict("security:src/app.py:1:s1")]]
+    )
+    runner = RecordingRunner(provider)
+    judge = _judge(provider, runner=runner, timeout_seconds=5)
+
+    result = await judge.judge_dimensions([_dimension("security", ["S1"])])
+
+    assert len(provider.calls) == 2  # one rejection + its correction
+    assert len(runner.specs) == 1  # both belong to one judge run
+    assert result.error is None
+    assert result.stats is not None
+    assert result.stats.total_candidates == 1
+    assert result.stats.sent_candidates == 1
+    assert result.stats.returned_verdicts == 1
 
 
 async def test_judge_usage_resets_between_runs() -> None:
@@ -740,11 +759,11 @@ async def test_judge_usage_resets_between_runs() -> None:
     assert second.usage == {}
 
 
-async def test_judge_batch_runs_through_shared_runner_with_structured_output() -> None:
-    """The batch uses the injected runner and a fully configured AgentRunSpec."""
+async def test_judge_run_uses_the_shared_runner_with_structured_output() -> None:
+    """The run uses the injected runner and a fully configured AgentRunSpec."""
     provider = FakeJudgeProvider([[]])
     runner = RecordingRunner(provider)
-    judge = _judge(provider, runner=runner, max_tokens=128)
+    judge = _judge(provider, runner=runner, budget=_budget(output=128))
     dimensions = [_dimension("security", ["S1"])]
 
     await judge.judge_dimensions(dimensions)
@@ -763,7 +782,7 @@ async def test_judge_batch_runs_through_shared_runner_with_structured_output() -
     assert spec.output_contract.name == "judge_verdicts"
     assert spec.output_retry_limit == 3
     assert spec.max_iterations == spec.output_retry_limit + 3
-    # The batch shares no session, workspace, checkpoint or injection state.
+    # The run shares no session, workspace, checkpoint or injection state.
     assert spec.workspace is None
     assert spec.session_key is None
     assert spec.checkpoint_callback is None
@@ -774,7 +793,7 @@ async def test_judge_batch_runs_through_shared_runner_with_structured_output() -
 
 
 async def test_judge_prose_response_marks_candidates_needs_confirmation() -> None:
-    """A model that only answers prose fails the batch, never accepts silently."""
+    """A model that only answers prose fails the run, never accepts silently."""
     provider = FakeJudgeProvider([_PROSE])
     judge = _judge(provider, timeout_seconds=5)
 
@@ -784,7 +803,7 @@ async def test_judge_prose_response_marks_candidates_needs_confirmation() -> Non
     assert result.error is not None
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-    assert "batch failed" in verdict.reason
+    assert "AI judge failed" in verdict.reason
 
 
 async def test_judge_malformed_verdicts_are_retried_then_succeed() -> None:
@@ -802,7 +821,7 @@ async def test_judge_malformed_verdicts_are_retried_then_succeed() -> None:
     assert result.verdicts[candidate_id].decision == ReviewJudgeDecision.ACCEPT
 
 
-async def test_judge_permanently_malformed_verdicts_fail_the_batch() -> None:
+async def test_judge_permanently_malformed_verdicts_fail_the_run() -> None:
     """A payload rejected to the retry limit fails with a bounded error."""
     provider = FakeJudgeProvider([_RawArgs({"verdicts": "not-an-array"})])
     judge = _judge(provider, timeout_seconds=5)
@@ -812,11 +831,11 @@ async def test_judge_permanently_malformed_verdicts_fail_the_batch() -> None:
     assert result.error is not None
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
-    assert "batch failed" in verdict.reason
+    assert "AI judge failed" in verdict.reason
 
 
-async def test_judge_verdicts_matching_no_candidate_fail_the_batch() -> None:
-    """Invented verdict ids judge nothing, so the batch must not look clean."""
+async def test_judge_verdicts_matching_no_candidate_fail_the_run() -> None:
+    """Invented verdict ids judge nothing, so the run must not look clean."""
     provider = FakeJudgeProvider([[_accept_verdict("security:src/app.py:99:ghost")]])
     judge = _judge(provider, timeout_seconds=5)
 
@@ -854,6 +873,34 @@ async def test_judge_ignores_configured_model_preset(tmp_path: Path) -> None:
     assert judge._model == "plan-model"  # noqa: SLF001
 
 
+async def test_judge_window_and_output_cap_come_from_the_review_config(
+    tmp_path: Path,
+) -> None:
+    """The judge is budgeted from ``review`` config, not from module defaults.
+
+    Reverting ``_build_review_judge`` to a hard-coded window or to a default
+    ``ReviewBudget()`` would leave every other case green, so this pins the
+    wiring: the numbers that decide whether a candidate set fits.
+    """
+    loop = SessionCoordinator(
+        MessageBus(),
+        StubPlanProvider(),
+        tmp_path,
+        review_config=ReviewConfig(
+            context_window_tokens=99_000,
+            budget_safety_margin_tokens=777,
+            judge=ReviewJudgeSettings(max_tokens=1_500),
+        ),
+    )
+
+    judge = loop._build_review_judge()  # noqa: SLF001
+
+    assert judge is not None
+    assert judge._budget.context_window_tokens == 99_000  # noqa: SLF001
+    assert judge._budget.judge_output_tokens == 1_500  # noqa: SLF001
+    assert judge._budget.safety_margin_tokens == 777  # noqa: SLF001
+
+
 async def test_judge_disabled_setting_yields_no_judge(tmp_path: Path) -> None:
     """A disabled judge keeps its original meaning: no judge object at all."""
     loop = SessionCoordinator(
@@ -877,7 +924,7 @@ def _workspace_judge(tmp_path: Path) -> ReviewJudge:
     return ReviewJudge(
         runner=RecordingRunner(FakeJudgeProvider([[]])),
         model="test-model",
-        config=ReviewJudgeConfig(context_window_tokens=_LARGE_WINDOW),
+        config=ReviewJudgeConfig(budget=_budget()),
         common_rules_workspace=tmp_path,
     )
 

@@ -462,6 +462,46 @@ def build_assistant_message(
     return msg
 
 
+#: Framing reserve per message (role markers, separators) that no tokenizer
+#: pass over the text alone would account for.
+_TOKENS_PER_MESSAGE = 4
+
+
+def _prompt_text(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> str:
+    """Flatten every field a provider sends into one countable text block."""
+    parts: list[str] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    txt = part.get("text", "")
+                    if txt:
+                        parts.append(txt)
+
+        tc = msg.get("tool_calls")
+        if tc:
+            parts.append(json.dumps(tc, ensure_ascii=False))
+
+        rc = msg.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            parts.append(rc)
+
+        for key in ("name", "tool_call_id"):
+            value = msg.get(key)
+            if isinstance(value, str) and value:
+                parts.append(value)
+
+    if tools:
+        parts.append(json.dumps(tools, ensure_ascii=False))
+    return "\n".join(parts)
+
+
 def estimate_prompt_tokens(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -470,41 +510,54 @@ def estimate_prompt_tokens(
 
     Counts all fields that providers send to the LLM: content, tool_calls,
     reasoning_content, tool_call_id, name, plus per-message framing overhead.
+    Returns ``0`` when tiktoken is unavailable; use
+    :func:`estimate_prompt_tokens_with_fallback` when a number is required.
     """
     try:
         enc = tiktoken.get_encoding("cl100k_base")
-        parts: list[str] = []
-        for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        txt = part.get("text", "")
-                        if txt:
-                            parts.append(txt)
-
-            tc = msg.get("tool_calls")
-            if tc:
-                parts.append(json.dumps(tc, ensure_ascii=False))
-
-            rc = msg.get("reasoning_content")
-            if isinstance(rc, str) and rc:
-                parts.append(rc)
-
-            for key in ("name", "tool_call_id"):
-                value = msg.get(key)
-                if isinstance(value, str) and value:
-                    parts.append(value)
-
-        if tools:
-            parts.append(json.dumps(tools, ensure_ascii=False))
-
-        per_message_overhead = len(messages) * 4
-        return len(enc.encode("\n".join(parts))) + per_message_overhead
+        return len(enc.encode(_prompt_text(messages, tools))) + (
+            _TOKENS_PER_MESSAGE * len(messages)
+        )
     except Exception:
         return 0
+
+
+def estimate_prompt_tokens_with_fallback(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[int, str]:
+    """Prompt tokens for a budget check, never zero.
+
+    One counting policy for every request the review pipeline accounts for:
+    tiktoken when it loads, otherwise the tokenizer-free upper bound. The
+    returned source tells the caller whether it has to warn about the fallback,
+    so no caller re-implements the policy.
+    """
+    estimated = estimate_prompt_tokens(messages, tools)
+    if estimated > 0:
+        return int(estimated), "tiktoken"
+    upper_bound = estimate_text_tokens_upper_bound(_prompt_text(messages, tools))
+    return upper_bound + (_TOKENS_PER_MESSAGE * len(messages)), "upper_bound"
+
+
+def estimate_text_tokens_upper_bound(text: str) -> int:
+    """Upper-bound token estimate for one text blob without a tokenizer.
+
+    Only callers that must keep working when ``tiktoken`` cannot load use this.
+    Source code and English prose average closer to three characters per token
+    in ``cl100k_base``, while CJK text is about one token per character: a flat
+    ``len(text) / 4`` therefore under-estimates a Chinese prompt by roughly
+    three times, enough to let a request that cannot fit the window pass a
+    pre-flight check. Both sides are counted pessimistically so the result
+    stays an upper bound rather than a best guess.
+    """
+    if not text:
+        return 0
+    ascii_chars = sum(1 for char in text if char.isascii())
+    # Round the ASCII part up: one to two remaining characters still cost a
+    # token, and truncating them would let a short prompt look free.
+    non_ascii_chars = len(text) - ascii_chars
+    return (ascii_chars + 2) // 3 + non_ascii_chars
 
 
 def estimate_message_tokens(message: dict[str, Any]) -> int:

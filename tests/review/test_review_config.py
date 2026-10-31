@@ -3,16 +3,29 @@ from __future__ import annotations
 from nanoreview.config.schema import Config
 
 
-def test_review_evidence_token_budget_fields_accept_camel_case() -> None:
+def test_review_budget_fields_accept_camel_case() -> None:
     config = Config(
         review={
-            "evidenceTokenBudget": 120_000,
+            "contextWindowTokens": 128_000,
+            "reviewerMaxOutputTokens": 4_096,
+            "reviewerContextReadReserveTokens": 16_000,
+            "budgetSafetyMarginTokens": 2_000,
             "prefetchBudgetChars": 12_000,
         }
     )
 
-    assert config.review.evidence_token_budget == 120_000
+    assert config.review.context_window_tokens == 128_000
+    assert config.review.reviewer_max_output_tokens == 4_096
+    assert config.review.reviewer_context_read_reserve_tokens == 16_000
+    assert config.review.budget_safety_margin_tokens == 2_000
     assert config.review.prefetch_budget_chars == 12_000
+
+
+def test_removed_evidence_token_budget_is_ignored() -> None:
+    """旧的证据总预算字段已删除：预算由模型窗口与请求预留决定。"""
+    config = Config(review={"evidenceTokenBudget": 120_000})
+
+    assert not hasattr(config.review, "evidence_token_budget")
 
 
 def test_removed_whole_repository_budget_fields_are_ignored() -> None:
