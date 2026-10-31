@@ -18,19 +18,22 @@ competing ones.
 
 from __future__ import annotations
 
+from copy import copy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
 import tiktoken
 from loguru import logger
 
+from nanoreview.providers.base import GenerationSettings
 from nanoreview.session.manager import Session
 from nanoreview.utils.helpers import (
     estimate_prompt_tokens_chain,
-    find_legal_message_start,
     truncate_text,
 )
 
 if TYPE_CHECKING:
+    from nanoreview.agent.llm_runtime import LLMRuntime
     from nanoreview.providers.base import LLMProvider
     from nanoreview.session.manager import SessionManager
 
@@ -110,6 +113,10 @@ class TranscriptSummarizer:
         self.model = model
         self.context_window_tokens = int(context_window_tokens or 0)
         self.max_completion_tokens = int(max_completion_tokens or 0)
+        self.generation = replace(
+            getattr(provider, "generation", GenerationSettings()),
+            max_tokens=self.max_completion_tokens,
+        )
         self.max_summary_chars = max_summary_chars
         self.prompt = prompt or _SUMMARY_PROMPT
 
@@ -121,6 +128,24 @@ class TranscriptSummarizer:
             getattr(getattr(provider, "generation", None), "max_tokens", 0)
             or self.max_completion_tokens
         )
+        self.generation = replace(
+            getattr(provider, "generation", GenerationSettings()),
+            max_tokens=self.max_completion_tokens,
+        )
+
+    def with_runtime(self, runtime: "LLMRuntime") -> "TranscriptSummarizer":
+        """Bind a run-local copy without changing the shared session summarizer."""
+        bound = copy(self)
+        bound.provider = runtime.provider
+        bound.model = runtime.model
+        bound.context_window_tokens = runtime.context_window_tokens
+        # A role with no reserved output keeps the summarizer's own reserve:
+        # sending ``max_tokens=0`` would let the prompt claim the whole window
+        # while ``_input_token_budget`` still withheld room for the answer.
+        max_tokens = runtime.max_tokens or bound.max_completion_tokens
+        bound.max_completion_tokens = max_tokens
+        bound.generation = replace(runtime.generation, max_tokens=max_tokens)
+        return bound
 
     @property
     def _input_token_budget(self) -> int:
@@ -283,6 +308,9 @@ class TranscriptSummarizer:
                 ],
                 tools=None,
                 tool_choice=None,
+                max_tokens=self.generation.max_tokens,
+                temperature=self.generation.temperature,
+                reasoning_effort=self.generation.reasoning_effort,
             )
             if on_usage is not None:
                 usage = _usage_dict(getattr(response, "usage", None))
@@ -436,62 +464,56 @@ class Consolidator:
     def _replay_overflow_boundary(
         session: Session,
         replay_max_messages: int | None,
+        replay_max_tokens: int = 0,
     ) -> int | None:
+        """First message the replay window hides, or ``None`` when it hides none.
+
+        The boundary is the session's own view of the window — both the message
+        count *and* the token budget — because ``Session.get_history`` applies
+        both cuts. A fold that only knew about the count left everything the
+        token budget cropped described by nothing at all.
+        """
         if not replay_max_messages or replay_max_messages <= 0:
             return None
-        tail = list(
-            enumerate(
-                session.messages[session.last_consolidated:],
-                session.last_consolidated,
-            )
+        first_visible = session.replay_window_start(
+            replay_max_messages,
+            max_tokens=replay_max_tokens,
+            include_timestamps=True,
         )
-        if len(tail) <= replay_max_messages:
+        if first_visible <= session.last_consolidated:
             return None
-
-        sliced = tail[-replay_max_messages:]
-        for i, (_idx, message) in enumerate(sliced):
-            if message.get("role") == "user":
-                start = i
-                if i > 0 and sliced[i - 1][1].get("_channel_delivery"):
-                    start = i - 1
-                sliced = sliced[start:]
-                break
-
-        legal_start = find_legal_message_start([message for _idx, message in sliced])
-        if legal_start:
-            sliced = sliced[legal_start:]
-        if not sliced:
-            return len(session.messages)
-
-        first_visible_idx = sliced[0][0]
-        if first_visible_idx <= session.last_consolidated:
-            return None
-        return first_visible_idx
+        return first_visible
 
     async def fold_replay_overflow(
         self,
         session: Session,
         replay_max_messages: int | None,
         *,
+        replay_max_tokens: int = 0,
         on_usage: Callable[[dict[str, int]], None] | None = None,
     ) -> str | None:
         """Fold turns hidden by the replay window into the checkpoint.
 
-        Without this, a narrow replay window would silently drop old turns: the
-        transcript no longer replays them and no summary ever describes them.
-        Returns the new checkpoint text when one was produced.
+        The window is the one the history read uses: a message count and a token
+        budget. Without this, a narrow window would silently drop old turns —
+        the transcript no longer replays them and no summary ever describes
+        them, so they reach neither the model nor long-term memory. Returns the
+        new checkpoint text when one was produced.
         """
-        end_idx = self._replay_overflow_boundary(session, replay_max_messages)
+        end_idx = self._replay_overflow_boundary(
+            session, replay_max_messages, replay_max_tokens
+        )
         if end_idx is None:
             return None
         chunk = session.messages[session.last_consolidated:end_idx]
         if not chunk:
             return None
         logger.info(
-            "Replay-window fold for {}: chunk={} msgs, replay_max={}",
+            "Replay-window fold for {}: chunk={} msgs, replay_max={}, replay_max_tokens={}",
             session.key,
             len(chunk),
             replay_max_messages,
+            replay_max_tokens,
         )
         summary = await self.summarizer.archive(
             chunk,

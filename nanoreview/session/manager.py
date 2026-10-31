@@ -153,84 +153,92 @@ class Session:
         """Return unconsolidated messages for LLM input.
 
         History is sliced by message count first (``max_messages``), then by
-        token budget from the tail (``max_tokens``) when provided.
+        token budget from the tail (``max_tokens``) when provided. Both cuts are
+        owned by :meth:`replay_window_start`: the caller that archives what the
+        window hides must use the same boundary, or the difference is a run of
+        turns the model never sees and no checkpoint describes.
         """
+        _start, out = self._replay_slice(
+            max_messages,
+            max_tokens=max_tokens,
+            include_timestamps=include_timestamps,
+        )
+        return out
+
+    def replay_window_start(
+        self,
+        max_messages: int = 120,
+        *,
+        max_tokens: int = 0,
+        include_timestamps: bool = False,
+    ) -> int:
+        """Absolute index into ``messages`` of the first replayed message.
+
+        The single definition of the replay window: ``get_history`` returns
+        ``messages[start:]`` (reformatted) and a session-level fold archives
+        ``messages[last_consolidated:start]``. ``len(messages)`` means the
+        window hides everything.
+        """
+        start, _out = self._replay_slice(
+            max_messages,
+            max_tokens=max_tokens,
+            include_timestamps=include_timestamps,
+        )
+        return start
+
+    def _replay_slice(
+        self,
+        max_messages: int,
+        *,
+        max_tokens: int,
+        include_timestamps: bool,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Return ``(start_index, replayed_messages)`` for one replay window."""
         unconsolidated = self.messages[self.last_consolidated:]
         max_messages = max_messages if max_messages > 0 else 120
-        sliced = unconsolidated[-max_messages:]
+        base = self.last_consolidated + max(0, len(unconsolidated) - max_messages)
+        indexed: list[tuple[int, dict[str, Any]]] = [
+            (base + offset, message)
+            for offset, message in enumerate(unconsolidated[-max_messages:])
+        ]
 
         # Avoid starting mid-turn when possible, except for proactive
         # assistant deliveries that the user may be replying to.
-        for i, message in enumerate(sliced):
+        for i, (_index, message) in enumerate(indexed):
             if message.get("role") == "user":
                 start = i
-                if i > 0 and sliced[i - 1].get("_channel_delivery"):
+                if i > 0 and indexed[i - 1][1].get("_channel_delivery"):
                     start = i - 1
-                sliced = sliced[start:]
+                indexed = indexed[start:]
                 break
 
         # Drop orphan tool results at the front.
-        start = find_legal_message_start(sliced)
+        start = find_legal_message_start([message for _index, message in indexed])
         if start:
-            sliced = sliced[start:]
+            indexed = indexed[start:]
 
-        out: list[dict[str, Any]] = []
-        for message in sliced:
-            if message.get("_command"):
-                continue
-            content = message.get("content", "")
-            role = message.get("role")
-            if role == "assistant" and isinstance(content, str):
-                content = _sanitize_assistant_replay_text(content)
-            # Synthesize an ``[image: path]`` breadcrumb from the persisted
-            # ``media`` kwarg so LLM replay still sees *something* where the
-            # image used to be. Without this, an image-only user turn
-            # replays as an empty user message — the assistant's reply then
-            # looks like it's responding to nothing.
-            media = message.get("media")
-            if role == "user" and isinstance(media, list) and media and isinstance(content, str):
-                breadcrumbs = "\n".join(
-                    image_placeholder_text(p) for p in media if isinstance(p, str) and p
-                )
-                content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
-            if include_timestamps:
-                content = self._annotate_message_time(message, content)
-            if role == "assistant" and isinstance(content, str) and not content.strip():
-                if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
-                    continue
-            entry: dict[str, Any] = {"role": message["role"], "content": content}
-            for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
-                if key in message:
-                    entry[key] = message[key]
-            if message.get("injected_event") == "subagent_result":
-                meta = {
-                    key: message[key]
-                    for key in (
-                        "injected_event",
-                        "subagent_task_id",
-                        "subagent_label",
-                        "subagent_status",
-                        "subagent_result",
-                    )
-                    if key in message
-                }
-                if meta:
-                    entry["_metadata"] = meta
-            out.append(entry)
+        pairs: list[tuple[int, dict[str, Any]]] = []
+        for index, message in indexed:
+            entry = self._replay_entry(message, include_timestamps=include_timestamps)
+            if entry is not None:
+                pairs.append((index, entry))
 
-        if max_tokens > 0 and out:
-            kept: list[dict[str, Any]] = []
+        if max_tokens > 0 and pairs:
+            kept: list[tuple[int, dict[str, Any]]] = []
             used = 0
-            for message in reversed(out):
-                tokens = estimate_message_tokens(message)
+            for pair in reversed(pairs):
+                tokens = estimate_message_tokens(pair[1])
                 if kept and used + tokens > max_tokens:
                     break
-                kept.append(message)
+                kept.append(pair)
                 used += tokens
             kept.reverse()
 
             # Keep history aligned to the first visible user turn.
-            first_user = next((i for i, m in enumerate(kept) if m.get("role") == "user"), None)
+            first_user = next(
+                (i for i, (_index, m) in enumerate(kept) if m.get("role") == "user"),
+                None,
+            )
             if first_user is not None:
                 kept = kept[first_user:]
             else:
@@ -238,18 +246,74 @@ class Session:
                 # If a user turn exists in the unsliced output, recover the
                 # nearest one even if it slightly exceeds the token budget.
                 recovered_user = next(
-                    (i for i in range(len(out) - 1, -1, -1) if out[i].get("role") == "user"),
+                    (
+                        i
+                        for i in range(len(pairs) - 1, -1, -1)
+                        if pairs[i][1].get("role") == "user"
+                    ),
                     None,
                 )
                 if recovered_user is not None:
-                    kept = out[recovered_user:]
+                    kept = pairs[recovered_user:]
 
             # And keep a legal tool-call boundary at the front.
-            start = find_legal_message_start(kept)
+            start = find_legal_message_start([entry for _index, entry in kept])
             if start:
                 kept = kept[start:]
-            out = kept
-        return out
+            pairs = kept
+
+        if not pairs:
+            return len(self.messages), []
+        return pairs[0][0], [entry for _index, entry in pairs]
+
+    @staticmethod
+    def _replay_entry(
+        message: dict[str, Any],
+        *,
+        include_timestamps: bool,
+    ) -> dict[str, Any] | None:
+        """Format one persisted message for replay (``None`` = not replayed)."""
+        if message.get("_command"):
+            return None
+        content = message.get("content", "")
+        role = message.get("role")
+        if role == "assistant" and isinstance(content, str):
+            content = _sanitize_assistant_replay_text(content)
+        # Synthesize an ``[image: path]`` breadcrumb from the persisted
+        # ``media`` kwarg so LLM replay still sees *something* where the
+        # image used to be. Without this, an image-only user turn
+        # replays as an empty user message — the assistant's reply then
+        # looks like it's responding to nothing.
+        media = message.get("media")
+        if role == "user" and isinstance(media, list) and media and isinstance(content, str):
+            breadcrumbs = "\n".join(
+                image_placeholder_text(p) for p in media if isinstance(p, str) and p
+            )
+            content = f"{content}\n{breadcrumbs}" if content else breadcrumbs
+        if include_timestamps:
+            content = Session._annotate_message_time(message, content)
+        if role == "assistant" and isinstance(content, str) and not content.strip():
+            if not any(key in message for key in ("tool_calls", "reasoning_content", "thinking_blocks")):
+                return None
+        entry: dict[str, Any] = {"role": message["role"], "content": content}
+        for key in ("tool_calls", "tool_call_id", "name", "reasoning_content", "thinking_blocks"):
+            if key in message:
+                entry[key] = message[key]
+        if message.get("injected_event") == "subagent_result":
+            meta = {
+                key: message[key]
+                for key in (
+                    "injected_event",
+                    "subagent_task_id",
+                    "subagent_label",
+                    "subagent_status",
+                    "subagent_result",
+                )
+                if key in message
+            }
+            if meta:
+                entry["_metadata"] = meta
+        return entry
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

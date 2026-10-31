@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 from loguru import logger
 
 from nanoreview.agent.context import ContextBuilder
+from nanoreview.agent.context_governance import input_token_budget
 from nanoreview.agent.hooks.file_edit import create_file_edit_activity_hook
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
@@ -333,10 +334,13 @@ class ConversationLoop:
         """Consume the handoff, build the context and create the tool registry."""
         # Turns hidden by the replay window are folded into the checkpoint
         # *before* the history is read: without it a narrow window would silently
-        # drop them (no longer replayed, never summarized).
+        # drop them (no longer replayed, never summarized). The window is the
+        # same one the read applies — message count *and* token budget — so a
+        # token-narrowed window is folded exactly like a count-narrowed one.
         folded = await self._consolidator.fold_replay_overflow(
             ctx.session,
             self._max_messages,
+            replay_max_tokens=self._replay_token_budget(),
             on_usage=self._record_summary_usage,
         )
         if folded:
@@ -1097,17 +1101,21 @@ class ConversationLoop:
         self._clear_pending_user_turn(session)
 
     def _replay_token_budget(self) -> int:
-        """Derive a token budget for session history replay from the window."""
+        """Derive a token budget for session history replay from the window.
+
+        Uses the governor's own arithmetic (``input_token_budget``) so the
+        replay window and the request budget leave the same room: a planner
+        that reserved less would replay history the request then rejects, and
+        one that reserved more would hide turns the governor never had to fold.
+        """
         if self._context_window_tokens <= 0:
             return 0
         max_output = getattr(
             getattr(self._provider, "generation", None), "max_tokens", 4096
         )
-        try:
-            reserved_output = int(max_output)
-        except (TypeError, ValueError):
-            reserved_output = 4096
-        budget = self._context_window_tokens - max(1, reserved_output) - 1024
+        if not isinstance(max_output, int) or max_output <= 0:
+            max_output = 4096
+        budget = input_token_budget(self._context_window_tokens, max_output)
         return budget if budget > 0 else max(128, self._context_window_tokens // 2)
 
 

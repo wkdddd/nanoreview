@@ -1117,6 +1117,8 @@ class AgentRunner:
             context_window_tokens=runtime.context_window_tokens,
             max_completion_tokens=runtime.max_tokens or 4096,
         )
+        if isinstance(summarizer, TranscriptSummarizer):
+            summarizer = summarizer.with_runtime(runtime)
 
         def _clean(body: list[dict[str, Any]]) -> list[dict[str, Any]]:
             try:

@@ -7,9 +7,14 @@ from typing import Any
 import pytest
 
 from nanoreview.agent.context import ContextBuilder
-from nanoreview.agent.memory import Consolidator, MemoryStore
-from nanoreview.providers.base import LLMProvider, LLMResponse
+from nanoreview.agent.context_governance import ContextCompactionState, input_token_budget
+from nanoreview.agent.llm_runtime import LLMRuntime
+from nanoreview.agent.memory import Consolidator, MemoryStore, TranscriptSummarizer
+from nanoreview.agent.runner import AgentRunner, AgentRunSpec
+from nanoreview.agent.tools.registry import ToolRegistry
+from nanoreview.providers.base import GenerationSettings, LLMProvider, LLMResponse
 from nanoreview.session.manager import Session, SessionManager
+from nanoreview.utils.helpers import estimate_message_tokens
 
 
 class SummaryProvider(LLMProvider):
@@ -27,6 +32,97 @@ class SummaryProvider(LLMProvider):
 
     def get_default_model(self) -> str:
         return "summary-model"
+
+
+@pytest.mark.parametrize("include_shared_summarizer", [False, True])
+async def test_run_compaction_uses_role_runtime_for_budget_and_request(
+    monkeypatch, include_shared_summarizer,
+) -> None:
+    provider = SummaryProvider()
+    provider.generation = GenerationSettings(max_tokens=8192, temperature=0.9)
+    runtime = LLMRuntime.capture(
+        provider, model="role-model", context_window_tokens=4096,
+    ).with_generation(max_tokens=512, temperature=0.2)
+    shared = TranscriptSummarizer(provider, "session-model", prompt="custom summary")
+    requests = []
+    budgets = []
+
+    async def capture_request(**kwargs):
+        requests.append(kwargs)
+        return LLMResponse(content="checkpoint")
+
+    def bounded_input(self, text, budget):
+        budgets.append(budget)
+        return text[:budget]
+
+    monkeypatch.setattr(provider, "chat_with_retry", capture_request)
+    monkeypatch.setattr(
+        TranscriptSummarizer, "_truncate_to_token_budget_keeping_ends", bounded_input,
+    )
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "x" * 6000},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "next"},
+    ]
+    spec = AgentRunSpec(
+        messages=messages, tools=ToolRegistry(), runtime=runtime,
+        max_iterations=1, max_tool_result_chars=10000, accepted_message_count=3,
+        summarizer=shared if include_shared_summarizer else None,
+    )
+    state = ContextCompactionState.from_messages(messages, accepted_message_count=3)
+    governor = AgentRunner(provider)._build_governor(spec, state)
+    monkeypatch.setattr(
+        governor, "estimate",
+        lambda messages: (sum(len(str(m.get("content", ""))) for m in messages), "test"),
+    )
+    # Simulate a later model switch; the already admitted run must stay pinned,
+    # including an explicitly unset reasoning_effort rather than the new default.
+    provider.generation = GenerationSettings(
+        max_tokens=16384, temperature=1.0, reasoning_effort="high",
+    )
+    shared.set_runtime(provider, "changed-session-model", 65536)
+
+    request = await governor.prepare_request(state)
+
+    assert state.compaction_count == 1
+    assert "checkpoint" in request[1]["content"]
+    assert budgets == [input_token_budget(4096, 512)]
+    assert requests[0]["model"] == "role-model"
+    assert requests[0]["max_tokens"] == 512
+    assert requests[0]["temperature"] == 0.2
+    assert requests[0]["reasoning_effort"] is None
+    if include_shared_summarizer:
+        assert requests[0]["messages"][0]["content"] == "custom summary"
+    assert shared.model == "changed-session-model"
+    assert shared.max_completion_tokens == 16384
+
+
+async def test_direct_summary_request_matches_its_reserved_output(monkeypatch) -> None:
+    provider = SummaryProvider()
+    provider.generation = GenerationSettings(
+        max_tokens=8192, temperature=0.3, reasoning_effort="low",
+    )
+    summarizer = TranscriptSummarizer(
+        provider, "summary-model", context_window_tokens=8192,
+        max_completion_tokens=1024,
+    )
+    requests = []
+
+    async def capture_request(**kwargs):
+        requests.append(kwargs)
+        return LLMResponse(content="checkpoint")
+
+    monkeypatch.setattr(provider, "chat_with_retry", capture_request)
+    monkeypatch.setattr(
+        summarizer, "_truncate_to_token_budget_keeping_ends", lambda text, budget: text,
+    )
+    await summarizer.archive([{"role": "user", "content": "remember this"}])
+
+    assert summarizer._input_token_budget == input_token_budget(8192, 1024)
+    assert requests[0]["max_tokens"] == 1024
+    assert requests[0]["temperature"] == 0.3
+    assert requests[0]["reasoning_effort"] == "low"
 
 
 def test_system_prompt_uses_personalization_without_long_term_memory(tmp_path) -> None:
@@ -319,6 +415,75 @@ async def test_the_replay_fold_archives_the_whole_hidden_prefix(tmp_path) -> Non
     assert "MARK-00" in first_round_markers
     summary = Consolidator.last_summary_text(session) or ""
     assert first_round_markers <= set(_MARKER.findall(summary))
+
+
+@pytest.mark.asyncio
+async def test_a_token_narrowed_replay_window_is_archived_before_it_is_hidden(
+    tmp_path,
+) -> None:
+    """A window narrowed by tokens must be folded like one narrowed by count.
+
+    ``Session.get_history`` cuts the tail twice: by message count and by token
+    budget. Everything before either cut is not replayed, so a fold that only
+    knows about the count leaves the token-dropped turns with neither a
+    transcript the model sees nor a checkpoint that describes them.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    _seed_turns(session, 0, 10)
+    sessions.save(session)
+
+    budget = (
+        sum(
+            estimate_message_tokens(message)
+            for message in session.get_history(
+                max_messages=0, include_timestamps=True
+            )
+        )
+        // 3
+    )
+    provider = MarkerSummaryProvider()
+    consolidator = _marker_consolidator(tmp_path, sessions, provider)
+
+    await consolidator.fold_replay_overflow(session, 120, replay_max_tokens=budget)
+
+    assert session.last_consolidated > 0
+    assert "MARK-00" in (Consolidator.last_summary_text(session) or "")
+    # The read and the archive describe the same window: nothing can be hidden
+    # by the token budget that no checkpoint covers.
+    assert (
+        session.replay_window_start(
+            120, max_tokens=budget, include_timestamps=True
+        )
+        == session.last_consolidated
+    )
+
+
+def test_the_replay_window_start_describes_exactly_what_is_replayed(tmp_path) -> None:
+    """The fold boundary and the history read must be the same boundary.
+
+    ``get_history`` is the only reader of the window and
+    ``replay_window_start`` the only writer of the fold boundary. If they could
+    disagree, a turn would be dropped by one and archived by neither.
+    """
+    sessions = SessionManager(tmp_path)
+    session = sessions.get_or_create("test:session")
+    _seed_turns(session, 0, 10)
+
+    full = session.get_history(120, include_timestamps=True)
+    whole = sum(estimate_message_tokens(message) for message in full)
+    starts: list[int] = []
+    for budget in (0, whole, whole // 2, whole // 5):
+        replayed = session.get_history(
+            120, max_tokens=budget, include_timestamps=True
+        )
+        start = session.replay_window_start(
+            120, max_tokens=budget, include_timestamps=True
+        )
+        assert start == len(session.messages) - len(replayed)
+        starts.append(start)
+
+    assert starts == sorted(starts)
 
 
 @pytest.mark.asyncio

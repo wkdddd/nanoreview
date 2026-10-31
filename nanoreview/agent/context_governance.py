@@ -1,10 +1,5 @@
 """Request-level context governance for one agent run.
 
-The runner used to keep two partitions (``frozen``/``working``) and compress the
-working zone at 60% (background) / 80% (synchronous) of the context window. That
-model is replaced here by the request-level state machine NanoReview now shares
-with the rest of the runtime:
-
 * the leading run of ``system``/``developer`` messages is a stable instruction
   header and is never summarized;
 * the rest of the transcript is split into "already accepted" history
