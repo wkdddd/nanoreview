@@ -13,9 +13,9 @@ github地址： https://github.com/HKUDS/nanobot
 - Behavior: AgentLoop 通过结构化 turn 输入调用共享 Runner，注入历史摘要、Provider compaction、消息注入、checkpoint 和持续目标回调。`build_transcript()` 保留当前 turn 边界，`build_messages()` 兼容合并相邻同角色消息。Session 按摘要 checkpoint 与 `last_archived` 回放历史；SessionManager 管理缓存、保留和存储，Provider state 独立持久化，runtime checkpoint 另有保存入口。
 - Contracts: `TranscriptInput` 分别承载 history、当前消息、media、session summary 和 runtime context。Runner 的 `initial_messages` 与 `transcript_input` 互斥，后者要求 `transcript_builder`，两种入口均要求 `consolidate_history`；Runner 管理 Provider conversation state。`ContextCompactionState` 区分已接受上下文和未发送增量，摘要后经 builder 重建；`ContextGovernor` 管理模型请求上下文并保留持久化历史。`SessionPolicy.persist` 控制是否保存。
 - Current mapping: 本条仅记录参考事实与接口差异，不定义 NanoReview 目标或迁移方案。
-- Differences: NanoReview 使用 `frozen_messages`/`working_messages` 与独立 run-level compression，不能直接替换为上述 Runner/治理接口。nanobot 对话编排仍耦合 automation、持续目标、跨渠道交付与运行时控制；上下文构造仍依赖 memory、skills、apps 和工具扩展，不能整段作为最小 ConversationLoop 提取。历史回放不等于恢复或重新执行中断任务。
+- Differences: NanoReview 已按本参考重做上下文治理：单一 `messages` transcript + `ContextGovernor.prepare_request`、`input_budget = window - max_output - 1024`、`ContextCompactionState` 的 accepted/compacted 边界、`LLMRuntime` 角色运行时快照，均为本项目自建实现（`agent/context_governance.py`、`agent/llm_runtime.py`），不是对 nanobot 模块的移植。nanobot 对话编排仍耦合 automation、持续目标、跨渠道交付与运行时控制；上下文构造仍依赖 memory、skills、apps 和工具扩展，不能整段作为最小 ConversationLoop 提取。历史回放不等于恢复或重新执行中断任务。
 - Risks/tests: 原核查仅阅读相关源码及 turn 边界、Runner 输入、Provider state 持久化的部分测试，未运行测试或服务；本次仅整理格式。相关测试为 `tests/agent/test_context_builder.py`、`test_runner_core.py`、`test_runner_governance.py`、`test_session_atomic.py`、`test_loop_session_policy.py`。未核对远端最新 HEAD；原核查时本地改动仅在 `webui/README.md`，不涉及核查范围。
-- Last checked: 2026-10-04
+- Last checked: 2026-10-31（仅更新 Differences 一节，未重新核查参考源码）
 
 ## 历史参考（4de728a5）
 

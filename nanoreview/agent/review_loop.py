@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from nanoreview.agent.context import ContextBuilder
+from nanoreview.agent.context_governance import input_token_budget
 from nanoreview.agent.review_board import (
     CHILD_COMPLETED,
     CHILD_ERROR,
@@ -85,8 +86,8 @@ from nanoreview.review.types import (
 )
 
 if TYPE_CHECKING:
+    from nanoreview.agent.llm_runtime import LLMRuntime
     from nanoreview.agent.subagent import SubagentManager
-    from nanoreview.providers.base import LLMProvider
     from nanoreview.review.output.finalizer import ReviewJudgeStats
     from nanoreview.review.output.judge import ReviewJudge
     from nanoreview.session.manager import Session, SessionManager
@@ -95,10 +96,10 @@ if TYPE_CHECKING:
 #: request). The last request still belongs to the reviewer: the accepted final
 #: answer has to be the structured findings payload, and ``AgentRunner`` feeds
 #: a rejected answer back with its concrete reason until the output retry
-#: budget or this iteration cap is reached.
+#: budget or this iteration cap is reached. There is no role-level wall clock:
+#: the request allowance, the per-request provider timeout and cancellation are
+#: the only bounds, so a slow model cannot have its work truncated mid-batch.
 REVIEWER_MODEL_REQUEST_LIMIT = 30
-#: Wall-clock timeout for one reviewer run.
-REVIEWER_TIMEOUT_SECONDS = 180
 
 #: Child id of the run's single aggregated judge pass.
 _JUDGE_BATCH_ID = "judge"
@@ -112,12 +113,16 @@ _PENDING_USER_TURN_KEY = "pending_user_turn"
 
 
 def review_budget_contract(budget: ReviewBudget | None = None) -> dict[str, int]:
-    """The review-run budget contract, persisted for replay/audit."""
+    """The review-run budget contract, persisted for replay/audit.
+
+    Every number comes from the runtime the run was admitted with (see
+    ``ReviewBudget.from_runtimes``), so a review started on a 64k model records
+    64k — not a fixed project-wide window.
+    """
     resolved = budget or ReviewBudget()
     return {
         **resolved.contract(),
         "reviewer_model_request_limit": REVIEWER_MODEL_REQUEST_LIMIT,
-        "reviewer_timeout_seconds": REVIEWER_TIMEOUT_SECONDS,
     }
 
 
@@ -260,6 +265,11 @@ class ReviewTurnRequest:
     session: "Session | None"
     msg: InboundMessage
     metadata: dict[str, Any]
+    #: Reviewer and Judge runtimes frozen when the review was admitted. A
+    #: conversation-side ``/model`` switch after admission must not change an
+    #: in-flight review, so the loop never re-derives them per task.
+    reviewer_runtime: "LLMRuntime | None" = None
+    judge_runtime: "LLMRuntime | None" = None
     events: EventSink = NO_EVENTS
     result_callback: Callable[[Any], Awaitable[None]] | None = None
 
@@ -311,6 +321,9 @@ class _ReviewInputs:
     changed_files: list[str]
     local_target: str | None
     execution_context: ReviewExecutionContext
+    reviewer_runtime: "LLMRuntime"
+    judge_runtime: "LLMRuntime | None"
+    budget: ReviewBudget
 
 
 class ReviewLoop:
@@ -323,13 +336,12 @@ class ReviewLoop:
         sessions: "SessionManager",
         subagents: "SubagentManager",
         boards: ReviewBoardStore,
-        model: str,
         max_tool_result_chars: int,
         context_builder: ContextBuilder | None = None,
         max_messages: int = 120,
         max_concurrent_subagents: int = 4,
         review_config: Any | None = None,
-        judge_factory: Callable[[], "ReviewJudge | None"] | None = None,
+        judge_factory: Callable[["LLMRuntime | None"], "ReviewJudge | None"] | None = None,
         snapshot_store: ReviewSnapshotStore | None = None,
     ) -> None:
         self._workspace = Path(workspace)
@@ -338,16 +350,16 @@ class ReviewLoop:
         # The board store is created by the coordinator: it owns every run's
         # authoritative state, and this loop only ever requests writes.
         self._boards = boards
-        self._model = model
         self._max_tool_result_chars = max_tool_result_chars
         self._context = context_builder or ContextBuilder(self._workspace)
         self._max_messages = max_messages if max_messages > 0 else 120
         self._max_concurrent_subagents = int(max_concurrent_subagents or 1)
-        # The review pipeline budgets against its own configured window, not
-        # the conversation agent's: reviewers and the judge are checked against
-        # the same explicit numbers (see ``ReviewBudget``).
-        self._budget = ReviewBudget.from_review_config(review_config)
-        self._context_window_tokens = self._budget.context_window_tokens
+        # The review budget is derived per run from the reviewer/Judge runtimes
+        # frozen at admission (see ``ReviewBudget.from_runtimes``): the window
+        # travels with the model that actually serves the role, so a review
+        # started on a 64k model is budgeted at 64k. Only the reserves stay
+        # configured here.
+        self._review_config = review_config
         self._judge_factory = judge_factory
         # Snapshots are written by the admission service; the loop augments the
         # same run's snapshot after planning with the accepted evidence, the
@@ -374,22 +386,14 @@ class ReviewLoop:
 
     # -- runtime ------------------------------------------------------------
 
-    def set_runtime_model(
-        self,
-        provider: "LLMProvider",
-        model: str,
-        context_window_tokens: int | None,
-    ) -> None:
-        """Swap the model used by future review turns.
+    def _default_reviewer_runtime(self) -> "LLMRuntime":
+        """Reviewer runtime when the caller did not freeze one.
 
-        The provider itself is shared through the coordinator's runner and
-        subagents; the loop only tracks the model id. The review context window
-        comes from ``ReviewConfig`` and is deliberately not updated by a
-        conversation-side model switch, so the review budget stays
-        deterministic; ``context_window_tokens`` is accepted for call-site
-        symmetry and ignored.
+        The coordinator always supplies the frozen runtime on an admitted turn;
+        this fallback keeps direct loop construction (tests, tooling) working
+        with the subagent manager's live selection.
         """
-        self._model = model
+        return self._subagents.default_runtime()
 
     # -- execution ----------------------------------------------------------
 
@@ -511,14 +515,18 @@ class ReviewLoop:
     # -- review turn context ------------------------------------------------
 
     def _review_messages(
-        self, request: ReviewTurnRequest, session: "Session | None"
+        self,
+        request: ReviewTurnRequest,
+        session: "Session | None",
+        reviewer_runtime: "LLMRuntime",
     ) -> list[dict[str, Any]]:
-        """Build the review turn's frozen/working context from the session.
+        """Build the review turn's context from the session.
 
         The review agent shares the conversation agent's ``ContextBuilder``
         (system prompt, ``COMMON_RULES``, skills), but keeps its own review task
         envelope. History is read *before* the user message is persisted so the
-        current message is not replayed twice in the same request.
+        current message is not replayed twice in the same request. No long-term
+        memory is injected: the review roles never see it.
         """
         msg = request.msg
         history: list[dict[str, Any]] = []
@@ -527,13 +535,13 @@ class ReviewLoop:
                 m
                 for m in session.get_history(
                     max_messages=self._max_messages,
-                    max_tokens=self._replay_token_budget(),
+                    max_tokens=self._replay_token_budget(reviewer_runtime),
                     include_timestamps=True,
                 )
                 if m.get("_metadata", {}).get("injected_event")
                 != "subagent_result"
             ]
-        frozen, working = self._context.build_partitioned_messages(
+        messages = self._context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -546,7 +554,7 @@ class ReviewLoop:
         )
         if session is not None:
             self._persist_review_user_message(session, msg)
-        return [*frozen, *working]
+        return messages
 
     def _persist_review_user_message(
         self, session: "Session", msg: InboundMessage
@@ -587,16 +595,18 @@ class ReviewLoop:
                 exc_info=True,
             )
 
-    def _replay_token_budget(self) -> int:
-        """Derive a token budget for session history replay from the window."""
-        if not self._context_window_tokens or self._context_window_tokens <= 0:
+    def _replay_token_budget(self, runtime: "LLMRuntime") -> int:
+        """Derive a token budget for session history replay from the window.
+
+        Uses the runtime's own reserved output, not a fixed constant: the replay
+        window and the request budget must leave the same room, or a review
+        replays history the request then rejects.
+        """
+        window = runtime.context_window_tokens
+        if not window or window <= 0:
             return 0
-        budget = self._context_window_tokens - 4096 - 1024
-        return (
-            budget
-            if budget > 0
-            else max(128, self._context_window_tokens // 2)
-        )
+        budget = input_token_budget(window, runtime.max_tokens)
+        return budget if budget > 0 else max(128, window // 2)
 
     async def _prepare_review(
         self,
@@ -613,6 +623,11 @@ class ReviewLoop:
         """
         await writer.advance(ReviewPhase.PREPARE)
         session = request.session
+        # Freeze the role runtimes for the whole run before any input is
+        # derived from them: the evidence budget, the diff window, the reviewer
+        # tasks and the Judge batches all read these same values.
+        reviewer_runtime = request.reviewer_runtime or self._default_reviewer_runtime()
+        judge_runtime = request.judge_runtime
         review_meta = dict(session.metadata) if session is not None else dict(
             request.metadata or {}
         )
@@ -653,10 +668,10 @@ class ReviewLoop:
                 board.run_id,
             )
 
-        # The review turn's frozen/working context is built once here: the
-        # review inputs are derived from it, and the reviewer agent's message list
-        # from the same build so the user message is persisted exactly once.
-        review_messages = self._review_messages(request, session)
+        # The review turn's context is built once here: the review inputs are
+        # derived from it, and the reviewer agent's message list from the same
+        # build so the user message is persisted exactly once.
+        review_messages = self._review_messages(request, session, reviewer_runtime)
         preparation = await prepare_code_review_context(
             review_messages,
             review_meta,
@@ -704,6 +719,13 @@ class ReviewLoop:
                     or self._max_concurrent_subagents
                 ),
                 result_callback=request.result_callback,
+            ),
+            reviewer_runtime=reviewer_runtime,
+            judge_runtime=judge_runtime,
+            budget=ReviewBudget.from_runtimes(
+                reviewer_runtime,
+                judge_runtime=judge_runtime,
+                review_config=self._review_config,
             ),
         )
 
@@ -885,7 +907,17 @@ class ReviewLoop:
             for assignment in assignments
         ]
         sections: dict[str, Any] = {
-            "budget": review_budget_contract(self._budget),
+            "budget": review_budget_contract(inputs.budget),
+            # The frozen role runtimes are part of the run's audit trail: which
+            # model, window and generation parameters each role actually used.
+            "models": {
+                "reviewer": inputs.reviewer_runtime.describe(),
+                "judge": (
+                    inputs.judge_runtime.describe()
+                    if inputs.judge_runtime is not None
+                    else None
+                ),
+            },
             "evidence": {
                 "accepted_units": len(accepted_ids),
                 "accepted_ids": accepted_ids,
@@ -921,12 +953,14 @@ class ReviewLoop:
             plan=inputs.plan,
             assignments=assignments,
             evidence=inputs.evidence,
+            budget=inputs.budget,
         )
         await writer.start_assignments(tuple(assignments))
         limits_by_dimension = self._derive_execution_limits(
             evidence=inputs.evidence,
             assignments=assignments,
             prompt_tokens_by_dimension=prompt_tokens_by_dimension,
+            reviewer_runtime=inputs.reviewer_runtime,
         )
         board = self._boards.view(request.session_key)
         finalizer = ReviewFinalizer(
@@ -950,7 +984,9 @@ class ReviewLoop:
         dimensions: tuple[ReviewDimensionResult, ...] = (
             board.dimensions if board is not None else ()
         )
-        judge = self._judge_factory() if self._judge_factory else None
+        judge = (
+            self._judge_factory(inputs.judge_runtime) if self._judge_factory else None
+        )
         judge_stats: "ReviewJudgeStats | None" = None
         draft_reason = ""
         if judge is not None:
@@ -1051,6 +1087,7 @@ class ReviewLoop:
         plan: ReviewPlan,
         assignments: tuple[ReviewAssignment, ...],
         evidence: ReviewEvidenceBundle,
+        budget: ReviewBudget,
     ) -> dict[str, int]:
         """Reject the run when any selected reviewer's first request is too big.
 
@@ -1058,7 +1095,7 @@ class ReviewLoop:
         complete diff::
 
             prompt + complete diff + context read reserve + output reserve
-                + safety margin <= configured window
+                + safety margin <= frozen reviewer window
 
         One over-budget reviewer rejects the whole review, because reviewing the
         rest would present an incomplete change as a finished review. Returns the
@@ -1079,25 +1116,27 @@ class ReviewLoop:
                 plan=plan, assignment=assignment, references=references
             )
             prompt_tokens_by_dimension[assignment.dimension] = prompt_tokens
-            budget = self._budget.reviewer_request(prompt_tokens=prompt_tokens)
+            request_budget = budget.reviewer_request(prompt_tokens=prompt_tokens)
             logger.info(
                 "review.subagent.budget dimension={} evidence_units={} required_tokens={} window={}",
                 assignment.dimension,
                 len(references),
-                budget.required_tokens,
-                budget.context_window_tokens,
+                request_budget.required_tokens,
+                request_budget.context_window_tokens,
             )
-            if budget.fits:
+            if request_budget.fits:
                 continue
             raise ReviewPlanningError(
                 f"Review cannot start: reviewer {assignment.dimension!r} needs "
-                f"{budget.required_tokens} tokens for its first request "
-                f"({budget.describe()}, over by {budget.over_by_tokens}), "
+                f"{request_budget.required_tokens} tokens for its first request "
+                f"({request_budget.describe()}, over by {request_budget.over_by_tokens}), "
                 f"including the complete diff of {len(references)} evidence unit(s). "
                 "No reviewer was started. "
-                "Reduce the reviewed diff, or raise review.context_window_tokens "
-                "(or lower review.reviewer_context_read_reserve_tokens) to match "
-                "the model actually serving the review roles."
+                "Reduce the reviewed diff, or raise the reviewer model's context "
+                "window (review.reviewer.contextWindowTokens, or the conversation "
+                "agent's window it inherits) or lower "
+                "review.reviewer_context_read_reserve_tokens to match the model "
+                "actually serving the review roles."
             )
         return prompt_tokens_by_dimension
 
@@ -1155,15 +1194,17 @@ class ReviewLoop:
         evidence: ReviewEvidenceBundle,
         assignments: tuple[ReviewAssignment, ...],
         prompt_tokens_by_dimension: dict[str, int],
+        reviewer_runtime: "LLMRuntime",
     ) -> dict[str, SubagentExecutionLimits]:
         """Derive per-dimension execution limits.
 
-        Reviewer limits come from the review budget: at most
-        ``REVIEWER_MODEL_REQUEST_LIMIT`` model requests (the last iteration is
-        the reviewer's final structured answer), the configured reviewer output
-        cap per response, ``REVIEWER_TIMEOUT_SECONDS`` wall clock and the
-        configured review context window. Evidence volume is recorded for
-        observability but does not scale the request allowance.
+        Reviewer limits are the run's frozen runtime plus the request
+        allowance: at most ``REVIEWER_MODEL_REQUEST_LIMIT`` model requests (the
+        last iteration is the reviewer's final structured answer). The window and
+        output cap travel inside ``runtime``; there is no role-level wall clock,
+        so a slow request is bounded by the provider timeout only. Evidence
+        volume is recorded for observability but does not scale the request
+        allowance.
         """
         reference_map = evidence.by_id()
         limits: dict[str, SubagentExecutionLimits] = {}
@@ -1173,9 +1214,7 @@ class ReviewLoop:
             )
             limits[assignment.dimension] = SubagentExecutionLimits(
                 max_iterations=REVIEWER_MODEL_REQUEST_LIMIT,
-                max_tokens=self._budget.reviewer_output_tokens,
-                timeout_seconds=REVIEWER_TIMEOUT_SECONDS,
-                context_window_tokens=self._budget.context_window_tokens,
+                runtime=reviewer_runtime,
             )
             logger.info(
                 "review.subagent.limit dimension={} evidence_units={} prompt_tokens={}",
@@ -1184,11 +1223,12 @@ class ReviewLoop:
                 prompt_tokens_by_dimension.get(assignment.dimension),
             )
         logger.info(
-            "review.subagent.limits dimensions={} max_iterations={} max_tokens={} timeout_seconds={}",
+            "review.subagent.limits dimensions={} model={} max_iterations={} max_tokens={} context_window_tokens={}",
             len(limits),
+            reviewer_runtime.model,
             REVIEWER_MODEL_REQUEST_LIMIT,
-            self._budget.reviewer_output_tokens,
-            REVIEWER_TIMEOUT_SECONDS,
+            reviewer_runtime.max_tokens,
+            reviewer_runtime.context_window_tokens,
         )
         return limits
 

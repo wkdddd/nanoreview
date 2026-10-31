@@ -128,5 +128,8 @@ async def test_accepted_submission_carries_admitted_marker(
     assert metadata["_review_admitted"]
     assert connection.events() == []
     loop = channel._agent_loop  # type: ignore[attr-defined]
-    state = loop._review_runs["websocket:chat-2"]
+    # The admitted run is announced by the marker and owned by the board, which
+    # is the single writer of review-run state.
+    state = loop._review_boards.view("websocket:chat-2")  # noqa: SLF001
+    assert state is not None
     assert state.run_id == metadata["_review_admitted"]

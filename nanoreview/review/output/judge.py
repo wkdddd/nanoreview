@@ -16,13 +16,12 @@ usage accounting instead of calling the provider directly.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -45,6 +44,9 @@ from nanoreview.utils.helpers import (
     estimate_prompt_tokens_with_fallback,
     merge_token_usage,
 )
+
+if TYPE_CHECKING:
+    from nanoreview.agent.llm_runtime import LLMRuntime
 
 #: Output tokens reserved per candidate on top of its verdict skeleton, so the
 #: reserve covers the free-text ``reason`` the model writes for each verdict.
@@ -94,12 +96,18 @@ class ReviewJudgeStats:
 
 @dataclass(frozen=True, slots=True)
 class ReviewJudgeConfig:
+    """Judge settings.
+
+    There is no window, output cap or wall clock here: those travel inside the
+    ``LLMRuntime`` frozen when the review started, so the numbers the batch is
+    checked against are the ones the model actually runs with. ``budget`` only
+    carries the reserves, and is derived from that same runtime when omitted.
+    """
+
     enabled: bool = True
-    timeout_seconds: int = 60
-    #: Window, output cap and margin of the judge request. Built once from
-    #: ``ReviewConfig`` (``ReviewBudget.from_review_config``) so the judge never
-    #: re-derives the numbers it is checked against.
-    budget: ReviewBudget = field(default_factory=ReviewBudget)
+    #: Reserves for the request account; window and output caps come from the
+    #: runtime (``ReviewBudget.from_runtimes``).
+    budget: ReviewBudget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,12 +136,12 @@ class JudgeExecutionResult:
 
 
 class _JudgeUsageObserver(AgentHook):
-    """Snapshot per-iteration usage so a timed-out run keeps its spend.
+    """Snapshot per-iteration usage so a cancelled run keeps its spend.
 
     ``AgentRunner`` reports usage only through ``AgentRunResult``, which a run
-    cancelled by its own ``asyncio.wait_for`` timeout never produces. This hook
+    cancelled by the provider's request timeout never produces. This hook
     records each iteration's usage as it completes, so tokens already consumed
-    before the timeout stay visible to the caller instead of being dropped.
+    before the cancellation stay visible to the caller instead of being dropped.
     """
 
     __slots__ = ("usage",)
@@ -147,16 +155,6 @@ class _JudgeUsageObserver(AgentHook):
         # finalization retry merged into it), and the runner calls this once
         # per iteration, so accumulating here mirrors ``AgentRunResult.usage``.
         merge_token_usage(self.usage, context.usage)
-
-    def record_compression_usage(self, usage: dict[str, int]) -> None:
-        """Fold a completed run-compression request's usage into the snapshot.
-
-        Run-level compression calls the provider outside the iteration loop, so
-        ``after_iteration`` never sees that spend. The runner invokes this
-        callback the moment each compression request's usage is billed, which
-        keeps it visible even when the run is cancelled by the outer timeout.
-        """
-        merge_token_usage(self.usage, usage)
 
 
 class _JudgeRunError(RuntimeError):
@@ -178,26 +176,30 @@ class _JudgeRunError(RuntimeError):
 class ReviewJudge:
     """Use an LLM to judge whether subagent candidates are review-worthy.
 
-    The judge shares the coordinator/plan ``AgentRunner`` and model. It never
-    creates its own provider, runner or model preset: the run differs from the
-    plan run only in the prompt and tool set — it has no tools at all and its
-    final answer is the structured verdict payload.
+    The judge shares the coordinator's ``AgentRunner`` but runs on the runtime
+    frozen for its own role at review admission — never on the conversation
+    agent's live model, which a ``/model`` switch could move mid-review. It
+    never creates its own runner or provider: the run differs from a reviewer
+    run only in the prompt and tool set — it has no tools at all and its final
+    answer is the structured verdict payload.
     """
 
     def __init__(
         self,
         *,
         runner: AgentRunner,
-        model: str,
+        runtime: "LLMRuntime",
         config: ReviewJudgeConfig | None = None,
         common_rules_workspace: Path | None = None,
     ) -> None:
         self._runner = runner
-        self._model = model
+        self._runtime = runtime
         self._config = config or ReviewJudgeConfig()
         #: One budget object for the check *and* the run, so the window that
         #: decided "it fits" is the window the run then executes in.
-        self._budget = self._config.budget
+        self._budget = self._config.budget or ReviewBudget.from_runtimes(
+            runtime, judge_runtime=runtime
+        )
         #: NanoReview workspace whose ``COMMON_RULES.md`` is read once per run.
         self._common_rules_workspace = common_rules_workspace
         #: Emits the tokenizer-fallback warning at most once per judge.
@@ -274,7 +276,7 @@ class ReviewJudge:
             "review.judge.start trace_id={} candidates={} model={} window={} required_tokens={}",
             trace_id,
             total_candidates,
-            self._model,
+            self._runtime.model,
             budget.context_window_tokens,
             budget.required_tokens,
         )
@@ -487,27 +489,29 @@ class ReviewJudge:
         ``needs_confirmation``, records a bounded error and still accounts for
         the spend.
         """
-        # Observes per-iteration usage so a run cancelled by the timeout below
+        # Observes per-iteration usage so a run rejected or cancelled mid-flight
         # still reports the tokens it burned; harmless on the success path,
         # where ``AgentRunResult.usage`` is authoritative.
         usage_observer = _JudgeUsageObserver()
         spec = AgentRunSpec(
-            frozen_messages=[
+            messages=[
                 {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": self._build_prompt(candidates)},
             ],
-            working_messages=[],
             # The judge is a pure decision step: it needs no tools, only the
             # candidate set and its output contract.
             tools=ToolRegistry(),
-            model=self._model,
+            # Window, output cap and generation parameters all ride in the
+            # frozen runtime; the assignment window and output reserve are
+            # therefore the same numbers the request is actually sent with.
+            runtime=self._runtime,
             max_iterations=_JUDGE_MAX_ITERATIONS,
             max_tool_result_chars=_JUDGE_MAX_TOOL_RESULT_CHARS,
-            temperature=0,
-            max_tokens=self._budget.judge_output_tokens,
+            # The candidate set is authorized evidence: a checkpoint summary
+            # may not stand in for it, so nothing here is summarizable.
+            accepted_message_count=0,
             output_contract=judge_contract(),
             output_retry_limit=_JUDGE_OUTPUT_RETRY_LIMIT,
-            context_window_tokens=self._budget.context_window_tokens,
             error_message=None,
             concurrent_tools=False,
             # The judge run is self-contained: no persisted session, checkpoint,
@@ -521,22 +525,17 @@ class ReviewJudge:
             hook=build_agent_turn_hook(
                 AgentTurnHookSpec(turn_hooks=[usage_observer])
             ),
-            # Bank compression usage the instant it is billed, so a run that
-            # is cancelled by the timeout below still reports that spend.
-            compression_usage_callback=usage_observer.record_compression_usage,
         )
 
         try:
-            result = await asyncio.wait_for(
-                self._runner.run(spec),
-                timeout=self._config.timeout_seconds,
-            )
+            result = await self._runner.run(spec)
         except TimeoutError as exc:
-            # ``wait_for`` cancels the run mid-flight, so there is no
-            # ``AgentRunResult``: the observer snapshot is the only record of
-            # what this run already spent. Cancellation of the judge itself
-            # (``/stop``) stays a ``CancelledError`` and still propagates.
-            detail = str(exc) or f"exceeded {self._config.timeout_seconds}s"
+            # The provider's own per-request timeout cancels the run mid-flight,
+            # so there is no ``AgentRunResult``: the observer snapshot is the
+            # only record of what this run already spent. Cancellation of the
+            # judge itself (``/stop``) stays a ``CancelledError`` and still
+            # propagates.
+            detail = str(exc) or "model request timed out"
             logger.warning(
                 "review.judge.run.rejected trace_id={} stop_reason=timeout reason={} observed_usage={}",
                 trace_id,

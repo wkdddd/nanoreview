@@ -78,6 +78,17 @@ async def test_stop_with_no_task_settles_a_leftover_review_run() -> None:
     assert result.content == "Settled review run run-x as stopped."
 
 
+def test_dream_is_advertised_and_routable() -> None:
+    """``/dream`` must appear in help and reach its handler."""
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    commands = {spec.command for spec in BUILTIN_COMMAND_SPECS}
+
+    assert "/dream" in commands
+    assert router.is_dispatchable_command("/dream") is True
+
+
 def test_removed_math_commands_are_not_advertised_or_routable() -> None:
     router = CommandRouter()
     register_builtin_commands(router)

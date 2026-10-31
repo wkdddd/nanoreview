@@ -66,7 +66,7 @@ class SpecCapturingRunner:
         self.specs.append(spec)
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 
@@ -86,7 +86,7 @@ class ToolCallingRunner(SpecCapturingRunner):
         )
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 

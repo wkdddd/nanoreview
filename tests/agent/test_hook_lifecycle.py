@@ -27,6 +27,7 @@ from nanoreview.agent.hooks import (
     build_agent_turn_hook,
     finalize_content_result,
 )
+from nanoreview.agent.llm_runtime import LLMRuntime
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.registry import ToolRegistry
 from nanoreview.events import NO_EVENTS, ProgressEvent, StreamDeltaEvent
@@ -155,17 +156,71 @@ class CancellingProvider(LLMProvider):
         return "dummy"
 
 
-def make_spec(**overrides: Any) -> AgentRunSpec:
+def make_spec(provider: LLMProvider, **overrides: Any) -> AgentRunSpec:
     values: dict[str, Any] = {
-        "frozen_messages": [],
-        "working_messages": [],
+        "messages": [],
         "tools": ToolRegistry(),
-        "model": "dummy",
+        "runtime": LLMRuntime.capture(
+            provider, model="dummy", context_window_tokens=65_536
+        ),
         "max_iterations": 1,
         "max_tool_result_chars": 1000,
     }
     values.update(overrides)
     return AgentRunSpec(**values)
+
+
+async def run_spec(provider: LLMProvider, **overrides: Any) -> Any:
+    """Run one spec whose runtime is the provider under test."""
+    return await AgentRunner(provider).run(make_spec(provider, **overrides))
+
+
+class StubSummarizer:
+    """Replacement checkpoint producer that bills a fixed summarization usage."""
+
+    def __init__(self, summary: str, *, usage: dict[str, int] | None = None) -> None:
+        self.summary = summary
+        self.usage = dict(usage or {})
+        self.calls: list[int] = []
+
+    async def archive(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        previous_summary: str | None = None,
+        on_usage: Any = None,
+    ) -> str | None:
+        self.calls.append(len(messages))
+        if on_usage is not None and self.usage:
+            on_usage(dict(self.usage))
+        return self.summary
+
+    def raw_archive(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        previous_summary: str | None = None,
+    ) -> str | None:
+        return self.summary
+
+
+def oversized_runtime(provider: LLMProvider) -> Any:
+    """A runtime whose input budget is a few hundred tokens."""
+    return LLMRuntime.capture(
+        provider, model="dummy", context_window_tokens=2_048
+    ).with_generation(max_tokens=64)
+
+
+def oversized_transcript() -> list[dict[str, Any]]:
+    """Header + accepted history + current message, larger than the budget."""
+    body = "lorem ipsum dolor sit amet " * 200
+    return [
+        {"role": "system", "content": "instructions"},
+        {"role": "user", "content": body},
+        {"role": "assistant", "content": body},
+        {"role": "user", "content": body},
+        {"role": "user", "content": "the current question"},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +232,7 @@ async def test_successful_run_calls_before_after_and_finally_in_order() -> None:
     calls: list[str] = []
     provider = ScriptedProvider([LLMResponse(content="done")])
 
-    result = await AgentRunner(provider).run(make_spec(hook=RecordingHook("h", calls)))
+    result = await run_spec(provider, hook=RecordingHook("h", calls))
 
     assert result.stop_reason == "completed"
     assert calls == [
@@ -197,7 +252,7 @@ async def test_model_error_calls_on_error_before_after_run_and_finally() -> None
         LLMResponse(content="Error: upstream unavailable", finish_reason="error")
     ])
 
-    result = await AgentRunner(provider).run(make_spec(hook=RecordingHook("h", calls)))
+    result = await run_spec(provider, hook=RecordingHook("h", calls))
 
     assert result.stop_reason == "error"
     assert calls == [
@@ -215,7 +270,7 @@ async def test_uncaught_exception_calls_on_error_then_finally_and_reraises() -> 
     hook = ExplodingBeforeRunHook("h", calls, fail="before_run")
 
     with pytest.raises(RuntimeError, match="h.before_run failed"):
-        await AgentRunner(ExplodingProvider()).run(make_spec(hook=hook))
+        await run_spec(ExplodingProvider(), hook=hook)
 
     # No ``after_run``: the run never completed.
     assert calls == ["h.before_run", "h.on_error", "h.on_finally"]
@@ -228,7 +283,7 @@ async def test_cancellation_skips_on_error_and_after_run_but_runs_finally() -> N
     hook = RecordingHook("h", calls)
 
     with pytest.raises(asyncio.CancelledError):
-        await AgentRunner(CancellingProvider()).run(make_spec(hook=hook))
+        await run_spec(CancellingProvider(), hook=hook)
 
     assert calls == ["h.before_run", "h.before_iteration", "h.on_finally"]
 
@@ -275,7 +330,7 @@ async def test_before_run_messages_are_isolated_from_the_run_history() -> None:
     observer appending to it rewrote the transcript the caller persists."""
     hook = MutatingObserverHook()
 
-    result = await AgentRunner(UsageProvider()).run(make_spec(hook=hook))
+    result = await run_spec(UsageProvider(), hook=hook)
 
     assert all(
         not (isinstance(m, dict) and m.get("content") == "INJECTED BY OBSERVER")
@@ -288,9 +343,9 @@ async def test_run_context_usage_is_isolated_from_the_result_usage() -> None:
     observer's mutation showed up in ``AgentRunResult.usage``."""
     hook = MutatingObserverHook()
 
-    result = await AgentRunner(
-        UsageProvider({"prompt_tokens": 7, "completion_tokens": 3})
-    ).run(make_spec(hook=hook))
+    result = await run_spec(
+        UsageProvider({"prompt_tokens": 7, "completion_tokens": 3}), hook=hook
+    )
 
     assert result.usage["prompt_tokens"] == 7
     # The observer did mutate the context it was handed; only the result is safe.
@@ -301,57 +356,43 @@ async def test_run_context_usage_is_isolated_from_the_result_usage() -> None:
 async def test_run_context_tools_used_is_isolated_from_the_result() -> None:
     hook = MutatingObserverHook()
 
-    result = await AgentRunner(UsageProvider()).run(make_spec(hook=hook))
+    result = await run_spec(UsageProvider(), hook=hook)
 
     assert "MUTATED" not in result.tools_used
 
 
 async def test_after_run_observes_the_settled_usage() -> None:
-    """Regression: ``after_run`` ran before compression settled and usage was
-    merged, so the run-level result hook saw a partial sum while the caller got
-    the full one.
+    """Regression: ``after_run`` ran before compaction usage was merged, so the
+    run-level result hook saw a partial sum while the caller got the full one.
+
+    A run that compacts bills a summarization request outside the iteration
+    loop; that spend has to be inside the usage both the hook and the caller
+    observe (see ``test_context_governance`` for the compaction itself).
     """
     hook = MutatingObserverHook()
-    runner = AgentRunner(UsageProvider({"prompt_tokens": 40, "completion_tokens": 20}))
-    original_close = runner._close_compression
+    provider = UsageProvider({"prompt_tokens": 40, "completion_tokens": 20})
+    summarizer = StubSummarizer(
+        "summary of the old turns",
+        usage={"prompt_tokens": 100, "completion_tokens": 50},
+    )
+    spec = make_spec(
+        provider,
+        messages=oversized_transcript(),
+        summarizer=summarizer,
+        accepted_message_count=4,
+        runtime=oversized_runtime(provider),
+        hook=hook,
+    )
 
-    async def billed_compression(spec: Any, state: Any, usage: dict[str, int]) -> None:
-        # Stand in for compression tokens billed during the run.
-        await original_close(spec, state, usage)
-        usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + 100
-        usage["completion_tokens"] = usage.get("completion_tokens", 0) + 50
-
-    runner._close_compression = billed_compression  # type: ignore[method-assign]
-
-    result = await runner.run(make_spec(hook=hook))
+    result = await AgentRunner(provider).run(spec)
 
     assert result.usage == {"prompt_tokens": 140, "completion_tokens": 70}
     # The run-level result hook and the caller agree.
     assert hook.after_usage == result.usage
     assert hook.after_usage is not None
     assert hook.after_usage["prompt_tokens"] == 140
-
-
-async def test_settled_usage_is_merged_exactly_once() -> None:
-    """Accounting is settled both before ``after_run`` and in ``finally``; the
-    second call must not double-count compression usage."""
-    runner = AgentRunner(UsageProvider({"prompt_tokens": 40, "completion_tokens": 20}))
-    original_close = runner._close_compression
-    calls = 0
-
-    async def counted(spec: Any, state: Any, usage: dict[str, int]) -> None:
-        nonlocal calls
-        calls += 1
-        await original_close(spec, state, usage)
-        usage["prompt_tokens"] = usage.get("prompt_tokens", 0) + 100
-
-    runner._close_compression = counted  # type: ignore[method-assign]
-
-    result = await runner.run(make_spec())
-
-    # ``_close_compression`` itself is guarded by ``state.closed``; the merge is
-    # guarded separately, so the total is exactly one compression contribution.
-    assert result.usage["prompt_tokens"] == 140
+    assert result.compaction is not None
+    assert result.compaction.summary == "summary of the old turns"
 
 
 async def test_after_run_on_a_model_error_sees_the_final_error_state() -> None:
@@ -365,7 +406,7 @@ async def test_after_run_on_a_model_error_sees_the_final_error_state() -> None:
         LLMResponse(content="Error: upstream unavailable", finish_reason="error")
     ])
 
-    result = await AgentRunner(provider).run(make_spec(hook=CapturingHook()))
+    result = await run_spec(provider, hook=CapturingHook())
 
     assert result.stop_reason == "error"
     assert contexts and contexts[0].error == "Error: upstream unavailable"
@@ -377,7 +418,7 @@ async def test_run_context_carries_the_final_state_on_success() -> None:
     hook = RecordingHook("h", calls)
     provider = ScriptedProvider([LLMResponse(content="all set")])
 
-    await AgentRunner(provider).run(make_spec(hook=hook))
+    await run_spec(provider, hook=hook)
 
     context = hook.run_contexts[0]
     assert context.final_content == "all set"
@@ -395,7 +436,7 @@ async def test_run_context_reports_the_error_text_on_a_model_error() -> None:
         LLMResponse(content="Error: upstream unavailable", finish_reason="error")
     ])
 
-    await AgentRunner(provider).run(make_spec(hook=hook))
+    await run_spec(provider, hook=hook)
 
     context = hook.run_contexts[0]
     assert context.stop_reason == "error"
@@ -416,7 +457,7 @@ async def test_run_context_reports_usage_when_finally_runs() -> None:
 
     provider = ScriptedProvider([LLMResponse(content="ok", usage={"prompt_tokens": 7, "completion_tokens": 3})])
 
-    await AgentRunner(provider).run(make_spec(hook=UsageCapturingHook("h", calls)))
+    await run_spec(provider, hook=UsageCapturingHook("h", calls))
 
     assert seen == [{"prompt_tokens": 7, "completion_tokens": 3}]
 
@@ -436,8 +477,8 @@ async def test_finally_failure_does_not_mask_a_raised_exception() -> None:
             raise RuntimeError("h.on_finally failed")
 
     with pytest.raises(RuntimeError, match="boom"):
-        await AgentRunner(ExplodingProvider()).run(
-            make_spec(hook=FailingBeforeRunHook("h", calls))
+        await run_spec(
+            ExplodingProvider(), hook=FailingBeforeRunHook("h", calls)
         )
 
     assert calls == ["h.before_run", "h.on_error", "h.on_finally"]
@@ -454,7 +495,7 @@ async def test_finally_failure_does_not_mask_cancellation() -> None:
     hook = FailingFinallyHook("h", calls)
 
     with pytest.raises(asyncio.CancelledError):
-        await AgentRunner(CancellingProvider()).run(make_spec(hook=hook))
+        await run_spec(CancellingProvider(), hook=hook)
 
     assert calls == ["h.before_run", "h.before_iteration", "h.on_finally"]
 

@@ -17,7 +17,8 @@ def test_agent_defaults_load_without_the_removed_ttl_field() -> None:
     assert "session_ttl_minutes" not in AgentDefaults.model_fields
     # Neighbouring fields are untouched by the removal.
     assert defaults.max_messages == 120
-    assert defaults.consolidation_ratio == 0.5
+    # Consolidation is request-level now: no ratio-based triggers remain.
+    assert "consolidation_ratio" not in AgentDefaults.model_fields
 
 
 def test_removed_ttl_keys_are_ignored_as_unknown_fields() -> None:
@@ -32,4 +33,5 @@ def test_removed_ttl_keys_are_ignored_as_unknown_fields() -> None:
     assert "session_ttl_minutes" not in defaults.model_dump()
     assert "idleCompactAfterMinutes" not in defaults.model_dump()
     assert defaults.max_messages == 120
-    assert defaults.consolidation_ratio == 0.5
+    # Consolidation is request-level now: no ratio-based triggers remain.
+    assert "consolidation_ratio" not in AgentDefaults.model_fields

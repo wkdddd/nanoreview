@@ -440,7 +440,7 @@ class _CapturingRunner:
         self.specs.append(spec)
         return AgentRunResult(
             final_content="answer",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 

@@ -10,6 +10,7 @@ from nanoreview.agent.hooks.lifecycle import (
     AgentHookContext,
     FinalizeContentResult,
 )
+from nanoreview.agent.llm_runtime import LLMRuntime
 from nanoreview.agent.output_contract import OutputContract
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.base import Tool
@@ -180,12 +181,24 @@ class ResponseFormatRejectingProvider(LLMProvider):
         return "dummy"
 
 
-def make_spec(tools: ToolRegistry | None = None, **overrides: Any) -> AgentRunSpec:
+#: Provider used by specs whose test never inspects the transport.
+DEFAULT_PROVIDER = DummyProvider()
+
+
+def make_spec(
+    tools: ToolRegistry | None = None,
+    *,
+    provider: LLMProvider | None = None,
+    **overrides: Any,
+) -> AgentRunSpec:
     values: dict[str, Any] = {
-        "frozen_messages": [],
-        "working_messages": [],
+        "messages": [],
         "tools": tools or ToolRegistry(),
-        "model": "dummy",
+        "runtime": LLMRuntime.capture(
+            provider or DEFAULT_PROVIDER,
+            model="dummy",
+            context_window_tokens=65_536,
+        ),
         "max_iterations": 1,
         "max_tool_result_chars": 1000,
     }
@@ -194,7 +207,7 @@ def make_spec(tools: ToolRegistry | None = None, **overrides: Any) -> AgentRunSp
 
 
 def test_build_request_kwargs_includes_tool_choice() -> None:
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     choice = {"function": {"name": "review_submit"}}
 
     kwargs = runner._build_request_kwargs(
@@ -207,7 +220,7 @@ def test_build_request_kwargs_includes_tool_choice() -> None:
 
 
 def test_build_request_kwargs_includes_response_format() -> None:
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     response_format = {"type": "json_object"}
 
     kwargs = runner._build_request_kwargs(
@@ -243,7 +256,7 @@ async def test_run_tool_logs_exception_and_preserves_model_error_payload(monkeyp
 
     tools = ToolRegistry()
     tools.register(FailingTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     spec = make_spec(tools)
 
     result, event, error = await runner._run_tool(
@@ -269,7 +282,7 @@ async def test_run_tool_soft_error_tool_overrides_fail_on_tool_error(monkeypatch
 
     tools = ToolRegistry()
     tools.register(FailingTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     spec = make_spec(
         tools,
         fail_on_tool_error=True,
@@ -294,7 +307,7 @@ async def test_run_tool_fail_on_tool_error_remains_strict_by_default(monkeypatch
 
     tools = ToolRegistry()
     tools.register(FailingTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     spec = make_spec(tools, fail_on_tool_error=True)
 
     result, event, error = await runner._run_tool(
@@ -318,7 +331,7 @@ async def test_replaced_final_content_does_not_drain_injections() -> None:
         calls += 1
         return [{"role": "user", "content": "late system summary request"}]
 
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     result = await runner.run(make_spec(
         hook=ReplacingHook(),
         injection_callback=injection_callback,
@@ -334,7 +347,7 @@ async def test_replaced_final_content_does_not_drain_injections() -> None:
 async def test_run_tool_does_not_catch_system_exit() -> None:
     tools = ToolRegistry()
     tools.register(SystemExitTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
 
     with pytest.raises(SystemExit):
         await runner._run_tool(
@@ -349,7 +362,7 @@ async def test_run_tool_does_not_catch_system_exit() -> None:
 async def test_run_tool_does_not_treat_error_word_as_error_status() -> None:
     tools = ToolRegistry()
     tools.register(ErrorTextTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
 
     result, event, error = await runner._run_tool(
         make_spec(tools),
@@ -374,7 +387,7 @@ async def test_drain_injections_falls_back_when_signature_is_unavailable(monkeyp
         lambda _callback: (_ for _ in ()).throw(ValueError("opaque")),
     )
 
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
     injected = await runner._drain_injections(
         make_spec(injection_callback=OpaqueInjectionCallback())
     )
@@ -387,7 +400,7 @@ async def test_run_tool_omits_raw_result_unless_declared() -> None:
     """An ordinary tool result is never kept untruncated by default."""
     tools = ToolRegistry()
     tools.register(LongResultTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
 
     result, event, error = await runner._run_tool(
         make_spec(tools),
@@ -407,7 +420,7 @@ async def test_run_tool_preserves_declared_tool_result_untruncated() -> None:
     """A declared tool keeps the full result alongside the bounded detail."""
     tools = ToolRegistry()
     tools.register(LongResultTool())
-    runner = AgentRunner(DummyProvider())
+    runner = AgentRunner(DEFAULT_PROVIDER)
 
     result, event, error = await runner._run_tool(
         make_spec(tools, preserve_tool_result_tools=frozenset({"long_result_tool"})),
@@ -451,7 +464,7 @@ async def test_accepted_output_completes_the_run() -> None:
     runner = AgentRunner(provider)
 
     result = await runner.run(
-        make_spec(output_contract=_payload_contract(), max_iterations=3)
+        make_spec(provider=provider, output_contract=_payload_contract(), max_iterations=3)
     )
 
     assert result.stop_reason == "completed"
@@ -469,6 +482,7 @@ async def test_rejected_output_retries_then_fails_at_limit() -> None:
 
     result = await runner.run(
         make_spec(
+            provider=provider,
             output_contract=_payload_contract(),
             output_retry_limit=2,
             max_iterations=5,
@@ -494,6 +508,7 @@ async def test_rejected_output_then_accepted_answer_completes_the_run() -> None:
 
     result = await runner.run(
         make_spec(
+            provider=provider,
             output_contract=_payload_contract(),
             output_retry_limit=3,
             max_iterations=5,
@@ -512,7 +527,7 @@ async def test_the_rejection_reason_is_fed_back_to_the_model() -> None:
     runner = AgentRunner(provider)
 
     await runner.run(
-        make_spec(output_contract=_payload_contract(), max_iterations=3)
+        make_spec(provider=provider, output_contract=_payload_contract(), max_iterations=3)
     )
 
     # The second request carries a correction prompt naming the concrete problem,
@@ -529,7 +544,7 @@ async def test_the_final_turn_tells_the_model_to_answer_without_tools() -> None:
     runner = AgentRunner(provider)
 
     result = await runner.run(
-        make_spec(output_contract=_payload_contract(), max_iterations=1)
+        make_spec(provider=provider, output_contract=_payload_contract(), max_iterations=1)
     )
 
     assert result.stop_reason == "completed"
@@ -545,6 +560,7 @@ async def test_a_rejection_on_the_final_turn_reports_the_real_reason() -> None:
 
     result = await runner.run(
         make_spec(
+            provider=provider,
             output_contract=_payload_contract(),
             output_retry_limit=5,
             max_iterations=2,
@@ -565,7 +581,7 @@ async def test_a_run_without_a_contract_completes_on_free_text() -> None:
     provider = ScriptedProvider([_prose_response("anything goes")])
     runner = AgentRunner(provider)
 
-    result = await runner.run(make_spec(max_iterations=2))
+    result = await runner.run(make_spec(provider=provider, max_iterations=2))
 
     assert result.stop_reason == "completed"
     assert result.final_content == "anything goes"
@@ -579,7 +595,7 @@ async def test_a_blank_answer_is_reported_before_the_contract() -> None:
     runner = AgentRunner(provider)
 
     result = await runner.run(
-        make_spec(output_contract=_payload_contract(), max_iterations=3)
+        make_spec(provider=provider, output_contract=_payload_contract(), max_iterations=3)
     )
 
     assert result.stop_reason == "empty_final_response"

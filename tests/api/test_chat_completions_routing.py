@@ -41,8 +41,7 @@ class _StubRunner:
         return AgentRunResult(
             final_content="ok",
             messages=[
-                *spec.frozen_messages,
-                *spec.working_messages,
+                *spec.messages,
                 {"role": "assistant", "content": "ok"},
             ],
         )
@@ -61,14 +60,14 @@ class _BlockingRunner:
         if self.stream:
             assert spec.hook is not None
             context = AgentHookContext(
-                iteration=0, messages=[*spec.frozen_messages, *spec.working_messages]
+                iteration=0, messages=list(spec.messages)
             )
             await spec.hook.on_stream(context, "partial ")
         self.started.set()
         await asyncio.sleep(10)
         return AgentRunResult(
             final_content="late",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 

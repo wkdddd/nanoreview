@@ -22,13 +22,10 @@ from typing import Any
 import pytest
 
 from nanoreview.agent.coordinator import SessionCoordinator
+from nanoreview.agent.llm_runtime import ROLE_JUDGE, LLMRuntime
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.bus.queue import MessageBus
-from nanoreview.config.schema import (
-    ModelPresetConfig,
-    ReviewConfig,
-    ReviewJudgeSettings,
-)
+from nanoreview.config.schema import ReviewConfig, ReviewJudgeSettings
 from nanoreview.providers.base import LLMProvider, LLMResponse
 from nanoreview.review.budget import ReviewBudget
 from nanoreview.review.output.judge import JudgeExecutionResult, ReviewJudge, ReviewJudgeConfig
@@ -189,6 +186,26 @@ def _budget(
     )
 
 
+def _runtime(
+    provider: Any,
+    *,
+    budget: ReviewBudget | None = None,
+    model: str = "test-model",
+) -> LLMRuntime:
+    """The Judge runtime frozen at admission.
+
+    Window and output cap live here, not in the judge config: this is the
+    snapshot whose numbers the request is both checked against and sent with.
+    """
+    resolved = budget or _budget()
+    return LLMRuntime.capture(
+        provider,
+        model=model,
+        context_window_tokens=resolved.context_window_tokens,
+        role=ROLE_JUDGE,
+    ).with_generation(max_tokens=resolved.judge_output_tokens)
+
+
 def _judge(
     provider: FakeJudgeProvider,
     *,
@@ -198,10 +215,11 @@ def _judge(
     **config: Any,
 ) -> ReviewJudge:
     """Build a judge whose runner is a real ``AgentRunner`` over ``provider``."""
+    resolved = budget or _budget()
     return ReviewJudge(
         runner=runner or RecordingRunner(provider),
-        model=model,
-        config=ReviewJudgeConfig(budget=budget or _budget(), **config),
+        runtime=_runtime(provider, budget=resolved, model=model),
+        config=ReviewJudgeConfig(budget=resolved, **config),
     )
 
 
@@ -209,10 +227,7 @@ def _judge(
 #: easily fits, so only the candidate payload can push the request over. A
 #: window below that overhead would reject every payload, which would leave the
 #: "the complete set must fit" rule untested.
-_SMALL_WINDOW_CONFIG = ReviewJudgeConfig(
-    budget=_budget(8_000, output=512, margin=0),
-    timeout_seconds=5,
-)
+_SMALL_WINDOW_BUDGET = _budget(8_000, output=512, margin=0)
 
 
 def _small_window_judge(
@@ -220,8 +235,8 @@ def _small_window_judge(
 ) -> ReviewJudge:
     return ReviewJudge(
         runner=runner or RecordingRunner(provider),
-        model="test-model",
-        config=_SMALL_WINDOW_CONFIG,
+        runtime=_runtime(provider, budget=_SMALL_WINDOW_BUDGET),
+        config=ReviewJudgeConfig(budget=_SMALL_WINDOW_BUDGET),
     )
 
 
@@ -356,10 +371,11 @@ async def test_judge_rejects_a_window_below_its_own_reserve() -> None:
     """
     provider = FakeJudgeProvider()
     runner = RecordingRunner(provider)
+    budget = _budget(2_000, output=128)
     judge = ReviewJudge(
         runner=runner,
-        model="test-model",
-        config=ReviewJudgeConfig(budget=_budget(2_000, output=128), timeout_seconds=5),
+        runtime=_runtime(provider, budget=budget),
+        config=ReviewJudgeConfig(budget=budget),
     )
     dimensions = [_dimension("security", ["S1"], evidence="value = 1")]
 
@@ -424,33 +440,54 @@ async def test_judge_provider_failure_marks_candidates_needs_confirmation() -> N
 
 
 class _NeverReturningProvider:
-    """Provider whose request never completes, so the judge times out."""
+    """Provider whose request never completes, so a run can still be cancelled."""
 
     async def chat_with_retry(self, **kwargs: Any):
         await asyncio.sleep(30)
 
 
-async def test_judge_timeout_sets_error() -> None:
-    """A judge request that exceeds the timeout is an error, not a completion."""
+class _SlowProvider:
+    """Provider whose request is cut off by its own timeout.
+
+    There is no judge-level wall clock any more: a slow request is bounded by
+    the provider timeout, which surfaces as an error response and therefore as
+    ``stop_reason="error"``. This is the shape the judge must still report.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat_with_retry(self, **kwargs: Any) -> LLMResponse:
+        self.calls += 1
+        return LLMResponse(
+            content="Error calling LLM: timed out after 300s",
+            finish_reason="error",
+            error_kind="timeout",
+        )
+
+
+async def test_judge_provider_timeout_sets_error() -> None:
+    """A request the provider times out is an error, not a completion."""
+    provider = _SlowProvider()
     judge = ReviewJudge(
-        runner=AgentRunner(_NeverReturningProvider()),
-        model="test-model",
-        config=ReviewJudgeConfig(budget=_budget(output=128), timeout_seconds=0.05),
+        runner=AgentRunner(provider),
+        runtime=_runtime(provider, budget=_budget(output=128)),
     )
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
+    assert provider.calls == 1
     assert len(result.verdicts) == 1
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
     assert "AI judge failed" in verdict.reason
     # The bounded reason must be non-empty: the orchestrator treats an empty
     # error as a clean completion and would mark a timed-out run completed.
-    assert result.error and "timeout" in result.error
+    assert result.error and "timed out" in result.error
 
 
 class _TimeoutAfterUsageProvider:
-    """Answers one prose turn, then blocks so the judge batch times out."""
+    """Answers one prose turn, then times out on the retry."""
 
     def __init__(self, usage: dict[str, int]) -> None:
         self.calls = 0
@@ -460,32 +497,30 @@ class _TimeoutAfterUsageProvider:
         self.calls += 1
         if self.calls == 1:
             return LLMResponse(content="No verdicts from me.", usage=dict(self._usage))
-        await asyncio.sleep(30)
-        raise AssertionError("unreachable: the batch must be cancelled")
+        return LLMResponse(
+            content="Error calling LLM: timed out after 300s",
+            finish_reason="error",
+            error_kind="timeout",
+        )
 
 
 async def test_judge_timeout_keeps_usage_from_completed_iterations() -> None:
-    """Tokens burned before a batch timeout still reach the run total."""
+    """Tokens burned before the provider timed out still reach the run total."""
     provider = _TimeoutAfterUsageProvider(
         {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
     )
     judge = ReviewJudge(
         runner=AgentRunner(provider),
-        model="test-model",
-        config=ReviewJudgeConfig(budget=_budget(output=128), timeout_seconds=0.05),
+        runtime=_runtime(provider, budget=_budget(output=128)),
     )
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
-    # The batch never returns a result, so only the observer can report the
-    # first iteration's usage; dropping it would understate real spend.
+    # The first iteration's spend must not be dropped just because the run
+    # ended in a provider timeout.
     assert provider.calls >= 2
-    assert result.error is not None and "timeout" in result.error
-    assert result.usage == {
-        "prompt_tokens": 120,
-        "completion_tokens": 30,
-        "total_tokens": 150,
-    }
+    assert result.error is not None and "timed out" in result.error
+    assert result.usage["total_tokens"] == 150
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
     assert "AI judge failed" in verdict.reason
@@ -497,7 +532,7 @@ async def test_judge_failed_run_keeps_consumed_usage() -> None:
         [_PROSE],  # never calls submit_verdicts -> terminal_tool_failed
         usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
     )
-    judge = _judge(provider, timeout_seconds=5)
+    judge = _judge(provider)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -512,58 +547,45 @@ async def test_judge_failed_run_keeps_consumed_usage() -> None:
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
 
 
-class _CompressionStopRunner:
-    """Judge runner stub whose run is stopped by run-level compression."""
+class _ContextLimitRunner:
+    """Judge runner stub whose run stops on the context limit."""
 
-    def __init__(self, stop_reason: str, usage: dict[str, int]) -> None:
-        self.stop_reason = stop_reason
+    def __init__(self, usage: dict[str, int]) -> None:
         self._usage = usage
 
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         return AgentRunResult(
             final_content=None,
-            messages=list([*spec.frozen_messages, *spec.working_messages]),
-            stop_reason=self.stop_reason,
-            error="sync compression failed after 2 attempts: no content",
+            messages=list(spec.messages),
+            stop_reason="context_limit",
+            error="context window exceeded: 24000 > 16000",
             usage=dict(self._usage),
         )
 
 
-async def test_judge_compression_stop_is_a_failed_run_with_usage() -> None:
-    """A compression-stopped run fails but still reports the tokens it spent."""
+async def test_judge_context_limit_is_a_failed_run_with_usage() -> None:
+    """A context-stopped run fails but still reports the tokens it spent."""
     usage = {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50}
     judge = ReviewJudge(
-        runner=_CompressionStopRunner("compression_failed", usage),  # type: ignore[arg-type]
-        model="test-model",
-        config=ReviewJudgeConfig(budget=_budget(), timeout_seconds=5),
+        runner=_ContextLimitRunner(usage),  # type: ignore[arg-type]
+        runtime=_runtime(FakeJudgeProvider()),
     )
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
-    assert result.error is not None and "compression" in result.error
+    assert result.error is not None and "context window exceeded" in result.error
     # The spend is never hidden behind the failure.
     assert result.usage == usage
     verdict = next(iter(result.verdicts.values()))
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
 
 
-def test_judge_usage_observer_folds_compression_usage() -> None:
-    """The observer accumulates compression usage so it survives a timeout."""
-    from nanoreview.review.output.judge import _JudgeUsageObserver
-
-    observer = _JudgeUsageObserver()
-    observer.record_compression_usage({"prompt_tokens": 7, "completion_tokens": 3})
-    observer.record_compression_usage({"prompt_tokens": 5, "completion_tokens": 2})
-
-    assert observer.usage == {"prompt_tokens": 12, "completion_tokens": 5}
-
-
 async def test_judge_cancellation_propagates() -> None:
     """``/stop`` must cancel a judge batch instead of being swallowed."""
+    provider = _NeverReturningProvider()
     judge = ReviewJudge(
-        runner=AgentRunner(_NeverReturningProvider()),
-        model="test-model",
-        config=ReviewJudgeConfig(budget=_budget(output=128), timeout_seconds=30),
+        runner=AgentRunner(provider),
+        runtime=_runtime(provider, budget=_budget(output=128)),
     )
 
     task = asyncio.create_task(judge.judge_dimensions([_dimension("security", ["S1"])]))
@@ -718,7 +740,7 @@ async def test_judge_usage_sums_every_request_of_the_single_run() -> None:
         [_PROSE, [_accept_verdict("security:src/app.py:1:s1")]],
         usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
     )
-    judge = _judge(provider, timeout_seconds=5)
+    judge = _judge(provider)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -735,7 +757,7 @@ async def test_judge_correction_retry_is_not_a_second_adjudication() -> None:
         [_RawArgs({"verdicts": "not-an-array"}), [_accept_verdict("security:src/app.py:1:s1")]]
     )
     runner = RecordingRunner(provider)
-    judge = _judge(provider, runner=runner, timeout_seconds=5)
+    judge = _judge(provider, runner=runner)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -770,10 +792,12 @@ async def test_judge_run_uses_the_shared_runner_with_structured_output() -> None
 
     assert len(runner.specs) == 1
     spec = runner.specs[0]
-    assert spec.model == "test-model"
-    assert spec.temperature == 0
-    assert spec.max_tokens == 128
-    assert spec.context_window_tokens == _LARGE_WINDOW
+    # Model, window and output cap all ride in the frozen runtime.
+    assert spec.runtime.model == "test-model"
+    assert spec.runtime.max_tokens == 128
+    assert spec.runtime.context_window_tokens == _LARGE_WINDOW
+    # The candidate set is authorized evidence and never summarizable.
+    assert spec.accepted_message_count == 0
     assert spec.error_message is None
     # The judge has no tools at all: its final answer *is* the verdict payload.
     assert spec.tool_choice is None
@@ -787,7 +811,7 @@ async def test_judge_run_uses_the_shared_runner_with_structured_output() -> None
     assert spec.session_key is None
     assert spec.checkpoint_callback is None
     assert spec.injection_callback is None
-    messages = [*spec.frozen_messages, *spec.working_messages]
+    messages = list(spec.messages)
     assert [message["role"] for message in messages] == ["system", "user"]
     assert "S1" in messages[1]["content"]
 
@@ -795,7 +819,7 @@ async def test_judge_run_uses_the_shared_runner_with_structured_output() -> None
 async def test_judge_prose_response_marks_candidates_needs_confirmation() -> None:
     """A model that only answers prose fails the run, never accepts silently."""
     provider = FakeJudgeProvider([_PROSE])
-    judge = _judge(provider, timeout_seconds=5)
+    judge = _judge(provider)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -812,7 +836,7 @@ async def test_judge_malformed_verdicts_are_retried_then_succeed() -> None:
     provider = FakeJudgeProvider(
         [_RawArgs({"verdicts": "not-an-array"}), [_accept_verdict(candidate_id)]]
     )
-    judge = _judge(provider, timeout_seconds=5)
+    judge = _judge(provider)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -824,7 +848,7 @@ async def test_judge_malformed_verdicts_are_retried_then_succeed() -> None:
 async def test_judge_permanently_malformed_verdicts_fail_the_run() -> None:
     """A payload rejected to the retry limit fails with a bounded error."""
     provider = FakeJudgeProvider([_RawArgs({"verdicts": "not-an-array"})])
-    judge = _judge(provider, timeout_seconds=5)
+    judge = _judge(provider)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -837,7 +861,7 @@ async def test_judge_permanently_malformed_verdicts_fail_the_run() -> None:
 async def test_judge_verdicts_matching_no_candidate_fail_the_run() -> None:
     """Invented verdict ids judge nothing, so the run must not look clean."""
     provider = FakeJudgeProvider([[_accept_verdict("security:src/app.py:99:ghost")]])
-    judge = _judge(provider, timeout_seconds=5)
+    judge = _judge(provider)
 
     result = await judge.judge_dimensions([_dimension("security", ["S1"])])
 
@@ -847,53 +871,48 @@ async def test_judge_verdicts_matching_no_candidate_fail_the_run() -> None:
     assert verdict.decision == ReviewJudgeDecision.NEEDS_CONFIRMATION
 
 
-async def test_judge_ignores_configured_model_preset(tmp_path: Path) -> None:
-    """``review.judge.model_preset`` must not fork the judge onto another model."""
+async def test_judge_role_override_forks_only_the_judge(tmp_path: Path) -> None:
+    """``review.judge.model`` moves the judge off the conversation agent.
+
+    The runner (and therefore the tool/retry machinery) stays shared; only the
+    frozen runtime differs, which is what makes a per-role model override safe.
+    """
     loop = SessionCoordinator(
         MessageBus(),
         StubPlanProvider(),
         tmp_path,
-        review_config=ReviewConfig(
-            judge=ReviewJudgeSettings(model_preset="judge-premium")
-        ),
-        model_presets={
-            "judge-premium": ModelPresetConfig(model="other-model", provider="auto")
-        },
+        review_config=ReviewConfig(judge=ReviewJudgeSettings(model="judge-model")),
     )
 
-    judge = loop._build_review_judge()  # noqa: SLF001
+    judge = loop._build_review_judge(None)  # noqa: SLF001
 
     assert judge is not None
-    # Even though the preset exists and would resolve to a different model, the
-    # judge runs on the plan's runner and model.
-    assert loop.model_presets["judge-premium"].model == "other-model"
+    assert judge._runtime.model == "judge-model"  # noqa: SLF001
+    assert loop.model == "plan-model"
     assert judge._runner is loop.runner  # noqa: SLF001
     assert judge._runner.provider is loop.provider  # noqa: SLF001
-    assert judge._model == loop.model  # noqa: SLF001
-    assert judge._model == "plan-model"  # noqa: SLF001
 
 
-async def test_judge_window_and_output_cap_come_from_the_review_config(
+async def test_judge_window_and_output_cap_come_from_its_runtime(
     tmp_path: Path,
 ) -> None:
-    """The judge is budgeted from ``review`` config, not from module defaults.
+    """The judge is budgeted from its frozen runtime plus the configured reserves.
 
-    Reverting ``_build_review_judge`` to a hard-coded window or to a default
-    ``ReviewBudget()`` would leave every other case green, so this pins the
-    wiring: the numbers that decide whether a candidate set fits.
+    Reverting ``_build_review_judge`` to a hard-coded window, to module defaults
+    or to the conversation agent's numbers would leave every other case green,
+    so this pins the wiring: the numbers that decide whether a candidate set fits.
     """
     loop = SessionCoordinator(
         MessageBus(),
         StubPlanProvider(),
         tmp_path,
         review_config=ReviewConfig(
-            context_window_tokens=99_000,
             budget_safety_margin_tokens=777,
-            judge=ReviewJudgeSettings(max_tokens=1_500),
+            judge=ReviewJudgeSettings(context_window_tokens=99_000, max_tokens=1_500),
         ),
     )
 
-    judge = loop._build_review_judge()  # noqa: SLF001
+    judge = loop._build_review_judge(None)  # noqa: SLF001
 
     assert judge is not None
     assert judge._budget.context_window_tokens == 99_000  # noqa: SLF001
@@ -910,7 +929,7 @@ async def test_judge_disabled_setting_yields_no_judge(tmp_path: Path) -> None:
         review_config=ReviewConfig(judge=ReviewJudgeSettings(enabled=False)),
     )
 
-    assert loop._build_review_judge() is None  # noqa: SLF001
+    assert loop._build_review_judge(None) is None  # noqa: SLF001
 
 
 def test_judge_execution_result_is_immutable() -> None:
@@ -923,7 +942,7 @@ def test_judge_execution_result_is_immutable() -> None:
 def _workspace_judge(tmp_path: Path) -> ReviewJudge:
     return ReviewJudge(
         runner=RecordingRunner(FakeJudgeProvider([[]])),
-        model="test-model",
+        runtime=_runtime(FakeJudgeProvider()),
         config=ReviewJudgeConfig(budget=_budget()),
         common_rules_workspace=tmp_path,
     )

@@ -38,9 +38,15 @@ class ContextBuilder:
     def build_system_prompt(
         self,
         channel: str | None = None,
-        session_summary: str | None = None,
+        memory_text: str | None = None,
     ) -> str:
-        """Build the system prompt from identity, personalization files, and skills."""
+        """Build the system prompt from identity, personalization files, and skills.
+
+        ``memory_text`` is the long-term memory snapshot the Conversation Agent
+        read at the start of its turn. It is a parameter rather than something
+        this builder loads so the review roles — which share the same builder —
+        can never inherit it.
+        """
         parts = [self._get_identity(channel=channel)]
 
         bootstrap = self._load_bootstrap_files()
@@ -57,8 +63,8 @@ class ContextBuilder:
         if skills_summary:
             parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
-        if session_summary:
-            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+        if memory_text and memory_text.strip():
+            parts.append(f"# Long-term Memory\n\n{memory_text.strip()}")
 
         return "\n\n---\n\n".join(parts)
 
@@ -156,48 +162,15 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         sender_id: str | None = None,
-        session_summary: str | None = None,
+        memory_text: str | None = None,
         session_metadata: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the complete message list for an LLM call."""
-        frozen, working = self.build_partitioned_messages(
-            history,
-            current_message,
-            media=media,
-            channel=channel,
-            chat_id=chat_id,
-            current_role=current_role,
-            sender_id=sender_id,
-            session_summary=session_summary,
-            session_metadata=session_metadata,
-        )
-        return [*frozen, *working]
+        """Build the complete, ordered message list for one model call.
 
-    def build_partitioned_messages(
-        self,
-        history: list[dict[str, Any]],
-        current_message: str,
-        media: list[str] | None = None,
-        channel: str | None = None,
-        chat_id: str | None = None,
-        current_role: str = "user",
-        sender_id: str | None = None,
-        session_summary: str | None = None,
-        session_metadata: Mapping[str, Any] | None = None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Build the frozen/working partition of the context for one turn.
-
-        Ownership is explicit and never inferred from the history's last role:
-
-        - Frozen is the system prompt plus the current user (or subagent) turn,
-          including the runtime-context block. It is copied verbatim into every
-          request and run-level compression must never summarize or trim it.
-        - Working is the replayable session history. It is the only zone
-          run-level compression may summarize; everything the run appends later
-          lands at its tail.
-
-        The current turn is never merged back into the last history message, so
-        a caller always knows which zone holds the live task.
+        Shape: ``[system, *history, current]``. The system message is the
+        instruction header (identity, shared rules, skills, long-term memory);
+        everything after it is transcript data. Replayed history comes before
+        the current turn so the model reads the conversation in order.
         """
         runtime_ctx = self._build_runtime_context(
             channel,
@@ -216,15 +189,13 @@ class ContextBuilder:
         else:
             merged = user_content + [{"type": "text", "text": runtime_ctx}]
         system_prompt = self.build_system_prompt(
-            channel=channel, session_summary=session_summary
+            channel=channel, memory_text=memory_text
         )
-        return (
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": current_role, "content": merged},
-            ],
-            [dict(message) for message in history],
-        )
+        return [
+            {"role": "system", "content": system_prompt},
+            *[dict(message) for message in history],
+            {"role": current_role, "content": merged},
+        ]
 
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:

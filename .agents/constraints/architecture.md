@@ -2,19 +2,31 @@
 
 ## 当前链路
 
-本节基于主工作区 `850aeb6b` 之上的当前实现（含 Conversation Agent 收敛改动：`AgentLoop` 已并入 `SessionCoordinator` 并删除）；候选分支与目标方案不等于已落地实现。
+本节基于主工作区 `7c000b1d` 之上的当前实现（含对话上下文治理重构：请求级压缩取代 frozen/working 分区与 turn 级 Consolidator）；候选分支与目标方案不等于已落地实现。
 
 `channels -> MessageBus -> SessionCoordinator -> AgentRunner / ReviewLoop -> MessageBus -> channels`
 
-- `agent/coordinator.py`：进程运行时与唯一决策点——MessageBus 接收/发送、per-session 串行与有界 pending 队列、命令分发、取消调度、review/conversation 路由与门禁、handoff 值对象（`ReviewHandoff`）与其唯一一次 session 写入（`SessionCoordinator.consume_handoff`）、结果发布。自身不调用模型、不执行工具、不写普通对话历史：review turn 整体交给 `ReviewLoop`，conversation turn 交给 `ConversationLoop`。
+- `agent/coordinator.py`：进程运行时与唯一决策点——MessageBus 接收/发送、per-session 串行与有界 pending 队列、命令分发、取消调度、review/conversation 路由与门禁、handoff 值对象（`ReviewHandoff`）与其唯一一次 session 写入（`SessionCoordinator.consume_handoff`）、结果发布、角色运行时解析（`_conversation_runtime()` / `_reviewer_runtime()` / `_judge_runtime()`）、长期记忆装配（`memory_journal` / `dream` / `dream_scheduler`）。自身不调用模型、不执行工具、不写普通对话历史：review turn 整体交给 `ReviewLoop`，conversation turn 交给 `ConversationLoop`。
 - `agent/review_loop.py`：一次 review run 的唯一 supervisor——准备、计划、reviewer/Judge 执行、用户消息与报告持久化、资源清理与终态写入，内部按 `PREPARE -> PLAN -> REVIEW -> FINALIZE -> CLEANUP -> DONE` 顺序执行；同时拥有状态迁移和结构化结果。
-- `agent/conversation_loop.py`：一个完整 conversation turn——读取 session/历史、调用注入的 handoff consumer 完成交接写入、构建 frozen/working 上下文与 per-turn 核心 `ToolRegistry`、单次 `AgentRunner` 运行、历史持久化与回复组装；只注册通用 workspace 工具，不存在仓库级 reader 工具（`local_review` 已整体删除）。构造时必需 `handoff_consumer`，`ReviewHandoff` 只在 `TYPE_CHECKING` 下导入。连接 MCP 后把代理工具注册进该轮注册表。
-- `agent/runner.py`：单个 agent 的模型/工具循环、运行内压缩、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
+- `agent/conversation_loop.py`：一个完整 conversation turn——读取 session/历史、调用注入的 handoff consumer 完成交接写入、构建上下文与 per-turn 核心 `ToolRegistry`、单次 `AgentRunner` 运行、历史持久化、按 run 结果推进 session checkpoint 与回复组装；只注册通用 workspace 工具，不存在仓库级 reader 工具（`local_review` 已整体删除）。构造时必需 `handoff_consumer`，`ReviewHandoff` 只在 `TYPE_CHECKING` 下导入。连接 MCP 后把代理工具注册进该轮注册表。长期记忆经注入的 `memory_reader`（turn 开始读一次快照）与 `archive_recorder`（把被压缩的旧历史写进记忆 journal）接入，二者缺省为 `None`。
+- `agent/runner.py`：单个 agent 的模型/工具循环、**请求级上下文治理**（`agent/context_governance.py`）、停止原因和 usage；不感知 review 业务，完整未截断工具结果只对调用方经 `AgentRunSpec.preserve_tool_result_tools` 显式声明的工具保留，默认不保留。
+- `agent/llm_runtime.py`：不可变 `LLMRuntime`（provider 引用 + model + generation + context window + role）与字段级 `RoleModelOverrides`，一次 run 从准入到最后一个 iteration 只用一个快照。
+- `agent/dream.py`：长期记忆——`memory/history.jsonl` 的追加与消费 cursor（`MemoryJournal`）、`memory/MEMORY.md` 的暂存/原子写回（`MemoryEditor` 语义由两个专属工具 + `DreamService` 承担）、固定周窗口调度（`DreamScheduler`）。
 - `agent/subagent.py`：子代理任务生命周期；`agent/review_state.py`：run 状态、fingerprint 与报告 artifact。
 - `review/`：`admission.py` 准入边界，`result.py` 终态结果与交接渲染，`input/`、`planning/`、`source/`、`output/` 输入、证据、源码、finding 校验、Judge 与报告领域逻辑。
-- `session/`：历史持久化与回放；`agent/context.py`、`memory.py`：提示上下文与会话整理（会话整理只由 `Consolidator` 按 token 触发）。
+- `session/`：历史持久化与回放；`agent/context.py`、`memory.py`：提示上下文与会话 checkpoint（`Consolidator` 不再按 token 扫描，只落盘请求级压缩产出的 checkpoint 并折叠回放窗口溢出的历史）。
 - `channels/`：协议、交付和重试；`providers/`：模型调用适配；`agent/tools/`：能力与 workspace scope。
 - `review-webui/`：展示与交互；`templates/`、`skills/`：模型行为契约。
+
+## 请求级上下文治理
+
+`AgentRunner` 每轮发包前由 `ContextGovernor` 重建请求（`prepare_request`）：首部连续 `system`/`developer` 原样保留，被压缩区间替换为一条**带标记的数据消息**（`<archived_context_summary>`），其余按原顺序重建。原始 transcript（`AgentRunSpec.messages`）只追加、从不改写。
+
+- 只有在某轮真的要发包时才判定预算：首包同样校验，放不下就压缩，压不动就以 `context_limit` 结束 run，绝不发送超窗请求。
+- `ContextCompactionState` 是 run 内状态（不挂在 runner 实例上）：`accepted_message_count` 由调用方声明「哪些是已存在的会话历史，可以摘要」，`accepted_boundary` 记录已经发出去过多少，`compacted_through` 记录已被 summary 覆盖到哪。对话 turn 传 `1 + len(history)`；reviewer（单次任务全量授权证据）与 Judge（候选批次）传 `0`，因此它们的信封不可摘要，超窗即失败而不是被摘要掉。
+- 三级降级：摘要 accepted 区间 → 把**尚未发送**的超大 `read_file` 结果替换为「重读更小范围」的提示（原始 transcript 保留全文）→ 抛 `ContextWindowExceededError`。摘要失败/空响应退化为有界原文 checkpoint（`TranscriptSummarizer.raw_archive`）。
+- `AgentRunResult.compaction`（`summary` / `compacted_session_messages` / `compaction_count`）只统计 `messages[header:accepted_message_count]` 被覆盖的数量，session owner 据此精确推进回放边界；reviewer/Judge 的临时摘要不进入长期记忆。
+- 已删除：`agent/compression.py`（frozen/working 分区、`split_units`、60% 软限/80% 同步限）、`AgentDefaults.consolidation_ratio`、turn 前/后的 token Consolidator 扫描，以及 reviewer/Judge 的角色级 wall clock（只保留 provider 请求超时与取消）。
 
 ## MCP 边界
 
@@ -25,6 +37,14 @@
 - `SessionCoordinator.aclose()` 是幂等关闭入口，顺序固定为：停止准入 → 取消并等待活动 turn 与子任务 → 清空 pending queue → 排空后台任务 → 关闭 MCP。Gateway、CLI 与 API cleanup 统一调用，SDK 调用方需显式关闭。`/stop` 与 API 请求取消通过 `task_is_cancelling()` 区分外部取消，不重试被取消的 MCP 调用。
 
 当前代码在 review `running` 时拒绝普通消息和非控制命令；只有清理完成且终态 metadata 已成功落盘（phase `done`）才发布 live `DONE` 并路由到 conversation。清理失败、再次取消或终态保存失败时 run 保持 `running`、门禁不开放，并向 turn 返回有界错误；已准入且停在 `PREPARE` 的 run 同样收尾为 `stopped`/`error` 及原因。失败原因与结果摘要随终态持久化，供重启后读取；无 live executor 的持久化 `running` 仍一次性规范化为 `error`。长期目标见 `.agents/plans/project-roadmap.md`。
+
+## 角色运行时与长期记忆
+
+- **角色运行时在准入时冻结**：`SessionCoordinator._run_review_turn` 一次性构造 `reviewer_runtime` / `judge_runtime`（`LLMRuntime`），随 `ReviewTurnRequest` 进入 `ReviewLoop`，再写入 run snapshot 的 `models` 段与 `budget` 段（`review_budget_contract(runtime)`）。中途 `/model` 只影响下一个 run，不影响已启动的审查。`AgentRunner` 是共享实例，所有请求都走 `spec.runtime.provider`——用 `self.provider` 会把自建 provider 的角色发到对话 agent 的 provider 上。
+- **覆盖是字段级的**：`review.reviewer` / `review.judge` 的未设字段（unset 或 `null`）继承对话 agent 当刻的有效值；跨 provider 必须显式写 `provider`，由注入的 `role_provider_factory`（`providers/factory.py::make_role_provider_factory`，复用 provider 凭据）创建，缺失时抛 `ValueError` 而不是静默复用旧 provider。
+- **长期记忆只有一条写入路径**：`ConversationLoop` 把被请求级压缩覆盖的旧历史经注入的 `archive_recorder` 追加到 `memory/history.jsonl`（一条一轮，带 cursor）；reviewer/Judge 的临时摘要永不进入该 journal。`MEMORY.md` 只在对话 turn 开始时读一次作为快照（`memory_reader`），经 `ContextBuilder.build_messages(memory_text=...)` 进入 system prompt；共享同一 builder 的审查角色不传该参数，因此看不到 MEMORY。
+- **Dream 是独立临时 run**：不建 session、不注册 shell/MCP/目录写工具，只有 `read_memory` / `write_memory` 两个工具；`write_memory` **只暂存**，run 正常结束后由宿主原子写回 `memory/MEMORY.md`，成功后才推进 cursor。失败、取消或未完成都不提交、不推进；合法无改动则只推进 cursor。用对话 agent 的模型与普通对话轮数，`role="dream"`。
+- **调度固定且不补跑**：每周日 03:00 Asia/Shanghai，窗口只有一个 tick（`DREAM_TICK_SECONDS`），错过即放弃；当周触发标识与 cursor 一起落在 `memory/dream-state.json`，失败也不在同一周重试。每个 workspace 同时只跑一个 Dream：手动重复调用返回「运行中」，自动触发遇到运行中直接跳过。`dream.enabled`（默认开）只关自动调度，`/dream` 始终可用。ticker 由 `SessionCoordinator.run()` 启动，`aclose()` 先取消它再排空后台任务（它是死循环，排空会挂住）。
 
 ## 本地 review 准入
 
@@ -68,14 +88,14 @@
 - **保留 plan 阶段但含义改为程序生成 assignments**：阶段顺序不变（`PREPARE -> PLAN -> REVIEW -> ...`），前端消费的阶段名与状态不变；`review/planning/manifest.py`、`review/planning/triage.py`、`review/planning/prompt.py`、`agent/tools/review_plan.py` 与相关分诊工具已整体删除。
 - **报告只呈现所选 Reviewer**：`### Selected Reviewers` 列出被选中的 reviewer 标签，不再有 `Mode:` 行，也不再有 `Triage Outcome` 段；黑板的 `evidence_stats`/`assignment_stats` 与 snapshot 的 `evidence`/`assignments` 只做运行审计，不进入 report findings。
 - **`risk_hints` 已从运行模型完全删除**：静态关键词表、检测函数、`_score_unit` 评分、`CodeUnit`/`EvidenceReference`/prefetch 的字段与渲染全部移除；evidence 按 frozen diff 稳定顺序截尾而非按风险排序，`matched` 仅作展示元数据，不参与排序或路由。
-- **review 全链路不再有 terminal tool 提交协议**：reviewer 与 Judge 都是自由回合，最终答案必须是契约要求的一个 JSON 对象。`AgentRunSpec.output_contract` + `output_retry_limit` 承担全部校验与纠正：解析失败时把具体原因（走 `OutputContract.repair_prompt`）作为一条 user 消息追加进同一 run 的上下文，模型可在同一 run 内修正；配额耗尽后 `stop_reason="invalid_output"`、`output_error` 非空、`structured_output is None`。旧的 `terminal_tools` / `terminal_retry_limit` / `prose_retry_limit` / `reserve_terminal_iteration` / `terminal_attempts` / `terminal_error` 已全部删除。reviewer 请求上限 30、Judge `_JUDGE_MAX_ITERATIONS = 3 + 3`（纠正配额 3 加 3 轮余量）。
-- **最后一次请求留给答案**：`AgentRunner._is_final_structured_turn()`（`iteration == max_iterations - 1` 且 run 有 output contract）在该轮不暴露工具，并把 `FINAL_STRUCTURED_ANSWER_PROMPT` 同时写进 raw `messages` 与 `state.working`（后者才是 `_model_context` 真正发送的内容）。该轮被拒时直接以 `invalid_output` 收场，不再追加一轮发不出去的纠正提示，也不能落回 `max_iterations` 掩盖真实原因。Conversation（无契约）不保留任何轮次。
+- **review 全链路不再有 terminal tool 提交协议**：reviewer 与 Judge 都是自由回合，最终答案必须是契约要求的一个 JSON 对象。`AgentRunSpec.output_contract` + `output_retry_limit` 承担全部校验与纠正：解析失败时把具体原因（走 `OutputContract.repair_prompt`）作为一条 user 消息追加进同一 run 的上下文，模型可在同一 run 内修正；配额耗尽后 `stop_reason="invalid_output"`、`output_error` 非空、`structured_output is None`。旧的 `terminal_tools` / `terminal_retry_limit` / `prose_retry_limit` / `reserve_terminal_iteration` / `terminal_attempts` / `terminal_error` 已全部删除。reviewer 与 Judge 的模型请求上限都是 30 轮，没有角色级 wall clock。
+- **最后一次请求留给答案**：`AgentRunner._is_final_structured_turn()`（`iteration == max_iterations - 1` 且 run 有 output contract）在该轮不暴露工具，并把 `FINAL_STRUCTURED_ANSWER_PROMPT` 追加进 raw `messages`——请求本身由 governor 从 raw transcript 重建，不需要再同步一份 working 副本。该轮被拒时直接以 `invalid_output` 收场，不再追加一轮发不出去的纠正提示，也不能落回 `max_iterations` 掩盖真实原因。Conversation（无契约）不保留任何轮次。
 - **reviewer 的最终答案仍然由结构决定**：`review/contracts.py::reviewer_contract` 解析 `{"findings": [...]}` 并复用原提交工具的字段契约（`severity` 必须在 `critical|high|medium|low`、`line` 为整数或 null、`details` 必须是对象、文本字段不能为空）。一次被拒只说明哪一条 finding 的哪个字段不合法，模型在同一个 AgentRun 内改一处再答；空 `findings` 是否成立由程序判断（需要 `assigned_evidence` 或一次成功的 `read_file`/`grep`），模型自报不算。
 - reviewer run 自带去重 ledger（每个 subagent 一个独立 `FileStates`）：相同规范化文件范围/检索签名且内容未变时返回短提示而非全文，`force` 不可绕过，状态不跨 reviewer 或 review run 共享；用于定位重复探索，不新增累计 token 上限。
 - 阶段判断从 live 黑板投影、session metadata、report artifact 和交接索引推导，不新增 session phase 字段。终态 metadata 先落盘、后发布 live `DONE`，因此“可路由”等价于“已持久化”。无 live executor 的持久化 `running` 会被一次性规范化为终态 `error`，并持久化有界中断原因，不 resume、不重跑。规范化在 `pending_handoff()` 里先于 `_review_settled()` 执行（`result()` 提前调用），保证重启后第一条普通消息就修复 orphan，而非永远卡在 `running`。规范化的 `save()` 失败必须回滚 metadata（缓存不提前发布 `error/done`），保持磁盘与缓存一致，留待下次读重试。
 - 终态 metadata 除 run id/status/phase/fingerprint/report ref 外，还持久化有界 `review_summary`（report 摘要或失败原因）与 `review_error`（非 `completed` 终态的原因），供重启后读取；不持久化 child transcript 或其他中间状态。
 - 交接三态：`complete`（artifact 已落盘且无缺口）、`partial`（artifact 已落盘但存在缺口）、`failed`（无可用 artifact，绝不渲染为完整成功）。交接不重试、不自动补齐、不重跑；已落盘 report 仍可查看。
-- 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。写入由 `SessionCoordinator.consume_handoff` 执行，turn 顺序固定为「加载 session → 恢复中断历史 → 执行 token Consolidator → 调用 handoff consumer（处理 review handoff）→ 读取历史 → 构建模型上下文」；写入失败向上传播且不进入 Runner。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。review 完成 `DONE` 后，交接失败仍可进入对话，但必须说明失败、可用结果与覆盖缺口。
+- 首次对话注入完整 report：system directive 说明来源与只读规则，完整 block 作为带 `injected_event=review_handoff` 的 assistant 消息写入历史（可重放、不重复注入）。写入由 `SessionCoordinator.consume_handoff` 执行，turn 顺序固定为「加载 session → 恢复中断历史 → 回放窗口折叠（`fold_replay_overflow`）→ 调用 handoff consumer（处理 review handoff）→ 读取历史 → 读取 MEMORY 快照 → 构建模型上下文」；写入失败向上传播且不进入 Runner。完整 report 超出首次对话模型窗口时拒绝该 turn 并给出原因，不用自动摘要替代。review 完成 `DONE` 后，交接失败仍可进入对话，但必须说明失败、可用结果与覆盖缺口。
 - report artifact 与黑板是权威来源，Conversation Agent 不得改写；`review_context` 只是索引。
 - conversation 按 session 串行、最多 20 条待处理消息；`/stop` 取消当前与排队 turn 且保留已发生的修改不自动回滚；重启后不执行未完成队列。
 - CLI 交互入口：`cli/commands.py` 的 `review` 在准入成功后于同一 `cli:review:<id>` session 执行 review，终态后默认进入交互对话（`agent` 的交互模式复用同一 `_run_cli_session`）；交互阶段以 `session_key_override` 固定到该 session，因此命令路由、review 门禁和 report handoff 与其他 channel 一致。`--no-chat`、stdin/stdout 非终端或无控制台时的 `--fail-on` 调用保持一次性执行。review 报告经 `process_direct` 返回值交给 CLI 渲染（CLI 不请求 bus 报告流）。

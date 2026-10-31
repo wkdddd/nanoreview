@@ -1,6 +1,23 @@
 # 当前代码调整计划
 
-更新时间：2026-10-22
+更新时间：2026-10-31
+
+## 当前节点：统一上下文治理、角色模型配置与 Dream 长期记忆
+
+状态：已实施，待验收（worktree `nanoreview-ctx`，分支 `workbuddy/context-governance-dream`，基线 `7c000b1d`）。不恢复 Planner，不合并其他分支的在途重构。
+
+实施内容：
+
+1. **角色运行时**：新增 `agent/llm_runtime.py`（不可变 `LLMRuntime` + 字段级 `RoleModelOverrides` + `resolve_role_runtime`）。`review.reviewer` / `review.judge` 逐项覆盖，未设字段继承对话 agent；跨 provider 必须显式 `provider`，经 `make_role_provider_factory` 创建。review 准入时一次性冻结 reviewer/Judge runtime，写入 run snapshot 的 `models` 与 `budget` 段，中途 `/model` 不影响已启动审查。
+2. **请求级上下文治理**：新增 `agent/context_governance.py`。唯一预算公式 `input_token_budget = window - max_output - 1024`；每轮重建请求（首部 system/developer 原样、压缩区间换成带标记的数据消息）；首包同样校验；三级降级（摘要 → 替换未发送的超大 `read_file` → `context_limit` 失败）；`AgentRunResult.compaction` 只统计被摘要覆盖的会话消息数。
+3. **Consolidator 收敛**：只保存请求级压缩产出的 checkpoint（`persist_checkpoint`）并折叠回放窗口溢出（`fold_replay_overflow`），不再按 token 扫描，也不再有 turn 前后两套整理。
+4. **Dream 长期记忆**：新增 `agent/dream.py`。`memory/history.jsonl` + cursor（只由对话压缩追加）、独立临时 run（对话模型 + 普通轮数，仅 `read_memory`/`write_memory` 两个工具）、暂存后宿主原子写回 `memory/MEMORY.md` 再推进 cursor、失败/取消不提交、合法无改动也推进。固定周日 03:00 Asia/Shanghai，窗口一个 tick、不补跑、当周标识持久化、每 workspace 互斥；`/dream` 手动入口进命令表与帮助；新增 `dream.enabled`（默认开，只关自动调度）。MEMORY 只在对话 turn 开始时读一次快照，审查角色看不到。
+
+删除项（不要恢复）：`agent/compression.py` 全部（frozen/working 分区、`split_units`、60%/80% 软同步限、异步快照校验）、`AgentDefaults.consolidation_ratio`、`REVIEW_CONTEXT_WINDOW_TOKENS` / `REVIEWER_MAX_OUTPUT_TOKENS` / `REVIEWER_TIMEOUT_SECONDS`、`SubagentManager` 的角色级 `asyncio.timeout`、Judge 的 `asyncio.wait_for` 与固定 `temperature=0`/输出/窗口覆盖、`Consolidator.get_lock`/`maybe_consolidate_by_tokens`/`_persist_last_summary`。
+
+验证：`pytest` 全量 `1030 passed`（含新增 `test_context_governance.py` 17 项、`test_llm_runtime.py` 14 项、`test_dream.py` 34 项、`test_long_term_memory_wiring.py` 11 项、`/dream` 命令断言 1 项）；`ruff check nanoreview/ tests/` 44 项（基线 45，`tests/` 0 项）；`git diff --check` 通过。删除 `tests/agent/test_runner_compression.py`、`tests/agent/test_subagent_reasoning_config.py`，其余测试随接口迁移。
+
+遗留：WebUI 不新增 Dream 配置表单（本节点不做前端）；`ReviewRoutingMode` 的 Auto 文案适配仍是既有前端待办。
 
 ## 既有节点待验收与后续事项
 

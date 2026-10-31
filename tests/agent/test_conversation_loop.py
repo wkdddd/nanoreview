@@ -20,6 +20,7 @@ coordinator and the review side rely on:
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,33 @@ class DummyProvider(LLMProvider):
         return "dummy"
 
 
+_FACT = re.compile(r"FACT-\d+")
+
+
+class FactSummaryProvider(DummyProvider):
+    """Summarize by echoing every ``FACT-nn`` marker the request carried.
+
+    The loop's summarizer is exercised through the same provider as the turn,
+    so a marker-echoing summary proves which turns the checkpoint covers.
+    """
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        reasoning_effort: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> LLMResponse:
+        _ = (tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
+        _ = response_format
+        body = "\n".join(str(message.get("content", "")) for message in messages)
+        return LLMResponse(content="SUMMARY: " + " ".join(sorted(set(_FACT.findall(body)))))
+
+
 class SpecCapturingRunner:
     def __init__(self) -> None:
         self.specs: list[AgentRunSpec] = []
@@ -85,7 +113,7 @@ class SpecCapturingRunner:
         self.specs.append(spec)
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 
@@ -103,8 +131,7 @@ class InjectingRunner(SpecCapturingRunner):
         return AgentRunResult(
             final_content="ok",
             messages=[
-                *spec.frozen_messages,
-                *spec.working_messages,
+                *spec.messages,
                 *self.injected,
                 {"role": "assistant", "content": "ok"},
             ],
@@ -135,7 +162,7 @@ class ContextRefreshRunner(SpecCapturingRunner):
             self.observed_scopes.append(current_workspace_scope())
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 
@@ -270,20 +297,22 @@ async def test_the_first_turn_carries_the_report_and_its_directive(tmp_path) -> 
 
     spec = runner.specs[0]
     # The complete report — not a summary — is what the model sees, replayed
-    # from history in the working zone.
-    assert len(spec.working_messages) == 1
-    handoff_message = spec.working_messages[0]
-    assert handoff_message["role"] == "assistant"
-    assert handoff_message["content"].startswith("[ReviewAgent handoff]")
+    # from history as an assistant turn.
+    handoff_message = next(
+        message
+        for message in spec.messages
+        if message["role"] == "assistant"
+        and message["content"].startswith("[ReviewAgent handoff]")
+    )
     assert REPORT_MARKDOWN in handoff_message["content"]
-    # The provenance directive rides in the frozen system zone, which is never
-    # summarized away mid-run.
-    system = spec.frozen_messages[0]
+    # The provenance directive rides in the system message, which the governor
+    # never summarizes away.
+    system = spec.messages[0]
     assert system["role"] == "system"
     assert _handoff().directive in system["content"]
-    # The current user message stays in the frozen zone, after the system.
-    assert spec.frozen_messages[1]["role"] == "user"
-    assert "what did you find?" in spec.frozen_messages[1]["content"]
+    # The current user message closes the transcript.
+    assert spec.messages[-1]["role"] == "user"
+    assert "what did you find?" in spec.messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -333,10 +362,11 @@ async def test_the_persisted_summary_reaches_the_model_after_a_restart(
 ) -> None:
     """Consolidation hides old turns; the summary must carry them back in.
 
-    Written to disk by one process and replayed by the next, it has to land in
-    the system prompt. Otherwise the replay window keeps hiding those turns —
-    losing earlier decisions and open work — while the token probe still pays
-    for a summary the model never receives.
+    Written to disk by one process and replayed by the next, it is handed to the
+    run as ``initial_summary``; the request-level governor renders it as a marked
+    data message right after the header. Otherwise the replay window keeps
+    hiding those turns — losing earlier decisions and open work — while the token
+    probe still pays for a summary the model never receives.
     """
     summary = "PERSISTED-SUMMARY-MARKER: earlier decisions and open work"
 
@@ -362,9 +392,7 @@ async def test_the_persisted_summary_reaches_the_model_after_a_restart(
         target_root=tmp_path,
     )
 
-    system = runner.specs[0].frozen_messages[0]
-    assert system["role"] == "system"
-    assert summary in system["content"]
+    assert runner.specs[0].initial_summary == summary
 
 
 @pytest.mark.asyncio
@@ -380,23 +408,28 @@ async def test_a_session_without_a_summary_injects_none(tmp_path) -> None:
         target_root=tmp_path,
     )
 
-    system = runner.specs[0].frozen_messages[0]
-    assert "[Archived Context Summary]" not in system["content"]
+    assert runner.specs[0].initial_summary is None
 
 
 @pytest.mark.asyncio
-async def test_history_is_consolidated_before_the_handoff_is_written(
+async def test_the_replay_fold_runs_before_the_handoff_is_written(
     tmp_path,
 ) -> None:
+    """The fold must see the transcript the handoff is about to join.
+
+    Recording the full report comes after the replay-window fold: a fold that
+    ran afterwards would archive a chunk the handoff already widened, and the
+    boundary it advanced to would not describe what the model was sent.
+    """
     order: list[str] = []
     loop = _loop(tmp_path)
-    original_consolidate = loop._consolidator.maybe_consolidate_by_tokens
+    original_consolidate = loop._consolidator.fold_replay_overflow
 
     async def _traced_consolidate(*args, **kwargs):
         order.append("consolidate")
         return await original_consolidate(*args, **kwargs)
 
-    loop._consolidator.maybe_consolidate_by_tokens = _traced_consolidate  # type: ignore[method-assign]
+    loop._consolidator.fold_replay_overflow = _traced_consolidate  # type: ignore[method-assign]
     loop._handoff_consumer = lambda session, handoff: order.append("handoff")  # type: ignore[assignment]
 
     await loop.process_message(
@@ -433,6 +466,50 @@ async def test_a_failed_handoff_write_stops_the_turn_before_the_runner(
         )
 
     assert runner.specs == []
+
+
+@pytest.mark.asyncio
+async def test_a_token_cropped_history_is_archived_instead_of_dropped(
+    tmp_path,
+) -> None:
+    """A turn whose history is cropped by tokens must still archive the rest.
+
+    The replay window is narrowed twice: by ``max_messages`` and by the token
+    budget derived from the context window. A turn that only folds the count
+    overflow lets the token cut silently delete the oldest turns — the model
+    never sees them, no checkpoint carries them, and they never reach the
+    long-term memory journal that Dream reads.
+    """
+    loop = SessionCoordinator(
+        MessageBus(),
+        FactSummaryProvider(),
+        tmp_path,
+        context_window_tokens=3000,
+        max_messages=200,
+    ).conversation_loop
+    runner = SpecCapturingRunner()
+    loop._runner = runner
+
+    session = loop._sessions.get_or_create("cli:direct")
+    for index in range(12):
+        session.add_message("user", f"FACT-{index:02d} " + "detail " * 400)
+        session.add_message("assistant", f"answer {index:02d} " + "detail " * 400)
+    loop._sessions.save(session)
+
+    await loop.process_message(
+        _msg("hello"),
+        session_key="cli:direct",
+        turn_id="t1",
+        target_root=tmp_path,
+    )
+
+    assert session.last_consolidated > 0
+    assert "FACT-00" in (runner.specs[0].initial_summary or "")
+    # The checkpoint is the only carrier of the dropped turns, so it must also
+    # reach the journal Dream consumes.
+    journal = tmp_path / "memory" / "history.jsonl"
+    assert journal.exists()
+    assert "FACT-00" in journal.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
