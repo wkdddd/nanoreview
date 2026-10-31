@@ -217,31 +217,33 @@ def test_local_changed_patches_uses_net_head_diff_not_staged_concat(
 
 
 @pytest.mark.asyncio
-async def test_local_diff_skips_patch_over_diff_unit_threshold(
+async def test_local_diff_keeps_an_oversized_patch_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    # Above the fixed 8k per-file diff threshold and with no ``@@`` boundary to
-    # split at, the single hunk is recorded as an unreviewed oversized unit.
+    # However large a single-file patch is, it is one complete unit: the
+    # evidence layer never slices or drops it, so budget fitting happens later.
+    patch = "+" + ("x" * 40_000)
     monkeypatch.setattr(
         service,
         "local_changed_patches",
-        lambda _workspace=None: ({"src/large.py": "+" + ("x" * 40_000)}, {}),
+        lambda _workspace=None: ({"src/large.py": patch}, {}),
     )
 
     result = await service.local_changed_context(
         review_query="review",
         max_results=5,
         include_tests=True,
-        context_window_tokens=8,
     )
 
     assert service.last_result is not None
-    assert service.last_result.units == []
-    assert [(unit.path, unit.reason) for unit in service.last_result.skipped] == [
-        ("src/large.py", "token_limit_exceeded")
+    assert service.last_result.skipped == []
+    assert [(unit.path, unit.text) for unit in service.last_result.units] == [
+        ("src/large.py", patch)
     ]
-    assert "src/large.py" not in result
+    # The rendered context is a bounded manifest for display only; the reviewer
+    # reads ``unit.text`` through the evidence bundle excerpt.
+    assert "src/large.py" in result
 
 
 def test_local_changed_summary_cli_fallback_maps_subdirectory_target(
@@ -443,23 +445,25 @@ def _unit(path: str = "src/auth.py", text: str = "token = 'x'\n") -> CodeUnit:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_local_diff_forwards_context_window(
+async def test_dispatch_hands_the_whole_patch_to_the_preprocessor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
+    patch = "@@ -1 +1 @@\n-old\n+new"
     monkeypatch.setattr(
         service,
         "local_changed_patches",
-        lambda _workspace=None: ({"src/auth.py": "@@ -1 +1 @@\n-old\n+new"}, {}),
+        lambda _workspace=None: ({"src/auth.py": patch}, {}),
     )
     captured: dict[str, object] = {}
 
     def fake_diff_units(
-        patches: dict[str, str], *, review_query: str, context_window_tokens: int | None = None
+        patches: dict[str, str], *, review_query: str
     ) -> ProgrammaticEvidenceResult:
-        captured["window"] = context_window_tokens
+        captured["patches"] = dict(patches)
+        captured["query"] = review_query
         return ProgrammaticEvidenceResult(
-            units=[_unit(text="+new")], skipped=[], context="context", mode="direct"
+            units=[_unit(text="+new")], skipped=[], context="context"
         )
 
     monkeypatch.setattr(service.preprocessor, "diff_units", fake_diff_units)
@@ -470,11 +474,12 @@ async def test_dispatch_local_diff_forwards_context_window(
         review_query="auth",
         max_results=5,
         include_tests=True,
-        context_window_tokens=16_384,
     )
 
     assert result == "context"
-    assert captured["window"] == 16_384
+    # No window is threaded down: the diff reaches the preprocessor untouched.
+    assert captured["patches"] == {"src/auth.py": patch}
+    assert captured["query"] == "auth"
 
 
 @pytest.mark.asyncio

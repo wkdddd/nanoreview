@@ -27,7 +27,6 @@ class ReviewMetaKey:
     MAX_CONCURRENT_SUBAGENTS = "max_concurrent_subagents"
     ALLOWED_DIMENSIONS = "allowed_review_dimensions"
     EVIDENCE_PROVIDER = "_review_evidence_service"
-    DIFF_CONTEXT_WINDOW_TOKENS = "_review_diff_context_window_tokens"
     #: In-process handoff of the admitted snapshot's frozen net diff, so
     #: prefetch reviews exactly the change captured at admission instead of
     #: re-reading a worktree that may have moved on. Never persisted to session
@@ -198,11 +197,6 @@ class EvidenceReference:
     @property
     def is_related(self) -> bool:
         return "related" in self.tags
-
-
-# Reasons accepted for SkippedReviewUnit.reason.
-SKIPPED_REASON_TOKEN_LIMIT = "token_limit_exceeded"
-SKIPPED_REASON_BUDGET = "budget_exhausted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,7 +375,6 @@ class ReviewEvidenceProvider(Protocol):
         max_results: int,
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
-        context_window_tokens: int | None = None,
         frozen_diff: dict[str, Any] | None = None,
     ) -> str: ...
 
@@ -397,6 +390,5 @@ class ReviewEvidenceProvider(Protocol):
         include_tests: bool | None = None,
         local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
-        context_window_tokens: int | None = None,
         frozen_diff: dict[str, Any] | None = None,
     ) -> str: ...

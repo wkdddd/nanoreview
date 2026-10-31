@@ -1,29 +1,28 @@
-"""Deterministic diff evidence pre-processing for review workflows.
+"""Deterministic diff evidence preparation for review workflows.
 
 Pipeline (per review run):
 
-1. **Patch/hunk splitting** — a changed file whose patch is below
-   ``DIFF_UNIT_TOKEN_THRESHOLD`` stays one complete diff unit; at or above it
-   the patch is split at ``@@`` boundaries and an oversized hunk is skipped.
+1. **One unit per changed file** — the admitted patch is carried whole: file
+   header, every hunk and both old/new line numbers stay intact so evidence
+   location, previews and the report can name real lines.
 2. **Query annotation** — the user's review-query hit words are recorded on
    each unit as display metadata; they never order or route evidence.
-3. **Budget filtering** — units keep the frozen order; the ones that no longer
-   fit are recorded as unreviewed (a later, smaller unit may still be kept).
-4. **ID, preview and manifest** — stable ``ev-NNN`` IDs, one representative
+3. **ID, preview and manifest** — stable ``ev-NNN`` IDs, one representative
    preview per unit and a manifest text used for the prefetch summary and the
-   run log. Reviewers read the structured ``excerpt`` of each unit, not this
-   rendered text.
+   run log. The structured ``excerpt`` of a unit is the complete patch;
+   previews are display-only and may sample lines, but nothing that reaches a
+   reviewer is truncated here.
 
-Every changed path is processed: preprocessing makes no language decision, so
-a diff in a language without a bundled grammar is still reviewed as diff text.
+Preprocessing makes no budget decision: it neither measures the diff against a
+token threshold nor drops units to fit a budget. Whether the complete diff fits
+a reviewer request is decided once, before dispatch, by the review loop's
+request budget (see ``nanoreview.review.budget``); a diff that does not fit
+rejects the run instead of being reviewed in pieces.
 
 Preprocessing consumes the diff only: it never enumerates the repository,
 never reads whole source files and never parses ASTs. Reading a changed file's
 surrounding context is the reviewer's own restricted-scope job, and repository
 indexing belongs to the independent RAG module.
-
-Every skipped file/hunk is reported with a reason so progress events and the
-final report can show exactly what was not reviewed.
 """
 
 from __future__ import annotations
@@ -32,8 +31,6 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
-
-from loguru import logger
 
 # ---------------------------------------------------------------------------
 # Query term extraction
@@ -45,76 +42,18 @@ from loguru import logger
 _TERM_RE = re.compile(r"[A-Za-z0-9_]{2,}")
 
 # ---------------------------------------------------------------------------
-# Token budget accounting
+# Token accounting
 # ---------------------------------------------------------------------------
 
-#: Static reservations subtracted from the provider context window before any
-#: evidence token caps are derived (system prompt, tool descriptions, output
-#: reserve). Keeps direct caps conservative.
-SYSTEM_PROMPT_TOKENS = 2_000
-TOOL_DESCRIPTIONS_TOKENS = 3_000
-OUTPUT_RESERVE_TOKENS = 4_000
-SAFETY_MARGIN_RATIO = 0.10
-
-#: Hard clamps for derived caps.
-MIN_DIRECT_UNIT_TOKENS = 1_600
-MIN_USABLE_TOKENS = 1_000
-
-#: Per-file diff unit threshold. A changed file whose patch is below this many
-#: tokens is kept as one complete diff unit; at or above it the hunk-splitting
-#: strategy applies. Judged per file, so a large target does not force every
-#: small changed file into hunks.
-DIFF_UNIT_TOKEN_THRESHOLD = 8_000
+#: Reason for a changed path that carried no diff text at all. File-level filter
+#: reasons (``binary_file``, ``filtered``) come from the patch collector, which
+#: prepends them to the same skipped list.
+SKIPPED_REASON_EMPTY_PATCH = "empty_patch"
 
 
 def estimate_tokens(text: str) -> int:
     """Cheap deterministic token estimate (~4 chars per token)."""
     return max(1, (len(text) + 3) // 4) if text else 0
-
-
-@dataclass(frozen=True, slots=True)
-class EvidenceBudget:
-    """Token caps derived from config and the provider context window."""
-
-    usable_input_tokens: int
-    evidence_budget_tokens: int
-    direct_cap_tokens: int
-
-    @classmethod
-    def from_options(
-        cls,
-        *,
-        evidence_token_budget: int,
-        context_window_tokens: int | None,
-    ) -> "EvidenceBudget":
-        window = context_window_tokens or 65_536
-        overhead = SYSTEM_PROMPT_TOKENS + TOOL_DESCRIPTIONS_TOKENS + OUTPUT_RESERVE_TOKENS
-        margin = int(window * SAFETY_MARGIN_RATIO)
-        usable = max(MIN_USABLE_TOKENS, window - overhead - margin)
-        # Total accepted evidence also fits inside the review token budget.
-        # A configured value above ``usable`` cannot widen the window, so
-        # record the clamp source instead of failing silently.
-        if evidence_token_budget <= MIN_USABLE_TOKENS:
-            clamp_source = "min_floor"
-        elif evidence_token_budget < usable:
-            clamp_source = "evidence_token_budget"
-        else:
-            clamp_source = "usable_window"
-        evidence_budget = max(MIN_USABLE_TOKENS, min(evidence_token_budget, usable))
-        logger.info(
-            "review.evidence.budget evidence_budget={} source={} configured={} usable_window={}",
-            evidence_budget,
-            clamp_source,
-            evidence_token_budget,
-            usable,
-        )
-        # Small diffs below this stay in direct mode (whole evidence inlined).
-        direct_cap = min(evidence_budget, max(MIN_DIRECT_UNIT_TOKENS, usable // 4))
-        return cls(
-            usable_input_tokens=usable,
-            evidence_budget_tokens=evidence_budget,
-            direct_cap_tokens=direct_cap,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -124,10 +63,8 @@ class EvidenceBudget:
 
 @dataclass(slots=True)
 class ProgrammaticEvidenceOptions:
-    # Budget knobs mirrored from ReviewConfig so callers can inject config.
-    evidence_token_budget: int = 100_000
+    # Display knobs mirrored from ReviewConfig so callers can inject config.
     prefetch_budget_chars: int = 16_000
-    context_window_tokens: int | None = 65_536
     # Per-unit preview budget: ``preview_target_chars`` is a soft goal
     # (mid-size units may exceed it), ``preview_hard_limit`` is the absolute
     # per-preview ceiling. The overall manifest cap stays prefetch_budget_chars.
@@ -147,7 +84,6 @@ class ProgrammaticEvidenceOptions:
         if review_config is None:
             return options
         for name, attr in (
-            ("evidence_token_budget", "evidence_token_budget"),
             ("prefetch_budget_chars", "prefetch_budget_chars"),
             ("preview_target_chars", "preview_target_chars"),
             ("preview_hard_limit", "preview_hard_limit"),
@@ -202,9 +138,7 @@ class ProgrammaticEvidenceResult:
     units: list[CodeUnit]
     skipped: list[SkippedUnit]
     context: str
-    mode: str = "direct"  # direct | oversized
     total_tokens: int = 0
-    accepted_tokens: int = 0
 
 
 def preview_text(text: str, *, max_lines: int = 12, max_chars: int = 600) -> str:
@@ -485,7 +419,7 @@ def build_unit_preview(
 
 
 class ProgrammaticEvidenceService:
-    """Bounded, deterministic diff evidence selection.
+    """Deterministic diff evidence preparation.
 
     ``workspace`` is kept so callers can resolve the review root per scope; the
     service itself never touches the working tree, it only transforms patches.
@@ -500,13 +434,13 @@ class ProgrammaticEvidenceService:
         patches: dict[str, str],
         *,
         review_query: str,
-        context_window_tokens: int | None = None,
     ) -> ProgrammaticEvidenceResult:
-        """Convert diff patches into bounded diff units with budget filtering."""
-        budgets = EvidenceBudget.from_options(
-            evidence_token_budget=self.options.evidence_token_budget,
-            context_window_tokens=context_window_tokens or self.options.context_window_tokens,
-        )
+        """Turn every changed file's patch into one complete diff unit.
+
+        No unit is split, skipped or dropped here: the admitted change is the
+        review scope, so a unit carries its whole patch and any overflow is a
+        request-budget problem for the review loop to reject.
+        """
         units: list[CodeUnit] = []
         skipped: list[SkippedUnit] = []
         for path, patch in patches.items():
@@ -515,20 +449,15 @@ class ProgrammaticEvidenceService:
         for unit in units:
             self._annotate_unit(unit, terms)
         total_tokens = sum(unit.token_count for unit in units)
-        mode = "direct" if total_tokens <= budgets.direct_cap_tokens else "oversized"
-        if mode == "oversized":
-            units, budget_skipped = self._apply_main_budget(units, budgets)
-            skipped.extend(budget_skipped)
-        units, _ = self._assign_ids(units, start=1)
+        units, empty = self._assign_ids(units, start=1)
+        skipped.extend(empty)
         for unit in units:
             self._build_preview(unit, terms=terms)
         return ProgrammaticEvidenceResult(
             units=units,
             skipped=skipped,
             context=self.render_manifest(units, skipped, budget_chars=self.options.prefetch_budget_chars),
-            mode=mode,
             total_tokens=total_tokens,
-            accepted_tokens=sum(unit.token_count for unit in units),
         )
 
     # -- diff units -------------------------------------------------------
@@ -539,55 +468,25 @@ class ProgrammaticEvidenceService:
         patch: str,
         skipped: list[SkippedUnit],
     ) -> list[CodeUnit]:
+        """One unit carrying the complete patch of *path*."""
         tokens = estimate_tokens(patch)
-        if tokens < DIFF_UNIT_TOKEN_THRESHOLD:
-            start, end = ProgrammaticEvidenceService._patch_range(patch)
-            return [
-                CodeUnit(
-                    path=path,
-                    kind="diff",
-                    name=f"{Path(path).name} (diff)",
-                    start_line=start,
-                    end_line=end,
-                    text=patch,
-                    token_count=tokens,
-                )
-            ]
-        # At or above the per-file threshold, split oversized patches by hunks.
-        pieces = re.split(r"(?=^@@ )", patch, flags=re.MULTILINE)
-        # Text before the first ``@@`` is the git file header, not a hunk:
-        # emitting it would create a bogus 1-1 unit that only carries
-        # ``diff --git`` / ``+++`` lines. A patch with no hunk at all is still
-        # handled as one piece so an oversized body stays reported.
-        has_hunks = any(piece.lstrip("\r\n").startswith("@@") for piece in pieces)
-        units: list[CodeUnit] = []
-        for piece in pieces:
-            if not piece.strip():
-                continue
-            if has_hunks and not piece.lstrip("\r\n").startswith("@@"):
-                continue
-            piece_tokens = estimate_tokens(piece)
-            match = re.search(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))?", piece)
-            start = int(match.group(1)) if match else 1
-            count = int(match.group(2) or 1) if match else 1
-            end = start + max(count - 1, 0)
-            if piece_tokens > DIFF_UNIT_TOKEN_THRESHOLD:
-                skipped.append(
-                    SkippedUnit(path, "token_limit_exceeded", start, end, detail="oversized hunk")
-                )
-                continue
-            units.append(
-                CodeUnit(
-                    path=path,
-                    kind="diff",
-                    name=f"{Path(path).name} (diff hunk)",
-                    start_line=start,
-                    end_line=end,
-                    text=piece,
-                    token_count=piece_tokens,
-                )
+        if not tokens:
+            skipped.append(
+                SkippedUnit(path, SKIPPED_REASON_EMPTY_PATCH, detail="no diff text")
             )
-        return units
+            return []
+        start, end = ProgrammaticEvidenceService._patch_range(patch)
+        return [
+            CodeUnit(
+                path=path,
+                kind="diff",
+                name=f"{Path(path).name} (diff)",
+                start_line=start,
+                end_line=end,
+                text=patch,
+                token_count=tokens,
+            )
+        ]
 
     @staticmethod
     def _patch_range(patch: str) -> tuple[int, int]:
@@ -607,7 +506,7 @@ class ProgrammaticEvidenceService:
         last = parse(hunks[-1])
         return first[0], max(first[1], last[1])
 
-    # -- annotation and budget filtering ---------------------------------
+    # -- annotation -------------------------------------------------------
 
     @staticmethod
     def _query_terms(query: str) -> set[str]:
@@ -638,51 +537,30 @@ class ProgrammaticEvidenceService:
             hard_limit=self.options.preview_hard_limit,
         )
 
-    def _apply_main_budget(
-        self,
-        units: list[CodeUnit],
-        budgets: EvidenceBudget,
-    ) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        """Keep diff units within the evidence budget, in frozen order.
-
-        Units are visited in the stable order preprocessing produced them (file
-        order, then line order per file) and any unit that no longer fits is
-        recorded as skipped; a later unit that still fits is kept, so the
-        accepted set is the frozen order minus the overflow. Nothing re-ranks
-        evidence by risk or query hits, so the reviewers see exactly the admitted
-        change itself.
-        """
-        accepted: list[CodeUnit] = []
-        skipped: list[SkippedUnit] = []
-        used = 0
-        for unit in units:
-            if used + unit.token_count > budgets.evidence_budget_tokens and accepted:
-                skipped.append(
-                    SkippedUnit(unit.path, "budget_exhausted", unit.start_line, unit.end_line, detail="task budget")
-                )
-                continue
-            accepted.append(unit)
-            used += unit.token_count
-        return accepted, skipped
-
     # -- ID assignment and manifest --------------------------------------
 
     @staticmethod
     def _assign_ids(units: list[CodeUnit], *, start: int) -> tuple[list[CodeUnit], list[SkippedUnit]]:
-        """Assign stable ev-NNN IDs; drop units without text as skipped."""
+        """Assign stable ev-NNN IDs; report units without text as skipped."""
         assigned: list[CodeUnit] = []
-        overflow: list[SkippedUnit] = []
+        empty: list[SkippedUnit] = []
         index = start - 1
         for unit in units:
             if not unit.text.strip():
-                overflow.append(
-                    SkippedUnit(unit.path, "token_limit_exceeded", unit.start_line, unit.end_line, detail="empty unit")
+                empty.append(
+                    SkippedUnit(
+                        unit.path,
+                        SKIPPED_REASON_EMPTY_PATCH,
+                        unit.start_line,
+                        unit.end_line,
+                        detail="empty unit",
+                    )
                 )
                 continue
             index += 1
             unit.unit_id = f"ev-{index:03d}"
             assigned.append(unit)
-        return assigned, overflow
+        return assigned, empty
 
     def render_manifest(
         self,

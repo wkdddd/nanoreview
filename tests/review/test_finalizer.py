@@ -31,11 +31,12 @@ from nanoreview.review.types import (
 class FakeJudge:
     """Judge stub returning a ``JudgeExecutionResult`` for the given verdicts."""
 
-    def __init__(self, verdicts, *, stats=None, usage=None, error=None):
+    def __init__(self, verdicts, *, stats=None, usage=None, error=None, budget_rejected=False):
         self.verdicts = verdicts
         self.stats = stats
         self.usage = dict(usage or {})
         self.error = error
+        self.budget_rejected = budget_rejected
         self.calls = 0
 
     async def judge_dimensions(self, dimensions):
@@ -45,6 +46,7 @@ class FakeJudge:
             stats=self.stats,
             usage=dict(self.usage),
             error=self.error,
+            budget_rejected=self.budget_rejected,
         )
 
 
@@ -544,18 +546,17 @@ class TestJudge:
             sent_candidates=1,
             returned_verdicts=0,
             needs_confirmation=1,
-            batches=1,
         )
         judge = FakeJudge(
             {
                 "security:src/app.py:1:partial judge issue": ReviewJudgeVerdict(
                     decision=ReviewJudgeDecision.NEEDS_CONFIRMATION,
-                    reason="AI judge batch failed; manual verification required",
+                    reason="AI judge failed; manual verification required",
                 )
             },
             stats=stats,
             usage={"total_tokens": 42},
-            error="AI judge batch failed (invalid_output): boom",
+            error="AI judge failed (invalid_output): boom",
         )
 
         returned, judged = await f.judge(judge, (validated,))
@@ -563,13 +564,62 @@ class TestJudge:
 
         assert returned.stats is stats
         assert returned.usage == {"total_tokens": 42}
-        assert returned.error == "AI judge batch failed (invalid_output): boom"
+        assert returned.error == "AI judge failed (invalid_output): boom"
         # A judge error never silently accepts: the candidate is surfaced.
         assert len(result.needs_confirmation) == 1
         assert result.needs_confirmation[0][0].title == "Partial judge issue"
-        assert "batch failed" in result.needs_confirmation[0][1].reason
+        assert "AI judge failed" in result.needs_confirmation[0][1].reason
         assert "### AI Judge Statistics" in result.report_markdown
         assert "- Sent to judge: 1" in result.report_markdown
+
+    @pytest.mark.asyncio
+    async def test_a_budget_rejected_judge_keeps_the_report_a_draft(self, workspace):
+        """A rejected candidate set adjudicates nothing: no candidate is confirmed."""
+        f = ReviewFinalizer(workspace)
+        validated = f.validate_findings(
+            "security",
+            _findings(
+                [
+                    {
+                        "severity": "high",
+                        "file": "src/app.py",
+                        "line": 1,
+                        "title": "Unadjudicated issue",
+                        "evidence": "line1",
+                        "impact": "bad",
+                        "recommendation": "fix",
+                    }
+                ]
+            ),
+        )
+        reason = (
+            "AI judge was not run: the complete candidate set does not fit one "
+            "judge request"
+        )
+        judge = FakeJudge(
+            {},
+            usage={},
+            error=reason,
+            budget_rejected=True,
+            stats=ReviewJudgeStats(
+                total_candidates=1, sent_candidates=0, needs_confirmation=1
+            ),
+        )
+
+        execution, judged = await f.judge(judge, (validated,))
+        result = f.finalize(judged, target_name="test", judge_stats=execution.stats)
+
+        assert execution.budget_rejected is True
+        # The validator accepted the candidate, but the judge never ruled on it.
+        assert len(result.dimensions[0].judged) == 1
+        assert result.dimensions[0].judged[0].judge_verdict is not None
+        assert (
+            result.dimensions[0].judged[0].judge_verdict.decision
+            == ReviewJudgeDecision.NEEDS_CONFIRMATION
+        )
+        assert "### Findings\n\nNo confirmed findings" in result.report_markdown
+        assert "### Needs Confirmation" in result.report_markdown
+        assert reason in result.report_markdown
 
     @pytest.mark.asyncio
     async def test_an_escalated_failure_reports_a_bounded_error(self, workspace):

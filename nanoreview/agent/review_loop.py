@@ -60,6 +60,7 @@ from nanoreview.agent.review_state import (
 from nanoreview.agent.subagent_profiles import SubagentExecutionLimits
 from nanoreview.bus.events import InboundMessage
 from nanoreview.events import NO_EVENTS, EventSink, ProgressEvent
+from nanoreview.review.budget import REVIEWER_TOOL_SCHEMA_TOKENS, ReviewBudget
 from nanoreview.review.input.snapshot import ReviewSnapshotStore
 from nanoreview.review.output.finalizer import (
     ReviewFinalizer,
@@ -72,6 +73,7 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceOptions,
     ProgrammaticEvidenceService,
 )
+from nanoreview.review.profiles import reviewer_execution_profiles
 from nanoreview.review.result import ReviewResult, result_from_board
 from nanoreview.review.types import (
     EvidenceReference,
@@ -89,13 +91,6 @@ if TYPE_CHECKING:
     from nanoreview.review.output.judge import ReviewJudge
     from nanoreview.session.manager import Session, SessionManager
 
-#: Fixed context window for the whole review pipeline (reviewer, Judge). The
-#: review run does not follow the conversation agent's configured window and
-#: does not dynamically probe the provider: the project fixes it at 200k so
-#: evidence budgets are deterministic.
-REVIEW_CONTEXT_WINDOW_TOKENS = 200_000
-#: Reviewer per-response output cap.
-REVIEWER_MAX_OUTPUT_TOKENS = 8_192
 #: Hard cap on reviewer model requests per run (each AgentRun iteration is one
 #: request). The last request still belongs to the reviewer: the accepted final
 #: answer has to be the structured findings payload, and ``AgentRunner`` feeds
@@ -105,7 +100,7 @@ REVIEWER_MODEL_REQUEST_LIMIT = 30
 #: Wall-clock timeout for one reviewer run.
 REVIEWER_TIMEOUT_SECONDS = 180
 
-#: Batch id of the run's single aggregated judge pass.
+#: Child id of the run's single aggregated judge pass.
 _JUDGE_BATCH_ID = "judge"
 
 #: Header used when a run fails before a report can be produced, so the turn
@@ -116,11 +111,11 @@ _ERROR_REPORT_HEADER = "## Code Review Report\n\n### Error"
 _PENDING_USER_TURN_KEY = "pending_user_turn"
 
 
-def review_budget_contract() -> dict[str, int]:
-    """The fixed review-run budget contract, persisted for replay/audit."""
+def review_budget_contract(budget: ReviewBudget | None = None) -> dict[str, int]:
+    """The review-run budget contract, persisted for replay/audit."""
+    resolved = budget or ReviewBudget()
     return {
-        "context_window_tokens": REVIEW_CONTEXT_WINDOW_TOKENS,
-        "reviewer_max_output_tokens": REVIEWER_MAX_OUTPUT_TOKENS,
+        **resolved.contract(),
         "reviewer_model_request_limit": REVIEWER_MODEL_REQUEST_LIMIT,
         "reviewer_timeout_seconds": REVIEWER_TIMEOUT_SECONDS,
     }
@@ -348,9 +343,11 @@ class ReviewLoop:
         self._context = context_builder or ContextBuilder(self._workspace)
         self._max_messages = max_messages if max_messages > 0 else 120
         self._max_concurrent_subagents = int(max_concurrent_subagents or 1)
-        # The review pipeline uses one fixed window, independent of the
-        # conversation agent's configured window (see the module constants).
-        self._context_window_tokens = REVIEW_CONTEXT_WINDOW_TOKENS
+        # The review pipeline budgets against its own configured window, not
+        # the conversation agent's: reviewers and the judge are checked against
+        # the same explicit numbers (see ``ReviewBudget``).
+        self._budget = ReviewBudget.from_review_config(review_config)
+        self._context_window_tokens = self._budget.context_window_tokens
         self._judge_factory = judge_factory
         # Snapshots are written by the admission service; the loop augments the
         # same run's snapshot after planning with the accepted evidence, the
@@ -371,6 +368,9 @@ class ReviewLoop:
         # One-shot guard for the tokenizer-unavailable warning so long runs
         # with many dimensions do not spam the log.
         self._tokenizer_fallback_warned = False
+        #: Reviewer execution profiles, resolved on first use for the
+        #: pre-dispatch request budget check.
+        self._reviewer_profiles: dict[str, Any] | None = None
 
     # -- runtime ------------------------------------------------------------
 
@@ -384,8 +384,8 @@ class ReviewLoop:
 
         The provider itself is shared through the coordinator's runner and
         subagents; the loop only tracks the model id. The review context window
-        is fixed (see ``REVIEW_CONTEXT_WINDOW_TOKENS``) and is deliberately not
-        updated by a conversation-side model switch, so the review budget stays
+        comes from ``ReviewConfig`` and is deliberately not updated by a
+        conversation-side model switch, so the review budget stays
         deterministic; ``context_window_tokens`` is accepted for call-site
         symmetry and ignored.
         """
@@ -440,36 +440,40 @@ class ReviewLoop:
             )
         finally:
             self._release_inflight_marker(request)
-        # The artifact decides success: a run whose report could not be
-        # persisted must never be handed over as a complete review.
+        # Two things can keep a run from being completed, and both still deliver
+        # the report: a missing artifact (nothing is on disk to hand over) and a
+        # draft (the candidate set was never adjudicated). Decide the terminal
+        # status and its reason first, then take the single cleanup/settle exit
+        # below — the exits differ only in those two values.
         board = self._boards.view(request.session_key)
         report_ref = board.report_ref if board is not None else None
         if report_ref is None:
+            status = ReviewRunStatus.ERROR
             reason = (
                 board.warnings[-1]
                 if board is not None and board.warnings
                 else "the review report artifact could not be persisted"
             )
-            try:
-                await self._cleanup_run(request.session_key, writer)
-                result = await self._settle_run(writer, ReviewRunStatus.ERROR)
-            except (ReviewCleanupError, ReviewBoardPersistenceError) as exc:
-                return self._unsettled_outcome(finalizer_result, f"{reason}; {exc}")
-            return ReviewLoopOutcome(
-                report_markdown=finalizer_result.report_markdown,
-                result=result,
-                stop_reason="error",
-                error=reason,
-                produces_report=True,
-            )
+        elif finalizer_result.draft_reason:
+            # The reason is already on the board: it was recorded before the
+            # artifact was written.
+            status = ReviewRunStatus.ERROR
+            reason = finalizer_result.draft_reason
+        else:
+            status = ReviewRunStatus.COMPLETED
+            reason = ""
         try:
             await self._cleanup_run(request.session_key, writer)
-            result = await self._settle_run(writer, ReviewRunStatus.COMPLETED)
+            result = await self._settle_run(writer, status)
         except (ReviewCleanupError, ReviewBoardPersistenceError) as exc:
-            return self._unsettled_outcome(finalizer_result, str(exc))
+            return self._unsettled_outcome(
+                finalizer_result, f"{reason}; {exc}" if reason else str(exc)
+            )
         return ReviewLoopOutcome(
             report_markdown=finalizer_result.report_markdown,
             result=result,
+            stop_reason="error" if reason else "",
+            error=reason,
             produces_report=True,
         )
 
@@ -615,9 +619,6 @@ class ReviewLoop:
         review_meta.setdefault(
             ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS, self._max_concurrent_subagents
         )
-        review_meta[ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS] = (
-            self._context_window_tokens
-        )
         # The evidence service is an internal dependency of the review loop, so
         # prefetch works without a repository-reader tool being registered for
         # the review model roles.
@@ -759,7 +760,6 @@ class ReviewLoop:
         changed = False
         for key in (
             ReviewMetaKey.ALLOWED_DIMENSIONS,
-            ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS,
             ReviewMetaKey.LOCAL_ROOT,
             ReviewMetaKey.LOCAL_TARGET,
             ReviewMetaKey.LOCAL_SCOPE_KIND,
@@ -885,7 +885,7 @@ class ReviewLoop:
             for assignment in assignments
         ]
         sections: dict[str, Any] = {
-            "budget": review_budget_contract(),
+            "budget": review_budget_contract(self._budget),
             "evidence": {
                 "accepted_units": len(accepted_ids),
                 "accepted_ids": accepted_ids,
@@ -913,17 +913,20 @@ class ReviewLoop:
     ) -> ReviewFinalizerResult:
         """Dispatch reviewers, collect them, apply the Judge, finalize."""
         await writer.advance(ReviewPhase.REVIEW)
-        # Every validated assignment is dispatched: dimensions are either
-        # explicit user intent or planner decisions, and neither may be
-        # silently dropped by a token-count gate. Evidence-side over-budget
-        # units are already recorded by the preprocessor as SkippedReviewUnit.
-        await writer.start_assignments(tuple(assignments))
-        limits_by_dimension = await self._derive_execution_limits(
+        # The admitted diff reaches every reviewer in full, so the run is either
+        # served by the configured window or rejected here — before a single
+        # reviewer starts. Dropping files, clipping excerpts or skipping one
+        # reviewer would review a subset of the change while reporting success.
+        prompt_tokens_by_dimension = self._require_reviewer_request_budget(
             plan=inputs.plan,
+            assignments=assignments,
+            evidence=inputs.evidence,
+        )
+        await writer.start_assignments(tuple(assignments))
+        limits_by_dimension = self._derive_execution_limits(
             evidence=inputs.evidence,
             assignments=assignments,
-            validation_workspace=inputs.validation_workspace,
-            local_target=inputs.local_target,
+            prompt_tokens_by_dimension=prompt_tokens_by_dimension,
         )
         board = self._boards.view(request.session_key)
         finalizer = ReviewFinalizer(
@@ -949,16 +952,26 @@ class ReviewLoop:
         )
         judge = self._judge_factory() if self._judge_factory else None
         judge_stats: "ReviewJudgeStats | None" = None
+        draft_reason = ""
         if judge is not None:
             # The aggregated batch goes running before the pass starts so a
             # failure cannot leave it stuck in ``pending``/``running``.
             await writer.judge_started(_JUDGE_BATCH_ID)
             judge_result, judged = await finalizer.judge(judge, dimensions)
             # Only this invocation's judge usage is folded into the run total,
-            # so it reflects exactly one judge pass. Batches are a context-window
-            # split inside one business step, not independent units.
+            # so it reflects exactly one judge pass.
             await writer.add_usage(judge_result.usage)
             judge_stats = judge_result.stats
+            # A rejected budget means no verdict exists: the run keeps the
+            # reviewer/validator results as a draft and settles as ``error``
+            # instead of completing an unadjudicated review.
+            if judge_result.budget_rejected:
+                # A rejected budget always leaves a draft: fall back to a fixed
+                # reason so no judge implementation can settle it as completed.
+                draft_reason = (
+                    judge_result.error
+                    or "AI judge was not run; manual verification required"
+                )
             if judge_result.error:
                 # Judge failure/timeout stays a judge-level problem: record it
                 # locally, keep the run eligible to complete, and let the
@@ -988,6 +1001,7 @@ class ReviewLoop:
             dimensions,
             target_name=inputs.plan.target_name or inputs.plan.target or "target",
             judge_stats=judge_stats,
+            draft_reason=draft_reason,
         )
         for error in finalizer_result.errors:
             await writer.add_warning(error)
@@ -1011,121 +1025,172 @@ class ReviewLoop:
         method finishes that phase rather than re-entering it.
         """
         findings, verdicts = serialize_finalizer_result(finalizer_result)
+        if finalizer_result.draft_reason:
+            # Recorded before the artifact is written: the artifact is the
+            # durable record of the run, so its warnings and status must agree
+            # with the ``error`` the run settles to. A draft stored as a
+            # completed review would stay misleading after a restart.
+            await writer.add_warning(finalizer_result.draft_reason)
         report_ref = await writer.record_report(
             report_markdown=finalizer_result.report_markdown,
             findings=findings,
             verdicts=verdicts,
+            status=(
+                ReviewRunStatus.ERROR
+                if finalizer_result.draft_reason
+                else ReviewRunStatus.COMPLETED
+            ),
         )
         if report_ref is None:
             await writer.add_warning("Failed to persist the review report artifact.")
         await writer.persist_metadata()
 
-    async def _derive_execution_limits(
+    def _require_reviewer_request_budget(
         self,
         *,
         plan: ReviewPlan,
-        evidence: ReviewEvidenceBundle,
         assignments: tuple[ReviewAssignment, ...],
-        validation_workspace: str,
-        local_target: str | None,
-    ) -> dict[str, SubagentExecutionLimits]:
-        """Derive per-dimension execution limits.
+        evidence: ReviewEvidenceBundle,
+    ) -> dict[str, int]:
+        """Reject the run when any selected reviewer's first request is too big.
 
-        Reviewer limits are fixed by the review budget contract: at most
-        ``REVIEWER_MODEL_REQUEST_LIMIT`` model requests (the last iteration is
-        the reviewer's final structured answer), ``REVIEWER_MAX_OUTPUT_TOKENS``
-        output tokens per response, ``REVIEWER_TIMEOUT_SECONDS`` wall clock and
-        the fixed review context window. Evidence volume is recorded for
-        observability but no longer scales the request allowance, and no
-        dimension is skipped here.
+        Checked before dispatch, for every selected reviewer, against the same
+        complete diff::
+
+            prompt + complete diff + context read reserve + output reserve
+                + safety margin <= configured window
+
+        One over-budget reviewer rejects the whole review, because reviewing the
+        rest would present an incomplete change as a finished review. Returns the
+        prompt tokens it measured per dimension, so dispatch and the run log
+        never rebuild the same request to measure it again.
         """
         reference_map = evidence.by_id()
-        limits: dict[str, SubagentExecutionLimits] = {}
-        # Every selected reviewer now receives the same accepted evidence set,
-        # so the estimate is memoised per evidence tuple: the tokenizer pass and
-        # the target-file read happen once per distinct set, not once per
-        # reviewer. Distinct sets still get their own estimate.
-        estimates: dict[tuple[str, ...], int] = {}
+        prompt_tokens_by_dimension: dict[str, int] = {}
         for assignment in assignments:
             references = _expand_assignment_references(
                 reference_map, assignment.evidence_ids
             )
-            estimate_key = tuple(reference.id for reference in references)
-            input_tokens = estimates.get(estimate_key)
-            if input_tokens is None:
-                input_tokens = await self._estimate_input_tokens(
-                    plan=plan,
-                    references=references,
-                    validation_workspace=validation_workspace,
-                    local_target=local_target,
-                )
-                estimates[estimate_key] = input_tokens
-            limits[assignment.dimension] = SubagentExecutionLimits(
-                max_iterations=REVIEWER_MODEL_REQUEST_LIMIT,
-                max_tokens=REVIEWER_MAX_OUTPUT_TOKENS,
-                timeout_seconds=REVIEWER_TIMEOUT_SECONDS,
-                context_window_tokens=REVIEW_CONTEXT_WINDOW_TOKENS,
+            if not references:
+                # Nothing to review in this dimension; dispatch records it as an
+                # explicit incomplete reviewer instead of a budget rejection.
+                continue
+            prompt_tokens = self._reviewer_request_prompt_tokens(
+                plan=plan, assignment=assignment, references=references
             )
+            prompt_tokens_by_dimension[assignment.dimension] = prompt_tokens
+            budget = self._budget.reviewer_request(prompt_tokens=prompt_tokens)
             logger.info(
-                "review.subagent.limit dimension={} evidence_units={} estimated_input_tokens={}",
+                "review.subagent.budget dimension={} evidence_units={} required_tokens={} window={}",
                 assignment.dimension,
                 len(references),
-                input_tokens,
+                budget.required_tokens,
+                budget.context_window_tokens,
+            )
+            if budget.fits:
+                continue
+            raise ReviewPlanningError(
+                f"Review cannot start: reviewer {assignment.dimension!r} needs "
+                f"{budget.required_tokens} tokens for its first request "
+                f"({budget.describe()}, over by {budget.over_by_tokens}), "
+                f"including the complete diff of {len(references)} evidence unit(s). "
+                "No reviewer was started. "
+                "Reduce the reviewed diff, or raise review.context_window_tokens "
+                "(or lower review.reviewer_context_read_reserve_tokens) to match "
+                "the model actually serving the review roles."
+            )
+        return prompt_tokens_by_dimension
+
+    def _reviewer_request_prompt_tokens(
+        self,
+        *,
+        plan: ReviewPlan,
+        assignment: ReviewAssignment,
+        references: list[EvidenceReference],
+    ) -> int:
+        """Tokens of the reviewer's initial request prompt (system + full diff)."""
+        system_prompt = self._reviewer_system_prompt(plan, assignment.dimension)
+        task = self._build_subagent_task(
+            plan=plan, assignment=assignment, references=references
+        )
+        from nanoreview.utils.helpers import estimate_prompt_tokens_with_fallback
+
+        prompt_tokens, source = estimate_prompt_tokens_with_fallback(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": task},
+            ]
+        )
+        if source == "upper_bound" and not self._tokenizer_fallback_warned:
+            logger.warning(
+                "review.reviewer.tokenizer_unavailable fallback=upper_bound_per_character"
+            )
+            self._tokenizer_fallback_warned = True
+        # The reviewer scope ships its own tool schemas; they travel with every
+        # request but cannot be enumerated without the subagent manager, so they
+        # are accounted as a conservative reserve.
+        return prompt_tokens + REVIEWER_TOOL_SCHEMA_TOKENS
+
+    def _reviewer_system_prompt(self, plan: ReviewPlan, dimension: str) -> str:
+        """Build the reviewer system prompt exactly as its run will receive it."""
+        if self._reviewer_profiles is None:
+            self._reviewer_profiles = reviewer_execution_profiles()
+        profile = self._reviewer_profiles.get(dimension)
+        if profile is None or profile.prompt_builder is None:
+            return ""
+        metadata = {
+            "repository_root": validation_repository_root(plan, self._workspace),
+            "common_rules_workspace": str(self._workspace),
+        }
+        workspace = (
+            profile.workspace_resolver(metadata, self._workspace)
+            if profile.workspace_resolver is not None
+            else self._workspace
+        )
+        return profile.prompt_builder(metadata, workspace)
+
+    def _derive_execution_limits(
+        self,
+        *,
+        evidence: ReviewEvidenceBundle,
+        assignments: tuple[ReviewAssignment, ...],
+        prompt_tokens_by_dimension: dict[str, int],
+    ) -> dict[str, SubagentExecutionLimits]:
+        """Derive per-dimension execution limits.
+
+        Reviewer limits come from the review budget: at most
+        ``REVIEWER_MODEL_REQUEST_LIMIT`` model requests (the last iteration is
+        the reviewer's final structured answer), the configured reviewer output
+        cap per response, ``REVIEWER_TIMEOUT_SECONDS`` wall clock and the
+        configured review context window. Evidence volume is recorded for
+        observability but does not scale the request allowance.
+        """
+        reference_map = evidence.by_id()
+        limits: dict[str, SubagentExecutionLimits] = {}
+        for assignment in assignments:
+            references = _expand_assignment_references(
+                reference_map, assignment.evidence_ids
+            )
+            limits[assignment.dimension] = SubagentExecutionLimits(
+                max_iterations=REVIEWER_MODEL_REQUEST_LIMIT,
+                max_tokens=self._budget.reviewer_output_tokens,
+                timeout_seconds=REVIEWER_TIMEOUT_SECONDS,
+                context_window_tokens=self._budget.context_window_tokens,
+            )
+            logger.info(
+                "review.subagent.limit dimension={} evidence_units={} prompt_tokens={}",
+                assignment.dimension,
+                len(references),
+                prompt_tokens_by_dimension.get(assignment.dimension),
             )
         logger.info(
             "review.subagent.limits dimensions={} max_iterations={} max_tokens={} timeout_seconds={}",
             len(limits),
             REVIEWER_MODEL_REQUEST_LIMIT,
-            REVIEWER_MAX_OUTPUT_TOKENS,
+            self._budget.reviewer_output_tokens,
             REVIEWER_TIMEOUT_SECONDS,
         )
         return limits
-
-    async def _estimate_input_tokens(
-        self,
-        *,
-        plan: ReviewPlan,
-        references: list[EvidenceReference],
-        validation_workspace: str,
-        local_target: str | None,
-    ) -> int:
-        """Estimate target/evidence input without blocking the event loop.
-
-        tiktoken is optional; when unavailable the estimate falls back to a
-        chars/4 heuristic (with a one-time warning) so the derived round
-        count keeps scaling with evidence instead of silently collapsing.
-        """
-        target_text = ""
-        target_path = local_target
-        if (
-            target_path is None
-            and plan.local_scope is not None
-            and plan.local_scope.kind == "file"
-        ):
-            target_path = plan.local_scope.target_path
-        if target_path:
-            try:
-                path = Path(target_path).expanduser().resolve()
-                root = Path(validation_workspace).expanduser().resolve()
-                path.relative_to(root)
-                target_text = await asyncio.to_thread(path.read_text, encoding="utf-8")
-            except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
-                target_text = ""
-        evidence_text = "\n".join(reference.excerpt for reference in references)
-        combined = "\n".join((target_text, evidence_text))
-        from nanoreview.utils.helpers import estimate_prompt_tokens
-
-        estimate = estimate_prompt_tokens([{"role": "user", "content": combined}])
-        if estimate > 0:
-            return int(estimate)
-        if not self._tokenizer_fallback_warned:
-            logger.warning(
-                "review.orchestration.tokenizer_unavailable fallback=chars_per_token_4"
-            )
-            self._tokenizer_fallback_warned = True
-        # Conservative fallback mirroring review/output/judge.py: ~4 chars
-        # per token; max(1, ...) keeps an empty input estimateable.
-        return max(1, len(combined) // 4)
 
     async def _dispatch_and_collect(
         self,
@@ -1564,7 +1629,6 @@ def _judge_stats_payload(stats: "ReviewJudgeStats | None") -> dict[str, int]:
         "sent_candidates": stats.sent_candidates,
         "returned_verdicts": stats.returned_verdicts,
         "needs_confirmation": stats.needs_confirmation,
-        "batches": stats.batches,
     }
 
 

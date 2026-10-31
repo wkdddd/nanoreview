@@ -241,8 +241,11 @@ class ToolsConfig(Base):
 class ReviewJudgeSettings(Base):
     """AI judge configuration for code review findings.
 
-    The judge collects all accepted/uncertain candidates and batches them by
-    the model's context window; there is no fixed candidate cap.
+    The judge receives every accepted/uncertain candidate in one request and
+    returns one verdict per candidate; ``max_tokens`` is the response cap that
+    both the window check and the request use, so it has to hold the complete
+    verdict payload (roughly 90 tokens per candidate). A set that does not fit
+    is rejected outright instead of being split.
     """
 
     enabled: bool = True
@@ -259,7 +262,7 @@ class ReviewJudgeSettings(Base):
         serialization_alias="timeoutSeconds",
     )
     max_tokens: int = Field(
-        default=2048,
+        default=8192,
         ge=256,
         le=16000,
         validation_alias=AliasChoices("maxTokens", "max_tokens"),
@@ -273,12 +276,16 @@ class ReviewConfig(Base):
     default_focus: list[str] = Field(default_factory=list)
     max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None
-    # Upper bound on accepted evidence tokens. The effective budget is also
-    # clamped by the provider context window (see EvidenceBudget.from_options);
-    # values above the usable window cannot widen it. ReviewLoop fixes the
-    # context window at 200k, giving a usable window of 171k and a 150k diff
-    # evidence budget.
-    evidence_token_budget: int = Field(default=150_000, ge=10_000)
+    # Model window the review roles run in. Every reviewer request and the
+    # judge request are checked against it before the model is called; review
+    # never trims input to fit, so a request that does not fit rejects the run.
+    context_window_tokens: int = Field(default=200_000, ge=4_096)
+    # Response cap of one reviewer turn.
+    reviewer_max_output_tokens: int = Field(default=8_192, ge=256)
+    # Room kept so a reviewer can still read context after its initial request.
+    reviewer_context_read_reserve_tokens: int = Field(default=32_000, ge=0)
+    # Slack subtracted from every request budget check.
+    budget_safety_margin_tokens: int = Field(default=4_000, ge=0)
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
     # Per-unit evidence preview budget: soft target and absolute ceiling.
     preview_target_chars: int = Field(default=600, ge=1)

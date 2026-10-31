@@ -70,7 +70,6 @@ class ReviewEvidenceService:
         include_tests: bool | None = None,
         local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
-        context_window_tokens: int | None = None,
         frozen_diff: dict[str, Any] | None = None,
     ) -> str:
         """Unified entry point for review evidence retrieval.
@@ -95,7 +94,6 @@ class ReviewEvidenceService:
             max_results=max_results,
             include_tests=include_tests,
             local_scope=local_scope,
-            context_window_tokens=context_window_tokens,
             frozen_diff=frozen_diff,
         )
 
@@ -114,7 +112,6 @@ class ReviewEvidenceService:
         max_results: int,
         include_tests: bool | None,
         local_scope: LocalReviewScope | None = None,
-        context_window_tokens: int | None = None,
         frozen_diff: dict[str, Any] | None = None,
     ) -> str:
         started = time.perf_counter()
@@ -138,7 +135,6 @@ class ReviewEvidenceService:
             preprocessor.diff_units,
             patches,
             review_query=(review_query or "").strip() or _DEFAULT_DIFF_QUERY,
-            context_window_tokens=context_window_tokens,
         )
         # File-level filter reasons from the patch collector become skipped units.
         result.skipped.extend(
@@ -157,7 +153,7 @@ class ReviewEvidenceService:
             changed_files=len(patches),
             units_count=len(result.units),
             skipped_count=len(result.skipped),
-            mode=result.mode,
+            total_tokens=result.total_tokens,
             frozen=frozen,
             context_chars=len(result.context),
             elapsed_ms=f"{(time.perf_counter() - started) * 1000:.1f}",

@@ -72,6 +72,9 @@ class ReviewFinalizerResult:
         default_factory=list
     )
     errors: list[str] = field(default_factory=list)
+    #: Non-empty when the candidate set was never adjudicated: the report is a
+    #: draft over reviewer/validator results and the run must settle as error.
+    draft_reason: str = ""
 
 
 class ReviewFinalizer:
@@ -164,20 +167,14 @@ class ReviewFinalizer:
         Returns the judge's execution result and the *new* candidate set: the
         caller records both, so the report and the recorded verdicts always come
         from one candidate version. Candidates without a verdict — including
-        every candidate of a failed batch — are marked ``needs_confirmation``
-        rather than inheriting their hard verdicts, so a candidate is never
-        presented as having passed the judge.
+        every candidate of a rejected or failed pass — are marked
+        ``needs_confirmation`` rather than inheriting their hard verdicts, so a
+        candidate is never presented as having passed the judge.
         """
-        from nanoreview.review.output.judge import JudgeExecutionResult
-
         if judge is None:
             logger.info("review.finalizer.judge.unavailable reason=not_created")
-            judged, stats = self._mark_unjudged(
+            return self._unjudged(
                 dimensions, "AI judge is unavailable; manual verification required"
-            )
-            return (
-                JudgeExecutionResult(verdicts={}, stats=stats, usage={}, error=None),
-                judged,
             )
         try:
             result = await judge.judge_dimensions(list(dimensions))
@@ -185,35 +182,33 @@ class ReviewFinalizer:
             # Cancellation is a BaseException and propagates untouched; any
             # other escaping judge failure degrades to needs_confirmation.
             logger.warning("review.finalizer.judge.failed reason={}", exc)
-            judged, stats = self._mark_unjudged(
-                dimensions, "AI judge failed; manual verification required"
+            return self._unjudged(
+                dimensions,
+                "AI judge failed; manual verification required",
+                error=bound_child_error(exc),
             )
-            return (
-                JudgeExecutionResult(
-                    verdicts={}, stats=stats, usage={}, error=bound_child_error(exc)
-                ),
-                judged,
+        if result.budget_rejected:
+            logger.warning("review.finalizer.judge.rejected reason={}", result.error)
+            return self._unjudged(
+                dimensions,
+                result.error or "AI judge was not run; manual verification required",
+                usage=result.usage,
+                error=result.error,
+                budget_rejected=True,
             )
         if result.error:
-            logger.warning("review.finalizer.judge.partial_failure reason={}", result.error)
+            logger.warning("review.finalizer.judge.failed reason={}", result.error)
         if not result.verdicts:
             if self._candidate_total(dimensions) > 0:
                 logger.warning(
                     "review.finalizer.judge.no_verdicts candidates={}",
                     self._candidate_total(dimensions),
                 )
-                judged, stats = self._mark_unjudged(
+                return self._unjudged(
                     dimensions,
                     "AI judge returned no verdicts; manual verification required",
-                )
-                return (
-                    JudgeExecutionResult(
-                        verdicts={},
-                        stats=stats,
-                        usage=result.usage,
-                        error=result.error,
-                    ),
-                    judged,
+                    usage=result.usage,
+                    error=result.error,
                 )
             return result, self._apply_hard_verdicts(dimensions)
         merged = tuple(
@@ -223,6 +218,36 @@ class ReviewFinalizer:
         logger.info("review.finalizer.judge.applied dimensions={}", len(merged))
         return result, merged
 
+    def _unjudged(
+        self,
+        dimensions: tuple[ReviewDimensionResult, ...],
+        reason: str,
+        *,
+        usage: dict[str, int] | None = None,
+        error: str | None = None,
+        budget_rejected: bool = False,
+    ) -> tuple["JudgeExecutionResult", tuple[ReviewDimensionResult, ...]]:
+        """Mark every candidate unjudged; the single exit for "no adjudication".
+
+        Reached when no judge is configured, when it crashed, when its budget
+        could not serve the candidate set, and when it returned no verdicts.
+        Keeping the hard verdicts but never a judge decision is what stops these
+        paths from reading as a passed review.
+        """
+        from nanoreview.review.output.judge import JudgeExecutionResult
+
+        judged, stats = self._mark_unjudged(dimensions, reason)
+        return (
+            JudgeExecutionResult(
+                verdicts={},
+                stats=stats,
+                usage=dict(usage or {}),
+                error=error,
+                budget_rejected=budget_rejected,
+            ),
+            judged,
+        )
+
     # -- report -------------------------------------------------------------
 
     def finalize(
@@ -231,12 +256,14 @@ class ReviewFinalizer:
         *,
         target_name: str | None = None,
         judge_stats: "ReviewJudgeStats | None" = None,
+        draft_reason: str = "",
     ) -> ReviewFinalizerResult:
         """Render the report from a candidate set.
 
         A run with no dimension results is an error: the program always
         dispatches one task per selected reviewer, so an empty result set means
-        no reviewer produced a usable outcome.
+        no reviewer produced a usable outcome. ``draft_reason`` labels a report
+        whose candidate set was never adjudicated.
         """
         errors: list[str] = []
         if not dimensions:
@@ -252,6 +279,7 @@ class ReviewFinalizer:
                 selected_dimensions=self._selected_dimensions,
                 skipped_files=self._skipped_files,
                 judge_stats=judge_stats,
+                draft_reason=draft_reason,
             )
         except Exception as exc:
             logger.error("report rendering failed: {}", exc)
@@ -265,6 +293,7 @@ class ReviewFinalizer:
             dimensions=final_dimensions,
             needs_confirmation=needs_confirmation,
             errors=errors,
+            draft_reason=draft_reason,
         )
 
     def _target_name(self) -> str:
@@ -363,7 +392,6 @@ class ReviewFinalizer:
             sent_candidates=0,
             returned_verdicts=0,
             needs_confirmation=total,
-            batches=0,
         )
 
     @staticmethod
