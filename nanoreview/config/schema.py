@@ -176,6 +176,33 @@ class GatewayConfig(Base):
     port: int = 18790
 
 
+class DatabaseConfig(Base):
+    """PostgreSQL connection used by every persistence path.
+
+    ``database.url`` may be overridden at process start by
+    ``NANOREVIEW_DATABASE_URL`` so deployments never need the credential in
+    ``config.json``. ``postgres://`` and ``postgresql://`` URLs are normalized
+    to the asyncpg driver by :func:`nanoreview.storage.database.resolve_database_url`.
+    """
+
+    url: str | None = None
+    echo: bool = False
+    pool_size: int = Field(default=5, ge=1, le=50)
+
+
+class GitHubConfig(Base):
+    """Server-side GitHub credentials for pull-request review.
+
+    One token serves every review; per-user OAuth is explicitly out of scope.
+    The token is never written to business tables, prompts, logs or reports.
+    """
+
+    token: str | None = None
+    api_base: str = "https://api.github.com"
+    timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
+    max_pages: int = Field(default=50, ge=1, le=200)
+
+
 def _lazy_default(module_path: str, class_name: str) -> Any:
     """Deferred import helper for ToolsConfig default factories."""
     import importlib
@@ -301,6 +328,8 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
