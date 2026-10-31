@@ -1,9 +1,9 @@
 """PostgreSQL persistence for sessions, PR snapshots and review artifacts."""
 
 from nanoreview.storage.database import (
+    SCHEMA_HEAD,
     Database,
     DatabaseNotConfiguredError,
-    SCHEMA_HEAD,
     SchemaNotMigratedError,
     resolve_database_url,
 )

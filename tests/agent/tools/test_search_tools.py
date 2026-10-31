@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from nanoreview.agent.tools.context import RequestContext, reset_current_request_context, set_current_request_context
+from nanoreview.agent.tools.context import (
+    RequestContext,
+    reset_current_request_context,
+    set_current_request_context,
+)
 from nanoreview.agent.tools.search import GrepTool, search_text_lines
 from nanoreview.agent.tools.search_core import (
     MatchConfig,

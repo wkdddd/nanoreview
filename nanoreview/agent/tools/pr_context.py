@@ -11,7 +11,12 @@ from __future__ import annotations
 from typing import Any
 
 from nanoreview.agent.tools.base import Tool, tool_parameters
-from nanoreview.agent.tools.schema import BooleanSchema, IntegerSchema, StringSchema, tool_parameters_schema
+from nanoreview.agent.tools.schema import (
+    BooleanSchema,
+    IntegerSchema,
+    StringSchema,
+    tool_parameters_schema,
+)
 from nanoreview.review.source.pr_context import PrContextSession
 
 

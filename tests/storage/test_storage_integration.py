@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from nanoreview.storage.database import Database, SCHEMA_HEAD, SchemaNotMigratedError
+from nanoreview.storage.database import SCHEMA_HEAD, Database, SchemaNotMigratedError
 from nanoreview.storage.records import ChangedFile, ReviewSnapshot
 from nanoreview.storage.repositories import Storage
 

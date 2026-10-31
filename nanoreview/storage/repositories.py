@@ -23,12 +23,12 @@ from nanoreview.storage.models import (
     MessageRow,
     PullRequestRow,
     RepositoryRow,
+    ReviewerResultRow,
     ReviewEvidenceRow,
     ReviewFindingRow,
     ReviewReportRow,
     ReviewRunRow,
     ReviewSnapshotRow,
-    ReviewerResultRow,
     SessionRow,
 )
 from nanoreview.storage.records import (
