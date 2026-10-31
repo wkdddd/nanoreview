@@ -54,6 +54,8 @@ coverage.xml
 # in subprocess test runs; safe to delete, never tracked)
 pytest-of-*/
 pytest-*/
+# basetemp used by the review test runs (never tracked)
+.pytest-tmp/
 
 # Lock files (project policy)
 poetry.lock
