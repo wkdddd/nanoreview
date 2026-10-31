@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from nanoreview.agent.output_contract import OutputContract
 from nanoreview.agent.runner import AgentRunResult
+
+if TYPE_CHECKING:
+    from nanoreview.agent.llm_runtime import LLMRuntime
 
 BUG_REVIEWER_SCOPE = "reviewer.bug"
 SECURITY_REVIEWER_SCOPE = "reviewer.security"
@@ -23,14 +26,18 @@ GENERAL_REVIEWER_SCOPE = "reviewer.general"
 
 @dataclass(frozen=True, slots=True)
 class SubagentExecutionLimits:
-    """Per-task runtime limits supplied by a controlling orchestrator."""
+    """Per-task runtime limits supplied by a controlling orchestrator.
+
+    There is deliberately no role-level wall-clock budget: a run is bounded by
+    its request allowance (``max_iterations``) and by the per-request provider
+    timeout, so a slow request can never silently truncate a reviewer's work
+    halfway through a batch.
+    """
 
     max_iterations: int | None = None
-    max_tokens: int | None = None
-    timeout_seconds: float | None = None
-    #: Per-task context window override. ``None`` keeps the manager's window;
-    #: the review pipeline pins its reviewers to the fixed review window.
-    context_window_tokens: int | None = None
+    #: Frozen model runtime for this task. ``None`` keeps the manager's live
+    #: provider/model and its current generation settings.
+    runtime: "LLMRuntime | None" = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -31,6 +31,7 @@ from typing import Any, cast
 
 import pytest
 
+from nanoreview.agent.llm_runtime import ROLE_REVIEWER, LLMRuntime
 from nanoreview.agent.review_board import (
     CHILD_COMPLETED,
     CHILD_ERROR,
@@ -42,10 +43,7 @@ from nanoreview.agent.review_board import (
     ReviewerSnapshot,
 )
 from nanoreview.agent.review_loop import (
-    REVIEW_CONTEXT_WINDOW_TOKENS,
-    REVIEWER_MAX_OUTPUT_TOKENS,
     REVIEWER_MODEL_REQUEST_LIMIT,
-    REVIEWER_TIMEOUT_SECONDS,
     ReviewLoop,
     ReviewLoopOutcome,
     ReviewPlanningError,
@@ -59,7 +57,7 @@ from nanoreview.agent.review_state import (
 )
 from nanoreview.agent.runner import AgentRunner
 from nanoreview.bus.events import InboundMessage
-from nanoreview.providers.base import LLMResponse
+from nanoreview.providers.base import GenerationSettings, LLMResponse
 from nanoreview.review.input.snapshot import build_snapshot
 from nanoreview.review.output.judge import ReviewJudge, ReviewJudgeConfig
 from nanoreview.review.planning.planner import ReviewPreparation
@@ -139,15 +137,17 @@ class _FakeJudgeProvider:
 
 
 def _build_judge(provider: _FakeJudgeProvider) -> ReviewJudge:
-    """Judge sharing one ``AgentRunner``/provider/model with the plan run."""
+    """Judge sharing one ``AgentRunner``/provider with the plan run.
+
+    The runtime is the one a review run freezes at admission; the Judge never
+    re-derives model parameters of its own.
+    """
     return ReviewJudge(
         runner=AgentRunner(provider),
-        model="test-model",
-        config=ReviewJudgeConfig(
-            context_window_tokens=200_000,
-            max_tokens=128,
-            timeout_seconds=5,
-        ),
+        runtime=LLMRuntime.capture(
+            provider, model="test-model", context_window_tokens=200_000
+        ).with_generation(max_tokens=128),
+        config=ReviewJudgeConfig(),
     )
 
 
@@ -171,6 +171,25 @@ def _security_findings() -> list[dict[str, Any]]:
             },
         }
     ]
+
+
+class _RuntimeProvider:
+    """Provider stand-in for frozen runtimes; no request is sent through it."""
+
+    def __init__(self, **generation: Any) -> None:
+        self.generation = GenerationSettings(**generation)
+
+
+def _reviewer_runtime(
+    *, window: int = 200_000, max_tokens: int = 8_192
+) -> LLMRuntime:
+    """A frozen reviewer runtime, the shape the coordinator freezes at admission."""
+    return LLMRuntime.capture(
+        _RuntimeProvider(max_tokens=max_tokens),
+        model="reviewer-model",
+        context_window_tokens=window,
+        role=ROLE_REVIEWER,
+    )
 
 
 class _Subagents:
@@ -198,6 +217,10 @@ class _Subagents:
 
     def get_running_count(self) -> int:
         return 0
+
+    def default_runtime(self) -> LLMRuntime:
+        """Reviewer runtime used when a request arrives without a frozen one."""
+        return _reviewer_runtime()
 
     async def spawn(self, **kwargs: Any) -> str:
         self.calls.append(kwargs)
@@ -360,10 +383,9 @@ def _build_loop(
         sessions=session_manager,
         subagents=subagents,
         boards=boards,
-        model="test",
         max_concurrent_subagents=max_concurrent_subagents,
         max_tool_result_chars=1000,
-        judge_factory=(lambda: judge) if judge is not None else None,
+        judge_factory=(lambda _runtime: judge) if judge is not None else None,
     )
 
 
@@ -1351,15 +1373,41 @@ def test_review_planning_error_is_the_module_contract() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fixed review budget
+# Frozen review runtimes
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_review_run_binds_the_fixed_window_and_reviewer_limits(
+async def test_review_run_binds_the_frozen_reviewer_runtime(tmp_path, prepared) -> None:
+    """Reviewers run on the runtime frozen at admission, not on live defaults.
+
+    The window also decides the evidence budget: a run started on a 128k model
+    must not be measured against the conversation agent's window, and the same
+    number must reach the navigation metadata that gates evidence dispatch.
+    """
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    prepared(_plan("security"), _evidence())
+    subagents = _Subagents()
+    loop = _build_loop(tmp_path, subagents=subagents)
+    _register_run(loop)
+    runtime = _reviewer_runtime(window=131_072, max_tokens=4_096)
+
+    await loop.execute(_request(reviewer_runtime=runtime))
+
+    limits = subagents.calls[0]["execution_limits"]
+    assert limits.runtime is runtime
+    assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
+    assert (
+        subagents.calls[0]["origin_metadata"][ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS]
+        == 131_072
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_request_without_a_runtime_falls_back_to_the_live_selection(
     tmp_path, prepared
 ) -> None:
-    """Reviewers use the fixed review window and reviewer limits."""
+    """Direct loop construction keeps working with the subagent manager's runtime."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security"), _evidence())
     subagents = _Subagents()
@@ -1369,33 +1417,19 @@ async def test_review_run_binds_the_fixed_window_and_reviewer_limits(
     await loop.execute(_request())
 
     limits = subagents.calls[0]["execution_limits"]
+    assert limits.runtime is not None
+    assert limits.runtime.role == ROLE_REVIEWER
     assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
-    assert limits.max_tokens == REVIEWER_MAX_OUTPUT_TOKENS
-    assert limits.timeout_seconds == REVIEWER_TIMEOUT_SECONDS
-    assert limits.context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
-    # Review navigation metadata carries the same fixed window for evidence.
-    assert (
-        subagents.calls[0]["origin_metadata"][ReviewMetaKey.DIFF_CONTEXT_WINDOW_TOKENS]
-        == REVIEW_CONTEXT_WINDOW_TOKENS
-    )
 
 
-def test_review_window_is_fixed_and_survives_a_model_switch(tmp_path) -> None:
-    """The conversation-side model switch never widens the review window."""
-    loop = _build_loop(tmp_path, subagents=_Subagents())
-    assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
+def test_review_budget_contract_is_derived_from_the_runtime() -> None:
+    """The audit contract records the run's numbers, never project-wide constants."""
+    runtime = _reviewer_runtime(window=64_000, max_tokens=2_048)
 
-    loop.set_runtime_model(None, "switched-model", 131_072)  # type: ignore[arg-type]
-
-    assert loop._context_window_tokens == REVIEW_CONTEXT_WINDOW_TOKENS
-
-
-def test_review_budget_contract_matches_the_confirmed_numbers() -> None:
-    assert review_budget_contract() == {
-        "context_window_tokens": 200_000,
-        "reviewer_max_output_tokens": 8_192,
+    assert review_budget_contract(runtime) == {
+        "context_window_tokens": 64_000,
+        "reviewer_max_output_tokens": 2_048,
         "reviewer_model_request_limit": 30,
-        "reviewer_timeout_seconds": 180,
     }
 
 

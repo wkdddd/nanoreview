@@ -59,19 +59,34 @@ from loguru import logger
 
 from nanoreview.agent import model_presets as preset_helpers
 from nanoreview.agent.context import ContextBuilder
+from nanoreview.agent.context_governance import input_token_budget
 from nanoreview.agent.conversation_loop import (
     MAX_PENDING_CONVERSATION_MESSAGES,
     ConversationLoop,
 )
+from nanoreview.agent.dream import (
+    DreamOutcome,
+    DreamScheduler,
+    DreamService,
+    MemoryJournal,
+)
 from nanoreview.agent.event_sink import build_bus_event_sink, event_text, metadata_for_event
 from nanoreview.agent.hooks.lifecycle import AgentHook
+from nanoreview.agent.llm_runtime import (
+    ROLE_CONVERSATION,
+    ROLE_JUDGE,
+    ROLE_REVIEWER,
+    LLMRuntime,
+    ProviderBuilder,
+    RoleModelOverrides,
+    resolve_role_runtime,
+)
 from nanoreview.agent.memory import Consolidator
 from nanoreview.agent.review_board import (
     ReviewBoardStore,
     ReviewBoardView,
 )
 from nanoreview.agent.review_loop import (
-    REVIEW_CONTEXT_WINDOW_TOKENS,
     ReviewLoop,
     ReviewTurnRequest,
     persist_review_subagent_result,
@@ -101,7 +116,7 @@ from nanoreview.events import (
     StreamEndEvent,
 )
 from nanoreview.providers.base import LLMProvider
-from nanoreview.providers.factory import ProviderSnapshot
+from nanoreview.providers.factory import ProviderSnapshot, make_role_provider_factory
 from nanoreview.review.admission import (
     ReviewAdmission,
     ReviewAdmissionCode,
@@ -138,10 +153,6 @@ REVIEW_ALLOWED_COMMANDS = frozenset({"/status", "/stop"})
 #: Index / handoff markers stored on the persisted session messages.
 REVIEW_CONTEXT_EVENT = "review_context"
 REVIEW_HANDOFF_EVENT = "review_handoff"
-
-#: How much of the context window is held back from the handoff check for the
-#: system prompt, runtime block and the model's own output.
-_HANDOFF_PROMPT_RESERVE_TOKENS = 1024
 
 #: Reason recorded when a run lost its executor before producing a result.
 INTERRUPTED_RUN_REASON = (
@@ -266,7 +277,6 @@ class SessionCoordinator:
         session_manager: SessionManager | None = None,
         channels_config: "ChannelsConfig | None" = None,
         timezone: str | None = None,
-        consolidation_ratio: float = 0.5,
         max_messages: int = 120,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
@@ -279,8 +289,9 @@ class SessionCoordinator:
         model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
-        default_reasoning_effort: str | None = None,
         reserved_output_tokens: int | None = None,
+        role_provider_factory: ProviderBuilder | None = None,
+        dream_config: Any | None = None,
     ):
         from nanoreview.config.schema import ToolsConfig, _resolve_tool_config_refs
 
@@ -324,7 +335,12 @@ class SessionCoordinator:
         self.tools_config = _tc
         self.review_config = review_config
         self.exec_config = _tc.exec
-        self._default_reasoning_effort = default_reasoning_effort
+        #: Builds a provider for a role that names its own ``provider``:
+        #: ``(provider_name, model) -> (provider, resolved_provider_name)``.
+        #: Injected by ``from_config`` (which owns the root config); without it
+        #: a role asking for another provider fails loudly instead of silently
+        #: running on the conversation agent's provider.
+        self._role_provider_factory = role_provider_factory
         self._reserved_output_tokens = int(
             reserved_output_tokens
             if reserved_output_tokens is not None
@@ -366,7 +382,6 @@ class SessionCoordinator:
                 if max_concurrent_subagents is not None
                 else defaults.max_concurrent_subagents
             ),
-            reasoning_effort=self._resolve_subagent_reasoning_effort(),
             llm_wall_timeout_for_session=lambda sk: None,
             execution_profiles=reviewer_execution_profiles(),
             context_window_tokens=self.context_window_tokens,
@@ -378,6 +393,9 @@ class SessionCoordinator:
         self._closed = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._background_tasks: list[asyncio.Task] = []
+        #: The weekly Dream ticker. Owned separately from the background tasks
+        #: because it never finishes on its own and must be cancelled first.
+        self._dream_task: asyncio.Task | None = None
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
         self._pending_queues: dict[str, asyncio.Queue] = {}
@@ -394,7 +412,6 @@ class SessionCoordinator:
             sessions=self.sessions,
             subagents=self.subagents,
             boards=self._review_boards,
-            model=self.model,
             max_tool_result_chars=self.max_tool_result_chars,
             context_builder=self.context,
             max_messages=self._max_messages,
@@ -421,7 +438,24 @@ class SessionCoordinator:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
-            consolidation_ratio=consolidation_ratio,
+        )
+
+        # Long-term memory: one append-only journal per workspace plus a bounded
+        # weekly consolidation run. Only conversation compaction appends; the
+        # review roles never reach this file.
+        self.memory_journal = MemoryJournal(workspace)
+        self.dream = DreamService(
+            workspace=workspace,
+            provider=provider,
+            model=self.model,
+            context_window_tokens=self.context_window_tokens,
+            runner=self.runner,
+            max_iterations=self.max_iterations,
+            journal=self.memory_journal,
+        )
+        self.dream_scheduler = DreamScheduler(
+            service=self.dream,
+            enabled=bool(getattr(dream_config, "enabled", True)),
         )
 
         # Conversation side: ConversationLoop owns one complete conversation
@@ -446,12 +480,13 @@ class SessionCoordinator:
             max_messages=self._max_messages,
             review_config=self.review_config,
             provider_snapshot_loader=self._provider_snapshot_loader,
-            background_scheduler=self._schedule_background,
             hooks=self._extra_hooks,
             hooks_getter=lambda: self._extra_hooks,
             usage_recorder=self._record_result_usage,
             handoff_consumer=self.consume_handoff,
             mcp_provider=self.mcp,
+            memory_reader=self.memory_journal.read_memory,
+            archive_recorder=self._record_conversation_summary,
         )
 
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
@@ -489,6 +524,9 @@ class SessionCoordinator:
             config,
             provider_snapshot_loader,
         )
+        role_provider_factory = extra.pop(
+            "role_provider_factory", None
+        ) or make_role_provider_factory(config)
         return cls(
             bus=bus,
             provider=provider,
@@ -506,7 +544,6 @@ class SessionCoordinator:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
-            consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
             review_config=config.review,
@@ -514,17 +551,45 @@ class SessionCoordinator:
             model_preset=defaults.model_preset,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
-            default_reasoning_effort=defaults.reasoning_effort,
+            role_provider_factory=role_provider_factory,
+            dream_config=getattr(config, "dream", None),
             **extra,
         )
 
     # -- provider / model ---------------------------------------------------
 
-    def _resolve_subagent_reasoning_effort(self) -> str | None:
-        subagent_effort = getattr(self.review_config, "subagent_reasoning_effort", None)
-        if subagent_effort is not None:
-            return subagent_effort
-        return self._default_reasoning_effort
+    def _conversation_runtime(self) -> "LLMRuntime":
+        """Frozen snapshot of the conversation agent's current selection."""
+        return LLMRuntime.capture(
+            self.provider,
+            model=self.model,
+            context_window_tokens=self.context_window_tokens,
+            role=ROLE_CONVERSATION,
+            model_preset=self.model_preset,
+        )
+
+    def _role_runtime(self, role: str, settings: Any) -> "LLMRuntime":
+        """Derive one role's runtime from the conversation agent plus overrides.
+
+        Only the fields ``review.<role>`` actually declares change; everything
+        else is what the conversation agent had at this moment. A role that
+        switches provider must name it explicitly (``review.<role>.provider``) —
+        the credentials are reused from the provider factory.
+        """
+        return resolve_role_runtime(
+            self._conversation_runtime(),
+            role=role,
+            overrides=RoleModelOverrides.from_settings(settings),
+            provider_builder=self._role_provider_factory,
+        )
+
+    def _reviewer_runtime(self) -> "LLMRuntime":
+        return self._role_runtime(
+            ROLE_REVIEWER, getattr(self.review_config, "reviewer", None)
+        )
+
+    def _judge_runtime(self) -> "LLMRuntime":
+        return self._role_runtime(ROLE_JUDGE, getattr(self.review_config, "judge", None))
 
     def _apply_provider_snapshot(
         self,
@@ -547,7 +612,6 @@ class SessionCoordinator:
         self.conversation_loop.set_runtime_model(
             provider, model, context_window_tokens
         )
-        self.review_loop.set_runtime_model(provider, model, context_window_tokens)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
             self._runtime_model_publisher(
@@ -655,25 +719,19 @@ class SessionCoordinator:
             tools=",".join(registered),
         )
 
-    def _build_review_judge(self) -> ReviewJudge | None:
-        """Build the judge on the coordinator/plan runner and model.
+    def _build_review_judge(self, runtime: "LLMRuntime | None") -> ReviewJudge | None:
+        """Build the judge on the coordinator's runner and the frozen runtime.
 
-        The judge shares the fixed review context window rather than the
-        conversation agent's window, so review budgeting stays deterministic.
+        ``runtime`` is the Judge runtime frozen when the review was admitted, so
+        batching and generation parameters stay consistent for the whole run.
         """
         judge_settings = getattr(self.review_config, "judge", None)
         if judge_settings is not None and not getattr(judge_settings, "enabled", True):
             return None
-        config = ReviewJudgeConfig(
-            enabled=bool(getattr(judge_settings, "enabled", True)),
-            timeout_seconds=int(getattr(judge_settings, "timeout_seconds", 60)),
-            max_tokens=int(getattr(judge_settings, "max_tokens", 2048)),
-            context_window_tokens=REVIEW_CONTEXT_WINDOW_TOKENS,
-        )
         return ReviewJudge(
             runner=self.runner,
-            model=self.model,
-            config=config,
+            runtime=runtime or self._judge_runtime(),
+            config=ReviewJudgeConfig(enabled=True),
             common_rules_workspace=self.workspace,
         )
 
@@ -1282,13 +1340,12 @@ class SessionCoordinator:
         return markdown if isinstance(markdown, str) and markdown.strip() else None
 
     def _prompt_budget(self) -> int:
-        if self.context_window_tokens <= 0:
-            return 0
-        budget = (
-            self.context_window_tokens
-            - max(1, self._reserved_output_tokens)
-            - _HANDOFF_PROMPT_RESERVE_TOKENS
-        )
+        """Input tokens the first handoff may occupy.
+
+        Same formula the governor enforces for a real request, so a report that
+        passes this check is not summarized away on its first turn.
+        """
+        budget = input_token_budget(self.context_window_tokens, self._reserved_output_tokens)
         return budget if budget > 0 else 0
 
     def _handoff_fits(self, result: ReviewResult, report_markdown: str | None) -> bool:
@@ -1335,12 +1392,19 @@ class SessionCoordinator:
             if persist_review_subagent_result(session, subagent_message):
                 self.sessions.save(session)
 
+        # Every role runtime this run will use is frozen here, once: a later
+        # ``/model`` switch must not change a review that is already admitted.
+        judge_enabled = bool(
+            getattr(getattr(self.review_config, "judge", None), "enabled", True)
+        )
         outcome = await self.review_loop.execute(
             ReviewTurnRequest(
                 session_key=session_key,
                 session=session,
                 msg=msg,
                 metadata=dict(msg.metadata or {}),
+                reviewer_runtime=self._reviewer_runtime(),
+                judge_runtime=self._judge_runtime() if judge_enabled else None,
                 events=events,
                 result_callback=_persist_automatic_subagent_result,
             )
@@ -1540,11 +1604,43 @@ class SessionCoordinator:
         session.add_message("assistant", result.content, _command=True)
         self.sessions.save(session)
 
+    # -- long-term memory ---------------------------------------------------
+
+    def _record_conversation_summary(self, session_key: str, summary: str) -> None:
+        """Append one compacted conversation summary to the memory journal.
+
+        Called by ``ConversationLoop`` for conversation history only. The
+        journal is best-effort: a failed append must never fail the turn, and
+        Dream simply sees one entry fewer.
+        """
+        text = (summary or "").strip()
+        if not text:
+            return
+        try:
+            self.memory_journal.append(f"[{session_key}] {text}")
+        except Exception:
+            logger.warning("memory.journal.append_failed session={}", session_key)
+
+    async def run_dream(self, *, trigger: str = "manual") -> DreamOutcome:
+        """Run one Dream consolidation now. Backs the ``/dream`` command."""
+        return await self.dream.run(trigger=trigger)
+
+    def _start_dream_scheduler(self) -> None:
+        """Start the weekly ticker, once, when the run loop starts."""
+        if not getattr(self.dream_scheduler, "enabled", False):
+            return
+        if self._dream_task is not None and not self._dream_task.done():
+            return
+        self._dream_task = asyncio.create_task(
+            self.dream_scheduler.serve(), name="dream-scheduler"
+        )
+
     # -- run loop -----------------------------------------------------------
 
     async def run(self) -> None:
         """Run the coordinator, dispatching messages as tasks for /stop."""
         self._running = True
+        self._start_dream_scheduler()
 
         while self._running:
             try:
@@ -1938,6 +2034,14 @@ class SessionCoordinator:
         # entry and the MCP proxy registration all check it. It is set before
         # any await so no new turn can be admitted while the tasks below are
         # being cancelled.
+
+        if self._dream_task is not None:
+            # The ticker loops forever by design, so it is cancelled before the
+            # background drain (which waits instead of cancelling).
+            self._dream_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._dream_task
+            self._dream_task = None
 
         for tasks in list(self._active_tasks.values()):
             for task in tasks:

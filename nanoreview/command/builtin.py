@@ -74,6 +74,12 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "[n]",
     ),
     BuiltinCommandSpec(
+        "/dream",
+        "Consolidate long-term memory",
+        "Merge archived conversation summaries into memory/MEMORY.md.",
+        "moon",
+    ),
+    BuiltinCommandSpec(
         "/goal",
         "Start long-running goal",
         "Tell the agent to treat the request as a long-running goal.",
@@ -207,6 +213,49 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
         content="New session started.",
         metadata=dict(ctx.msg.metadata or {})
+    )
+
+
+async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
+    """Consolidate the long-term memory journal now."""
+    loop = ctx.loop
+    metadata = dict(ctx.msg.metadata or {})
+    try:
+        outcome = await loop.run_dream(trigger="manual")
+    except Exception as exc:  # a failed dream must not break the chat surface
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=f"Dream failed: {exc}",
+            metadata=metadata,
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=_format_dream_outcome(outcome),
+        metadata=metadata,
+    )
+
+
+def _format_dream_outcome(outcome) -> str:
+    if outcome.status == "idle":
+        return "Nothing to consolidate: the memory journal has no new entries."
+    if outcome.status == "busy":
+        return "A dream run is already in progress; nothing was started."
+    if outcome.status == "failed":
+        return (
+            "Dream failed and nothing was written. "
+            f"The journal was left untouched: {outcome.reason}"
+        )
+    if outcome.applied:
+        return (
+            f"Dream consolidated {outcome.entries} journal "
+            f"{'entry' if outcome.entries == 1 else 'entries'} into memory/MEMORY.md."
+        )
+    return (
+        f"Dream reviewed {outcome.entries} journal "
+        f"{'entry' if outcome.entries == 1 else 'entries'}; "
+        "the memory file needed no change."
     )
 
 
@@ -472,6 +521,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/model ", cmd_model)
     router.exact("/history", cmd_history)
     router.prefix("/history ", cmd_history)
+    router.exact("/dream", cmd_dream)
     router.exact("/goal", cmd_goal)
     router.prefix("/goal ", cmd_goal)
     router.exact("/help", cmd_help)

@@ -9,21 +9,15 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from loguru import logger
 
-from nanoreview.agent.compression import (
-    AsyncSnapshot,
-    CompressionError,
-    RunCompressionState,
-    build_summary_message,
-    canonical_json,
-    is_compression_summary,
-    parse_and_validate,
-    partition_working,
-    serialize_transcript,
-    split_units,
+from nanoreview.agent.context_governance import (
+    ContextCompactionState,
+    ContextGovernanceConfig,
+    ContextGovernor,
+    ContextWindowExceededError,
 )
 from nanoreview.agent.hooks.lifecycle import (
     AgentHook,
@@ -31,6 +25,8 @@ from nanoreview.agent.hooks.lifecycle import (
     AgentRunHookContext,
     finalize_content_result,
 )
+from nanoreview.agent.llm_runtime import LLMRuntime
+from nanoreview.agent.memory import TranscriptSummarizer
 from nanoreview.agent.output_contract import OutputContract
 from nanoreview.agent.tools.base import tool_result_is_error
 from nanoreview.agent.tools.registry import ToolRegistry
@@ -38,10 +34,7 @@ from nanoreview.agent.tools.safety_boundary import classify_violation
 from nanoreview.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanoreview.utils.helpers import (
     build_assistant_message,
-    estimate_message_tokens,
-    estimate_prompt_tokens_chain,
     extract_reasoning,
-    find_legal_message_start,
     maybe_persist_tool_result,
     merge_token_usage,
     truncate_text,
@@ -64,7 +57,6 @@ _MAX_EMPTY_RETRIES = 2
 _MAX_LENGTH_RECOVERIES = 3
 _MAX_INJECTIONS_PER_TURN = 5
 _MAX_INJECTION_CYCLES = 10
-_SNIP_SAFETY_BUFFER = 1024
 _MICROCOMPACT_KEEP_RECENT = 10
 _MICROCOMPACT_MIN_CHARS = 500
 _COMPACTABLE_TOOLS = frozenset(
@@ -80,25 +72,21 @@ _COMPACTABLE_TOOLS = frozenset(
 _BACKFILL_CONTENT = "[Tool result unavailable — call was interrupted or lost]"
 _STREAM_OUTER_TIMEOUT_MULTIPLIER = 3.0
 _TOOL_ERROR_PREFIXES = ("Error:", "Error executing ")
-# Run-level compression stop reasons. Both carry a non-empty ``error`` and end
-# the run before the next business model request.
-_STOP_COMPRESSION_FAILED = "compression_failed"
-_STOP_COMPRESSION_LIMIT = "compression_limit"
-# Each compression task runs at most this many runner-level logical requests
-# (first attempt + one retry). Provider-internal retries are not counted here.
-_COMPRESSION_ATTEMPTS = 2
+# Stop reason of a run whose request still does not fit the model input budget
+# after compaction and the unsent-read replacement. It always carries a
+# non-empty ``error`` and ends the run before the next model request.
+_STOP_CONTEXT_LIMIT = "context_limit"
 # Max characters of a failure reason recorded/logged (never the full context).
-_COMPRESSION_RETRY_REASON_CHARS = 200
-_COMPRESSION_TEMPLATE_PATH = "agent/memory_compression.md"
+_BOUNDED_REASON_CHARS = 200
 #: Stop reason of a run whose final answer never satisfied its output contract.
 _STOP_INVALID_OUTPUT = "invalid_output"
 
 
 def _bounded(reason: Any) -> str:
-    """Truncate a compression failure reason so logs never carry full context."""
+    """Truncate a stop reason so logs never carry a full context dump."""
     text = str(reason or "").strip().replace("\n", " ")
-    if len(text) > _COMPRESSION_RETRY_REASON_CHARS:
-        return text[: _COMPRESSION_RETRY_REASON_CHARS - 3] + "..."
+    if len(text) > _BOUNDED_REASON_CHARS:
+        return text[: _BOUNDED_REASON_CHARS - 3] + "..."
     return text
 
 
@@ -116,25 +104,33 @@ def _is_tool_error_result(result: Any) -> bool:
 class AgentRunSpec:
     """Configuration for a single agent execution.
 
-    ``frozen_messages`` and ``working_messages`` are an explicit partition of
-    the run's starting context, chosen by the caller (the runner never guesses
-    a boundary by role or position):
+    ``messages`` is the run's whole starting transcript. Its first entries must
+    be the instruction header: a leading run of ``system``/``developer``
+    messages carrying the role rules, the task objective and the review
+    boundary. Everything after it is transcript data — session history, the
+    current user message, the evidence/report/candidate payload and later tool
+    rounds — and is what request-level governance may summarize.
 
-    - ``frozen_messages`` is a fixed task/evidence envelope copied verbatim into
-      every request. Context governance never repairs, compacts, or trims it.
-    - ``working_messages`` is the mutable history. It may be summarized by
-      run-level compression; the original messages stay in the run result.
+    ``accepted_message_count`` marks where the pre-existing conversation context
+    ends inside ``messages``: that region may be folded into a summary before the
+    very first request. Reviewers and the Judge pass ``0`` because their task
+    envelope is fixed authorized input, not history: when it does not fit, the
+    run must fail explicitly instead of silently dropping evidence.
     """
 
-    frozen_messages: list[dict[str, Any]]
-    working_messages: list[dict[str, Any]]
+    messages: list[dict[str, Any]]
     tools: ToolRegistry
-    model: str
+    #: Frozen provider/model/generation selection for this whole run.
+    runtime: LLMRuntime
     max_iterations: int
     max_tool_result_chars: int
-    temperature: float | None = None
-    max_tokens: int | None = None
-    reasoning_effort: str | None = None
+    #: Raw index where the pre-existing conversation context ends (see above).
+    accepted_message_count: int = 0
+    #: Checkpoint carried from the session, replayed as a marked data message.
+    initial_summary: str | None = None
+    #: Summarizer used when a request must be compacted. ``None`` builds one from
+    #: ``runtime`` (provider/model window, no journal).
+    summarizer: TranscriptSummarizer | None = None
     tool_choice: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
     hook: AgentHook | None = None
@@ -144,7 +140,6 @@ class AgentRunSpec:
     fail_on_tool_error: bool = False
     workspace: Path | None = None
     session_key: str | None = None
-    context_window_tokens: int | None = None
     context_block_limit: int | None = None
     provider_retry_mode: str = "standard"
     retry_wait_callback: Any | None = None
@@ -166,14 +161,21 @@ class AgentRunSpec:
     #: Correction attempts allowed after an invalid final answer. The value
     #: counts rejections, so the model always gets at least one retry.
     output_retry_limit: int = 3
-    #: Overrides the default ``agent/memory_compression.md`` prompt template.
-    compression_prompt: str | None = None
-    #: Wall-clock timeout applied to each compression-layer logical request.
-    compression_timeout_s: float = 180.0
-    #: Receives each completed compression request's usage for outer-timeout
-    #: snapshots (judge). Exceptions are logged, never fatal.
-    compression_usage_callback: Callable[[dict[str, int]], None] | None = None
 
+
+@dataclass(frozen=True, slots=True)
+class RunCompaction:
+    """Request-level compaction that happened during a run.
+
+    ``compacted_session_messages`` counts how many messages of the run's
+    pre-existing context (``messages[header:accepted_message_count]``) the
+    replacement summary now covers, so a session owner can advance its replay
+    boundary by exactly that amount.
+    """
+
+    summary: str
+    compacted_session_messages: int
+    compaction_count: int
 
 
 @dataclass(slots=True)
@@ -195,6 +197,8 @@ class AgentRunResult:
     #: How many final answers the contract rejected before the run settled.
     output_attempts: int = 0
     output_error: str | None = None
+    #: Replacement checkpoint produced by request-level compaction, if any.
+    compaction: RunCompaction | None = None
 
 
 @dataclass(slots=True)
@@ -223,9 +227,19 @@ class _IterationOutcome:
 
 
 class AgentRunner:
-    """Run a tool-capable LLM loop without product-layer concerns."""
+    """Run a tool-capable LLM loop without product-layer concerns.
+
+    The runner is shared: the coordinator owns one instance for conversation,
+    reviewer and Judge runs. Requests therefore always go to
+    ``spec.runtime.provider`` — the provider frozen for that run's role — never
+    to ``self.provider``, otherwise a role that selects its own provider would
+    silently be sent to the conversation agent's.
+    """
 
     def __init__(self, provider: LLMProvider):
+        #: Provider of the *next* run created without a runtime snapshot
+        #: (``SubagentManager`` and tests build specs by hand). Every run with a
+        #: runtime ignores it.
         self.provider = provider
 
     @staticmethod
@@ -267,7 +281,6 @@ class AgentRunner:
         self,
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
-        state: RunCompressionState | None,
         assistant_message: dict[str, Any] | None,
         injection_cycles: int,
         *,
@@ -277,10 +290,9 @@ class AgentRunner:
         """Drain pending injections. Returns (should_continue, updated_cycles).
 
         If injections are found and we haven't exceeded _MAX_INJECTION_CYCLES,
-        append them to *messages* (and to the model working context when *state*
-        is given, plus a checkpoint if *assistant_message* and *iteration* are
-        both provided) and return (True, cycles+1) so the caller continues the
-        iteration loop. Otherwise return (False, cycles).
+        append them to *messages* (plus a checkpoint if *assistant_message* and
+        *iteration* are both provided) and return (True, cycles+1) so the caller
+        continues the iteration loop. Otherwise return (False, cycles).
         """
         if injection_cycles >= _MAX_INJECTION_CYCLES:
             return False, injection_cycles
@@ -289,30 +301,22 @@ class AgentRunner:
             return False, injection_cycles
         injection_cycles += 1
         if assistant_message is not None:
-            if state is not None:
-                self._append_raw(messages, state, assistant_message)
-            else:
-                messages.append(assistant_message)
+            self._append_raw(messages, assistant_message)
             if iteration is not None:
                 await self._emit_checkpoint(
                     spec,
                     {
                         "phase": "final_response",
                         "iteration": iteration,
-                        "model": spec.model,
+                        "model": spec.runtime.model,
                         "assistant_message": assistant_message,
                         "completed_tool_results": [],
                         "pending_tool_calls": [],
                     },
                 )
-        # Injections are written separately (independent copies) into the raw
-        # history and the model working context; they also count as new
-        # interactive content for the working revision, which re-enables a
-        # previously failed async compression retry.
+        # Injected follow-up turns are ordinary transcript entries: the governor
+        # sees them as not-yet-sent input on the next request.
         self._append_injected_messages(messages, deepcopy(injections))
-        if state is not None:
-            self._append_injected_messages(state.working, deepcopy(injections))
-            state.working_revision += 1
         logger.info(
             "Injected {} follow-up message(s) {} ({}/{})",
             len(injections),
@@ -380,18 +384,19 @@ class AgentRunner:
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         # ``messages`` is the raw run history: it is append-only and is what the
-        # caller persists. Run-level compression only ever rewrites the separate
-        # model working context, never this list. Raw history, model state and
-        # provider requests all hold independent deep copies, so a provider
-        # that mutates its request in place can never corrupt either.
-        messages = deepcopy([*spec.frozen_messages, *spec.working_messages])
-        # Run-local compression state: never stored on the runner, so concurrent
-        # reviewer/judge runs cannot apply or cancel each other's jobs.
-        state = RunCompressionState(
-            frozen=deepcopy(spec.frozen_messages),
-            working=deepcopy(spec.working_messages),
-            context_window_tokens=spec.context_window_tokens,
+        # ``messages`` is the raw transcript: it is append-only and is what the
+        # caller persists. Governance only rebuilds the *request* payload, never
+        # this list, so a provider that mutates its request in place cannot
+        # corrupt the history either.
+        messages = deepcopy(spec.messages)
+        # Run-local governance state. Never stored on the runner, so concurrent
+        # reviewer/judge runs cannot apply or cancel each other's compaction.
+        state = ContextCompactionState.from_messages(
+            messages,
+            initial_summary=spec.initial_summary,
+            accepted_message_count=spec.accepted_message_count,
         )
+        governor = self._build_governor(spec, state)
         final_content: str | None = None
         tools_used: list[str] = []
         usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -419,26 +424,6 @@ class AgentRunner:
         try:
             await hook.before_run(run_context)
             for iteration in range(spec.max_iterations):
-                # The first business request skips run-level 60%/80%
-                # compression, but its context is already built as
-                # ``frozen + governed working``: governance (orphan repair,
-                # backfill, microcompact, tool budget, hard trim) only ever
-                # touches the working zone and never crosses the frozen
-                # boundary. From the second request on, the compression state
-                # machine additionally runs before every request.
-                if iteration > 0:
-                    outcome = await self._apply_run_compression(spec, state)
-                    if outcome == "stop":
-                        stop_reason = state.stopped_reason or _STOP_COMPRESSION_FAILED
-                        error = state.stopped_error or stop_reason
-                        # Normal agents surface the caller's user-facing error
-                        # message; the bounded diagnostic stays in ``error``.
-                        # Callers that pass ``error_message=None`` (coordinator,
-                        # reviewer, judge) fall back to the diagnostic itself.
-                        final_content = (
-                            spec.error_message if spec.error_message is not None else error
-                        )
-                        break
                 # The last permitted request of a structured run is reserved for
                 # the answer itself: no tools are exposed and the model is told
                 # so, otherwise the budget can be spent on a tool call the run
@@ -446,18 +431,35 @@ class AgentRunner:
                 # ``max_iterations`` with nothing to hand over.
                 final_structured = self._is_final_structured_turn(spec, iteration)
                 if final_structured:
-                    # Written to both zones: the raw history keeps the record,
-                    # and the working zone is what ``_model_context`` actually
-                    # sends, so the model is told why its tools are gone.
-                    answer_request = [build_final_structured_answer_message()]
-                    self._append_injected_messages(messages, answer_request)
                     self._append_injected_messages(
-                        state.working, [dict(item) for item in answer_request]
+                        messages, [build_final_structured_answer_message()]
                     )
-                    state.working_revision += 1
+                # Every request — the first one included — is measured against
+                # the input budget. Under pressure the accepted history is
+                # folded into one replacement summary; if the rebuilt request
+                # still does not fit even after replacing unsent read results,
+                # the run stops with an explicit ``context_limit``.
+                try:
+                    messages_for_model = await governor.prepare_request(state)
+                except ContextWindowExceededError as exc:
+                    stop_reason = _STOP_CONTEXT_LIMIT
+                    error = _bounded(exc)
+                    final_content = (
+                        spec.error_message if spec.error_message is not None else error
+                    )
+                    logger.warning(
+                        "context.limit scope={} trace={} session={} reason={}",
+                        spec.session_key or spec.runtime.role,
+                        state.trace_id,
+                        spec.session_key or "default",
+                        error,
+                    )
+                    break
+                # Everything carried by this request is now "already sent".
+                state.accept_request(len(messages))
                 # The provider gets its own deep copy: in-place cleanup by the
-                # provider chain must never reach the raw history or the state.
-                messages_for_model = deepcopy(self._model_context(spec, state))
+                # provider chain must never reach the raw transcript.
+                messages_for_model = deepcopy(messages_for_model)
                 context = AgentHookContext(iteration=iteration, messages=messages)
                 context.session_key = spec.session_key
                 await hook.before_iteration(context)
@@ -477,7 +479,6 @@ class AgentRunner:
 
                 iteration_outcome = await self._run_iteration(
                     spec,
-                    state,
                     messages,
                     messages_for_model,
                     response,
@@ -522,7 +523,7 @@ class AgentRunner:
                         strip=True,
                         max_iterations=spec.max_iterations,
                     )
-                self._append_raw(messages, state, build_assistant_message(final_content))
+                self._append_raw(messages, build_assistant_message(final_content))
                 # Drain any remaining injections so they are appended to the
                 # conversation history instead of being re-published as
                 # independent inbound messages by _dispatch's finally block.
@@ -531,7 +532,6 @@ class AgentRunner:
                 drained_after_max_iterations, injection_cycles = await self._try_drain_injections(
                     spec,
                     messages,
-                    state,
                     None,
                     injection_cycles,
                     phase="after max_iterations",
@@ -541,7 +541,7 @@ class AgentRunner:
         except asyncio.CancelledError as exc:
             # A cancelled run is not a run failure: ``on_error`` stays silent so
             # error reporting never races the caller's own cancellation.
-            await self._settle_run_accounting(spec, state, usage)
+            self._settle_run_accounting(state, usage)
             self._fill_run_context(
                 run_context,
                 messages=messages,
@@ -557,7 +557,7 @@ class AgentRunner:
             run_context.usage = dict(usage)
             raise
         except Exception as exc:
-            await self._settle_run_accounting(spec, state, usage)
+            self._settle_run_accounting(state, usage)
             self._fill_run_context(
                 run_context,
                 messages=messages,
@@ -574,11 +574,11 @@ class AgentRunner:
             await hook.on_error(run_context)
             raise
         else:
-            # Settle compression *before* snapshotting: ``after_run`` is the
-            # run-level result hook, so it must observe the same usage (and the
-            # same finalized transcript) the caller receives from
+            # Settle compaction usage *before* snapshotting: ``after_run`` is
+            # the run-level result hook, so it must observe the same usage (and
+            # the same finalized transcript) the caller receives from
             # ``AgentRunResult``, not a pre-settlement partial sum.
-            await self._settle_run_accounting(spec, state, usage)
+            self._settle_run_accounting(state, usage)
             self._fill_run_context(
                 run_context,
                 messages=messages,
@@ -600,7 +600,7 @@ class AgentRunner:
             # above; on the error/cancel paths it ran before the snapshot. This
             # call is idempotent (a settled state is a no-op), so it only does
             # work if a future exit path forgets to settle early.
-            await self._settle_run_accounting(spec, state, usage)
+            self._settle_run_accounting(state, usage)
             if run_context.exception is None:
                 await hook.on_finally(run_context)
             else:
@@ -627,6 +627,15 @@ class AgentRunner:
             structured_output=structured_output,
             output_attempts=output_attempts,
             output_error=output_error,
+            compaction=(
+                RunCompaction(
+                    summary=state.summary,
+                    compacted_session_messages=state.compacted_session_messages,
+                    compaction_count=state.compaction_count,
+                )
+                if state.summary and state.compaction_count
+                else None
+            ),
         )
 
     @staticmethod
@@ -663,7 +672,6 @@ class AgentRunner:
     async def _run_iteration(
         self,
         spec: AgentRunSpec,
-        state: RunCompressionState,
         messages: list[dict[str, Any]],
         messages_for_model: list[dict[str, Any]],
         response: LLMResponse,
@@ -721,14 +729,14 @@ class AgentRunner:
                 reasoning_content=response.reasoning_content,
                 thinking_blocks=response.thinking_blocks,
             )
-            self._append_raw(messages, state, assistant_message)
+            self._append_raw(messages, assistant_message)
             tools_used.extend(tc.name for tc in response.tool_calls)
             await self._emit_checkpoint(
                 spec,
                 {
                     "phase": "awaiting_tools",
                     "iteration": iteration,
-                    "model": spec.model,
+                    "model": spec.runtime.model,
                     "assistant_message": assistant_message,
                     "completed_tool_results": [],
                     "pending_tool_calls": [
@@ -763,7 +771,7 @@ class AgentRunner:
                         result,
                     ),
                 }
-                self._append_raw(messages, state, tool_message)
+                self._append_raw(messages, tool_message)
                 completed_tool_results.append(tool_message)
             if fatal_error is not None:
                 error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
@@ -777,7 +785,6 @@ class AgentRunner:
                 should_continue, injection_cycles = await self._try_drain_injections(
                     spec,
                     messages,
-                    state,
                     None,
                     outcome.injection_cycles,
                     phase="after tool error",
@@ -795,7 +802,7 @@ class AgentRunner:
                 {
                     "phase": "tools_completed",
                     "iteration": iteration,
-                    "model": spec.model,
+                    "model": spec.runtime.model,
                     "assistant_message": assistant_message,
                     "completed_tool_results": completed_tool_results,
                     "pending_tool_calls": [],
@@ -807,7 +814,6 @@ class AgentRunner:
             _drained, injection_cycles = await self._try_drain_injections(
                 spec,
                 messages,
-                state,
                 None,
                 outcome.injection_cycles,
                 phase="after tool execution",
@@ -878,7 +884,6 @@ class AgentRunner:
                     await hook.on_stream_end(context, resuming=True)
                 self._append_raw(
                     messages,
-                    state,
                     build_assistant_message(
                         clean,
                         reasoning_content=response.reasoning_content,
@@ -890,7 +895,6 @@ class AgentRunner:
                 # of appending the rest of a broken JSON document.
                 self._append_raw(
                     messages,
-                    state,
                     build_structured_length_recovery_message()
                     if spec.output_contract is not None
                     else build_length_recovery_message(),
@@ -917,7 +921,6 @@ class AgentRunner:
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec,
                 messages,
-                state,
                 assistant_message,
                 outcome.injection_cycles,
                 phase="after final response",
@@ -946,7 +949,6 @@ class AgentRunner:
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec,
                 messages,
-                state,
                 None,
                 outcome.injection_cycles,
                 phase="after LLM error",
@@ -971,7 +973,6 @@ class AgentRunner:
             should_continue, injection_cycles = await self._try_drain_injections(
                 spec,
                 messages,
-                state,
                 None,
                 outcome.injection_cycles,
                 phase="after empty response",
@@ -992,7 +993,6 @@ class AgentRunner:
         if spec.output_contract is not None and not is_replaced:
             self._append_raw(
                 messages,
-                state,
                 assistant_message
                 or build_assistant_message(
                     clean,
@@ -1052,15 +1052,12 @@ class AgentRunner:
             repair_prompt = spec.output_contract.repair_prompt(
                 rejection or "the final answer was rejected"
             )
+            # The correction prompt is new input for the next request. It is
+            # appended to the raw transcript only: the request payload is rebuilt
+            # from it, so there is no separate "working" copy to keep in sync.
             self._append_injected_messages(
                 messages, [{"role": "user", "content": repair_prompt}]
             )
-            # The correction prompt must enter the model working context too.
-            self._append_injected_messages(
-                state.working, [{"role": "user", "content": repair_prompt}]
-            )
-            # New interactive content: counts for the compression retry gate.
-            state.working_revision += 1
             await hook.after_iteration(context)
             return outcome
 
@@ -1072,13 +1069,13 @@ class AgentRunner:
                 thinking_blocks=response.thinking_blocks,
             )
         )
-        self._append_raw(messages, state, final_message)
+        self._append_raw(messages, final_message)
         await self._emit_checkpoint(
             spec,
             {
                 "phase": "final_response",
                 "iteration": iteration,
-                "model": spec.model,
+                "model": spec.runtime.model,
                 "assistant_message": messages[-1],
                 "completed_tool_results": [],
                 "pending_tool_calls": [],
@@ -1093,637 +1090,77 @@ class AgentRunner:
         return outcome
 
     # ------------------------------------------------------------------
-    # Run-level compression
+    # Request governance
     # ------------------------------------------------------------------
     @staticmethod
-    def _append_raw(
-        messages: list[dict[str, Any]],
-        state: RunCompressionState,
-        message: dict[str, Any],
-    ) -> None:
-        """Append a message to the raw history and the model working context.
-
-        Each list receives its own deep copy, so no nested content, tool call
-        or metadata is ever shared between the persisted history and the
-        model-visible context. Bumping ``working_revision`` records that new
-        interactive content exists, which is what re-enables a previously
-        failed async compression retry.
-        """
+    def _append_raw(messages: list[dict[str, Any]], message: dict[str, Any]) -> None:
+        """Append an independent copy of *message* to the raw transcript."""
         messages.append(deepcopy(message))
-        state.working.append(deepcopy(message))
-        state.working_revision += 1
 
-    def _model_context(
+    def _build_governor(
         self,
         spec: AgentRunSpec,
-        state: RunCompressionState,
-    ) -> list[dict[str, Any]]:
-        """Build the message list for the next business model request.
+        state: ContextCompactionState,
+    ) -> ContextGovernor:
+        """Wire request-level governance for this run.
 
-        From the very first request on, the context is ``frozen verbatim +
-        governed working``: orphan repair, backfill, microcompact, tool-result
-        budget and hard trim only ever see the working zone, never the frozen
-        envelope, and never pair a tool round across the boundary. If the
-        frozen zone alone exceeds the window it is still sent whole and the
-        Provider is the one that reports the context-length error.
+        The summarizer is built from the run's own runtime unless the caller
+        supplies one (the conversation agent shares its session summarizer so the
+        checkpoint it stores is produced by the same prompt). Compaction usage is
+        folded into the run's usage as it is billed, so a run that later fails
+        still reports what it spent.
         """
-        try:
-            return self._prepare_messages(spec, state.frozen, list(state.working))
-        except Exception:
-            logger.exception(
-                "Context governance failed for {}; applying minimal repair",
-                spec.session_key or "default",
-            )
+        runtime = spec.runtime
+        summarizer = spec.summarizer or TranscriptSummarizer(
+            runtime.provider,
+            runtime.model,
+            context_window_tokens=runtime.context_window_tokens,
+            max_completion_tokens=runtime.max_tokens or 4096,
+        )
+
+        def _clean(body: list[dict[str, Any]]) -> list[dict[str, Any]]:
             try:
-                repaired = self._drop_orphan_tool_results(list(state.working))
-                repaired = self._backfill_missing_tool_results(repaired)
-                return [*[dict(m) for m in state.frozen], *repaired]
+                return self._govern(spec, body)
             except Exception:
-                return [*[dict(m) for m in state.frozen], *state.working]
-
-    async def _apply_run_compression(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-    ) -> str:
-        """Run the pre-request compression state machine.
-
-        Returns ``"stop"`` when the run must end (``compression_failed`` /
-        ``compression_limit``), otherwise ``"continue"``.
-        """
-        sync_limit = state.sync_limit
-        soft_limit = state.soft_limit
-        if sync_limit is None:
-            # No usable window: nothing to protect, leave the run untouched.
-            return "continue"
-
-        # 1. Collect a completed async task. Its usage is always recorded, even
-        #    when the result is discarded because the context moved on. When the
-        #    summary is applied, the next business request is sent as rebuilt:
-        #    sync compression is deliberately not re-entered in the same step,
-        #    the recount happens before the following request.
-        if await self._collect_async_result(spec, state):
-            return "continue"
-
-        # 2. Recount the full request that would be sent next.
-        before_tokens, source = self._count_request_tokens(spec, state)
-        if before_tokens <= 0:
-            return "continue"
-
-        if before_tokens >= sync_limit:
-            # 3. Sync compression takes priority over any background job.
-            await self._cancel_pending_compression(state, reason="sync_takeover")
-            await self._compress_sync(
-                spec, state, before_tokens=before_tokens, source=source
-            )
-            if state.stopped:
-                return "stop"
-            after_tokens, _ = self._count_request_tokens(spec, state)
-            if after_tokens >= sync_limit:
-                state.stopped = True
-                state.stopped_reason = _STOP_COMPRESSION_LIMIT
-                state.stopped_error = (
-                    "compression succeeded but the request still reaches "
-                    f"{after_tokens} tokens (>= {sync_limit} sync limit)"
+                logger.exception(
+                    "Context governance failed for {}; applying minimal repair",
+                    spec.session_key or "default",
                 )
-                logger.warning(
-                    "compression.stopped trace={} reason={} tokens={} limit={}",
-                    state.trace_id,
-                    _STOP_COMPRESSION_LIMIT,
-                    after_tokens,
-                    sync_limit,
-                )
-            return "stop" if state.stopped else "continue"
+                repaired = self._drop_orphan_tool_results(list(body))
+                return self._backfill_missing_tool_results(repaired)
 
-        # 4. Below the hard limit: start async compression if we are in the
-        #    soft zone, there is no pending job, and a retry is permitted.
-        if before_tokens >= soft_limit:
-            await self._maybe_start_async_compression(
-                spec, state, before_tokens=before_tokens, source=source
-            )
-        return "continue"
-
-    def _tool_definitions_for_estimate(self, spec: AgentRunSpec) -> list[dict[str, Any]]:
-        try:
-            return spec.tools.get_definitions()
-        except Exception:
-            logger.exception("Failed to build tool definitions for token estimate")
-            return []
-
-    def _count_request_tokens(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-    ) -> tuple[int, str]:
-        """Estimate the full next request: frozen + working + tools."""
-        messages = self._model_context(spec, state)
-        try:
-            tokens, source = estimate_prompt_tokens_chain(
-                self.provider,
-                spec.model,
-                messages,
-                self._tool_definitions_for_estimate(spec),
-            )
-        except Exception:
-            logger.exception("Token estimate failed; treating request as under limit")
-            return 0, "none"
-        return int(tokens), source
-
-    def _compression_template(self, spec: AgentRunSpec) -> str:
-        if spec.compression_prompt:
-            return spec.compression_prompt
-        return render_template(_COMPRESSION_TEMPLATE_PATH, strip=True)
-
-    async def _collect_async_result(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-    ) -> bool:
-        """Apply a finished async compression job if its snapshot still matches.
-
-        Returns ``True`` only when a summary was actually written back, so the
-        caller can skip further compression decisions for this request. The
-        job's usage was already banked when the compression request returned
-        (see ``_compress_working``), so nothing is recorded here.
-        """
-        pending = state.pending
-        if pending is None or not pending.done():
-            return False
-        state.pending = None
-        snapshot = state.snapshot
-        state.snapshot = None
-        try:
-            result = pending.result()
-        except asyncio.CancelledError:
-            return False
-        except Exception as exc:
-            state.async_failed = True
-            # Retry is keyed on the working revision the failed attempt
-            # started from: messages appended while the job was in flight
-            # (even before this failure was collected) move the revision and
-            # therefore count as a retryable condition; a failure with no new
-            # content does not.
-            state.async_failed_revision = (
-                snapshot.working_revision if snapshot is not None else state.working_revision
-            )
-            logger.warning(
-                "compression.failed mode=async trace={} attempts={} reason={}",
-                state.trace_id,
-                _COMPRESSION_ATTEMPTS,
-                _bounded(exc),
-            )
-            return False
-        if result is None or snapshot is None:
-            return False
-        if not self._snapshot_matches(state, snapshot):
-            logger.info(
-                "compression.discarded mode=async trace={} reason=snapshot_mismatch snapshot={}",
-                state.trace_id,
-                state.snapshot_context(),
-            )
-            return False
-        summary_message = build_summary_message(canonical_json(result))
-        # Rebuild: new summary + the snapshot's active zone + everything appended
-        # since the snapshot. The compress zone (which held the previous summary,
-        # if any) is dropped from the model context, so summaries are replaced,
-        # never accumulated, and the active zone is never lost.
-        suffix = state.working[len(snapshot.working_prefix) :]
-        state.working = self._rebuild_working(
-            summary_message, snapshot.active_prefix, suffix
-        )
-        state.working_revision += 1
-        state.async_failed = False
-        state.async_failed_revision = None
-        after_tokens, _ = self._count_request_tokens(spec, state)
-        logger.info(
-            "compression.applied mode=async trace={} before_tokens={} after_tokens={} "
-            "active={} suffix={} working_len={}",
-            state.trace_id,
-            snapshot.before_tokens,
-            after_tokens,
-            len(snapshot.active_prefix),
-            len(suffix),
-            len(state.working),
-        )
-        return True
-
-    @staticmethod
-    def _rebuild_working(
-        summary_message: dict[str, Any],
-        active_prefix: list[dict[str, Any]],
-        suffix: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Rebuild the model working context after a successful compression.
-
-        Shared by the async apply path and the sync path: ``frozen + summary +
-        active + suffix``. The compress zone is replaced by the synthetic
-        summary, the active zone is replayed verbatim, and anything appended
-        after the compression boundary keeps its position at the tail.
-        """
-        return [
-            summary_message,
-            *[dict(message) for message in active_prefix],
-            *[dict(message) for message in suffix],
-        ]
-
-    def _snapshot_matches(
-        self,
-        state: RunCompressionState,
-        snapshot: AsyncSnapshot,
-    ) -> bool:
-        """Whether the snapshot's frozen/working prefixes are still intact.
-
-        Comparison is by value, not object identity: the async job and the
-        governance pipeline both deep-copy messages, so the live entries are
-        never the same objects the snapshot captured. While a snapshot is live,
-        ``state.working`` only ever grows at the tail (``_append_raw``); every
-        path that rewrites it (sync compression, applying an async summary)
-        clears ``state.snapshot`` first. A value-equal prefix therefore means the
-        region the summary was built from has not been rewritten.
-        """
-        if len(state.frozen) < snapshot.frozen_len:
-            return False
-        if len(state.working) < snapshot.working_len:
-            return False
-        return all(
-            state.frozen[index] == snapshot.frozen_prefix[index]
-            for index in range(snapshot.frozen_len)
-        ) and all(
-            state.working[index] == snapshot.working_prefix[index]
-            for index in range(snapshot.working_len)
+        return ContextGovernor(
+            ContextGovernanceConfig(
+                provider=runtime.provider,
+                model=runtime.model,
+                context_window_tokens=runtime.context_window_tokens,
+                max_tokens=runtime.max_tokens,
+                context_block_limit=spec.context_block_limit,
+                tool_definitions=lambda: self._tool_definitions(spec),
+            ),
+            summarizer=summarizer,
+            clean=_clean,
+            on_usage=lambda usage: merge_token_usage(state.usage, usage),
+            log_scope=spec.session_key or runtime.role,
         )
 
-    async def _maybe_start_async_compression(
+    def _settle_run_accounting(
         self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-        *,
-        before_tokens: int,
-        source: str,
-    ) -> None:
-        if state.pending is not None:
-            return
-        # Retry gate after a failed attempt: the working revision must have
-        # moved on since that attempt started (a complete round or an
-        # injection was appended). Without new content the failure is never
-        # retried, so no request loop forms.
-        if state.async_failed and state.working_revision == state.async_failed_revision:
-            return
-        working_prefix = deepcopy(state.working)
-        frozen_prefix = deepcopy(state.frozen)
-        # Only snapshot the compress zone: keep the newest complete units active.
-        keep_budget = state.soft_limit or before_tokens
-        partition = partition_working(
-            working_prefix,
-            keep_budget_tokens=keep_budget,
-            estimate=estimate_message_tokens,
-        )
-        if not partition.compress:
-            return
-        if not self._compression_request_room_available(partition.compress_prefix):
-            return
-        # The snapshot records the compress zone, the active zone that must be
-        # replayed verbatim on apply, the full working prefix used to locate
-        # the suffix appended while the job was in flight, and the working
-        # revision that governs any later retry decision.
-        snapshot = AsyncSnapshot(
-            frozen_prefix=frozen_prefix,
-            working_prefix=working_prefix,
-            compress_prefix=partition.compress_prefix,
-            active_prefix=partition.active_prefix,
-            working_revision=state.working_revision,
-            before_tokens=before_tokens,
-        )
-        state.snapshot = snapshot
-        logger.info(
-            "compression.started mode=async trace={} session={} before_tokens={} "
-            "soft_limit={} source={}",
-            state.trace_id,
-            spec.session_key or "default",
-            before_tokens,
-            state.soft_limit,
-            source,
-        )
-        state.pending = asyncio.create_task(
-            self._async_compress(spec, state, partition.compress_prefix)
-        )
-
-    @staticmethod
-    def _compression_request_room_available(messages: list[dict[str, Any]]) -> bool:
-        """Whether the compress zone carries anything worth summarizing.
-
-        A zone made only of synthetic summaries has no new content to fold in;
-        re-summarizing a summary would loop without shrinking the request, so
-        such a zone is treated as not compressible (the caller then reports
-        ``compression_limit`` on its recount).
-        """
-        return any(not is_compression_summary(message) for message in messages)
-
-    async def _async_compress(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-        prefix: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Deep-copy the compress zone, summarize it, and return the payload.
-
-        Nothing is written back here: the runner applies the summary only after
-        re-validating the snapshot, so a cancelled or stale job can never
-        rewrite the working context. Per-attempt logging (including retry and
-        failure reasons) happens inside ``_compress_working``; this coroutine
-        stays silent so a failure is logged exactly once when collected.
-        """
-        working_copy = deepcopy(prefix)
-        return await self._compress_working(spec, state, working_copy, mode="async")
-
-    async def _cancel_pending_compression(
-        self,
-        state: RunCompressionState,
-        *,
-        reason: str,
-    ) -> None:
-        pending = state.pending
-        if pending is None:
-            return
-        state.pending = None
-        state.snapshot = None
-        if not pending.done():
-            pending.cancel()
-            logger.info(
-                "compression.discarded mode=async trace={} reason={}",
-                state.trace_id,
-                reason,
-            )
-        with suppress(asyncio.CancelledError, Exception):
-            await pending
-
-    async def _settle_run_accounting(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
+        state: ContextCompactionState,
         usage: dict[str, int],
     ) -> None:
-        """Settle compression and merge its billed usage into ``usage``.
+        """Merge summarization usage into the run's usage exactly once.
 
         Idempotent: the normal path settles before the run-level result hook so
         the hook sees final usage, and ``finally`` calls it again purely as an
-        exit-path safety net. ``_close_compression`` guards on ``state.closed``;
-        the merge is guarded here so a second call cannot double-count.
-
-        Compression usage recorded here is part of the run and must survive
-        every exit path (normal completion, terminal tool, business error, max
-        iterations, cancellation).
+        exit-path safety net. Usage observed by a summarization request is part
+        of the run and survives every exit path (normal, error, max iterations,
+        cancellation).
         """
         if state.usage_banked:
             return
-        await self._close_compression(spec, state, usage)
         merge_token_usage(usage, state.usage)
         state.usage_banked = True
-
-    async def _close_compression(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-        usage: dict[str, int],
-    ) -> None:
-        """Settle the in-flight compression task when the run ends."""
-        if state.closed:
-            return
-        state.closed = True
-        pending = state.pending
-        if pending is None:
-            return
-        state.pending = None
-        if not pending.done():
-            pending.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await pending
-            # A cancelled summary must never be applied.
-            state.snapshot = None
-            return
-        # Already finished but not yet consumed: still bank its usage.
-        try:
-            pending.result()
-        except (asyncio.CancelledError, Exception):
-            # A failed async job contributed only its own (already recorded)
-            # usage; nothing to apply.
-            state.snapshot = None
-            return
-        state.snapshot = None
-
-    async def _compress_sync(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-        *,
-        before_tokens: int,
-        source: str,
-    ) -> None:
-        """Synchronously compress the compress zone; stop the run on failure."""
-        keep_budget = state.soft_limit or before_tokens
-        partition = partition_working(
-            [dict(message) for message in state.working],
-            keep_budget_tokens=keep_budget,
-            estimate=estimate_message_tokens,
-        )
-        if not partition.compress or not self._compression_request_room_available(
-            partition.compress_prefix
-        ):
-            # No legal complete prefix (or only synthetic summaries, which
-            # carry nothing new): nothing to summarize. The caller then
-            # reports compression_limit because the request is still too big.
-            return
-        logger.info(
-            "compression.started mode=sync trace={} session={} before_tokens={} "
-            "sync_limit={} source={}",
-            state.trace_id,
-            spec.session_key or "default",
-            before_tokens,
-            state.sync_limit,
-            source,
-        )
-        try:
-            payload = await self._compress_working(
-                spec, state, partition.compress_prefix, mode="sync"
-            )
-        except CompressionError as exc:
-            state.stopped = True
-            state.stopped_reason = _STOP_COMPRESSION_FAILED
-            state.stopped_error = (
-                f"sync compression failed after {_COMPRESSION_ATTEMPTS} attempts: "
-                f"{_bounded(exc)}"
-            )
-            logger.warning(
-                "compression.failed mode=sync trace={} attempts={} reason={}",
-                state.trace_id,
-                _COMPRESSION_ATTEMPTS,
-                _bounded(exc),
-            )
-            logger.warning(
-                "compression.stopped trace={} reason={} detail={}",
-                state.trace_id,
-                _STOP_COMPRESSION_FAILED,
-                state.stopped_error,
-            )
-            return
-        summary_message = build_summary_message(canonical_json(payload))
-        # Same rebuild as the async path: summary + active zone, no suffix
-        # because sync compression is applied at the compression boundary.
-        state.working = self._rebuild_working(
-            summary_message, partition.active_prefix, ()
-        )
-        state.working_revision += 1
-        state.async_failed = False
-        state.async_failed_revision = None
-        after_tokens, _ = self._count_request_tokens(spec, state)
-        logger.info(
-            "compression.applied mode=sync trace={} before_tokens={} after_tokens={} "
-            "active={} working_len={}",
-            state.trace_id,
-            before_tokens,
-            after_tokens,
-            len(partition.active_prefix),
-            len(state.working),
-        )
-
-    async def _compress_working(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-        messages: list[dict[str, Any]],
-        *,
-        mode: str,
-    ) -> dict[str, Any]:
-        """Run the bounded compression requests for *messages*.
-
-        At most ``_COMPRESSION_ATTEMPTS`` runner-level logical requests are made
-        (first attempt + one retry). The Provider's visible usage is recorded
-        for *every* attempt — error responses, empty responses and first-fail/
-        second-success alike — before ``finish_reason``, content and JSON are
-        validated, and each recording triggers ``compression_usage_callback``.
-        Usage that the Provider never exposed (timeouts, raised exceptions) is
-        never fabricated.
-        """
-        last_error: CompressionError | None = None
-        for attempt in range(1, _COMPRESSION_ATTEMPTS + 1):
-            try:
-                content, attempt_usage = await self._run_compression_request(
-                    spec, messages
-                )
-            except CompressionError as exc:
-                last_error = exc
-                if exc.visible_usage:
-                    # The Provider returned (and billed) a response whose
-                    # content was unusable; its usage still counts.
-                    self._record_compression_usage(spec, state, exc.visible_usage)
-                logger.warning(
-                    "compression.retry mode={} trace={} attempt={}/{} reason={}",
-                    mode,
-                    state.trace_id,
-                    attempt,
-                    _COMPRESSION_ATTEMPTS,
-                    _bounded(exc),
-                )
-                continue
-            self._record_compression_usage(spec, state, attempt_usage)
-            try:
-                payload = parse_and_validate(content)
-            except CompressionError as exc:
-                last_error = exc
-                logger.warning(
-                    "compression.retry mode={} trace={} attempt={}/{} reason={}",
-                    mode,
-                    state.trace_id,
-                    attempt,
-                    _COMPRESSION_ATTEMPTS,
-                    _bounded(exc),
-                )
-                continue
-            return payload
-        raise last_error or CompressionError("compression produced no usable summary")
-
-    async def _run_compression_request(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> tuple[str, dict[str, int]]:
-        """One compression-layer logical request. Raises on failure/timeout."""
-        template = self._compression_template(spec)
-        transcript = serialize_transcript(messages)
-        request_messages = [
-            {"role": "system", "content": template},
-            {"role": "user", "content": transcript},
-        ]
-        kwargs = self._build_compression_kwargs(spec, request_messages)
-        timeout_s = spec.compression_timeout_s
-        try:
-            coro = self.provider.chat_with_retry(**kwargs)
-            if timeout_s is not None and timeout_s > 0:
-                response = await asyncio.wait_for(coro, timeout=timeout_s)
-            else:
-                response = await coro
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError as exc:
-            raise CompressionError(
-                f"compression request timed out after {timeout_s:g}s"
-            ) from exc
-        except Exception as exc:
-            raise CompressionError(f"compression request failed: {exc}") from exc
-        usage = self._usage_dict(response.usage)
-        if response.finish_reason == "error" or not (response.content or "").strip():
-            # The Provider answered (and billed usage for) a response whose
-            # content is unusable: carry the visible usage on the error so the
-            # retry loop can still account for it before validating anything.
-            raise CompressionError(
-                f"compression request returned no content ({response.finish_reason})",
-                visible_usage=usage,
-            )
-        return response.content, usage
-
-    def _build_compression_kwargs(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Compression request kwargs: same provider chain, no business tools.
-
-        ``max_tokens`` is only forwarded when the spec sets it; otherwise the
-        parameter is omitted so ``Provider.chat_with_retry()`` falls back to the
-        provider's own generation default instead of a hard-coded cap.
-        """
-        kwargs: dict[str, Any] = {
-            "messages": messages,
-            "tools": None,
-            "model": spec.model,
-            "retry_mode": spec.provider_retry_mode,
-            "on_retry_wait": spec.retry_wait_callback,
-            "response_format": {"type": "json_object"},
-        }
-        if spec.temperature is not None:
-            kwargs["temperature"] = spec.temperature
-        if isinstance(spec.max_tokens, int):
-            kwargs["max_tokens"] = spec.max_tokens
-        if spec.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = spec.reasoning_effort
-        return kwargs
-
-    def _record_compression_usage(
-        self,
-        spec: AgentRunSpec,
-        state: RunCompressionState,
-        attempt_usage: dict[str, int],
-    ) -> None:
-        if not attempt_usage:
-            return
-        merge_token_usage(state.usage, attempt_usage)
-        callback = spec.compression_usage_callback
-        if callback is None:
-            return
-        try:
-            callback(dict(attempt_usage))
-        except Exception:
-            logger.exception("compression_usage_callback failed")
 
     def _build_request_kwargs(
         self,
@@ -1732,20 +1169,25 @@ class AgentRunner:
         *,
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
+        """Request kwargs taken from the run's frozen runtime, never the provider.
 
+        Reading ``provider.generation`` here would let a concurrent ``/model``
+        switch or another role's mutation change an admitted run mid-flight.
+        """
+        runtime = spec.runtime
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tools,
-            "model": spec.model,
+            "model": runtime.model,
             "retry_mode": spec.provider_retry_mode,
             "on_retry_wait": spec.retry_wait_callback,
         }
-        if spec.temperature is not None:
-            kwargs["temperature"] = spec.temperature
-        if spec.max_tokens is not None:
-            kwargs["max_tokens"] = spec.max_tokens
-        if spec.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = spec.reasoning_effort
+        if runtime.temperature is not None:
+            kwargs["temperature"] = runtime.temperature
+        if runtime.max_tokens > 0:
+            kwargs["max_tokens"] = runtime.max_tokens
+        if runtime.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = runtime.reasoning_effort
         if spec.tool_choice is not None:
             kwargs["tool_choice"] = spec.tool_choice
         if spec.response_format is not None:
@@ -1817,14 +1259,14 @@ class AgentRunner:
                 context.streamed_reasoning = True
                 await hook.emit_reasoning(delta)
 
-            coro = self.provider.chat_stream_with_retry(
+            coro = spec.runtime.provider.chat_stream_with_retry(
                 **kwargs,
                 on_content_delta=_stream,
                 on_thinking_delta=_thinking,
                 on_tool_event=_provider_tool_event,
             )
         else:
-            coro = self.provider.chat_with_retry(**kwargs)
+            coro = spec.runtime.provider.chat_with_retry(**kwargs)
 
         # Streaming requests have provider-level idle timeouts
         # (NANOBOT_STREAM_IDLE_TIMEOUT_S), plus a longer wall-clock cap here as
@@ -1860,7 +1302,7 @@ class AgentRunner:
         retry_messages = list(messages)
         retry_messages.append(build_finalization_retry_message())
         kwargs = self._build_request_kwargs(spec, retry_messages, tools=None)
-        return await self.provider.chat_with_retry(**kwargs)
+        return await spec.runtime.provider.chat_with_retry(**kwargs)
 
     @staticmethod
     def _usage_dict(usage: dict[str, Any] | None) -> dict[str, int]:
@@ -2132,34 +1574,22 @@ class AgentRunner:
             return truncate_text(content, spec.max_tool_result_chars)
         return content
 
-    def _prepare_messages(
-        self,
-        spec: AgentRunSpec,
-        frozen: list[dict[str, Any]],
-        working: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Prepare message history for the model in a fixed-order pipeline.
-
-        ``frozen`` is copied verbatim and prepended; governance (orphan repair,
-        backfill, microcompact, tool-result budget, hard trim) only ever touches
-        the ``working`` zone and never pairs a tool round across the boundary.
-        """
-        governed = self._govern(spec, list(working))
-        frozen_copy = [dict(message) for message in frozen]
-        return [*frozen_copy, *governed]
-
     def _govern(
         self,
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Run the repair/compact/budget/trim pipeline over *messages*."""
+        """Run the repair/compact/budget pipeline over a request body.
+
+        The pipeline never drops interactive units: capacity problems are handled
+        by request-level compaction and, as a last resort, by the governor's
+        explicit failure, so a request is either complete or rejected.
+        """
         result = self._drop_orphan_tool_results(messages)
         result = self._backfill_missing_tool_results(result)
         result = self._microcompact(result)
         result = self._apply_tool_result_budget(spec, result)
-        result = self._snip_history(spec, result)
-        # Snipping may create new orphans
+        # Dropping/backfilling tool results can create new orphans.
         result = self._drop_orphan_tool_results(result)
         result = self._backfill_missing_tool_results(result)
         return result
@@ -2281,84 +1711,6 @@ class AgentRunner:
                     updated = [dict(m) for m in messages]
                 updated[idx]["content"] = normalized
         return updated
-
-    def _snip_history(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not messages or not spec.context_window_tokens:
-            return messages
-
-        provider_max_tokens = getattr(
-            getattr(self.provider, "generation", None), "max_tokens", 4096
-        )
-        max_output = (
-            spec.max_tokens
-            if isinstance(spec.max_tokens, int)
-            else (provider_max_tokens if isinstance(provider_max_tokens, int) else 4096)
-        )
-        budget = spec.context_block_limit or (
-            spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
-        )
-        if budget <= 0:
-            return messages
-
-        estimate, _ = estimate_prompt_tokens_chain(
-            self.provider,
-            spec.model,
-            messages,
-            spec.tools.get_definitions(),
-        )
-        if estimate <= budget:
-            return messages
-
-        system_messages = [dict(msg) for msg in messages if msg.get("role") == "system"]
-        non_system = [dict(msg) for msg in messages if msg.get("role") != "system"]
-        if not non_system:
-            return messages
-
-        system_tokens = sum(estimate_message_tokens(msg) for msg in system_messages)
-        remaining_budget = max(128, budget - system_tokens)
-        # Drop the oldest whole interactive units so a user/assistant/tool round
-        # is never cut in half (which would orphan tool results or split a
-        # tool-call from its results).
-        units = split_units(non_system)
-        kept_units: list[list[dict[str, Any]]] = []
-        kept_tokens = 0
-        for unit in reversed(units):
-            unit_tokens = sum(estimate_message_tokens(message) for message in unit)
-            if kept_units and kept_tokens + unit_tokens > remaining_budget:
-                break
-            kept_units.append(unit)
-            kept_tokens += unit_tokens
-        kept_units.reverse()
-        kept: list[dict[str, Any]] = [message for unit in kept_units for message in unit]
-
-        if kept:
-            for i, message in enumerate(kept):
-                if message.get("role") == "user":
-                    kept = kept[i:]
-                    break
-            else:
-                # Recover nearest user message from outside the kept window;
-                # GLM rejects system→assistant (error 1214).  Budget is
-                # intentionally exceeded — oversized beats invalid.
-                for idx in range(len(non_system) - 1, -1, -1):
-                    if non_system[idx].get("role") == "user":
-                        kept = non_system[idx:]
-                        break
-                # If no user exists at all, _enforce_role_alternation
-                # will insert a synthetic one as a safety net.
-            start = find_legal_message_start(kept)
-            if start:
-                kept = kept[start:]
-        if not kept:
-            kept = non_system[-min(len(non_system), 4) :]
-            start = find_legal_message_start(kept)
-            if start:
-                kept = kept[start:]
-        return system_messages + kept
 
     def _partition_tool_batches(
         self,

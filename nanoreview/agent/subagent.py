@@ -9,7 +9,6 @@ review results are not conversation inbound events.
 import asyncio
 import time
 import uuid
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +17,7 @@ from loguru import logger
 from nanoreview.agent.event_sink import event_text, metadata_for_event
 from nanoreview.agent.hooks.subagent import SubagentHook, SubagentStatus
 from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
+from nanoreview.agent.llm_runtime import ROLE_REVIEWER, LLMRuntime
 from nanoreview.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
 from nanoreview.agent.subagent_profiles import (
     SubagentCompletion,
@@ -86,7 +86,6 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
-        reasoning_effort: str | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None]
         | None = None,
         execution_profiles: dict[str, SubagentExecutionProfile] | None = None,
@@ -112,11 +111,6 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
-        self.reasoning_effort = reasoning_effort
-        # Context window wiring mirrors the main agent: the runner trims history
-        # to this window, so subagents get the same protection as the main
-        # agent. None keeps the runner's no-trim behaviour for callers that
-        # manage context themselves.
         self.context_window_tokens = (
             context_window_tokens
             if context_window_tokens is not None
@@ -325,6 +319,20 @@ class SubagentManager:
         if context_window_tokens is not None:
             self.context_window_tokens = context_window_tokens
 
+    def default_runtime(self) -> LLMRuntime:
+        """Live runtime for a task that was not given a frozen one.
+
+        The review pipeline always passes a runtime frozen at review start (see
+        ``SubagentExecutionLimits.runtime``); this is only the fallback for
+        dispatch paths that manage their own runtime.
+        """
+        return LLMRuntime.capture(
+            self.provider,
+            model=self.model,
+            context_window_tokens=self.context_window_tokens,
+            role=ROLE_REVIEWER,
+        )
+
     async def spawn(
         self,
         task: str,
@@ -416,7 +424,6 @@ class SubagentManager:
     ) -> None:
         """Execute one profile-configured subagent and announce its result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
-        lifecycle_started_at = time.monotonic()
         session_key = (
             origin.get("session_key") or f"{origin['channel']}:{origin['chat_id']}"
         )
@@ -519,7 +526,7 @@ class SubagentManager:
             )
             # Reviewer system prompt + task/evidence envelope are a frozen
             # envelope; the reviewer run starts with no inherited history.
-            frozen_messages: list[dict[str, Any]] = [
+            messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
@@ -535,159 +542,151 @@ class SubagentManager:
                 if execution_limits and execution_limits.max_iterations is not None
                 else self.max_iterations
             )
-            effective_max_tokens = execution_limits.max_tokens if execution_limits else None
-            timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
-            effective_context_window = (
-                execution_limits.context_window_tokens
-                if execution_limits and execution_limits.context_window_tokens is not None
-                else self.context_window_tokens
+            # The review pipeline hands over a runtime frozen when the review
+            # started, so a conversation-side ``/model`` switch cannot change an
+            # in-flight reviewer. Everything else falls back to the manager's
+            # live selection.
+            runtime = (
+                execution_limits.runtime
+                if execution_limits and execution_limits.runtime is not None
+                else self.default_runtime()
             )
             # One info record of the actually effective limits replaces the
             # per-result metadata observability (quota/input estimates were
             # removed with the budget admission gate).
             logger.info(
-                "subagent.limits task_id={} label={} max_iterations={} max_tokens={} "
-                "timeout_seconds={} context_window_tokens={} context_block_limit={}",
+                "subagent.limits task_id={} label={} role={} model={} max_iterations={} "
+                "max_tokens={} context_window_tokens={} context_block_limit={}",
                 task_id,
                 label,
+                runtime.role,
+                runtime.model,
                 effective_iterations,
-                effective_max_tokens,
-                timeout_seconds,
-                effective_context_window,
+                runtime.max_tokens,
+                runtime.context_window_tokens,
                 self.context_block_limit,
             )
-            timeout_scope = (
-                asyncio.timeout(
-                    max(0.0, timeout_seconds - (time.monotonic() - lifecycle_started_at))
+            result = await self.runner.run(
+                AgentRunSpec(
+                    messages=messages,
+                    tools=tools,
+                    runtime=runtime,
+                    max_iterations=effective_iterations,
+                    max_tool_result_chars=self.max_tool_result_chars,
+                    # The envelope is this run's new input and is never
+                    # summarized before the first request: a reviewer's
+                    # authorized evidence must reach the model verbatim or the
+                    # run fails explicitly with ``context_limit``.
+                    accepted_message_count=0,
+                    hook=hook,
+                    max_iterations_message=profile.max_iterations_message,
+                    error_message=None,
+                    fail_on_tool_error=True,
+                    soft_tool_error_tools=self.soft_tool_error_tools(profile),
+                    output_contract=self.output_contract(profile),
+                    preserve_tool_result_tools=profile.preserve_tool_result_tools,
+                    checkpoint_callback=_on_checkpoint,
+                    session_key=sess_key,
+                    llm_timeout_s=llm_timeout,
+                    context_block_limit=self.context_block_limit,
                 )
-                if timeout_seconds is not None and timeout_seconds > 0
-                else nullcontext()
             )
-            async with timeout_scope:
-                result = await self.runner.run(
-                    AgentRunSpec(
-                        frozen_messages=frozen_messages,
-                        working_messages=[],
-                        tools=tools,
-
-                        model=self.model,
-                        max_iterations=effective_iterations,
-                        max_tokens=effective_max_tokens,
-                        max_tool_result_chars=self.max_tool_result_chars,
-                        reasoning_effort=self.reasoning_effort,
-                        hook=hook,
-                        max_iterations_message=profile.max_iterations_message,
-                        error_message=None,
-                        fail_on_tool_error=True,
-                        soft_tool_error_tools=self.soft_tool_error_tools(profile),
-                        output_contract=self.output_contract(profile),
-                        preserve_tool_result_tools=profile.preserve_tool_result_tools,
-                        checkpoint_callback=_on_checkpoint,
-                        session_key=sess_key,
-                        llm_timeout_s=llm_timeout,
-                        # Route the subagent through the same context-window
-                        # trimming as the main agent (runner._snip_history);
-                        # without this value the runner skips trimming and
-                        # long reviewer runs grow unbounded.
-                        context_window_tokens=effective_context_window,
-                        context_block_limit=self.context_block_limit,
-                    )
+            status.stop_reason = result.stop_reason
+            self._apply_dedup_stats(status, tools)
+            if status.duplicate_reads or status.duplicate_searches:
+                logger.info(
+                    "subagent.dedup task_id={} label={} duplicate_reads={} duplicate_searches={}",
+                    task_id,
+                    label,
+                    status.duplicate_reads,
+                    status.duplicate_searches,
                 )
-                status.stop_reason = result.stop_reason
-                self._apply_dedup_stats(status, tools)
-                if status.duplicate_reads or status.duplicate_searches:
-                    logger.info(
-                        "subagent.dedup task_id={} label={} duplicate_reads={} duplicate_searches={}",
-                        task_id,
-                        label,
-                        status.duplicate_reads,
-                        status.duplicate_searches,
-                    )
 
-                if result.stop_reason == "tool_error":
-                    status.phase = "error"
-                    status.tool_events = list(result.tool_events)
-                    final_result = self._format_partial_progress(result)
-                    await self._announce_result(
-                        task_id,
-                        label,
-                        task,
-                        final_result,
-                        origin,
-                        "error",
-                        origin_message_id,
-                        usage=result.usage,
-                        execution_limits=execution_limits,
-                    )
-                    return
-                if result.stop_reason in (
-                    "error",
-                    "compression_failed",
-                    "compression_limit",
-                    "invalid_output",
-                ):
-                    # Run-level compression stopped the run, or the final answer
-                    # never satisfied the profile's output contract: both are
-                    # execution failures, not completions. The reviewer is
-                    # marked error so the caller treats its assignment as
-                    # incomplete instead of parsing a rejected answer.
-                    status.phase = "error"
-                    reason = result.error or (
-                        f"Error: reviewer run stopped with {result.stop_reason}."
-                    )
-                    await self._announce_result(
-                        task_id,
-                        label,
-                        task,
-                        reason,
-                        origin,
-                        "error",
-                        origin_message_id,
-                        usage=result.usage,
-                        execution_limits=execution_limits,
-                    )
-                    return
-
-                completion = await self.handle_completed_result(
-                    profile=profile,
-                    result=result,
-                    metadata=metadata,
-                )
-                final_result = completion.content
-                status.stop_reason = completion.stop_reason or status.stop_reason
-
-                logger.info("Subagent [{}] completed status={}", task_id, completion.status)
-                # A reviewer that answered with empty findings without evidence
-                # is an execution failure; a run whose final answer never
-                # satisfied its output contract is still a completed lifecycle
-                # with an error result for compatibility.
-                status.phase = (
-                    "error"
-                    if completion.status == "error"
-                    and completion.content.startswith("Error: Review incomplete")
-                    else "done"
-                )
-                lifecycle_status = "completed" if completion.status == "ok" else "error"
+            if result.stop_reason == "tool_error":
+                status.phase = "error"
+                status.tool_events = list(result.tool_events)
+                final_result = self._format_partial_progress(result)
                 await self._announce_result(
                     task_id,
                     label,
                     task,
                     final_result,
                     origin,
-                    completion.status,
+                    "error",
                     origin_message_id,
                     usage=result.usage,
                     execution_limits=execution_limits,
-                    payload=completion.payload,
                 )
+                return
+            if result.stop_reason in (
+                "error",
+                "context_limit",
+                "invalid_output",
+            ):
+                # The run could not fit its evidence in the reviewer's context
+                # window, or the final answer never satisfied the profile's
+                # output contract: both are execution failures, not
+                # completions. The reviewer is marked error so the caller treats
+                # its assignment as incomplete instead of parsing a rejected
+                # answer.
+                status.phase = "error"
+                reason = result.error or (
+                    f"Error: reviewer run stopped with {result.stop_reason}."
+                )
+                await self._announce_result(
+                    task_id,
+                    label,
+                    task,
+                    reason,
+                    origin,
+                    "error",
+                    origin_message_id,
+                    usage=result.usage,
+                    execution_limits=execution_limits,
+                )
+                return
+
+            completion = await self.handle_completed_result(
+                profile=profile,
+                result=result,
+                metadata=metadata,
+            )
+            final_result = completion.content
+            status.stop_reason = completion.stop_reason or status.stop_reason
+
+            logger.info("Subagent [{}] completed status={}", task_id, completion.status)
+            # A reviewer that answered with empty findings without evidence
+            # is an execution failure; a run whose final answer never
+            # satisfied its output contract is still a completed lifecycle
+            # with an error result for compatibility.
+            status.phase = (
+                "error"
+                if completion.status == "error"
+                and completion.content.startswith("Error: Review incomplete")
+                else "done"
+            )
+            lifecycle_status = "completed" if completion.status == "ok" else "error"
+            await self._announce_result(
+                task_id,
+                label,
+                task,
+                final_result,
+                origin,
+                completion.status,
+                origin_message_id,
+                usage=result.usage,
+                execution_limits=execution_limits,
+                payload=completion.payload,
+            )
 
         except TimeoutError:
+            # A *request* timeout (provider-side wall clock), not a role budget:
+            # reviewer runs are bounded by their request allowance instead.
             status.phase = "error"
             status.stop_reason = "timeout"
             self._apply_dedup_stats(status, tools)
-            timeout_seconds = execution_limits.timeout_seconds if execution_limits else None
-            message = f"Error: subagent execution timed out after {timeout_seconds or 0:g}s"
-            logger.warning("Subagent [{}] timed out after {}s", task_id, timeout_seconds)
+            message = "Error: the reviewer's model request timed out."
+            logger.warning("Subagent [{}] model request timed out", task_id)
             await self._announce_result(
                 task_id,
                 label,
@@ -813,11 +812,10 @@ class SubagentManager:
         ):
             metadata["subagent_duplicate_reads"] = status_obj.duplicate_reads
             metadata["subagent_duplicate_searches"] = status_obj.duplicate_searches
-        if execution_limits is not None:
-            if execution_limits.max_tokens is not None:
-                metadata["subagent_max_tokens"] = execution_limits.max_tokens
-            if execution_limits.timeout_seconds is not None:
-                metadata["subagent_timeout_seconds"] = execution_limits.timeout_seconds
+        if execution_limits is not None and execution_limits.runtime is not None:
+            # The reviewer's effective runtime is part of the run's audit trail:
+            # it says which model/window actually judged this assignment.
+            metadata["subagent_model_runtime"] = execution_limits.runtime.describe()
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
         msg = InboundMessage(

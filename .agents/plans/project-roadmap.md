@@ -29,7 +29,8 @@ NanoReview 是以代码审查为入口的个人多智能体系统。用户明确
 - 保留 reviewer 结果全部完成写入、validator、Judge、清理及终态持久化的阶段与门禁。移除 terminal tool 提交协议，保留输出业务校验、有界纠正与收尾预算；对话继续自由文本输出。
 - Review 与 Conversation 共用 Runner、Provider、工具实现、压缩、usage 和取消能力，独立 prompt、消息上下文、ToolRegistry、tool context、执行 profile 与权限。review 的 planning、evidence、validation、Judge batching、finalizer 留在领域层，Runner 不承担 session 路由或 WebUI 协议。
 - 权限在工具层执行：每 turn 解析 WorkspaceScope，review 固定 restricted；保留角色工具隔离、路径限制、命令 guard、sandbox 和通用联网边界，不引入逐工具 approval 或风险分级授权。应用层 guard 不等于操作系统隔离。
-- 共同规则在 conversation turn、planner/reviewer run、Judge batch 开始时读取，内部迭代保持快照。单 run 使用 Runner compression，跨轮对话使用 Consolidator，不复制第二套 Runner 或恢复 AutoCompact 产品路径。
+- 共同规则在 conversation turn、planner/reviewer run、Judge batch 开始时读取，内部迭代保持快照。上下文治理统一为**请求级压缩**（`ContextGovernor`，唯一预算公式，首包同样校验），跨轮只保留 session checkpoint（`Consolidator` 负责落盘与回放折叠），不复制第二套 Runner 或恢复 AutoCompact 产品路径。
+- 模型参数按角色冻结：一次 run 从准入到最后一个 iteration 使用同一个 `LLMRuntime`（provider/model/generation/window），角色可逐项覆盖对话 agent，跨 provider 需显式声明。长期记忆由对话压缩产出的 journal 与每周一次 Dream 收敛维护，review 角色不参与写入。
 - API、CLI、WebUI 共用领域流程；transport 只负责协议解析、交付与状态读取。不持久化 task、provider、lock、callback、future 或用于恢复执行的 runtime checkpoint。
 
 ## 报告与对话交接
@@ -42,7 +43,7 @@ NanoReview 是以代码审查为入口的个人多智能体系统。用户明确
 
 | 顺序 | 目标 |
 |---|---|
-| 当前 | run 黑板与结构化输出收敛，具体范围和验收见实施计划；旧节点未验收项另列，不视作文档清理后已完成。 |
+| 当前 | 统一上下文治理、角色模型配置与 Dream 长期记忆，具体范围和验收见实施计划；旧节点未验收项另列，不视作文档清理后已完成。 |
 | 后续 | 后端闭环验收：API/CLI 覆盖 review、报告交接、对话修复与测试，以及取消、部分修改、持久化、重启读取和错误交付。 |
 | 再后 | 审查效果评测：验证误报、已知问题检出及调整前后收益。 |
 | 最后 | 前端适配与演示：状态、报告、流式对话、控制、错误、刷新和重连；包含 reviewer mode 三态适配与 approval 残留清理。 |
@@ -65,7 +66,7 @@ NanoReview 是以代码审查为入口的个人多智能体系统。用户明确
 - COMMON_RULES 拆分为 review/conversation 规则。
 - 更强工作区隔离或自动 worktree。
 - 报告与历史的长期归档、搜索和跨 session 关联。
-- 模型路由、成本预算与更细压缩策略。
+- 模型路由、成本预算与更细压缩策略（角色运行时与请求级压缩已落地，这部分指按成本/能力选模型与更细的裁剪策略）。
 - ReviewLoop、MessageBus、WebUI transcript/trace 在当前黑板改造范围之外的进一步收敛，先核对调用方。
 - general 绕过 Planner、直接派发及 Kodus finder/verifier 流程。
 
@@ -73,7 +74,7 @@ NanoReview 是以代码审查为入口的个人多智能体系统。用户明确
 
 ## 明确不做
 
-- 首版不支持同 session 多次 review、多报告管理、纯对话入口、自主 review、定时自动化或 `/resume`。
+- 首版不支持同 session 多次 review、多报告管理、纯对话入口、自主 review、通用定时任务或 `/resume`。唯一例外是长期记忆的每周 Dream 收敛（固定周日 03:00 Asia/Shanghai、不补跑、只写 `memory/MEMORY.md`），它不是通用调度器，也不扩展到 review 或对话 turn。
 - 不自动重执行可能产生副作用的对话 turn，不直接照搬参考项目的截短或超窗重跑策略。
 - 不因产品专用化删除仍有消费者的通用 session、历史、Consolidator 或对话工具；删除组件前核对用途。
 - 不把未合并候选分支当作目标架构或实施基线。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from nanoreview.config.schema import Config, InlineFallbackConfig, ModelPresetConfig
 from nanoreview.providers.base import LLMProvider
@@ -134,6 +135,25 @@ def make_provider(
         )
 
     return provider
+
+
+def make_role_provider_factory(
+    config: Config,
+) -> Callable[[str, str], tuple[LLMProvider, str | None]]:
+    """Build a factory for roles that select their own provider.
+
+    A review role may name a different provider (``review.reviewer.provider``).
+    The factory creates that provider from the same root config — so credentials,
+    api base, headers and body come from the configured provider entry — and
+    returns the resolved registry name for diagnostics.
+    """
+
+    def _build(provider_name: str, model: str) -> tuple[LLMProvider, str | None]:
+        preset = ModelPresetConfig(model=model, provider=provider_name)
+        provider = make_provider(config, preset=preset)
+        return provider, config.get_provider_name(model, preset=preset)
+
+    return _build
 
 
 def provider_signature(

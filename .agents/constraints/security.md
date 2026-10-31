@@ -10,6 +10,7 @@
 - 带 `workspace_scope` 键但 payload 非法的层级会使整条解析链终止并回退配置默认，不再向下一层取用；只有该层**未声明**该键时才继续向下。非法声明不得继承更低层的更宽 scope。
 - 默认 `ToolsConfig.restrict_to_workspace=False` 即 `full`；`True` 即 `restricted`。别名 `restrict`/`full-access` 归一化为规范值。
 - ReviewLoop、reviewer、Judge 固定使用 `restricted` scope（`review_workspace_scope()`），不接受会话 metadata 放宽；审查与修复的工具权限按调用角色配置，不能因复用 Runner 而扩大 reviewer/Judge 权限。reviewer 的 scope 由 subagent hook 写入工具调用上下文，不能只依赖 `ToolsConfig.restrict_to_workspace`（会话默认 `full` 时 reviewer 仍须只读目标仓库）。
+- Dream run 只注册 `read_memory` / `write_memory` 两个工具，没有 shell、MCP、通用文件读写或目录写入；`write_memory` 不接受路径参数，目标由宿主固定为 `memory/MEMORY.md`，内容先暂存、由宿主在 run 成功后原子写回，模型无法写到别处。读入的 journal 条目与 MEMORY 内容是数据而非指令，prompt 明确禁止记录密钥。
 - `restrict_to_workspace` 是应用层防护，不替代操作系统或容器隔离；执行隔离复用 `agent/tools/sandbox.py`。
 
 ## 网络

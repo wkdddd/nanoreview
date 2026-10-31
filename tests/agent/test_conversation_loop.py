@@ -85,7 +85,7 @@ class SpecCapturingRunner:
         self.specs.append(spec)
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 
@@ -103,8 +103,7 @@ class InjectingRunner(SpecCapturingRunner):
         return AgentRunResult(
             final_content="ok",
             messages=[
-                *spec.frozen_messages,
-                *spec.working_messages,
+                *spec.messages,
                 *self.injected,
                 {"role": "assistant", "content": "ok"},
             ],
@@ -135,7 +134,7 @@ class ContextRefreshRunner(SpecCapturingRunner):
             self.observed_scopes.append(current_workspace_scope())
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
         )
 
 
@@ -270,20 +269,22 @@ async def test_the_first_turn_carries_the_report_and_its_directive(tmp_path) -> 
 
     spec = runner.specs[0]
     # The complete report — not a summary — is what the model sees, replayed
-    # from history in the working zone.
-    assert len(spec.working_messages) == 1
-    handoff_message = spec.working_messages[0]
-    assert handoff_message["role"] == "assistant"
-    assert handoff_message["content"].startswith("[ReviewAgent handoff]")
+    # from history as an assistant turn.
+    handoff_message = next(
+        message
+        for message in spec.messages
+        if message["role"] == "assistant"
+        and message["content"].startswith("[ReviewAgent handoff]")
+    )
     assert REPORT_MARKDOWN in handoff_message["content"]
-    # The provenance directive rides in the frozen system zone, which is never
-    # summarized away mid-run.
-    system = spec.frozen_messages[0]
+    # The provenance directive rides in the system message, which the governor
+    # never summarizes away.
+    system = spec.messages[0]
     assert system["role"] == "system"
     assert _handoff().directive in system["content"]
-    # The current user message stays in the frozen zone, after the system.
-    assert spec.frozen_messages[1]["role"] == "user"
-    assert "what did you find?" in spec.frozen_messages[1]["content"]
+    # The current user message closes the transcript.
+    assert spec.messages[-1]["role"] == "user"
+    assert "what did you find?" in spec.messages[-1]["content"]
 
 
 @pytest.mark.asyncio
@@ -333,10 +334,11 @@ async def test_the_persisted_summary_reaches_the_model_after_a_restart(
 ) -> None:
     """Consolidation hides old turns; the summary must carry them back in.
 
-    Written to disk by one process and replayed by the next, it has to land in
-    the system prompt. Otherwise the replay window keeps hiding those turns —
-    losing earlier decisions and open work — while the token probe still pays
-    for a summary the model never receives.
+    Written to disk by one process and replayed by the next, it is handed to the
+    run as ``initial_summary``; the request-level governor renders it as a marked
+    data message right after the header. Otherwise the replay window keeps
+    hiding those turns — losing earlier decisions and open work — while the token
+    probe still pays for a summary the model never receives.
     """
     summary = "PERSISTED-SUMMARY-MARKER: earlier decisions and open work"
 
@@ -362,9 +364,7 @@ async def test_the_persisted_summary_reaches_the_model_after_a_restart(
         target_root=tmp_path,
     )
 
-    system = runner.specs[0].frozen_messages[0]
-    assert system["role"] == "system"
-    assert summary in system["content"]
+    assert runner.specs[0].initial_summary == summary
 
 
 @pytest.mark.asyncio
@@ -380,23 +380,28 @@ async def test_a_session_without_a_summary_injects_none(tmp_path) -> None:
         target_root=tmp_path,
     )
 
-    system = runner.specs[0].frozen_messages[0]
-    assert "[Archived Context Summary]" not in system["content"]
+    assert runner.specs[0].initial_summary is None
 
 
 @pytest.mark.asyncio
-async def test_history_is_consolidated_before_the_handoff_is_written(
+async def test_the_replay_fold_runs_before_the_handoff_is_written(
     tmp_path,
 ) -> None:
+    """The fold must see the transcript the handoff is about to join.
+
+    Recording the full report comes after the replay-window fold: a fold that
+    ran afterwards would archive a chunk the handoff already widened, and the
+    boundary it advanced to would not describe what the model was sent.
+    """
     order: list[str] = []
     loop = _loop(tmp_path)
-    original_consolidate = loop._consolidator.maybe_consolidate_by_tokens
+    original_consolidate = loop._consolidator.fold_replay_overflow
 
     async def _traced_consolidate(*args, **kwargs):
         order.append("consolidate")
         return await original_consolidate(*args, **kwargs)
 
-    loop._consolidator.maybe_consolidate_by_tokens = _traced_consolidate  # type: ignore[method-assign]
+    loop._consolidator.fold_replay_overflow = _traced_consolidate  # type: ignore[method-assign]
     loop._handoff_consumer = lambda session, handoff: order.append("handoff")  # type: ignore[assignment]
 
     await loop.process_message(

@@ -12,4 +12,12 @@
 - review 角色现在没有提交工具：新增/修改 prompt 时不要写 `review_submit`、`submit_review_decision`、`finish_review_triage`，模型会去找不存在的工具。
 - 结构化输出被拒**不能**当成功：`structured_output is None` 时必须走失败分支，不能把 `final_content` 里的散文当成 findings。
 - `OutputContract.parse` 必须是纯函数；写成有状态校验器会让“上一次被拒”在重试时变成通过。
+- `AgentRunner` 是共享实例：请求一律走 `spec.runtime.provider`。改回 `self.provider` 会把自建 provider 的角色（跨 provider 的 reviewer/Judge）静默发到对话 agent 的 provider 上，测试只覆盖同 provider 时看不出来。
+- `AgentRunSpec` 只有一份 `messages`；`frozen_messages`/`working_messages` 已删除。测试替身必须读 `spec.messages`，写旧字段会得到 `TypeError`/`AttributeError` 而不是断言失败。
+- 预算公式只有 `input_token_budget()` 一处；任何角色自己算 `window - output - 某常量`，都会在发包时被 governor 判成 `context_limit`（Judge 分批曾因此产生必失败的批次）。
+- `context_limit`/`invalid_output` 是失败终态，必须带非空 `error`；`error` 为空会被上层当成正常完成。
+- 长期记忆：`write_memory` 只暂存，绝不能在工具里直接写 `MEMORY.md`；cursor 必须在原子写回**之后**推进，否则失败的 Dream 会吞掉自己没合并的条目。
+- 长期记忆：MEMORY 快照只经 `ConversationLoop` 的 `memory_reader` 注入，不要加进 `ContextBuilder` 的默认加载路径——reviewer/Judge 共享同一个 builder，会连带看到它。
+- Dream 的 ticker 是死循环：`aclose()` 必须先 `cancel()` 再排空后台任务，放进 `_background_tasks` 用 `gather` 等待会挂住关闭。
+- `Asia/Shanghai` 走 `zoneinfo`，Windows 无 tzdata 时回退固定 `+08:00`（大陆无夏令时，等价）；不要用宿主机本地时区做每周判定。
 - `tests/` 下没有 `__init__.py`，`--import-mode=importlib` 不把测试目录塞进 `sys.path`：不要写跨目录的共享测试 helper 模块，helper 直接定义在各测试文件里。

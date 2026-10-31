@@ -2,10 +2,9 @@
 
 ``ConversationLoop`` owns the whole ordinary (non-review) conversation turn:
 it loads the session, consumes the first review handoff through the
-coordinator, builds the frozen/working context, creates a core-only
-``ToolRegistry`` for the turn, runs one ``AgentRunner`` run (the model/tool loop
-lives in the runner), persists the turn's history and assembles the outbound
-reply.
+coordinator, builds the request context, creates a core-only ``ToolRegistry``
+for the turn, runs one ``AgentRunner`` run (the model/tool loop lives in the
+runner), persists the turn's history and assembles the outbound reply.
 
 It never decides *whether* the conversation is open: the ``SessionCoordinator``
 routes, gates, and prepares the read-only handoff inside the session lock, then
@@ -16,9 +15,14 @@ review report artifact or rewrites the review run state.
 
 Turn shape (linear helper calls, no state machine, no transition table):
 
-    load session -> restore checkpoint -> consume handoff
+    load session -> restore checkpoint -> fold replay overflow -> consume handoff
       -> build context/tools -> run -> persist history -> assemble reply
-      -> cleanup
+
+Context growth is handled per request by ``ContextGovernor`` inside the runner.
+This loop only feeds it: the pre-existing context count (``accepted_message_count``),
+the persisted checkpoint and the summarizer. When a run reports a replacement
+checkpoint, the loop advances the session's replay boundary by exactly the number
+of pre-existing messages the summary now covers.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from nanoreview.agent.context import ContextBuilder
 from nanoreview.agent.hooks.file_edit import create_file_edit_activity_hook
 from nanoreview.agent.hooks.lifecycle import AgentHook
 from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
+from nanoreview.agent.llm_runtime import ROLE_CONVERSATION, LLMRuntime
 from nanoreview.agent.memory import Consolidator
 from nanoreview.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
@@ -104,8 +109,12 @@ class _TurnContext:
     outbound_chat_id: str | None = None
 
     history: list[dict[str, Any]] = field(default_factory=list)
-    frozen_messages: list[dict[str, Any]] = field(default_factory=list)
-    working_messages: list[dict[str, Any]] = field(default_factory=list)
+    #: Ordered transcript handed to the runner: [system, *history, current].
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    #: Raw index where the pre-existing conversation context ends inside
+    #: ``messages`` — the region request-level compaction may summarize before
+    #: the first request of this turn.
+    accepted_message_count: int = 0
 
     final_content: str | None = None
     tools_used: list[str] = field(default_factory=list)
@@ -129,10 +138,16 @@ class _TurnContext:
     #: tool batch and let later calls reach outside the project root.
     workspace_scope: WorkspaceScope | None = None
 
-    #: Persisted Consolidator summary for this turn. Consolidation hides old
-    #: turns from the replay window, so this text is what carries them back into
-    #: the model prompt.
+    #: Persisted checkpoint summary for this turn. Compaction hides old turns
+    #: behind ``last_consolidated``, so this text is what carries them back into
+    #: the model prompt (as a marked data message, never as an instruction).
     session_summary: str | None = None
+
+    #: Long-term memory snapshot read once at turn start.
+    memory_text: str | None = None
+
+    #: Replacement checkpoint produced by request-level compaction in this turn.
+    compaction: Any | None = None
 
     pending_queue: asyncio.Queue | None = None
 
@@ -171,11 +186,12 @@ class ConversationLoop:
         max_messages: int = 120,
         review_config: Any = None,
         provider_snapshot_loader: Callable[..., Any] | None = None,
-        background_scheduler: Callable[[Awaitable[Any]], None] | None = None,
         hooks: list[AgentHook] | None = None,
         hooks_getter: Callable[[], list[AgentHook]] | None = None,
         usage_recorder: Callable[[dict[str, int]], None] | None = None,
         mcp_provider: "MCPProvider | None" = None,
+        memory_reader: Callable[[], str] | None = None,
+        archive_recorder: Callable[[str, str], None] | None = None,
     ) -> None:
         self._bus = bus
         self._provider = provider
@@ -196,7 +212,6 @@ class ConversationLoop:
         self._max_messages = max_messages if max_messages > 0 else 120
         self._review_config = review_config
         self._provider_snapshot_loader = provider_snapshot_loader
-        self._background_scheduler = background_scheduler
         self._extra_hooks: list[AgentHook] = hooks if hooks is not None else []
         # Dynamic accessor so the owner (coordinator/SDK) can swap its hook
         # list between turns; falls back to the static list when absent.
@@ -215,6 +230,14 @@ class ConversationLoop:
         # wrapper at call time, so a reconnect does not require rebuilding an
         # in-flight turn's registry.
         self._mcp_provider = mcp_provider
+        #: Reads the long-term memory file once per turn. It is a callback (not
+        #: a ContextBuilder responsibility) so the review roles, which share the
+        #: same builder, can never inherit it.
+        self._memory_reader = memory_reader
+        #: Appends one archived conversation summary to the long-term memory
+        #: journal. Review roles never call this: only conversation history is
+        #: archived.
+        self._archive_recorder = archive_recorder
         # One loader instance keeps the (package-scan) discovery cache warm;
         # each turn still registers a fresh registry from it.
         self._tool_loader = ToolLoader()
@@ -272,15 +295,12 @@ class ConversationLoop:
             on_retry_wait=on_retry_wait,
             pending_queue=pending_queue,
         )
-        try:
-            await self._load_session(ctx)
-            await self._build(ctx, handoff)
-            await self._run(ctx)
-            self._save(ctx)
-            await self._respond(ctx)
-            return ctx.outbound
-        finally:
-            self._cleanup(ctx)
+        await self._load_session(ctx)
+        await self._build(ctx, handoff)
+        await self._run(ctx)
+        self._save(ctx)
+        await self._respond(ctx)
+        return ctx.outbound
 
     # -- pipeline helpers ---------------------------------------------------
 
@@ -311,21 +331,26 @@ class ConversationLoop:
         self, ctx: _TurnContext, handoff: "ReviewHandoff | None"
     ) -> None:
         """Consume the handoff, build the context and create the tool registry."""
-        await self._consolidator.maybe_consolidate_by_tokens(
+        # Turns hidden by the replay window are folded into the checkpoint
+        # *before* the history is read: without it a narrow window would silently
+        # drop them (no longer replayed, never summarized).
+        folded = await self._consolidator.fold_replay_overflow(
             ctx.session,
-            replay_max_messages=self._max_messages,
+            self._max_messages,
+            on_usage=self._record_summary_usage,
         )
-        # Read what consolidation just left behind, so the turn that triggered it
-        # already sees the summary. It is also the same text the token probe
-        # counts: without this injection the replay window keeps hiding the old
-        # turns while the budget still pays for a summary nobody receives.
+        if folded:
+            self._record_archived_summary(ctx, folded)
+        # Read what the session now carries. It reaches the model as a marked
+        # data message through the runner, not through the system prompt, so the
+        # review roles sharing the same builder never see it.
         ctx.session_summary = self._consolidator.last_summary_text(ctx.session)
+        ctx.memory_text = self._read_memory()
 
         # The handoff was prepared (and size-checked) by the coordinator, which
-        # also owns the single replayable write. The loop calls it after history
-        # consolidation and before reading history, so the report is available to
-        # this turn and every later one; a failed write propagates and the
-        # runner never starts.
+        # also owns the single replayable write. The loop calls it before reading
+        # history, so the report is available to this turn and every later one; a
+        # failed write propagates and the runner never starts.
         if handoff is not None:
             self._handoff_consumer(ctx.session, handoff)
 
@@ -337,9 +362,40 @@ class ConversationLoop:
         ):
             message_tool.start_turn()
 
-        ctx.frozen_messages, ctx.working_messages = self._build_partitioned(ctx)
-        self._apply_handoff_directive(ctx.frozen_messages, ctx.handoff_directive)
+        ctx.messages = self._build_messages(ctx)
+        # Everything the session already contained may be compacted before the
+        # first request; the current user message may not.
+        ctx.accepted_message_count = 1 + len(ctx.history)
+        self._apply_handoff_directive(ctx.messages, ctx.handoff_directive)
         ctx.user_persisted_early = self._persist_user_message_early(ctx)
+
+    def _read_memory(self) -> str | None:
+        """Read the long-term memory snapshot once for this turn."""
+        if self._memory_reader is None:
+            return None
+        try:
+            text = self._memory_reader()
+        except Exception:
+            logger.warning("Long-term memory read failed", exc_info=True)
+            return None
+        return text if text and text.strip() else None
+
+    def _record_archived_summary(self, ctx: _TurnContext, summary: str) -> None:
+        """Append one conversation summary to the long-term memory journal.
+
+        Only conversation history is archived: the review roles never call this,
+        and a failed write never fails the turn.
+        """
+        if self._archive_recorder is None:
+            return
+        try:
+            self._archive_recorder(summary, ctx.session_key)
+        except Exception:
+            logger.warning("Long-term memory journal write failed", exc_info=True)
+
+    def _record_summary_usage(self, usage: dict[str, int]) -> None:
+        if self._usage_recorder is not None and usage:
+            self._usage_recorder(dict(usage))
 
     async def _run(self, ctx: _TurnContext) -> None:
         """Execute one ``AgentRunner`` run and collect its result."""
@@ -351,6 +407,7 @@ class ConversationLoop:
         ctx.stop_reason = result.stop_reason
         ctx.had_injections = result.had_injections
         ctx.content_replaced = result.content_replaced
+        ctx.compaction = result.compaction
         # Report the returned run's usage before anything else can fail: the
         # owner must count it even when the ``message`` tool already sent the
         # reply (``None`` outbound) and even if persisting this turn fails.
@@ -406,6 +463,11 @@ class ConversationLoop:
             ctx.save_skip,
             turn_latency_ms=ctx.turn_latency_ms,
         )
+        # The run may have folded part of the replayed history into a
+        # replacement checkpoint. Advance the replay boundary by exactly the
+        # number of pre-existing session messages it now covers: the summary is
+        # the only carrier of those turns from now on, including after a restart.
+        self._apply_compaction(ctx)
         ctx.session.enforce_file_cap()
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
@@ -425,15 +487,27 @@ class ConversationLoop:
             turn_latency_ms=ctx.turn_latency_ms,
         )
 
-    def _cleanup(self, ctx: _TurnContext) -> None:
-        """Per-turn teardown; the coordinator owns queues/locks/queued messages."""
-        if ctx.session is not None and self._background_scheduler is not None:
-            self._background_scheduler(
-                self._consolidator.maybe_consolidate_by_tokens(
-                    ctx.session,
-                    replay_max_messages=self._max_messages,
-                )
-            )
+    def _apply_compaction(self, ctx: _TurnContext) -> None:
+        """Persist the run's replacement checkpoint, if it produced one.
+
+        ``persist_checkpoint`` always saves: ``last_consolidated`` has already
+        moved by then, so a skipped save would replay turns the summary already
+        covers. The session is saved again below with the full turn appended.
+        """
+        compaction = ctx.compaction
+        if compaction is None or ctx.session is None:
+            return
+        self._consolidator.persist_checkpoint(
+            ctx.session,
+            compaction.summary,
+            advance=compaction.compacted_session_messages,
+        )
+        logger.debug(
+            "conversation.compaction.applied session={} covered={} rounds={}",
+            ctx.session_key,
+            compaction.compacted_session_messages,
+            compaction.compaction_count,
+        )
 
     # -- runner -------------------------------------------------------------
 
@@ -480,21 +554,31 @@ class ConversationLoop:
         file_state_token = bind_file_states(
             self._file_state_store.for_session(ctx.session_key)
         )
+        runtime = LLMRuntime.capture(
+            self._provider,
+            model=self._model,
+            context_window_tokens=self._context_window_tokens,
+            role=ROLE_CONVERSATION,
+        )
         try:
             return await self._runner.run(
                 AgentRunSpec(
-                    frozen_messages=ctx.frozen_messages,
-                    working_messages=ctx.working_messages,
+                    messages=ctx.messages,
                     tools=ctx.tools,
-                    model=self._model,
+                    runtime=runtime,
                     max_iterations=self._max_iterations,
                     max_tool_result_chars=self._max_tool_result_chars,
+                    # Only the context that already existed may be folded into a
+                    # summary before the first request: the current user message
+                    # is this turn's new input and must always reach the model.
+                    accepted_message_count=ctx.accepted_message_count,
+                    initial_summary=ctx.session_summary,
+                    summarizer=self._consolidator.summarizer,
                     hook=hook,
                     error_message="Sorry, I encountered an error calling the AI model.",
                     concurrent_tools=True,
                     workspace=ctx.target_root,
                     session_key=ctx.session_key,
-                    context_window_tokens=self._context_window_tokens,
                     context_block_limit=self._context_block_limit,
                     provider_retry_mode=self._provider_retry_mode,
                     retry_wait_callback=ctx.on_retry_wait,
@@ -560,10 +644,8 @@ class ConversationLoop:
             if m.get("_metadata", {}).get("injected_event") != "subagent_result"
         ]
 
-    def _build_partitioned(
-        self, ctx: _TurnContext
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        return self._context.build_partitioned_messages(
+    def _build_messages(self, ctx: _TurnContext) -> list[dict[str, Any]]:
+        return self._context.build_messages(
             history=ctx.history,
             current_message=ctx.msg.content,
             media=ctx.msg.media if ctx.msg.media else None,
@@ -571,7 +653,7 @@ class ConversationLoop:
             chat_id=self._runtime_chat_id(ctx.msg),
             current_role="user",
             sender_id=ctx.msg.sender_id,
-            session_summary=ctx.session_summary,
+            memory_text=ctx.memory_text,
             session_metadata=ctx.session.metadata,
         )
 
@@ -633,17 +715,18 @@ class ConversationLoop:
 
     @staticmethod
     def _apply_handoff_directive(
-        frozen_messages: list[dict[str, Any]], directive: str | None
+        messages: list[dict[str, Any]], directive: str | None
     ) -> None:
-        """Append the review handoff directive to the frozen system prompt.
+        """Append the review handoff directive to the system prompt.
 
-        The frozen zone is copied verbatim into every request and is never
-        summarized by run-level compression, so the review's provenance and its
-        read-only constraint survive even if the replayed history is compacted.
+        The leading ``system`` message is the run's stable instruction header and
+        is never summarized by request-level compaction, so the review's
+        provenance and its read-only constraint survive even if the replayed
+        history is folded into a checkpoint.
         """
-        if not directive or not frozen_messages:
+        if not directive or not messages:
             return
-        first = frozen_messages[0]
+        first = messages[0]
         if first.get("role") != "system":
             return
         content = first.get("content")
@@ -874,8 +957,7 @@ class ConversationLoop:
         unstreamed_stop_reasons = {
             "error",
             "tool_error",
-            "compression_failed",
-            "compression_limit",
+            "context_limit",
         }
         if streamed and stop_reason not in unstreamed_stop_reasons:
             meta["_streamed"] = True

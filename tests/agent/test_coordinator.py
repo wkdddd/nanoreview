@@ -525,7 +525,7 @@ class _UsageRunner:
         self.runs += 1
         return AgentRunResult(
             final_content="ok",
-            messages=[*spec.frozen_messages, *spec.working_messages],
+            messages=list(spec.messages),
             usage=dict(self.usage),
         )
 

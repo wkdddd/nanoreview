@@ -9,22 +9,24 @@ at most once. Candidates that cannot fit into a single batch even on their own
 are explicitly marked as ``needs_confirmation`` rather than silently accepted.
 
 Each batch runs through the shared :class:`~nanoreview.agent.runner.AgentRunner`
-with the same provider/model as the coordinator/plan run, so the judge inherits
-provider retry, structured-output correction, cancellation and usage accounting
-instead of calling the provider directly.
+with the runtime frozen when the review started, so the judge inherits provider
+retry, structured-output correction, cancellation and usage accounting instead
+of calling the provider directly. Batching uses that runtime's real context
+window and reserved output budget; there is no fixed window and no role-level
+wall clock.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from nanoreview.agent.context_governance import input_token_budget
 from nanoreview.agent.hooks.lifecycle import AgentHook, AgentHookContext
 from nanoreview.agent.hooks.turn_hooks import AgentTurnHookSpec, build_agent_turn_hook
 from nanoreview.agent.review_state import bound_child_error
@@ -41,10 +43,12 @@ from nanoreview.review.types import (
 )
 from nanoreview.utils.helpers import estimate_prompt_tokens, merge_token_usage
 
+if TYPE_CHECKING:
+    from nanoreview.agent.llm_runtime import LLMRuntime
+
 #: Conservative fallback context window (tokens) when the runtime cannot
-#: supply a usable value. Logged when used so operators can correct the
-#: configuration. Chosen to be small enough to fit most judge models while
-#: still allowing a meaningful single batch.
+#: supply a usable value (0 means "unknown"). Logged when used so operators can
+#: set ``review.judge.contextWindowTokens`` or the conversation window.
 _FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000
 
 #: Rough chars-per-token estimate used ONLY when tiktoken is unavailable
@@ -52,8 +56,8 @@ _FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000
 #: bound for mixed ASCII/CJK content that avoids underestimating cost.
 _CHARS_PER_TOKEN = 4
 
-#: Reserved tokens for the model's response (matches ReviewJudgeConfig.max_tokens
-#: by default). Keeps room for the verdict payload.
+#: Reserved tokens for the model's response when the runtime declares no output
+#: budget. Keeps room for the verdict payload.
 _DEFAULT_RESERVED_OUTPUT_TOKENS = 2048
 
 #: Fixed instruction text prepended to the candidate JSON in each user prompt.
@@ -73,9 +77,11 @@ _PROMPT_INSTRUCTION = (
 
 #: Rejections of one batch's final answer allowed before the batch fails.
 _JUDGE_OUTPUT_RETRY_LIMIT = 3
-#: Request allowance per batch: the contract rejections above plus the
-#: empty/length recovery turns the runner may still need.
-_JUDGE_MAX_ITERATIONS = _JUDGE_OUTPUT_RETRY_LIMIT + 3
+#: Request allowance per batch. It matches the reviewer's allowance: the
+#: contract rejections above plus the empty/length recovery turns the runner may
+#: still need are all inside the same 30-request budget, and the batch has no
+#: wall clock of its own.
+_JUDGE_MAX_ITERATIONS = 30
 
 #: Tool-result budget for the judge run. The judge is tool-less, so this only
 #: bounds the runner's per-result normalization.
@@ -102,12 +108,15 @@ class ReviewJudgeStats:
 
 @dataclass(frozen=True, slots=True)
 class ReviewJudgeConfig:
+    """Judge behaviour flags.
+
+    Model selection, the context window and the reserved output budget all come
+    from the frozen ``LLMRuntime`` handed to :class:`ReviewJudge`; they are not
+    duplicated here, so a batch can never be planned against one window and run
+    against another.
+    """
+
     enabled: bool = True
-    timeout_seconds: int = 60
-    max_tokens: int = 2048
-    #: Model context window (tokens) used to split candidates into batches.
-    #: When 0/None the judge falls back to a conservative default and logs it.
-    context_window_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,12 +143,13 @@ class JudgeExecutionResult:
 
 
 class _JudgeUsageObserver(AgentHook):
-    """Snapshot per-iteration usage so a timed-out batch keeps its spend.
+    """Snapshot per-iteration usage so a cancelled batch keeps its spend.
 
     ``AgentRunner`` reports usage only through ``AgentRunResult``, which a run
-    cancelled by its own ``asyncio.wait_for`` timeout never produces. This hook
+    cancelled from outside (``/stop``, a tool error) never produces. This hook
     records each iteration's usage as it completes, so tokens already consumed
-    before the timeout stay visible to the caller instead of being dropped.
+    stay visible to the caller instead of being dropped. Compaction usage is
+    already folded into the run's usage by the runner itself.
     """
 
     __slots__ = ("usage",)
@@ -154,24 +164,14 @@ class _JudgeUsageObserver(AgentHook):
         # per iteration, so accumulating here mirrors ``AgentRunResult.usage``.
         merge_token_usage(self.usage, context.usage)
 
-    def record_compression_usage(self, usage: dict[str, int]) -> None:
-        """Fold a completed run-compression request's usage into the snapshot.
-
-        Run-level compression calls the provider outside the iteration loop, so
-        ``after_iteration`` never sees that spend. The runner invokes this
-        callback the moment each compression request's usage is billed, which
-        keeps it visible even when the batch is cancelled by the outer timeout.
-        """
-        merge_token_usage(self.usage, usage)
-
 
 class _JudgeBatchError(RuntimeError):
     """A failed judge batch that may still have consumed tokens.
 
     ``usage`` carries whatever the batch managed to spend — the run's reported
-    usage, or the observer snapshot when the run was cancelled by the batch
-    timeout — so the caller folds it into the judge total instead of dropping
-    already-billed tokens.
+    usage, or the observer snapshot when the run was cancelled mid-flight — so
+    the caller folds it into the judge total instead of dropping already-billed
+    tokens.
     """
 
     __slots__ = ("usage",)
@@ -184,22 +184,22 @@ class _JudgeBatchError(RuntimeError):
 class ReviewJudge:
     """Use an LLM to judge whether subagent candidates are review-worthy.
 
-    The judge shares the coordinator/plan ``AgentRunner`` and model. It never
-    creates its own provider, runner or model preset: batch execution differs
-    from the plan run only in the prompt and tool set: the run has no tools at
-    all and its final answer is the structured verdict payload.
+    The judge shares the coordinator's ``AgentRunner`` and the runtime frozen at
+    review start. It never creates its own provider or runner: batch execution
+    differs from the plan run only in the prompt and tool set — the run has no
+    tools at all and its final answer is the structured verdict payload.
     """
 
     def __init__(
         self,
         *,
         runner: AgentRunner,
-        model: str,
+        runtime: "LLMRuntime",
         config: ReviewJudgeConfig | None = None,
         common_rules_workspace: Path | None = None,
     ) -> None:
         self._runner = runner
-        self._model = model
+        self._runtime = runtime
         self._config = config or ReviewJudgeConfig()
         #: NanoReview workspace whose ``COMMON_RULES.md`` is read once per batch.
         self._common_rules_workspace = common_rules_workspace
@@ -214,10 +214,10 @@ class ReviewJudge:
 
         Returns a :class:`JudgeExecutionResult` covering every candidate.
         Candidates that could not be judged (too large to fit a single batch,
-        batch failure, timeout) receive an explicit ``needs_confirmation``
-        verdict so they are never silently treated as accepted. Cancellation
-        propagates; ordinary provider/output-contract/timeout errors become a bounded
-        ``error`` plus ``needs_confirmation`` candidates.
+        batch failure) receive an explicit ``needs_confirmation`` verdict so
+        they are never silently treated as accepted. Cancellation propagates;
+        ordinary provider/output-contract errors become a bounded ``error`` plus
+        ``needs_confirmation`` candidates.
         """
         candidates = self._collect_candidates(dimensions)
         total_candidates = len(candidates)
@@ -252,21 +252,24 @@ class ReviewJudge:
             )
 
         context_window = self._resolve_context_window()
-        reserved_output = max(1, int(self._config.max_tokens or _DEFAULT_RESERVED_OUTPUT_TOKENS))
-        # Per-request fixed cost: system prompt, the fixed instruction text of
-        # the user prompt, and the reserved output. Estimated with the shared
-        # tiktoken helper so judge budgeting matches the rest of the runtime.
-        fixed_tokens = (
-            self._estimate_tokens(
-                [
-                    {"role": "system", "content": self._system_prompt()},
-                    {"role": "user", "content": _PROMPT_INSTRUCTION},
-                ],
-            )
-            + reserved_output
+        reserved_output = max(
+            1, int(self._runtime.max_tokens or _DEFAULT_RESERVED_OUTPUT_TOKENS)
         )
-        # No minimum-batch floor: never let a batch exceed the real window.
-        available_per_batch = context_window - fixed_tokens
+        # Per-request fixed cost: the system prompt and the fixed instruction
+        # text of the user prompt. Estimated with the shared tiktoken helper so
+        # judge budgeting matches the rest of the runtime.
+        header_tokens = self._estimate_tokens(
+            [
+                {"role": "system", "content": self._system_prompt()},
+                {"role": "user", "content": _PROMPT_INSTRUCTION},
+            ],
+        )
+        fixed_tokens = header_tokens + reserved_output
+        # Planning and enforcement share one formula: a batch planned against a
+        # larger number than the governor allows would be rejected at request
+        # time (``context_limit``) instead of being split. No minimum-batch
+        # floor either — never let a batch exceed the real window.
+        available_per_batch = input_token_budget(context_window, reserved_output) - header_tokens
         if available_per_batch <= 0:
             # Fixed overhead alone exceeds the context window: no request can
             # ever fit. Mark every candidate as needs_confirmation without
@@ -309,7 +312,7 @@ class ReviewJudge:
             total_candidates,
             len(batches),
             len(unbatchable),
-            self._model,
+            self._runtime.model,
             context_window,
         )
 
@@ -500,9 +503,9 @@ class ReviewJudge:
         return verdicts, stats, usage, error
 
     def _resolve_context_window(self) -> int:
-        value = self._config.context_window_tokens
-        if isinstance(value, int) and value > 0:
-            return value
+        window = self._runtime.context_window_tokens
+        if isinstance(window, int) and window > 0:
+            return window
         logger.warning(
             "review.judge.context_window_unavailable fallback={}",
             _FALLBACK_CONTEXT_WINDOW_TOKENS,
@@ -611,27 +614,27 @@ class ReviewJudge:
         ``needs_confirmation``, records a bounded error and still accounts for
         the spend.
         """
-        # Observes per-iteration usage so a batch cancelled by the timeout below
-        # still reports the tokens it burned; harmless on the success path,
-        # where ``AgentRunResult.usage`` is authoritative.
+        # Observes per-iteration usage so a batch cancelled from outside still
+        # reports the tokens it burned; harmless on the success path, where
+        # ``AgentRunResult.usage`` is authoritative.
         usage_observer = _JudgeUsageObserver()
         spec = AgentRunSpec(
-            frozen_messages=[
+            messages=[
                 {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": self._build_prompt(batch)},
             ],
-            working_messages=[],
             # The judge is a pure decision step: it needs no tools, only the
             # candidate batch and its output contract.
             tools=ToolRegistry(),
-            model=self._model,
+            runtime=self._runtime,
             max_iterations=_JUDGE_MAX_ITERATIONS,
             max_tool_result_chars=_JUDGE_MAX_TOOL_RESULT_CHARS,
-            temperature=0,
-            max_tokens=self._config.max_tokens,
+            # The batch payload is this run's new input: it is never summarized
+            # before the first request, so an over-budget batch fails explicitly
+            # instead of being judged on a truncated candidate list.
+            accepted_message_count=0,
             output_contract=judge_contract(),
             output_retry_limit=_JUDGE_OUTPUT_RETRY_LIMIT,
-            context_window_tokens=self._config.context_window_tokens,
             error_message=None,
             concurrent_tools=False,
             # The judge batch is a self-contained execution: no persisted
@@ -646,22 +649,17 @@ class ReviewJudge:
             hook=build_agent_turn_hook(
                 AgentTurnHookSpec(turn_hooks=[usage_observer])
             ),
-            # Bank compression usage the instant it is billed, so a batch that
-            # is cancelled by the timeout below still reports that spend.
-            compression_usage_callback=usage_observer.record_compression_usage,
         )
 
         try:
-            result = await asyncio.wait_for(
-                self._runner.run(spec),
-                timeout=self._config.timeout_seconds,
-            )
+            result = await self._runner.run(spec)
         except TimeoutError as exc:
-            # ``wait_for`` cancels the run mid-flight, so there is no
-            # ``AgentRunResult``: the observer snapshot is the only record of
+            # A provider-side request timeout is the only wall clock a batch
+            # has: the run is cancelled mid-flight, so there is no
+            # ``AgentRunResult`` and the observer snapshot is the only record of
             # what this batch already spent. Cancellation of the judge itself
             # (``/stop``) stays a ``CancelledError`` and still propagates.
-            detail = str(exc) or f"exceeded {self._config.timeout_seconds}s"
+            detail = str(exc) or "the judge model request timed out"
             logger.warning(
                 "review.judge.batch.rejected trace_id={} stop_reason=timeout reason={} observed_usage={}",
                 trace_id,

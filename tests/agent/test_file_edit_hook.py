@@ -23,6 +23,7 @@ from nanoreview.agent.hooks import (
     build_agent_turn_hook,
     create_file_edit_activity_hook,
 )
+from nanoreview.agent.llm_runtime import LLMRuntime
 from nanoreview.agent.runner import AgentRunner, AgentRunSpec
 from nanoreview.agent.tools.filesystem import EditFileTool, WriteFileTool
 from nanoreview.agent.tools.registry import ToolRegistry
@@ -375,12 +376,18 @@ async def test_a_finished_turn_leaves_no_interruption_event(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_spec(tools: ToolRegistry, hook: Any, **overrides: Any) -> AgentRunSpec:
+def make_spec(
+    provider: LLMProvider,
+    tools: ToolRegistry,
+    hook: Any,
+    **overrides: Any,
+) -> AgentRunSpec:
     values: dict[str, Any] = {
-        "frozen_messages": [],
-        "working_messages": [],
+        "messages": [],
         "tools": tools,
-        "model": "dummy",
+        "runtime": LLMRuntime.capture(
+            provider, model="dummy", context_window_tokens=65_536
+        ),
         "max_iterations": 3,
         "max_tool_result_chars": 1000,
         "hook": hook,
@@ -408,7 +415,7 @@ async def test_a_conversation_turn_reports_its_file_edits(tmp_path) -> None:
     ])
 
     await AgentRunner(provider).run(
-        make_spec(tools, make_hook(tmp_path, collector.sink))
+        make_spec(provider, tools, make_hook(tmp_path, collector.sink))
     )
 
     assert collector.phases() == ["start", "end"]
@@ -436,7 +443,7 @@ async def test_review_and_judge_turns_report_no_file_edits(tmp_path) -> None:
     ])
 
     review_hook = build_agent_turn_hook(AgentTurnHookSpec(workspace=tmp_path, ephemeral=True))
-    await AgentRunner(provider).run(make_spec(tools, review_hook))
+    await AgentRunner(provider).run(make_spec(provider, tools, review_hook))
 
     assert collector.phases() == []
     # The edit itself still happened: only the observation is absent.
@@ -468,6 +475,6 @@ async def test_the_builder_registers_the_hook_for_conversation_turns(tmp_path) -
         LLMResponse(content="done"),
     ])
 
-    await AgentRunner(provider).run(make_spec(tools, hook))
+    await AgentRunner(provider).run(make_spec(provider, tools, hook))
 
     assert collector.phases() == ["start", "end"]

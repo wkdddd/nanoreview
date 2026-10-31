@@ -99,13 +99,6 @@ class AgentDefaults(Base):
         default=120,
         ge=0,
     )  # Max messages to replay from session history (0 = use default 120, respects token budget)
-    consolidation_ratio: float = Field(
-        default=0.5,
-        ge=0.1,
-        le=0.95,
-        validation_alias=AliasChoices("consolidationRatio"),
-        serialization_alias="consolidationRatio",
-    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
 
 
 class AgentsConfig(Base):
@@ -238,33 +231,46 @@ class ToolsConfig(Base):
         super().__init__(**data)
 
 
-class ReviewJudgeSettings(Base):
-    """AI judge configuration for code review findings.
+class RoleModelSettings(Base):
+    """Optional per-role model overrides.
 
-    The judge collects all accepted/uncertain candidates and batches them by
-    the model's context window; there is no fixed candidate cap.
+    Every field is independently optional: an unset (or ``null``) field inherits
+    the conversation agent's effective value at review start. Switching to a
+    model on another provider requires naming that ``provider`` explicitly —
+    credentials and connection settings are reused from the provider factory.
     """
 
-    enabled: bool = True
-    model_preset: str | None = Field(
+    provider: str | None = None
+    model: str | None = None
+    context_window_tokens: int | None = Field(
         default=None,
-        validation_alias=AliasChoices("modelPreset", "model_preset"),
-        serialization_alias="modelPreset",
-    )
-    timeout_seconds: int = Field(
-        default=60,
         ge=1,
-        le=600,
-        validation_alias=AliasChoices("timeoutSeconds", "timeout_seconds"),
-        serialization_alias="timeoutSeconds",
+        validation_alias=AliasChoices("contextWindowTokens", "context_window_tokens"),
+        serialization_alias="contextWindowTokens",
     )
-    max_tokens: int = Field(
-        default=2048,
-        ge=256,
-        le=16000,
+    max_tokens: int | None = Field(
+        default=None,
+        ge=1,
         validation_alias=AliasChoices("maxTokens", "max_tokens"),
         serialization_alias="maxTokens",
     )
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoningEffort", "reasoning_effort"),
+        serialization_alias="reasoningEffort",
+    )
+
+
+class ReviewJudgeSettings(RoleModelSettings):
+    """AI judge configuration for code review findings.
+
+    The judge collects all accepted/uncertain candidates and batches them by
+    the judge model's own context window; there is no fixed candidate cap and no
+    role-level wall-clock limit (each batch is bounded by its request count).
+    """
+
+    enabled: bool = True
 
 
 class ReviewConfig(Base):
@@ -274,16 +280,16 @@ class ReviewConfig(Base):
     max_concurrent_subagents: int = Field(default=4, ge=1, le=10)
     fail_on: str | None = None
     # Upper bound on accepted evidence tokens. The effective budget is also
-    # clamped by the provider context window (see EvidenceBudget.from_options);
-    # values above the usable window cannot widen it. ReviewLoop fixes the
-    # context window at 200k, giving a usable window of 171k and a 150k diff
-    # evidence budget.
+    # clamped by the reviewer model's real context window (see
+    # EvidenceBudget.from_options); values above the usable window cannot widen
+    # it. The reviewer window comes from ``review.reviewer``/the conversation
+    # agent at review start, so it is no longer a fixed 200k.
     evidence_token_budget: int = Field(default=150_000, ge=10_000)
     prefetch_budget_chars: int = Field(default=16_000, ge=1_000)
     # Per-unit evidence preview budget: soft target and absolute ceiling.
     preview_target_chars: int = Field(default=600, ge=1)
     preview_hard_limit: int = Field(default=3_000, ge=1)
-    subagent_reasoning_effort: Literal["low", "medium", "high", "adaptive", "none"] | None = None
+    reviewer: RoleModelSettings = Field(default_factory=RoleModelSettings)
     judge: ReviewJudgeSettings = Field(default_factory=ReviewJudgeSettings)
 
     @model_validator(mode="after")
@@ -291,6 +297,17 @@ class ReviewConfig(Base):
         if self.preview_hard_limit < self.preview_target_chars:
             raise ValueError("preview_hard_limit must be >= preview_target_chars")
         return self
+
+
+class DreamConfig(Base):
+    """Long-term memory consolidation (Dream).
+
+    The automatic run is fixed to Sunday 03:00 Asia/Shanghai; a missed window is
+    never replayed. ``enabled`` only controls the automatic schedule — the manual
+    ``/dream`` command keeps working when it is off.
+    """
+
+    enabled: bool = True
 
 
 class Config(BaseSettings):
@@ -303,6 +320,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
+    dream: DreamConfig = Field(default_factory=DreamConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
