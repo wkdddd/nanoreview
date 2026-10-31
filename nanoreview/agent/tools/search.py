@@ -1,53 +1,47 @@
-"""Search tools: grep."""
+"""Search tool: local ``grep``.
+
+The matching/pagination core lives in :mod:`nanoreview.agent.tools.search_core`
+and is shared with the remote PR reader, so identical text yields identical
+pages regardless of where the bytes came from. This module owns only the local
+concerns: path resolution, workspace scope, directory traversal, read budgets,
+binary detection, and the reviewer-run dedup ledger.
+"""
 
 from __future__ import annotations
 
-import fnmatch
+import asyncio
 import os
 import re
+import threading
+import time
 from contextlib import suppress
-from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, TypeVar
+from pathlib import Path
+from typing import Any, Iterable
 
+from nanoreview.agent.tools.base import ToolResult
 from nanoreview.agent.tools.filesystem import ListDirTool, _FsTool
+from nanoreview.agent.tools.search_core import (
+    DEFAULT_CONTEXT_LINES,
+    DEFAULT_HEAD_LIMIT,
+    DEFAULT_LINE_LIMIT,
+    DEFAULT_MAX_RESULT_CHARS,
+    ContentPage,
+    MatchConfig,
+    MatchTooLargeError,
+    SearchBudget,
+    SearchBudgetExceededError,
+    SearchCancelledError,
+    SearchLine,
+    count_matches,
+    match_glob,
+    matches_type,
+    text_page,
+)
 
-_DEFAULT_HEAD_LIMIT = 250
-T = TypeVar("T")
-_TYPE_GLOB_MAP = {
-    "py": ("*.py", "*.pyi"),
-    "python": ("*.py", "*.pyi"),
-    "js": ("*.js", "*.jsx", "*.mjs", "*.cjs"),
-    "ts": ("*.ts", "*.tsx", "*.mts", "*.cts"),
-    "tsx": ("*.tsx",),
-    "jsx": ("*.jsx",),
-    "json": ("*.json",),
-    "md": ("*.md", "*.mdx"),
-    "markdown": ("*.md", "*.mdx"),
-    "go": ("*.go",),
-    "rs": ("*.rs",),
-    "rust": ("*.rs",),
-    "java": ("*.java",),
-    "sh": ("*.sh", "*.bash"),
-    "yaml": ("*.yaml", "*.yml"),
-    "yml": ("*.yaml", "*.yml"),
-    "toml": ("*.toml",),
-    "sql": ("*.sql",),
-    "html": ("*.html", "*.htm"),
-    "css": ("*.css", "*.scss", "*.sass"),
-}
-
-
-def _normalize_pattern(pattern: str) -> str:
-    return pattern.strip().replace("\\", "/")
-
-
-def _match_glob(rel_path: str, name: str, pattern: str) -> bool:
-    normalized = _normalize_pattern(pattern)
-    if not normalized:
-        return False
-    if "/" in normalized or normalized.startswith("**"):
-        return PurePosixPath(rel_path).match(normalized)
-    return fnmatch.fnmatch(name, normalized)
+_DEFAULT_MAX_FILE_BYTES = 2_000_000
+_DEFAULT_MAX_SCAN_PATHS = 500_000
+_DEFAULT_MAX_SCAN_SECONDS = 30.0
+_VALID_OUTPUT_MODES = {"content", "files_with_matches", "count"}
 
 
 def _is_binary(raw: bytes) -> bool:
@@ -60,48 +54,7 @@ def _is_binary(raw: bytes) -> bool:
     return (non_text / len(sample)) > 0.2
 
 
-def _paginate(items: list[T], limit: int | None, offset: int) -> tuple[list[T], bool]:
-    if limit is None:
-        return items[offset:], False
-    sliced = items[offset : offset + limit]
-    truncated = len(items) > offset + limit
-    return sliced, truncated
-
-
-def _pagination_note(limit: int | None, offset: int, truncated: bool) -> str | None:
-    if truncated:
-        if limit is None:
-            return f"(pagination: offset={offset})"
-        return f"(pagination: limit={limit}, offset={offset})"
-    if offset > 0:
-        return f"(pagination: offset={offset})"
-    return None
-
-
-def _matches_type(name: str, file_type: str | None) -> bool:
-    if not file_type:
-        return True
-    lowered = file_type.strip().lower()
-    if not lowered:
-        return True
-    patterns = _TYPE_GLOB_MAP.get(lowered, (f"*.{lowered}",))
-    return any(fnmatch.fnmatch(name.lower(), pattern.lower()) for pattern in patterns)
-
-
-def _grep_signature(
-    *,
-    pattern: str,
-    target: Path,
-    glob: str | None,
-    file_type: str | None,
-    case_insensitive: bool,
-    fixed_strings: bool,
-    output_mode: str,
-    context_before: int,
-    context_after: int,
-    limit: int | None,
-    offset: int,
-) -> str:
+def _grep_signature(*, config: MatchConfig, target: Path, glob: str | None, file_type: str | None) -> str:
     """Stable identity for one resolved grep request.
 
     Two calls share the identity only when every parameter that can change the
@@ -111,17 +64,17 @@ def _grep_signature(
     """
     return repr(
         (
-            pattern,
+            config.pattern,
             str(target),
             glob or "",
             (file_type or "").lower(),
-            bool(case_insensitive),
-            bool(fixed_strings),
-            output_mode,
-            int(context_before),
-            int(context_after),
-            limit,
-            int(offset),
+            bool(config.case_insensitive),
+            bool(config.fixed_strings),
+            config.output_mode,
+            int(config.context_before),
+            int(config.context_after),
+            config.head_limit,
+            int(config.offset),
         )
     )
 
@@ -135,20 +88,26 @@ class _SearchTool(_FsTool):
                 return target.relative_to(self._workspace).as_posix()
         return target.relative_to(root).as_posix()
 
-    def _iter_files(self, root: Path) -> Iterable[Path]:
+    def _iter_files(self, root: Path, budget: SearchBudget) -> Iterable[Path]:
         if root.is_file():
+            budget.visit_path()
             yield root
             return
 
         for dirpath, dirnames, filenames in os.walk(root):
+            budget.checkpoint()
+            for _ in dirnames:
+                budget.visit_path()
             dirnames[:] = sorted(d for d in dirnames if d not in self._IGNORE_DIRS)
             current = Path(dirpath)
             for filename in sorted(filenames):
+                budget.visit_path()
                 yield current / filename
 
 
 class GrepTool(_SearchTool):
-    """Search file contents using a regex-like pattern."""
+    """Search local file contents via the shared plain-text matcher."""
+
     _scopes = {
         "core", "subagent",
         "reviewer.bug", "reviewer.security",
@@ -156,8 +115,11 @@ class GrepTool(_SearchTool):
         "reviewer.general",
     }
 
-    _MAX_RESULT_CHARS = 128_000
-    _MAX_FILE_BYTES = 2_000_000
+    _MAX_RESULT_CHARS = DEFAULT_MAX_RESULT_CHARS
+    _MAX_RENDERED_LINE_CHARS = DEFAULT_LINE_LIMIT
+    _MAX_FILE_BYTES = _DEFAULT_MAX_FILE_BYTES
+    _MAX_SCAN_PATHS = _DEFAULT_MAX_SCAN_PATHS
+    _MAX_SCAN_SECONDS = _DEFAULT_MAX_SCAN_SECONDS
 
     @property
     def name(self) -> str:
@@ -166,10 +128,9 @@ class GrepTool(_SearchTool):
     @property
     def description(self) -> str:
         return (
-            "Search file contents with a regex pattern. "
-            "Default output_mode is files_with_matches (file paths only); "
-            "use content mode for matching lines with context. "
-            "Skips binary and files >2 MB. Supports glob/type filtering."
+            "Search file contents. Returns matches with five context lines by default. "
+            "fixed_strings=true treats the pattern literally. "
+            "Skips binary files and files over 2 MB; supports glob/type filters."
         )
 
     @property
@@ -183,102 +144,67 @@ class GrepTool(_SearchTool):
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex or plain text pattern to search for",
+                    "description": "Regex, or literal text when fixed_strings=true",
                     "minLength": 1,
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search in (default '.')",
+                    "description": "Search root (default '.')",
                 },
                 "glob": {
                     "type": "string",
-                    "description": "Optional file filter, e.g. '*.py' or 'tests/**/test_*.py'",
+                    "description": (
+                        "Root-relative path glob, e.g. 'src/**/*.{ts,tsx}'; "
+                        "a bare '*.py' matches at any depth"
+                    ),
                 },
                 "type": {
                     "type": "string",
-                    "description": "Optional file type shorthand, e.g. 'py', 'ts', 'md', 'json'",
+                    "description": "File type, e.g. 'py', 'ts', 'md', or 'json'",
                 },
                 "case_insensitive": {
                     "type": "boolean",
-                    "description": "Case-insensitive search (default false)",
+                    "description": "Ignore case (default false)",
                 },
                 "fixed_strings": {
                     "type": "boolean",
-                    "description": "Treat pattern as plain text instead of regex (default false)",
+                    "description": "Treat pattern literally (default false)",
                 },
                 "output_mode": {
                     "type": "string",
                     "enum": ["content", "files_with_matches", "count"],
                     "description": (
-                        "content: matching lines with optional context; "
-                        "files_with_matches: only matching file paths; "
-                        "count: matching line counts per file. "
-                        "Default: files_with_matches"
+                        "content: matches with context (default); "
+                        "files_with_matches: paths; count: matches per file"
                     ),
                 },
                 "context_before": {
                     "type": "integer",
-                    "description": "Number of lines of context before each match",
+                    "description": "Context lines before a match (default 5)",
                     "minimum": 0,
                     "maximum": 20,
                 },
                 "context_after": {
                     "type": "integer",
-                    "description": "Number of lines of context after each match",
+                    "description": "Context lines after a match (default 5)",
                     "minimum": 0,
                     "maximum": 20,
                 },
-                "max_matches": {
-                    "type": "integer",
-                    "description": (
-                        "Legacy alias for head_limit in content mode"
-                    ),
-                    "minimum": 1,
-                    "maximum": 1000,
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": (
-                        "Legacy alias for head_limit in files_with_matches or count mode"
-                    ),
-                    "minimum": 1,
-                    "maximum": 1000,
-                },
                 "head_limit": {
                     "type": "integer",
-                    "description": (
-                        "Maximum number of results to return. In content mode this limits "
-                        "matching line blocks; in other modes it limits file entries. "
-                        "Default 250"
-                    ),
+                    "description": "Maximum matches or file entries (default 250; 0 for all)",
                     "minimum": 0,
                     "maximum": 1000,
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Skip the first N results before applying head_limit",
+                    "description": "Matches or file entries to skip before head_limit",
                     "minimum": 0,
                     "maximum": 100000,
                 },
             },
             "required": ["pattern"],
         }
-
-    @staticmethod
-    def _format_block(
-        display_path: str,
-        lines: list[str],
-        match_line: int,
-        before: int,
-        after: int,
-    ) -> str:
-        start = max(1, match_line - before)
-        end = min(len(lines), match_line + after)
-        block = [f"{display_path}:{match_line}"]
-        for line_no in range(start, end + 1):
-            marker = ">" if line_no == match_line else " "
-            block.append(f"{marker} {line_no}| {lines[line_no - 1]}")
-        return "\n".join(block)
 
     async def execute(
         self,
@@ -288,196 +214,206 @@ class GrepTool(_SearchTool):
         type: str | None = None,
         case_insensitive: bool = False,
         fixed_strings: bool = False,
-        output_mode: str = "files_with_matches",
-        context_before: int = 0,
-        context_after: int = 0,
-        max_matches: int | None = None,
-        max_results: int | None = None,
+        output_mode: str = "content",
+        context_before: int = DEFAULT_CONTEXT_LINES,
+        context_after: int = DEFAULT_CONTEXT_LINES,
         head_limit: int | None = None,
         offset: int = 0,
         **kwargs: Any,
-    ) -> str:
+    ) -> Any:
+        cancelled = threading.Event()
         try:
+            return await asyncio.to_thread(
+                self._execute_sync,
+                pattern=pattern,
+                path=path,
+                glob=glob,
+                file_type=type,
+                case_insensitive=case_insensitive,
+                fixed_strings=fixed_strings,
+                output_mode=output_mode,
+                context_before=context_before,
+                context_after=context_after,
+                head_limit=head_limit,
+                offset=offset,
+                cancelled=cancelled,
+            )
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    def _execute_sync(
+        self,
+        *,
+        pattern: str,
+        path: str,
+        glob: str | None,
+        file_type: str | None,
+        case_insensitive: bool,
+        fixed_strings: bool,
+        output_mode: str,
+        context_before: int,
+        context_after: int,
+        head_limit: int | None,
+        offset: int,
+        cancelled: threading.Event,
+    ) -> Any:
+        budget = SearchBudget(
+            cancelled=cancelled,
+            deadline=time.monotonic() + self._MAX_SCAN_SECONDS,
+            max_paths=self._MAX_SCAN_PATHS,
+        )
+        try:
+            budget.checkpoint()
+            if output_mode not in _VALID_OUTPUT_MODES:
+                return ToolResult.error(
+                    f"Error: invalid output_mode {output_mode!r}; "
+                    f"use one of {sorted(_VALID_OUTPUT_MODES)}"
+                )
+            if glob:
+                try:
+                    match_glob("", "", glob)
+                except ValueError as exc:
+                    return ToolResult.error(f"Error: {exc}")
+
             target = self._resolve(path or ".")
             if not target.exists():
-                return f"Error: Path not found: {path}"
+                return ToolResult.error(f"Error: Path not found: {path}")
             if not (target.is_dir() or target.is_file()):
-                return f"Error: Unsupported path: {path}"
+                return ToolResult.error(f"Error: Unsupported path: {path}")
 
-            flags = re.IGNORECASE if case_insensitive else 0
+            limit = None if head_limit == 0 else (DEFAULT_HEAD_LIMIT if head_limit is None else head_limit)
+            config = MatchConfig(
+                pattern=pattern,
+                case_insensitive=case_insensitive,
+                fixed_strings=fixed_strings,
+                output_mode=output_mode,
+                context_before=max(0, context_before),
+                context_after=max(0, context_after),
+                head_limit=limit,
+                offset=max(0, offset),
+                max_chars=self._MAX_RESULT_CHARS,
+                line_limit=self._MAX_RENDERED_LINE_CHARS,
+            )
             try:
-                needle = re.escape(pattern) if fixed_strings else pattern
-                regex = re.compile(needle, flags)
+                regex = config.compile()
             except re.error as e:
-                return f"Error: invalid regex pattern: {e}"
+                return ToolResult.error(f"Error: invalid regex pattern: {e}")
 
-            if head_limit is not None:
-                limit = None if head_limit == 0 else head_limit
-            elif output_mode == "content" and max_matches is not None:
-                limit = max_matches
-            elif output_mode != "content" and max_results is not None:
-                limit = max_results
-            else:
-                limit = _DEFAULT_HEAD_LIMIT
             review_ledger = self._file_states.review_ledger
             search_signature = (
-                _grep_signature(
-                    pattern=pattern,
-                    target=target,
-                    glob=glob,
-                    file_type=type,
-                    case_insensitive=case_insensitive,
-                    fixed_strings=fixed_strings,
-                    output_mode=output_mode,
-                    context_before=context_before,
-                    context_after=context_after,
-                    limit=limit,
-                    offset=offset,
-                )
+                _grep_signature(config=config, target=target, glob=glob, file_type=file_type)
                 if review_ledger is not None
                 else ""
             )
-            blocks: list[str] = []
-            result_chars = 0
-            seen_content_matches = 0
-            truncated = False
-            size_truncated = False
+
+            page = ContentPage(
+                limit=config.head_limit,
+                offset=config.offset,
+                max_chars=config.max_chars,
+                line_limit=config.line_limit,
+            )
+            file_mtimes: dict[str, float] = {}
+            counts: dict[str, int] = {}
             skipped_binary = 0
             skipped_large = 0
-            matching_files: list[str] = []
-            counts: dict[str, int] = {}
-            file_mtimes: dict[str, float] = {}
             root = target if target.is_dir() else target.parent
 
-            for file_path in self._iter_files(target):
+            for file_path in self._iter_files(target, budget):
                 rel_path = file_path.relative_to(root).as_posix()
-                if glob and not _match_glob(rel_path, file_path.name, glob):
+                if glob and not match_glob(rel_path, file_path.name, glob):
                     continue
-                if not _matches_type(file_path.name, type):
+                if not matches_type(file_path.name, file_type):
                     continue
+                display_path = self._display_path(file_path, root)
 
-                raw = file_path.read_bytes()
-                if len(raw) > self._MAX_FILE_BYTES:
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    skipped_binary += 1
+                    continue
+                if stat.st_size > self._MAX_FILE_BYTES:
                     skipped_large += 1
+                    continue
+                try:
+                    raw = file_path.read_bytes()
+                except OSError:
+                    skipped_binary += 1
                     continue
                 if _is_binary(raw):
                     skipped_binary += 1
                     continue
-                try:
-                    mtime = file_path.stat().st_mtime
-                except OSError:
-                    mtime = 0.0
                 try:
                     content = raw.decode("utf-8")
                 except UnicodeDecodeError:
                     skipped_binary += 1
                     continue
 
-                lines = content.splitlines()
-                display_path = self._display_path(file_path, root)
+                lines = (
+                    SearchLine(number, text)
+                    for number, text in enumerate(content.splitlines(), start=1)
+                )
+                checked = self._checked(lines, budget)
                 file_had_match = False
-                for idx, line in enumerate(lines, start=1):
-                    if not regex.search(line):
-                        continue
-                    file_had_match = True
+                if output_mode == "content":
+                    page.scan(display_path, checked, regex, config.context_before, config.context_after)
+                    file_had_match = page.returned > 0
+                elif output_mode == "count":
+                    count = count_matches(checked, regex)
+                    if count:
+                        counts[display_path] = count
+                        file_mtimes[display_path] = stat.st_mtime
+                        file_had_match = True
+                else:
+                    file_had_match = count_matches(checked, regex, stop_after=1) > 0
+                    if file_had_match:
+                        file_mtimes[display_path] = stat.st_mtime
 
-                    if output_mode == "count":
-                        counts[display_path] = counts.get(display_path, 0) + 1
-                        continue
-                    if output_mode == "files_with_matches":
-                        if display_path not in matching_files:
-                            matching_files.append(display_path)
-                            file_mtimes[display_path] = mtime
-                        break
-
-                    seen_content_matches += 1
-                    if seen_content_matches <= offset:
-                        continue
-                    if limit is not None and len(blocks) >= limit:
-                        truncated = True
-                        break
-                    block = self._format_block(
-                        display_path,
-                        lines,
-                        idx,
-                        context_before,
-                        context_after,
-                    )
-                    extra_sep = 2 if blocks else 0
-                    if result_chars + extra_sep + len(block) > self._MAX_RESULT_CHARS:
-                        size_truncated = True
-                        break
-                    blocks.append(block)
-                    result_chars += extra_sep + len(block)
-                if output_mode == "count" and file_had_match:
-                    if display_path not in matching_files:
-                        matching_files.append(display_path)
-                        file_mtimes[display_path] = mtime
-                if output_mode in {"count", "files_with_matches"} and file_had_match:
-                    continue
-                if truncated or size_truncated:
+                if page.stopped:
                     break
 
-            if output_mode == "files_with_matches":
-                if not matching_files:
-                    result = f"No matches found for pattern '{pattern}' in {path}"
-                else:
-                    ordered_files = sorted(
-                        matching_files,
-                        key=lambda name: (-file_mtimes.get(name, 0.0), name),
-                    )
-                    paged, truncated = _paginate(ordered_files, limit, offset)
-                    result = "\n".join(paged)
-            elif output_mode == "count":
-                if not counts:
-                    result = f"No matches found for pattern '{pattern}' in {path}"
-                else:
-                    ordered_files = sorted(
-                        matching_files,
-                        key=lambda name: (-file_mtimes.get(name, 0.0), name),
-                    )
-                    ordered, truncated = _paginate(ordered_files, limit, offset)
-                    lines = [f"{name}: {counts[name]}" for name in ordered]
-                    result = "\n".join(lines)
-            else:
-                if not blocks:
-                    result = f"No matches found for pattern '{pattern}' in {path}"
-                else:
-                    result = "\n\n".join(blocks)
-
+            no_matches = f"No matches found for pattern '{pattern}' in {path}"
             notes: list[str] = []
-            if output_mode == "content" and truncated:
-                notes.append(
-                    f"(pagination: limit={limit}, offset={offset})"
+            if output_mode == "content":
+                result, note = page.render(no_matches)
+                if note:
+                    notes.append(note)
+            else:
+                ordered_files = sorted(
+                    file_mtimes, key=lambda name: (-file_mtimes.get(name, 0.0), name)
                 )
-            elif output_mode == "content" and size_truncated:
-                notes.append("(output truncated due to size)")
-            elif truncated and output_mode in {"count", "files_with_matches"}:
-                notes.append(
-                    f"(pagination: limit={limit}, offset={offset})"
+                entries = (
+                    [f"{name}: {counts[name]}" for name in ordered_files]
+                    if output_mode == "count"
+                    else ordered_files
                 )
-            elif output_mode in {"count", "files_with_matches"} and offset > 0:
-                notes.append(f"(pagination: offset={offset})")
-            elif output_mode == "content" and offset > 0 and blocks:
-                notes.append(f"(pagination: offset={offset})")
+                paged, truncated = text_page(entries, limit, offset, self._MAX_RESULT_CHARS)
+                if not entries:
+                    result = no_matches
+                else:
+                    result = "\n".join(paged)
+                    if truncated:
+                        notes.append(
+                            f"(pagination: limit={limit}, offset={offset}; "
+                            f"use offset={offset + len(paged)} to continue)"
+                        )
+                    elif offset > 0:
+                        notes.append(f"(pagination: offset={offset})")
+
             if skipped_binary:
                 notes.append(f"(skipped {skipped_binary} binary/unreadable files)")
             if skipped_large:
                 notes.append(f"(skipped {skipped_large} large files)")
             if output_mode == "count" and counts:
-                notes.append(
-                    f"(total matches: {sum(counts.values())} in {len(counts)} files)"
-                )
+                notes.append(f"(total matches: {sum(counts.values())} in {len(counts)} files)")
             if notes:
                 result += "\n\n" + "\n".join(notes)
+
             # Reviewer-run duplicate suppression: an identical request that
-            # already produced byte-identical output (unchanged tree) is
-            # answered with a short hint. Errors are never suppressed so a
-            # transient failure is always visible.
-            if (
-                review_ledger is not None
-                and not result.startswith("Error:")
-            ):
+            # already produced byte-identical output is answered with a short
+            # hint. Errors are never suppressed so a transient failure stays
+            # visible.
+            if review_ledger is not None:
                 if review_ledger.search_repeat(search_signature, result):
                     review_ledger.duplicate_searches += 1
                     return (
@@ -488,7 +424,57 @@ class GrepTool(_SearchTool):
                     )
                 review_ledger.note_search(search_signature, result)
             return result
+        except MatchTooLargeError as exc:
+            return ToolResult.error(f"Error: {exc}")
+        except SearchBudgetExceededError as exc:
+            detail = (
+                f"{self._MAX_SCAN_PATHS} paths"
+                if str(exc) == "paths"
+                else f"{self._MAX_SCAN_SECONDS:g} seconds"
+            )
+            return ToolResult.error(
+                f"Error: grep scan exceeded {detail}; narrow path, glob, or type and retry."
+            )
+        except SearchCancelledError:
+            return ToolResult.error("Error: grep search cancelled")
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult.error(f"Error: {e}")
         except Exception as e:
-            return f"Error searching files: {e}"
+            return ToolResult.error(f"Error searching files: {e}")
+
+    @staticmethod
+    def _checked(lines: Iterable[SearchLine], budget: SearchBudget) -> Iterable[SearchLine]:
+        for line in lines:
+            budget.checkpoint()
+            yield line
+
+
+def search_text_lines(
+    path: str,
+    lines: Iterable[SearchLine],
+    config: MatchConfig,
+    *,
+    budget: SearchBudget | None = None,
+) -> tuple[str, bool]:
+    """Run one path through the shared matcher.
+
+    Returns ``(rendered_page, has_match)``. Adapters that already fetched the
+    text (remote readers) use this to get byte-identical output to the local
+    tool without duplicating matcher logic.
+    """
+    regex = config.compile()
+    page = ContentPage(
+        limit=config.match_limit,
+        offset=config.offset,
+        max_chars=config.max_chars,
+        line_limit=config.line_limit,
+    )
+    source = lines if budget is None else GrepTool._checked(lines, budget)
+    page.scan(path, source, regex, config.context_before, config.context_after)
+    rendered, note = page.render(f"No matches found for pattern '{config.pattern}' in {path}")
+    if note:
+        rendered += "\n\n" + note
+    return rendered, page.returned > 0
+
+
+__all__ = ["GrepTool", "search_text_lines"]

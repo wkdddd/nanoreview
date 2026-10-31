@@ -117,3 +117,6 @@ nanobot-competition-post/
 .workbuddy/
 
 ROADMAP.md.stash-recovered/
+
+# Local pytest temp root used when the system TEMP is unavailable
+.pytest-tmp/
