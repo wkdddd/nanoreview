@@ -6,13 +6,13 @@
 
 ## 产品定位
 
-NanoReview 是以代码审查为入口的个人多智能体系统。用户明确发起一次本地 review，流程结束后在同一 session 讨论报告、debug、修复代码并执行验证。
+NanoReview 是多智能体 agent，用于 PR 审查。审查流程结束后在同一 session 讨论报告、debug、修复代码并执行验证。
 
 项目面向 Agent 开发求职，重点展示多智能体审查、上下文工程、工具执行边界和可复现的效果证据。投入周期为一个月，按优先级推进，不预先承诺完成全部方向。Nanobot、Kodus 等项目只提供参考，不替代本项目需求。
 
 ## 已确认目标与边界
 
-- 产品审查输入仅为本地 Git diff，单一 `target` 定义完整审查边界；无 Git、读取失败或空 diff 在准入时失败。不提供远端 PR、远端仓库获取或全仓审查入口。
+- 审查输入由 PR 快照定义：仓库链接 → 分页选 PR → 固定 SHA 取元数据、diff 与所需代码，不 clone、不整仓下载。该通道在未合并节点 `workbuddy/pr-review-postgres` 中实施；当前 `main` 仍只有本地 diff 入口（单一 `target`，无 Git、读取失败或空 diff 在准入时失败）。
 - diff 预处理不恢复全仓读取、AST/语义切块或 related 补充；也不做文件语言分类，任何路径的 diff 都按文本证据审查。独立 RAG 模块与 tree-sitter 依赖保留。
 - review 由用户显式触发；请求校验并注册后建立 session。不创建纯对话 session，Conversation Agent 不自主触发 review。
 - 同 session 首版仅一次 review。目标内 `scope` 收窄不接用户入口，保留为待评估方向；已有准入校验与快照能力不因未开放入口而删除。

@@ -15,13 +15,14 @@
 
 删除项（不要恢复）：`agent/compression.py` 全部（frozen/working 分区、`split_units`、60%/80% 软同步限、异步快照校验）、`AgentDefaults.consolidation_ratio`、`REVIEW_CONTEXT_WINDOW_TOKENS` / `REVIEWER_MAX_OUTPUT_TOKENS` / `REVIEWER_TIMEOUT_SECONDS`、`SubagentManager` 的角色级 `asyncio.timeout`、Judge 的 `asyncio.wait_for` 与固定 `temperature=0`/输出/窗口覆盖、`Consolidator.get_lock`/`maybe_consolidate_by_tokens`/`_persist_last_summary`。
 
-验证：`pytest` 全量 `1030 passed`（含新增 `test_context_governance.py` 17 项、`test_llm_runtime.py` 14 项、`test_dream.py` 34 项、`test_long_term_memory_wiring.py` 11 项、`/dream` 命令断言 1 项）；`ruff check nanoreview/ tests/` 44 项（基线 45，`tests/` 0 项）；`git diff --check` 通过。删除 `tests/agent/test_runner_compression.py`、`tests/agent/test_subagent_reasoning_config.py`，其余测试随接口迁移。
+验证：合并到 `main` 后全量 `pytest` `1058 passed`（本节点新增 `test_context_governance.py` 17 项、`test_llm_runtime.py` 14 项、`test_dream.py` 34 项、`test_long_term_memory_wiring.py` 11 项、`/dream` 命令断言 1 项）；`ruff check nanoreview/ tests/` 44 项（基线 45，`tests/` 0 项）；`git diff --check` 通过。删除 `tests/agent/test_runner_compression.py`、`tests/agent/test_subagent_reasoning_config.py`，其余测试随接口迁移。
 
 遗留：WebUI 不新增 Dream 配置表单（本节点不做前端）；`ReviewRoutingMode` 的 Auto 文案适配仍是既有前端待办。
 
 ## 既有节点待验收与后续事项
 
 - diff-only 预处理清理（2026-10-22 追加：移除 `classify_path` 语言分类与 `unsupported_code_type` 跳过，任何路径的 diff 都按文本证据处理）、reviewer 三态/general、Planner diff 分诊均已实施，待验收。
+- **PR-only 审查节点未合并**：`PR-only 审查、PostgreSQL 与 grep 内核复用` 的完整计划在 worktree `nanoreview-prdb`（分支 `workbuddy/pr-review-postgres`，`c67252f5`）的 `code-adjustment-plan.md` 里，grep 内核与持久化/远端读取地基已实施。它不进 `main` 的当前节点，等该分支合并时一并进入；不要误判为计划丢失。
 - 原 Planner 节点已整体移除（2026-10-28），其 golden diff replay 缺口随节点一并作废。
 - WebUI 的 reviewer mode 三态适配留待已确认的前端节点。
 
