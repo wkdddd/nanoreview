@@ -1846,7 +1846,7 @@ class WebSocketChannel(BaseChannel):
         if key is None:
             return web.json_response({"error": "invalid session key"}, status=400)
         try:
-            payload = self._review_report_payload(key)
+            payload = await self._review_report_payload(key)
         except ReviewArtifactError as exc:
             return web.json_response({"error": exc.reason}, status=exc.status)
         except RuntimeError as exc:
