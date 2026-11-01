@@ -86,7 +86,7 @@
 - 已完成并验证：`agent/tools/search_core.py` 抽取 nanobot `a4f2e98d` 纯文本匹配/分页内核；`agent/tools/search.py` 改为 content 默认、5 行上下文、`head_limit=250`、30 秒/500000 路径/12000 字符协作预算、`asyncio.to_thread` + `threading.Event` 取消，删除 `max_matches`/`max_results`，保留 scope、`ToolResult` 与重复检索 ledger。`tests/agent/tools/test_search_tools.py` 32 项与 `test_reviewer_read_dedup.py` 通过。
 - 已完成（未接入链路）：`storage/` 的 SQLAlchemy 模型、Alembic `0001_initial`、schema 头部校验、异步仓储与终态单事务；`review/input/github.py`、`review/input/pr_snapshot.py`、`review/source/pr_context.py`、`agent/tools/pr_context.py`。对应单测 40 项通过；PostgreSQL 集成用例在未设置 `NANOREVIEW_TEST_DATABASE_URL` 时跳过。
 - 未实施：准入改为 PR 目标、reviewer/Judge 工具替换为 `pr_context`、validator 去掉本地 Path、SessionManager 与报告/快照存储迁移到 PostgreSQL、HTTP/CLI/Gateway 入口、删除本地审查与修复链路。
-- 验证：全量 `pytest` 为 `1 failed / 1067 passed / 7 skipped`；唯一失败 `tests/channels/test_review_submission.py::test_accepted_submission_carries_admitted_marker` 断言已删除的 `SessionCoordinator._review_runs`，属既有基线失败，与本轮改动无关。`ruff check` 新增文件 0 项，`registry.py`/`sandbox.py` 的 3 项为既有问题。
+- 验证：合入 `main` 后全量 `pytest` 为 `1119 passed / 7 skipped`（7 项为未配置 `NANOREVIEW_TEST_DATABASE_URL` 的 PostgreSQL 集成用例）；`ruff check` 在新增文件上 0 项（`registry.py`/`sandbox.py` 的 3 项为既有问题）；`git diff --check` 通过。
 - 环境：本机没有 PostgreSQL 服务，也没有 MSVC（`chroma-hnswlib` 无 Python 3.13 轮子）；测试用独立 `.venv` 与 `.pytest-tmp`。
 
 ## 已实施节点（待验收）
