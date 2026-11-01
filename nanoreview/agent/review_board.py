@@ -38,13 +38,11 @@ from nanoreview.agent.review_state import (
     ReviewPhase,
     ReviewRunStatus,
     bound_child_error,
-    build_report_artifact,
 )
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import merge_token_usage
 
 if TYPE_CHECKING:
-    from nanoreview.agent.review_state import ReviewArtifactStore
     from nanoreview.review.admission import ReviewAdmission
     from nanoreview.review.output.finalizer import ReviewJudgeStats
     from nanoreview.review.types import (
@@ -190,6 +188,10 @@ class ReviewRunBoard:
     judge_stats: "ReviewJudgeStats | None" = None
     judge_batches: dict[str, JudgeBatchState] = field(default_factory=dict)
     findings: tuple[dict[str, Any], ...] = ()
+    #: Rendered report held in memory until the single terminal transaction
+    #: commits findings, report and run status together.
+    report_markdown: str = ""
+    verdicts: tuple[dict[str, Any], ...] = ()
     report_ref: str | None = None
     summary: str = ""
     usage: dict[str, int] = field(default_factory=dict)
@@ -673,10 +675,12 @@ class ReviewBoardStore:
         self,
         *,
         sessions: "SessionManager",
-        artifacts: "ReviewArtifactStore",
+        runs: Any,
     ) -> None:
         self._sessions = sessions
-        self._artifacts = artifacts
+        #: PostgreSQL review repository: the run row, findings and report are
+        #: written by the run's single terminal transaction.
+        self._runs = runs
         self._boards: dict[str, ReviewRunBoard] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -834,34 +838,40 @@ class ReviewBoardStore:
         verdicts: list[dict[str, Any]],
         status: ReviewRunStatus = ReviewRunStatus.COMPLETED,
     ) -> str | None:
+        """Stage the report for the run's single terminal transaction.
+
+        Nothing is durable yet: :meth:`_settle` writes findings, report and the
+        terminal status in one transaction, so a report can never exist without
+        the run that produced it. The returned reference is the stable identity
+        the session metadata and report API use.
+        """
+        if not report_markdown.strip():
+            return None
         async with self._lock_for(session_key):
             board = self._require(session_key, run_id)
             board.findings = findings
+            board.report_markdown = report_markdown
+            board.verdicts = tuple(verdicts)
             board.summary = _summary_text(report_markdown)
-            report_ref = self._artifacts.write(
-                build_report_artifact(
-                    _project(board),
-                    report_markdown=report_markdown,
-                    verdicts=verdicts,
-                    status=status,
-                )
+            board.report_ref = review_report_reference(run_id)
+            logger.info(
+                "review.report.staged session={} run_id={} chars={}",
+                session_key,
+                run_id,
+                len(report_markdown),
             )
-            if report_ref is None:
-                _add_warning(board, "Failed to persist the review report artifact.")
-            else:
-                board.report_ref = report_ref
-                logger.info(
-                    "review.artifact.persisted session={} run_id={} ref={}",
-                    session_key,
-                    run_id,
-                    report_ref,
-                )
-            return report_ref
+            return board.report_ref
 
     async def _settle(
         self, session_key: str, run_id: str, status: ReviewRunStatus
     ) -> ReviewBoardView:
-        """Persist the terminal state first, then publish ``DONE``."""
+        """Commit the terminal transaction first, then publish ``DONE``.
+
+        Findings, report markdown and the run's terminal status go to
+        PostgreSQL in one transaction. Only after that commit does the session
+        metadata record the terminal state; a failed commit leaves the run
+        ``running`` with the conversation gate closed.
+        """
         async with self._lock_for(session_key):
             board = self._require(session_key, run_id)
             if board.status is not ReviewRunStatus.RUNNING:
@@ -870,6 +880,30 @@ class ReviewBoardStore:
                 _settle_unfinished_children(board, status)
             view = _project(board)
             payload = view.metadata_payload(status=status, phase=ReviewPhase.DONE)
+            try:
+                await self._runs.commit_terminal(
+                    run_id,
+                    status=status.value,
+                    findings=list(board.findings),
+                    report_markdown=board.report_markdown or None,
+                    coverage=view.coverage_payload(),
+                    error=payload.get(ReviewMetaKey.ERROR),
+                    summary=board.summary or None,
+                    usage=dict(board.usage),
+                )
+            except Exception as exc:
+                reason = bound_child_error(
+                    "the terminal review transaction could not be committed"
+                    f" ({type(exc).__name__}: {exc})"
+                )
+                _add_warning(board, reason)
+                logger.warning(
+                    "review.board.settle.transaction_failed session={} run_id={}",
+                    session_key,
+                    run_id,
+                    exc_info=True,
+                )
+                raise ReviewBoardPersistenceError(reason) from exc
             session = self._sessions.get_or_create(session_key)
             previous = {
                 key: session.metadata.get(key, _ABSENT) for key in payload
@@ -933,6 +967,11 @@ class ReviewBoardStore:
 #: Placeholder for "key absent" when snapshotting session metadata before a
 #: terminal write, so a failed save can restore the exact previous state.
 _ABSENT = object()
+
+
+def review_report_reference(run_id: str) -> str:
+    """Stable wire reference of a run's report row (never a server path)."""
+    return f"review-reports/{run_id}"
 
 
 def _settle_unfinished_children(

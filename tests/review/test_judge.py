@@ -805,7 +805,9 @@ async def test_judge_run_uses_the_shared_runner_with_structured_output() -> None
     assert spec.output_contract is not None
     assert spec.output_contract.name == "judge_verdicts"
     assert spec.output_retry_limit == 3
-    assert spec.max_iterations == spec.output_retry_limit + 3
+    # 30 model rounds: the last one is the structured answer; the rest cover
+    # bounded pr_context verification and contract corrections.
+    assert spec.max_iterations == 30
     # The run shares no session, workspace, checkpoint or injection state.
     assert spec.workspace is None
     assert spec.session_key is None

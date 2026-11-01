@@ -1040,7 +1040,9 @@ def _resolve_cli_chat_mode(chat: bool | None, *, fail_on: str | None) -> bool:
 
 @app.command()
 def review(
-    target: str | None = typer.Argument(None, help="Local file or directory path to review"),
+    repository: str | None = typer.Argument(None, help="GitHub repository (owner/name or URL)"),
+    pr: int | None = typer.Option(None, "--pr", help="Pull request number to review"),
+    pr_url: str | None = typer.Option(None, "--pr-url", help="Full pull request URL (alternative to REPOSITORY + --pr)"),
     focus: str | None = typer.Option(
         None,
         "--focus",
@@ -1051,8 +1053,7 @@ def review(
             "defaults to general when omitted"
         ),
     ),
-    target_type: str = typer.Option("auto", "--target-type", help="Review target type: auto or local"),
-    action: str = typer.Option("diff", "--action", help="Review action: diff (only local diff review is supported)"),
+    action: str = typer.Option("diff", "--action", help="Review action: diff (only the PR diff is supported)"),
     max_concurrent_subagents: int | None = typer.Option(
         None,
         "--max-concurrent-subagents",
@@ -1069,25 +1070,26 @@ def review(
         help="Continue the session after the review (default: on for a terminal)",
     ),
 ):
-    """Review a local target with CodeReviewAgent, then keep the session open.
+    """Review a GitHub pull request, then keep the session open.
 
-    The review always runs in its own session. On a terminal the command
-    continues in that session, so the report can be discussed and the code
-    fixed; use --no-chat for a one-shot run (piped and scripted calls do that
-    automatically).
+    The review input is a pull request: pass REPOSITORY (owner/name) and --pr,
+    or --pr-url. The PR is frozen at its current commits; later pushes do not
+    change what is reviewed. The review runs in its own session and, on a
+    terminal, continues there so the report can be discussed; use --no-chat for
+    a one-shot run (piped and scripted calls do that automatically).
     """
     from nanoreview.cli.stream import StreamRenderer
     from nanoreview.review.admission import (
         ReviewAdmissionError,
         ReviewAdmissionRequest,
     )
-    from nanoreview.review.input import normalize_review_action
+    from nanoreview.review.input import (
+        normalize_review_action,
+        parse_pull_request_reference,
+    )
     from nanoreview.review.result import ReviewHandoffState
     from nanoreview.review.types import ReviewMetaKey
 
-    if target_type not in ("auto", "local"):
-        console.print(f"[red]Invalid --target-type '{target_type}'. Must be: auto or local[/red]")
-        raise typer.Exit(1)
     try:
         normalize_review_action(action)
     except ValueError as exc:
@@ -1096,10 +1098,27 @@ def review(
     if fail_on and fail_on not in ("critical", "high", "medium", "low"):
         console.print(f"[red]Invalid --fail-on '{fail_on}'. Must be: critical, high, medium, or low[/red]")
         raise typer.Exit(1)
-    if not target or not target.strip():
-        target = typer.prompt("Review target (local file or directory path)").strip()
-    if not target:
-        console.print("[red]Error: review target is required[/red]")
+
+    repo_name = (repository or "").strip()
+    pr_number = pr
+    if pr_url and pr_url.strip():
+        try:
+            reference = parse_pull_request_reference(pr_url.strip())
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1)
+        repo_name = f"{reference.owner}/{reference.name}"
+        pr_number = reference.number
+    if not repo_name:
+        repo_name = typer.prompt("GitHub repository (owner/name)").strip()
+    if pr_number is None or pr_number <= 0:
+        raw_number = typer.prompt("Pull request number").strip()
+        if not raw_number.isdigit():
+            console.print("[red]Error: pull request number must be an integer[/red]")
+            raise typer.Exit(1)
+        pr_number = int(raw_number)
+    if not repo_name:
+        console.print("[red]Error: a GitHub repository is required[/red]")
         raise typer.Exit(1)
 
     loaded = _load_runtime_config(config, workspace)
@@ -1132,15 +1151,13 @@ def review(
             # boundary validates the target, captures the input snapshot, and
             # registers the run before any work is delivered.
             try:
-                admission = agent_loop.admit_review(
+                admission = await agent_loop.admit_review(
                     ReviewAdmissionRequest(
-                        target=target,
-                        target_type=target_type,
+                        repository=repo_name,
+                        pull_request=pr_number,
                         action=action,
                         focus=focus,
                         session_key=session_key,
-                        cwd=os.getcwd(),
-                        max_concurrent_subagents=effective_max_subagents,
                     )
                 )
             except ReviewAdmissionError as exc:
@@ -1154,7 +1171,10 @@ def review(
                 await renderer.on_delta(delta)
 
             response = await agent_loop.process_direct(
-                content=admission.content,
+                content=(
+                    str(admission.plan.user_requirements or "").strip()
+                    or f"Review pull request {admission.target}."
+                ),
                 session_key=admission.session_key,
                 channel="cli",
                 chat_id="review",

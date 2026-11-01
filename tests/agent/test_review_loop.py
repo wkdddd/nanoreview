@@ -78,17 +78,89 @@ from nanoreview.session.manager import SessionManager
 
 SESSION_KEY = "cli:review"
 RUN_ID = "run-000111222333"
-SNAPSHOT_REF = "review-snapshots/run-000111222333.json"
+SNAPSHOT_REF = "snap_000111222333"
+PULL_REQUEST_LABEL = "octo/demo#7"
+
+
+def _snapshot():
+    from nanoreview.storage.records import ChangedFile, ReviewSnapshot
+
+    return ReviewSnapshot(
+        id=SNAPSHOT_REF,
+        run_id=RUN_ID,
+        repository_id=1,
+        pr_number=7,
+        base_repo="octo/demo",
+        head_repo="octo/demo",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        merge_base_sha="c" * 40,
+        changed_files=(
+            ChangedFile(
+                path="app.py",
+                old_path=None,
+                status="modified",
+                patch="@@ -1 +1 @@\n-value = 0\n+value = 1",
+            ),
+        ),
+    )
+
+
+def _pull_request():
+    from nanoreview.review.types import PullRequestTarget
+
+    return PullRequestTarget(
+        repository="octo/demo",
+        number=7,
+        base_repo="octo/demo",
+        head_repo="octo/demo",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        merge_base_sha="c" * 40,
+        snapshot_id=SNAPSHOT_REF,
+    )
 
 
 def _plan(*roles: str) -> ReviewPlan:
     return ReviewPlan(
-        target="repo",
-        target_name="repo",
-        target_type="local",
+        target="https://github.com/octo/demo/pull/7",
+        target_name=PULL_REQUEST_LABEL,
+        target_type="pull_request",
         action=ReviewAction.DIFF,
         roles=[ALL_REVIEW_ROLES[role] for role in roles],
+        pull_request=_pull_request(),
     )
+
+
+class _FakeRuns:
+    """Runs repository returning the module's frozen snapshot."""
+
+    def __init__(self) -> None:
+        self.audits: list[tuple[str, dict]] = []
+        self.commits: list[dict] = []
+
+    async def load_snapshot(self, run_id: str):
+        return _snapshot()
+
+    async def append_snapshot_audit(self, run_id: str, sections: dict) -> bool:
+        self.audits.append((run_id, dict(sections)))
+        return True
+
+    async def commit_terminal(self, *args, **kwargs) -> None:
+        self.commits.append({"args": args, **kwargs})
+        return None
+
+
+def _commit_calls(runs: "_FakeRuns") -> list[dict]:
+    return list(getattr(runs, "commits", ()))
+
+
+def _audit_calls(runs: "_FakeRuns") -> list[tuple[str, dict]]:
+    return list(getattr(runs, "audits", ()))
+
+
+class _FakeGitHub:
+    """Reviewers never reach the network in these pipeline tests."""
 
 
 def _evidence() -> ReviewEvidenceBundle:
@@ -373,13 +445,13 @@ def _build_loop(
     max_concurrent_subagents: int = 4,
     judge: ReviewJudge | None = None,
     sessions: SessionManager | None = None,
-    artifact_store: ReviewArtifactStore | None = None,
     review_config: ReviewConfig | None = None,
 ) -> ReviewLoop:
     session_manager = sessions or SessionManager(tmp_path)
+    runs = _FakeRuns()
     boards = ReviewBoardStore(
         sessions=session_manager,
-        artifacts=artifact_store or ReviewArtifactStore(tmp_path),
+        runs=runs,
     )
     return ReviewLoop(
         workspace=tmp_path,
@@ -390,6 +462,8 @@ def _build_loop(
         max_tool_result_chars=1000,
         review_config=review_config,
         judge_factory=(lambda _runtime: judge) if judge is not None else None,
+        runs=runs,
+        github=_FakeGitHub(),
     )
 
 
@@ -543,20 +617,14 @@ async def test_missing_plan_fails_before_any_dispatch(tmp_path, monkeypatch) -> 
 async def test_local_diff_without_evidence_explains_how_to_continue(
     tmp_path, prepared
 ) -> None:
-    plan = ReviewPlan(
-        target=str(tmp_path / "app.py"),
-        target_name="app.py",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[ALL_REVIEW_ROLES["security"]],
-    )
+    plan = _plan("security")
     prepared(plan, ReviewEvidenceBundle())
     loop = _build_loop(tmp_path, subagents=_Subagents())
     _register_run(loop)
 
     outcome = await loop.execute(_request())
 
-    assert "Stage or modify a file inside the target" in (outcome.error or "")
+    assert "no reviewable evidence unit" in (outcome.error or "")
     assert _board(loop).status is ReviewRunStatus.ERROR
 
 
@@ -573,7 +641,7 @@ async def test_diff_without_evidence_reports_skipped_units(tmp_path, prepared) -
 
     # A diff run that produced no accepted evidence still fails, and the
     # message names the unreviewed units so the coverage gap is visible.
-    assert "Diff review cannot start" in (outcome.error or "")
+    assert "Review cannot start" in (outcome.error or "")
     assert "src/big.py" in (outcome.error or "")
     assert "binary_file" in (outcome.error or "")
 
@@ -1098,30 +1166,28 @@ async def test_judge_no_candidates_does_not_call_provider(tmp_path, prepared) ->
 
 
 @pytest.mark.asyncio
-async def test_artifact_write_failure_settles_run_as_error(tmp_path, prepared) -> None:
-    """A report that cannot be persisted is never handed over as complete."""
+async def test_failed_terminal_commit_keeps_the_run_unsettled(tmp_path, prepared) -> None:
+    """A report that cannot be committed is never handed over as complete."""
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security"), _evidence())
-    # A one-byte artifact budget makes every write fail deterministically.
-    store = ReviewArtifactStore(tmp_path, max_bytes=1)
-    loop = _build_loop(
-        tmp_path,
-        subagents=_Subagents(),
-        artifact_store=store,
-    )
+
+    class _FailingRuns(_FakeRuns):
+        async def commit_terminal(self, *args, **kwargs) -> None:
+            raise OSError("disk full")
+
+    loop = _build_loop(tmp_path, subagents=_Subagents())
+    loop._runs = _FailingRuns()  # noqa: SLF001 - inject the failing repository
+    loop._boards._runs = loop._runs  # noqa: SLF001 - the board commits terminal state
     _register_run(loop)
 
     outcome = await loop.execute(_request())
 
     view = _board(loop)
-    assert view.status is ReviewRunStatus.ERROR
-    assert view.phase is ReviewPhase.DONE
-    assert view.report_ref is None
-    assert outcome.produces_report is True
+    # The terminal transaction failed, so the run stays running with the gate
+    # closed and the turn reports the bounded settle failure.
+    assert view.status is ReviewRunStatus.RUNNING
     assert outcome.stop_reason == "error"
-    assert outcome.result is not None
-    assert outcome.result.handoff is ReviewHandoffState.FAILED
-    assert "artifact" in (outcome.error or "")
+    assert "could not be committed" in (outcome.error or "")
 
 
 @pytest.mark.asyncio
@@ -1393,19 +1459,7 @@ async def test_review_run_binds_the_frozen_reviewer_runtime(tmp_path, prepared) 
     prepared(_plan("security"), _evidence())
     subagents = _Subagents()
     loop = _build_loop(tmp_path, subagents=subagents)
-    writer = _register_run(loop)
-    loop._snapshots.write(  # noqa: SLF001 - the store is the only snapshot writer
-        build_snapshot(
-            run_id=writer.run_id,
-            session_key=SESSION_KEY,
-            action="diff",
-            target_type="local",
-            target=str(tmp_path),
-            input_fingerprint="fp",
-            net_diff={"app.py": "@@ -0,0 +1 @@\n+value = 1"},
-            changed_files=["app.py"],
-        )
-    )
+    _register_run(loop)
     runtime = _reviewer_runtime(window=131_072, max_tokens=4_096)
 
     await loop.execute(_request(reviewer_runtime=runtime))
@@ -1415,11 +1469,13 @@ async def test_review_run_binds_the_frozen_reviewer_runtime(tmp_path, prepared) 
     assert limits.max_iterations == REVIEWER_MODEL_REQUEST_LIMIT
     # The audit record keeps the numbers the run actually used, and the model
     # recorded next to them is the one those numbers belong to.
-    snapshot = loop._snapshots.read(writer.run_id)  # noqa: SLF001
-    assert snapshot is not None
-    assert snapshot["budget"]["context_window_tokens"] == 131_072
-    assert snapshot["budget"]["reviewer_output_tokens"] == 4_096
-    assert snapshot["models"]["reviewer"]["model"] == "reviewer-model"
+    audits = [
+        sections
+        for _run_id, sections in _audit_calls(loop._runs)
+    ]
+    assert audits and audits[-1]["budget"]["context_window_tokens"] == 131_072
+    assert audits[-1]["budget"]["reviewer_output_tokens"] == 4_096
+    assert audits[-1]["models"]["reviewer"]["model"] == "reviewer-model"
 
 
 @pytest.mark.asyncio
@@ -1683,13 +1739,12 @@ async def test_an_unserviceable_judge_settles_the_run_as_a_draft(
     assert "DRAFT - Not Adjudicated" in report
     # The reviewer's candidate is still readable in the draft.
     assert "Hardcoded secret" in report
-    # The artifact is the durable record of the run, so it must not claim a
-    # completed review and must carry the reason it is a draft.
-    artifact = json.loads(
-        ReviewArtifactStore(tmp_path).path_for(RUN_ID).read_text(encoding="utf-8")
-    )
-    assert artifact["status"] == ReviewRunStatus.ERROR.value
-    assert any("AI judge was not run" in warning for warning in artifact["warnings"])
+    # The persisted run carries the draft reason and the board warnings, so a
+    # restart can explain why the review is not adjudicated.
+    commit = _commit_calls(loop._runs)
+    assert commit and commit[0]["status"] == ReviewRunStatus.ERROR.value
+    assert commit[0]["report_markdown"] and "DRAFT" in commit[0]["report_markdown"]
+    assert view.warnings and any("AI judge was not run" in w for w in view.warnings)
 
 
 @pytest.mark.asyncio
@@ -1725,42 +1780,28 @@ async def test_plan_snapshot_records_evidence_and_assignments(
 ) -> None:
     """The frozen audit record carries what was accepted and how it was split.
 
-    The snapshot is the run's only preserved input record, so the acceptance
+    The snapshot row is the run's only preserved input record, so the acceptance
     counts, the authorized evidence IDs and the per-reviewer task split must be
     readable there — not only on the board, which does not survive a restart.
     """
     (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
     prepared(_plan("security", "bug"), _evidence())
     loop = _build_loop(tmp_path, subagents=_Subagents())
-    writer = _register_run(loop)
-    loop._snapshots.write(  # noqa: SLF001 - the store is the only snapshot writer
-        build_snapshot(
-            run_id=writer.run_id,
-            session_key=SESSION_KEY,
-            action="diff",
-            target_type="local",
-            target=str(tmp_path),
-            input_fingerprint="fp",
-            net_diff={"app.py": "@@ -0,0 +1 @@\n+value = 1"},
-            changed_files=["app.py"],
-        )
-    )
+    _register_run(loop)
 
     await loop.execute(_request())
 
-    snapshot = loop._snapshots.read(writer.run_id)  # noqa: SLF001
-    assert snapshot is not None
-    evidence = snapshot["evidence"]
+    audits = _audit_calls(loop._runs)
+    assert audits and audits[0][0] == RUN_ID
+    sections = audits[0][1]
+    evidence = sections["evidence"]
     assert evidence["accepted_units"] == 1
     assert evidence["accepted_ids"] == ["ev-001"]
     assert evidence["skipped_units"] == 0
-    assert snapshot["assignments"] == [
+    assert sections["assignments"] == [
         {"dimension": "security", "evidence_units": 1},
         {"dimension": "bug", "evidence_units": 1},
     ]
-    # The pre-Planner keys are gone rather than written empty.
-    assert "planner_manifest" not in snapshot
-    assert "planner_triage" not in snapshot
 
 
 @pytest.mark.asyncio
@@ -1785,7 +1826,7 @@ async def test_prepare_failure_settles_run_as_error(tmp_path, monkeypatch) -> No
 async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
     tmp_path, prepared
 ) -> None:
-    """The validator diff boundary is the snapshot's changed set, not empty.
+    """The validator boundary is the snapshot's changed set, not empty.
 
     A regression here silently disabled ``validator``'s out-of-scope check (so
     findings in unmodified files were accepted) and made coverage report an
@@ -1796,22 +1837,10 @@ async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
     subagents = _Subagents()
     loop = _build_loop(tmp_path, subagents=subagents)
     _register_run(loop)
-    loop._snapshots.write(
-        build_snapshot(
-            run_id=RUN_ID,
-            session_key=SESSION_KEY,
-            action="diff",
-            target_type="local",
-            target=str(tmp_path),
-            input_fingerprint="fp",
-            net_diff={"app.py": "@@ -0,0 +1 @@\n+value = 1"},
-            changed_files=["app.py", "src/db.py"],
-        )
-    )
 
     await loop.execute(_request())
 
-    assert list(_board(loop).changed_files) == ["app.py", "src/db.py"]
+    assert list(_board(loop).changed_files) == ["app.py"]
     # The frozen diff is an internal planning input; it never reaches reviewer
     # metadata (where it would be persisted with the subagent result).
     assert all(
@@ -1824,43 +1853,31 @@ async def test_changed_file_boundary_comes_from_the_admitted_snapshot(
 async def test_review_reviews_the_frozen_snapshot_diff_not_the_worktree(
     tmp_path, monkeypatch
 ) -> None:
-    """The plan is built from the snapshot net diff, ignoring live edits.
+    """The plan is built from the snapshot patches, ignoring any local edits.
 
     ``prepare_code_review_context`` is the PREPARE entry point, so the frozen
     diff handoff (``ReviewMetaKey.FROZEN_DIFF``) must be present in the metadata
     it receives before prefetch can dispatch against it.
     """
-    from nanoreview.review.input.snapshot import ReviewSnapshotStore
-
-    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("live_only_marker = 1\n", encoding="utf-8")
     captured: dict[str, Any] = {}
 
     async def _prepare(_messages, meta, progress_callback=None):
         captured.update(meta)
-        return ReviewPreparation(_plan("security"), "plan", _evidence())
+        return ReviewPreparation(_plan("security"), _evidence())
 
     monkeypatch.setattr(
         "nanoreview.agent.review_loop.prepare_code_review_context", _prepare
     )
     loop = _build_loop(tmp_path, subagents=_Subagents())
     _register_run(loop)
-    ReviewSnapshotStore(tmp_path).write(
-        build_snapshot(
-            run_id=RUN_ID,
-            session_key=SESSION_KEY,
-            action="diff",
-            target_type="local",
-            target=str(tmp_path),
-            input_fingerprint="fp",
-            net_diff={"app.py": "@@ -0,0 +1 @@\n+frozen"},
-            changed_files=["app.py"],
-        )
-    )
 
     await loop.execute(_request())
 
     assert captured[ReviewMetaKey.FROZEN_DIFF] == {
-        "patches": {"app.py": "@@ -0,0 +1 @@\n+frozen"},
+        "patches": {
+            "app.py": "@@ -1 +1 @@\n-value = 0\n+value = 1",
+        },
         "skipped": {},
     }
 
@@ -1897,7 +1914,6 @@ async def test_prepare_syncs_review_metadata_onto_the_session(
 
     async def _prepare(_messages, meta, progress_callback=None):
         meta[ReviewMetaKey.ALLOWED_DIMENSIONS] = ["security"]
-        meta[ReviewMetaKey.LOCAL_ROOT] = str(tmp_path)
         return ReviewPreparation(plan, _evidence())
 
     monkeypatch.setattr(
@@ -1912,6 +1928,6 @@ async def test_prepare_syncs_review_metadata_onto_the_session(
     inputs = await loop._prepare_review(_request(session=session), _board(loop), writer)
 
     assert session.metadata[ReviewMetaKey.ALLOWED_DIMENSIONS] == ["security"]
-    assert session.metadata[ReviewMetaKey.LOCAL_ROOT] == str(tmp_path)
     assert inputs.plan is plan
-    assert inputs.validation_workspace == str(tmp_path)
+    assert inputs.pull_request.label == PULL_REQUEST_LABEL
+    assert inputs.changed_files == ("app.py",)

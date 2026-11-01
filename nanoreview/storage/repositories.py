@@ -381,6 +381,30 @@ class ReviewRunRepository:
                     update(ReviewRunRow).where(ReviewRunRow.id == run_id).values(phase=phase)
                 )
 
+    async def append_snapshot_audit(
+        self, run_id: str, sections: dict[str, Any]
+    ) -> bool:
+        """Merge run-audit sections into the snapshot's metadata.
+
+        The snapshot row keeps the frozen input; the audit sections recorded
+        after planning (budget contract, model identity, accepted evidence,
+        assignments) are additive metadata, so they are merged rather than
+        rewriting ``changed_files``/``patches``.
+        """
+        async with self._db.session() as session:
+            async with session.begin():
+                row = await session.scalar(
+                    select(ReviewSnapshotRow).where(ReviewSnapshotRow.run_id == run_id)
+                )
+                if row is None:
+                    return False
+                metadata = dict(row.metadata_payload or {})
+                audit = dict(metadata.get("audit") or {})
+                audit.update(sections)
+                metadata["audit"] = audit
+                row.metadata_payload = metadata
+                return True
+
     async def save_snapshot(self, snapshot: ReviewSnapshot) -> None:
         async with self._db.session() as session:
             async with session.begin():

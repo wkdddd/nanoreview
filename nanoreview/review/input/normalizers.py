@@ -1,9 +1,9 @@
 """Normalize review inputs before building a review plan."""
 from __future__ import annotations
 
-from nanoreview.review.input.targets import infer_review_target_type
 from nanoreview.review.types import (
     ALL_REVIEW_ROLES,
+    PULL_REQUEST_TARGET_TYPE,
     ReviewAction,
     ReviewRole,
     review_action_values,
@@ -53,10 +53,18 @@ def normalize_requested_dimensions(
 
 
 def normalize_review_target_type(raw: str | None, target: str | None = None) -> str | None:
+    """Resolve the target type; a review target is always a pull request.
+
+    ``target`` is kept in the signature because persisted metadata and caller
+    payloads still carry it, but it no longer selects a target type: a local
+    path is not a review target any more.
+    """
     value = (raw or "").strip().lower()
-    if value in {"auto", "local"}:
-        return value
-    return infer_review_target_type(target)
+    if not value or value in {"auto", "pull_request", "pr"}:
+        return PULL_REQUEST_TARGET_TYPE
+    raise ValueError(
+        f"Unsupported review target type '{value}'; review targets are pull requests."
+    )
 
 
 def normalize_review_action(raw: str | None) -> ReviewAction:

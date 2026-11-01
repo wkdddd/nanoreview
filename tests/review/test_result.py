@@ -27,6 +27,13 @@ from nanoreview.agent.review_board import (
     ReviewBoardWriter,
 )
 from nanoreview.agent.review_state import ReviewArtifactStore, ReviewRunStatus
+class _FakeRuns:
+    """The board only needs a runs repository at settle time."""
+
+    async def commit_terminal(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
 from nanoreview.review.result import (
     GAP_MAX_CHARS,
     REVIEW_REPORT_SOURCE,
@@ -40,17 +47,17 @@ from nanoreview.review.result import (
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.session.manager import SessionManager
 
-REPORT_REF = "review-artifacts/run-a.json"
+REPORT_REF = "review-reports/run-a"
 SESSION_KEY = "cli:review"
 RUN_ID = "run-a"
-SNAPSHOT_REF = "review-snapshots/run-a.json"
+SNAPSHOT_REF = "review-reports/run-a"
 
 
-class _FailingArtifacts(ReviewArtifactStore):
-    """Artifact store whose writes always fail (a full disk, a read-only root)."""
+class _FailingRuns:
+    """Runs repository whose terminal transaction always fails."""
 
-    def write(self, artifact: dict[str, Any]) -> str | None:  # noqa: D102 - stub
-        return None
+    async def commit_terminal(self, *args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
 
 
 @pytest.fixture
@@ -60,10 +67,10 @@ def boards(tmp_path):
     return _store(workspace)
 
 
-def _store(workspace, *, artifacts=None) -> ReviewBoardStore:
+def _store(workspace, *, runs=None) -> ReviewBoardStore:
     return ReviewBoardStore(
         sessions=SessionManager(workspace),
-        artifacts=artifacts or ReviewArtifactStore(workspace),
+        runs=runs if runs is not None else _FakeRuns(),
     )
 
 
@@ -316,30 +323,28 @@ async def test_payload_omits_unset_optional_fields(boards) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_failed_artifact_write_keeps_findings_without_a_report_ref(
-    tmp_path,
-) -> None:
+async def test_failed_terminal_transaction_keeps_the_run_unsettled(tmp_path) -> None:
+    """A failed terminal commit leaves the run running with the gate closed."""
+    from nanoreview.agent.review_board import ReviewBoardPersistenceError
+
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    store = _store(workspace, artifacts=_FailingArtifacts(workspace))
+    store = _store(workspace, runs=_FailingRuns())
     writer = _writer(store)
-    reference = await writer.record_report(
+    await writer.record_report(
         report_markdown="## Code Review Report\n\nbody",
         findings=(
             {"severity": "high", "file": "app.py", "line": 3, "title": "unbounded"},
         ),
         verdicts=[],
     )
-    await writer.settle(ReviewRunStatus.ERROR)
+    with pytest.raises(ReviewBoardPersistenceError):
+        await writer.settle(ReviewRunStatus.ERROR)
 
     view = store.view(SESSION_KEY)
-    assert reference is None
-    result = result_from_board(view)
-
-    assert result.handoff is ReviewHandoffState.FAILED
-    assert result.report_ref is None
-    # The candidates that were validated before the write failed stay recorded.
-    assert result.findings and result.findings[0]["file"] == "app.py"
+    assert view is not None
+    assert view.status is ReviewRunStatus.RUNNING
+    assert view.is_terminal is False
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +500,9 @@ async def test_failed_handoff_states_the_failure_and_the_partial_results(
 ) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
-    store = _store(workspace, artifacts=_FailingArtifacts(workspace))
+    # A run whose terminal commit fails never produces a readable handoff:
+    # the board stays running, so the caller records the failure instead.
+    store = _store(workspace, runs=_FailingRuns())
     writer = _writer(store)
     await writer.record_report(
         report_markdown="boom",
@@ -504,17 +511,22 @@ async def test_failed_handoff_states_the_failure_and_the_partial_results(
         ),
         verdicts=[],
     )
-    await writer.add_warning("artifact write failed")
-    await writer.settle(ReviewRunStatus.ERROR)
+    await writer.add_warning("terminal commit failed")
+    with pytest.raises(Exception):
+        await writer.settle(ReviewRunStatus.ERROR)
 
-    block = render_handoff_block(result_from_board(store.view(SESSION_KEY)), None)
+    # A terminal run with a warning but no persisted report is a failed handoff.
+    store_ok = _store(workspace)
+    writer_ok = _writer(store_ok)
+    await writer_ok.add_warning("judge unavailable")
+    await writer_ok.settle(ReviewRunStatus.ERROR)
+
+    block = render_handoff_block(result_from_board(store_ok.view(SESSION_KEY)), None)
 
     assert "handoff=failed" in block
     assert "no review report artifact is available" in block
     assert "cannot be retried or resumed" in block
-    assert "boom" in block
-    assert "app.py" in block
-    assert "artifact write failed" in block
+    assert "judge unavailable" in block
 
 
 async def test_handoff_directive_freezes_the_read_only_rule_at_system_level(

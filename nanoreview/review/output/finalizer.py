@@ -17,7 +17,7 @@ Nothing here reads or writes run state, and a failed reviewer is recorded as
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from loguru import logger
 
@@ -80,31 +80,27 @@ class ReviewFinalizerResult:
 class ReviewFinalizer:
     """Validates findings and renders the report for one review run.
 
-    The instance carries the run's fixed validation context (workspace, changed
-    files, allowed dimensions, mode, selected dimensions, skipped files and the
-    planned-no-reviewer explanation) and nothing else. It is safe to reuse for
-    every dimension of a run because it accumulates no state.
+    The instance carries the run's fixed validation boundary (the PR's changed
+    paths, the line ranges its diff touched, allowed dimensions, selected
+    dimensions, skipped files and the planned-no-reviewer explanation) and
+    nothing else. The evidence ids a candidate may cite are per reviewer, so
+    they travel with each :meth:`validate_findings` call.
     """
 
     def __init__(
         self,
-        workspace: str,
-        changed_files: list[str] | None = None,
         *,
+        changed_files: list[str] | tuple[str, ...] | None = None,
+        changed_ranges: dict[str, tuple[tuple[int, int], ...]] | None = None,
         allowed_dimensions: list[str] | set[str] | None = None,
-        local_target: str | None = None,
         selected_dimensions: list[str] | tuple[str, ...] | None = None,
         skipped_files: list["FileSkipSummary"] | tuple["FileSkipSummary", ...] = (),
+        target_name: str | None = None,
     ) -> None:
-        self._workspace = workspace
         self._changed_files = list(changed_files or [])
-        self._local_target = local_target
-        self._ctx = ValidationContext(
-            workspace=workspace,
-            changed_files=self._changed_files,
-            local_target=local_target,
-        )
-        self._validator = ReviewValidator(self._ctx)
+        self._changed_ranges = dict(changed_ranges or {})
+        self._target_label = target_name
+        self._seen_fingerprints: set[str] = set()
         self._allowed_dimensions = self._normalize_allowed_dimensions(allowed_dimensions)
         self._selected_dimensions = tuple(selected_dimensions or ())
         self._skipped_files = tuple(skipped_files)
@@ -128,13 +124,19 @@ class ReviewFinalizer:
         self,
         dimension: str,
         findings: list[dict[str, Any]],
+        *,
+        evidence_ids: Iterable[str] = (),
     ) -> ReviewDimensionResult:
         """Validate one reviewer's accepted findings for *dimension*.
 
         The findings array has already passed the reviewer output contract, so
-        this step is the *review* validation: target boundary, line range,
-        evidence presence and per-dimension rules. Candidates that fail are
-        recorded as rejected/uncertain instead of being dropped.
+        this step is the *review* validation: PR boundary, changed-line range,
+        evidence reference existence and per-dimension rules. Candidates that
+        fail are recorded as rejected/uncertain instead of being dropped.
+
+        ``evidence_ids`` are the ids this reviewer could legitimately cite:
+        the assigned prefetch units plus every ``pr_context`` read it performed
+        in this run.
         """
         normalized = self._normalize_dimension(dimension)
         if self._allowed_dimensions is not None and normalized not in self._allowed_dimensions:
@@ -153,7 +155,15 @@ class ReviewFinalizer:
         candidates = [
             self._dict_to_candidate(item, normalized) for item in findings
         ]
-        return self._validator.validate_candidates(candidates, normalized)
+        validator = ReviewValidator(
+            ValidationContext(
+                changed_files=tuple(self._changed_files),
+                changed_ranges=self._changed_ranges,
+                evidence_ids=frozenset(evidence_ids),
+            ),
+            seen_fingerprints=self._seen_fingerprints,
+        )
+        return validator.validate_candidates(candidates, normalized)
 
     # -- judge --------------------------------------------------------------
 
@@ -297,7 +307,7 @@ class ReviewFinalizer:
         )
 
     def _target_name(self) -> str:
-        return self._local_target or "target"
+        return self._target_name or "pull request"
 
     # -- helpers ------------------------------------------------------------
 
@@ -478,6 +488,7 @@ class ReviewFinalizer:
         return normalized or None
 
     def _dict_to_candidate(self, d: dict, dimension: str) -> ReviewFindingCandidate:
+        refs = d.get("evidence_refs")
         return ReviewFindingCandidate(
             severity=str(d.get("severity", "medium")).lower(),
             dimension=dimension,
@@ -490,6 +501,9 @@ class ReviewFinalizer:
             details=dict(d.get("details") or {}),
             confidence=str(d.get("confidence", "high")),
             source=str(d.get("source", "")),
+            side=str(d.get("side") or "new").lower(),
+            end_line=d.get("end_line"),
+            evidence_refs=tuple(str(item) for item in refs) if isinstance(refs, list) else (),
         )
 
 

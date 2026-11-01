@@ -26,6 +26,31 @@ def path_matches_scope(path: str, scopes: list[str]) -> bool:
     return any(normalized == scope or normalized.startswith(f"{scope}/") for scope in scopes)
 
 
+def changed_line_ranges(lines: list[int]) -> tuple[tuple[int, int], ...]:
+    """Collapse changed line numbers into inclusive ranges.
+
+    A finding may only point at a line the pull request actually touched, so
+    the validator needs ranges rather than the full line set.
+    """
+    ordered = sorted({line for line in lines if line > 0})
+    if not ordered:
+        return ()
+    ranges: list[tuple[int, int]] = []
+    start = previous = ordered[0]
+    for line in ordered[1:]:
+        if line == previous + 1:
+            previous = line
+            continue
+        ranges.append((start, previous))
+        start = previous = line
+    ranges.append((start, previous))
+    return tuple(ranges)
+
+
+def line_in_ranges(line: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= line <= end for start, end in ranges)
+
+
 def changed_lines_from_patch(filename: str, patch: str) -> list[int]:
     if not patch:
         return []

@@ -30,7 +30,8 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request as WsRequest
 from websockets.http11 import Response
 
-from nanoreview.agent.review_state import ReviewArtifactError, ReviewArtifactStore
+from nanoreview.agent.review_board import review_report_reference
+from nanoreview.agent.review_state import ReviewArtifactError
 from nanoreview.bus.events import OUTBOUND_META_AGENT_UI, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.channels.base import BaseChannel
@@ -41,6 +42,9 @@ from nanoreview.review import normalize_review_action
 from nanoreview.review.admission import (
     ReviewAdmissionError,
     ReviewAdmissionRequest,
+)
+from nanoreview.review.input.targets import (
+    try_parse_pull_request_reference,
 )
 from nanoreview.review.profiles import public_reviewer_profiles
 from nanoreview.review.types import ReviewMetaKey
@@ -62,6 +66,38 @@ _CODE_CONTEXT_DEFAULT_BEFORE = 8
 _CODE_CONTEXT_DEFAULT_AFTER = 12
 _CODE_CONTEXT_MAX_WINDOW = 80
 _CODE_CONTEXT_MAX_BYTES = 1_000_000
+
+
+async def _report_for_run(agent_loop: Any, run_id: str):
+    """Read one run's report row through the coordinator's PostgreSQL storage."""
+    if agent_loop is None:
+        raise ReviewArtifactError("review report unavailable", status=503)
+    return await agent_loop.storage().runs.get_report(run_id)
+
+
+def _resolve_ws_pr_target(
+    raw_repository: Any,
+    raw_pull_request: Any,
+    raw_target: Any,
+) -> tuple[str | None, int | None]:
+    """Resolve the WebUI review payload into ``(repository, number)``.
+
+    ``review_repository`` + ``review_pull_request`` is the supported shape; a
+    ``review_target`` holding a PR URL keeps working for older clients. Local
+    paths resolve to ``(None, None)`` and are rejected by the caller.
+    """
+    number: int | None = None
+    if isinstance(raw_pull_request, int) and not isinstance(raw_pull_request, bool):
+        number = raw_pull_request
+    elif isinstance(raw_pull_request, str) and raw_pull_request.strip().isdigit():
+        number = int(raw_pull_request.strip())
+    if isinstance(raw_repository, str) and raw_repository.strip() and number:
+        return raw_repository.strip(), number
+    if isinstance(raw_target, str) and raw_target.strip():
+        reference = try_parse_pull_request_reference(raw_target.strip())
+        if reference is not None:
+            return reference.repository, reference.number
+    return None, None
 
 
 class CodeContextError(Exception):
@@ -692,7 +728,7 @@ class WebSocketChannel(BaseChannel):
         # Read-only review report artifact (one-shot ReviewAgent sessions).
         m = re.match(r"^/api/sessions/([^/]+)/review-report$", got)
         if m:
-            return self._handle_review_report_get(request, m.group(1))
+            return await self._handle_review_report_get(request, m.group(1))
 
         m = re.match(r"^/api/sessions/([^/]+)/code-context$", got)
         if m:
@@ -1054,7 +1090,7 @@ class WebSocketChannel(BaseChannel):
             return _http_error(404, "webui thread not found")
         return _http_json_response(data)
 
-    def _handle_review_report_get(self, request: WsRequest, key: str) -> Response:
+    async def _handle_review_report_get(self, request: WsRequest, key: str) -> Response:
         """Serve the persisted review report artifact (read-only)."""
         if not self._check_api_token(request):
             return _http_error(401, "Unauthorized")
@@ -1064,7 +1100,7 @@ class WebSocketChannel(BaseChannel):
         if decoded_key is None:
             return _http_error(400, "invalid session key")
         try:
-            payload = self._review_report_payload(decoded_key)
+            payload = await self._review_report_payload(decoded_key)
         except ReviewArtifactError as exc:
             return _http_error(exc.status, exc.reason)
         if payload is None:
@@ -1125,12 +1161,14 @@ class WebSocketChannel(BaseChannel):
         self._augment_media_urls(data)
         return data
 
-    def _review_report_payload(self, key: str) -> dict[str, Any] | None:
-        """Load the persisted review report artifact for a session.
+    async def _review_report_payload(self, key: str) -> dict[str, Any] | None:
+        """Load the persisted review report for a session (read-only).
 
-        Returns the verified artifact payload, ``None`` when the session does
-        not exist, or raises :class:`ReviewArtifactError` (404/409) when the
-        session has no report reference or the artifact fails verification.
+        The report lives in PostgreSQL; the session metadata only carries the
+        reference. Returns ``None`` when the session does not exist, or raises
+        :class:`ReviewArtifactError` (404/409) when the session has no report
+        reference, the run produced none, or the reference does not match the
+        run id it names.
         """
         if self._session_manager is None:
             raise RuntimeError("session manager unavailable")
@@ -1143,20 +1181,25 @@ class WebSocketChannel(BaseChannel):
         if not isinstance(metadata, dict):
             raise ReviewArtifactError("session has no review report", status=404)
         run_id = metadata.get(ReviewMetaKey.RUN_ID)
-        fingerprint = metadata.get(ReviewMetaKey.INPUT_FINGERPRINT)
         report_ref = metadata.get(ReviewMetaKey.REPORT_REF)
         if not isinstance(run_id, str) or not run_id:
             raise ReviewArtifactError("session has no review report", status=404)
-        if not isinstance(fingerprint, str) or not fingerprint:
-            raise ReviewArtifactError("session has no review report", status=404)
         # ``review_report_ref`` is the stable wire reference; it must agree
-        # with the run id that produced it before any artifact is served.
+        # with the run id that produced it before any report is served.
         if not isinstance(report_ref, str) or not report_ref:
             raise ReviewArtifactError("review report not generated", status=404)
-        store = ReviewArtifactStore(self._workspace_root())
-        if report_ref != store.reference_for(run_id):
+        if report_ref != review_report_reference(run_id):
             raise ReviewArtifactError("review report reference mismatch", status=409)
-        artifact = store.read(run_id=run_id, session_key=key, input_fingerprint=fingerprint)
+        report = await _report_for_run(self._agent_loop, run_id)
+        if report is None:
+            raise ReviewArtifactError("review report not generated", status=404)
+        artifact = {
+            "run_id": run_id,
+            "session_key": key,
+            "report_markdown": report.markdown,
+            "findings": list(report.findings or ()),
+            "coverage": dict(report.coverage or {}),
+        }
         return {
             "run_id": run_id,
             "status": metadata.get(ReviewMetaKey.STATUS),
@@ -1335,21 +1378,23 @@ class WebSocketChannel(BaseChannel):
         self,
         connection: Any,
         cid: str,
+        raw_repository: Any,
+        raw_pull_request: Any,
         raw_target: Any,
-        raw_target_type: Any,
         normalized_action: str | None,
         raw_focus: Any,
         metadata: dict[str, Any],
     ) -> tuple[bool, str]:
         """Admit a WebUI review submission through the shared boundary.
 
+        The review input is a pull request: ``review_repository`` plus
+        ``review_pull_request``. A legacy ``review_target`` that holds a PR URL
+        is still accepted so an older client keeps working; a local path is
+        rejected by admission like any other non-PR target.
+
         Returns ``(approved, content)``. A rejection answers the connection
         with an ``error`` event carrying the stable admission ``code``/``field``
         and leaves session metadata, history, and the pending queue untouched.
-
-        The current WebUI shows the failure through its existing error path;
-        adapting the form to render the structured code is a follow-up frontend
-        task, so rejections deliberately reuse the ``error`` event.
         """
         if self._agent_loop is None:
             await self._send_event(
@@ -1360,15 +1405,29 @@ class WebSocketChannel(BaseChannel):
                 code="admission_unavailable",
             )
             return False, ""
+        repository, number = _resolve_ws_pr_target(
+            raw_repository, raw_pull_request, raw_target
+        )
+        if repository is None:
+            await self._send_event(
+                connection,
+                "error",
+                chat_id=cid,
+                detail=(
+                    "A review needs a pull request: send review_repository "
+                    "(owner/name) and review_pull_request, or a PR URL."
+                ),
+                code="invalid_target_type",
+            )
+            return False, ""
         try:
-            admission = self._agent_loop.admit_review(
+            admission = await self._agent_loop.admit_review(
                 ReviewAdmissionRequest(
-                    target=raw_target if isinstance(raw_target, str) else None,
-                    target_type=raw_target_type if isinstance(raw_target_type, str) else None,
+                    repository=repository,
+                    pull_request=number,
                     action=normalized_action,
                     focus=raw_focus if isinstance(raw_focus, list) else None,
                     session_key=f"websocket:{cid}",
-                    enforce_absolute=True,
                 )
             )
         except ReviewAdmissionError as exc:
@@ -1391,7 +1450,8 @@ class WebSocketChannel(BaseChannel):
                 "review_focus": admission.metadata.get(ReviewMetaKey.REQUESTED_DIMENSIONS),
             }
         )
-        return True, admission.content
+        content = str(admission.plan.user_requirements or "").strip()
+        return True, content or f"Review pull request {admission.target}."
 
     def _delete_session_key(self, key: str) -> bool | None:
         if self._session_manager is None:
@@ -2270,12 +2330,16 @@ class WebSocketChannel(BaseChannel):
                     )
                     return
 
+            raw_review_repository = envelope.get("review_repository")
+            raw_review_pull_request = envelope.get("review_pull_request")
             raw_review_target = envelope.get("review_target")
             raw_review_target_type = envelope.get("review_target_type")
             raw_review_action = envelope.get("review_action")
             raw_review_focus = envelope.get("review_focus")
             has_review_payload = (
-                isinstance(raw_review_target, str)
+                isinstance(raw_review_repository, str)
+                or raw_review_pull_request is not None
+                or isinstance(raw_review_target, str)
                 or isinstance(raw_review_target_type, str)
                 or isinstance(raw_review_action, str)
                 or isinstance(raw_review_focus, list)
@@ -2303,8 +2367,9 @@ class WebSocketChannel(BaseChannel):
                 approved, admitted_content = await self._admit_review_submission(
                     connection,
                     cid,
+                    raw_review_repository,
+                    raw_review_pull_request,
                     raw_review_target,
-                    raw_review_target_type,
                     normalized_review_action,
                     raw_review_focus,
                     metadata,

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from nanoreview.review.input import (
+    PullRequestReference,
+    ReviewTargetError,
     extract_review_target,
-    infer_review_target_type,
     normalize_requested_dimensions,
     normalize_review_action,
     normalize_review_target_type,
+    parse_pull_request_reference,
 )
 from nanoreview.review.planning.evidence import ReviewEvidenceService
 from nanoreview.review.planning.planner import (
@@ -72,7 +74,9 @@ __all__ = [
     "apply_review_metadata_from_message",
     "build_review_plan",
     "extract_review_target",
-    "infer_review_target_type",
+    "parse_pull_request_reference",
+    "PullRequestReference",
+    "ReviewTargetError",
     "latest_user_text",
     "normalize_requested_dimensions",
     "normalize_review_dimension",

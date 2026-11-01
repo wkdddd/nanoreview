@@ -20,7 +20,7 @@ from nanoreview.agent.tools.safety_boundary import (
 from nanoreview.agent.tools.shell import ExecTool
 from nanoreview.agent.tools.workspace_scope import ACCESS_FULL, ACCESS_RESTRICTED
 from nanoreview.review.input.normalizers import normalize_review_target_type
-from nanoreview.review.input.targets import infer_review_target_type
+from nanoreview.review.input.targets import try_parse_pull_request_reference
 
 
 class TestApprovalMachineryIsGone:
@@ -78,18 +78,31 @@ class TestGithubReviewInputIsGone:
         "target",
         [
             "https://github.com/owner/repo",
-            "https://github.com/owner/repo/pull/42",
             "https://github.com/owner/repo/blob/main/src/app.py",
             "git@github.com:owner/repo.git",
+            "src/app.py",
         ],
     )
-    def test_github_urls_always_infer_local(self, target: str):
-        assert infer_review_target_type(target) == "local"
+    def test_non_pr_targets_are_not_pull_request_references(self, target: str):
+        assert try_parse_pull_request_reference(target) is None
 
-    @pytest.mark.parametrize("raw", ["github", "remote"])
-    def test_unknown_target_types_fall_through_to_local_inference(self, raw: str):
-        """`github` is not a recognized type any more, so inference decides (always local)."""
-        assert normalize_review_target_type(raw, target="src/app.py") == "local"
+    def test_pull_request_reference_parses_url_and_slug(self):
+        from nanoreview.review.input.targets import parse_pull_request_reference
+
+        reference = parse_pull_request_reference(
+            "https://github.com/owner/repo/pull/42"
+        )
+        assert (reference.repository, reference.number) == ("owner/repo", 42)
+        reference = parse_pull_request_reference("owner/repo#42")
+        assert (reference.repository, reference.number) == ("owner/repo", 42)
+
+    @pytest.mark.parametrize("raw", ["github", "remote", "local"])
+    def test_target_types_other_than_pull_request_are_rejected(self, raw: str):
+        """A review target is a pull request; nothing else resolves."""
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="pull requests"):
+            normalize_review_target_type(raw, target="src/app.py")
 
     def test_review_plan_has_no_remote_fields(self):
         import dataclasses
@@ -115,12 +128,12 @@ class TestGithubMetadataKeysAreGone:
         for gone in ("GITHUB_PREFETCH_READY", "GITHUB_PR_HEAD_REF", "TARGET_REF"):
             assert not hasattr(ReviewMetaKey, gone), gone
 
-    def test_review_target_type_literal_excludes_github(self):
+    def test_review_target_type_is_pull_request_only(self):
         from typing import get_args
 
         from nanoreview.review.types import ReviewTargetType
 
-        assert set(get_args(ReviewTargetType)) == {"auto", "local"}
+        assert set(get_args(ReviewTargetType)) == {"pull_request"}
 
 
 class TestNetworkCapabilitiesAreRetained:

@@ -66,6 +66,16 @@ class PrContextTool(Tool):
     def __init__(self, session: PrContextSession) -> None:
         self._session = session
 
+    @classmethod
+    def enabled(cls, ctx: Any) -> bool:
+        """Never constructed by the loader: the host binds one session per run.
+
+        Registering a default instance would either read no snapshot at all or
+        let two reviewers share one session's mutable budgets, so the tool is
+        injected explicitly instead.
+        """
+        return False
+
     @property
     def name(self) -> str:
         return "pr_context"

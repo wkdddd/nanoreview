@@ -69,12 +69,13 @@ _PROMPT_INSTRUCTION = (
 
 #: Rejections of the final answer allowed before the judge run fails.
 _JUDGE_OUTPUT_RETRY_LIMIT = 3
-#: Request allowance: the contract rejections above plus the empty/length
-#: recovery turns the runner may still need.
-_JUDGE_MAX_ITERATIONS = _JUDGE_OUTPUT_RETRY_LIMIT + 3
+#: Model request allowance for one judge pass. The judge's final answer is the
+#: structured verdict payload; the remaining rounds are its bounded pr_context
+#: verification turns plus contract-correction retries.
+_JUDGE_MAX_ITERATIONS = 30
 
-#: Tool-result budget for the judge run. The judge is tool-less, so this only
-#: bounds the runner's per-result normalization.
+#: Tool-result budget for the judge run; it bounds the runner's per-result
+#: normalization for the judge's own bounded pr_context reads.
 _JUDGE_MAX_TOOL_RESULT_CHARS = 4_096
 
 
@@ -195,6 +196,10 @@ class ReviewJudge:
         self._runner = runner
         self._runtime = runtime
         self._config = config or ReviewJudgeConfig()
+        #: Set by the supervisor for one adjudication: a read-only session bound
+        #: to the run's frozen snapshot, with diff/read/search only and a small
+        #: call budget. ``None`` keeps the judge tool-less.
+        self._pr_context: "Any | None" = None
         #: One budget object for the check *and* the run, so the window that
         #: decided "it fits" is the window the run then executes in.
         self._budget = self._config.budget or ReviewBudget.from_runtimes(
@@ -204,6 +209,14 @@ class ReviewJudge:
         self._common_rules_workspace = common_rules_workspace
         #: Emits the tokenizer-fallback warning at most once per judge.
         self._tokenizer_fallback_warned = False
+
+    def attach_pr_context(self, session: Any) -> None:
+        """Bind one run's pr_context session for the next adjudication.
+
+        The session is detached afterwards: a later judge run must not inherit
+        another run's budgets, caches or collected evidence.
+        """
+        self._pr_context = session
 
     async def judge_dimensions(
         self,
@@ -493,14 +506,24 @@ class ReviewJudge:
         # still reports the tokens it burned; harmless on the success path,
         # where ``AgentRunResult.usage`` is authoritative.
         usage_observer = _JudgeUsageObserver()
+        # One adjudication owns its pr_context session: budgets, caches and
+        # collected evidence never leak into a later judge run.
+        pr_session = self._pr_context
+        self._pr_context = None
+        tools = ToolRegistry()
+        if pr_session is not None:
+            from nanoreview.agent.tools.pr_context import PrContextTool
+
+            tools.register(PrContextTool(pr_session))
         spec = AgentRunSpec(
             messages=[
                 {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": self._build_prompt(candidates)},
+                {"role": "user", "content": self._build_prompt(candidates, pr_session)},
             ],
-            # The judge is a pure decision step: it needs no tools, only the
-            # candidate set and its output contract.
-            tools=ToolRegistry(),
+            # The judge is a decision step: without a bound pr_context session it
+            # runs tool-less; with one, its reads stay inside the candidate
+            # paths and its call budget.
+            tools=tools,
             # Window, output cap and generation parameters all ride in the
             # frozen runtime; the assignment window and output reserve are
             # therefore the same numbers the request is actually sent with.
@@ -618,9 +641,12 @@ class ReviewJudge:
             "severity": candidate.severity,
             "dimension": candidate.dimension,
             "file": candidate.file,
+            "side": candidate.side,
             "line": candidate.line,
+            "end_line": candidate.end_line,
             "title": candidate.title,
             "evidence": candidate.evidence,
+            "evidence_refs": list(candidate.evidence_refs),
             "impact": candidate.impact,
             "recommendation": candidate.recommendation,
             "hard_verdict": verdict.verdict.value,
@@ -631,22 +657,38 @@ class ReviewJudge:
     def _build_prompt(
         cls,
         candidates: list[tuple[str, ReviewFindingCandidate, ReviewFindingVerdict]],
+        pr_session: Any | None = None,
     ) -> str:
         payload = [
             cls._candidate_payload_entry(candidate_id, candidate, verdict)
             for candidate_id, candidate, verdict in candidates
         ]
-        # The run has no tools, so the expected answer shape has to travel in
-        # the prompt itself: without it the model guesses (a bare array, a dict
-        # of id -> decision) and burns its first answer on a rejection.
+        # The expected answer shape has to travel in the prompt itself: without
+        # it the model guesses (a bare array, a dict of id -> decision) and
+        # burns its first answer on a rejection.
         shape = judge_contract().shape
+        tool_note = ""
+        if pr_session is not None:
+            allowed = ", ".join(sorted(pr_session_limits(pr_session)))
+            tool_note = (
+                "\n\nYou may use the pr_context tool to verify a candidate against "
+                f"the pull request at its pinned commits (allowed actions: {allowed}). "
+                "Its reads are budgeted; when the evidence already settles a "
+                "candidate, do not spend calls re-reading it."
+            )
         return (
             f"{_PROMPT_INSTRUCTION}\n\n"
             f"Answer with one JSON object and nothing else. Expected shape: {shape}\n"
             "Return exactly one verdict per candidate, reusing each candidate's "
-            '"id" value verbatim.\n\n'
+            '"id" value verbatim.'
+            f"{tool_note}\n\n"
             + json.dumps(payload, ensure_ascii=False)
         )
+
+
+def pr_session_limits(session: Any) -> frozenset[str]:
+    """The actions a bound pr_context session allows (prompt text only)."""
+    return frozenset(getattr(getattr(session, "_limits", None), "allowed_actions", ()) or ())
 
 
 __all__ = [

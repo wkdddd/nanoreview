@@ -1,18 +1,24 @@
-"""Hard validation for review finding candidates."""
+"""Hard validation for review finding candidates.
+
+Validation is a pure function of the frozen pull-request snapshot: a candidate
+is checked against the PR's changed paths, the line ranges the diff actually
+touched, the evidence ids the run handed that reviewer, and the dimension's
+detail schema. There is no filesystem access here, so a finding can never be
+"confirmed" by reading a file the PR did not change, and no location is silently
+rewritten to a different one.
+"""
 
 from __future__ import annotations
 
 import hashlib
-import re
-from dataclasses import dataclass, field, replace
-from pathlib import Path
+from dataclasses import dataclass, field
 
 from loguru import logger
 
 from nanoreview.agent.tools.base import Schema
 from nanoreview.review.profiles import get_reviewer_profile
+from nanoreview.review.source.utils import line_in_ranges
 from nanoreview.review.types import (
-    ALL_REVIEW_ROLES,
     SEVERITY_ORDER,
     FindingVerdict,
     ReviewDimensionResult,
@@ -20,37 +26,50 @@ from nanoreview.review.types import (
     ReviewFindingVerdict,
 )
 
+#: Sides a finding can point at. ``new`` is the head commit, ``old`` the merge
+#: base; both are pinned by the snapshot the run was admitted with.
+_VALID_SIDES = frozenset({"new", "old"})
 
-@dataclass
+
+@dataclass(frozen=True, slots=True)
 class ValidationContext:
-    """Context for validating candidates against a workspace."""
+    """The frozen PR boundary a candidate is validated against."""
 
-    workspace: str
-    changed_files: list[str] = field(default_factory=list)
-    max_line_lookup: bool = True
-    local_target: str | None = None
+    #: Repository-relative paths changed by the pull request (new side).
+    changed_files: tuple[str, ...] = ()
+    #: New-side line ranges the diff touched, per changed path.
+    changed_ranges: dict[str, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+    #: Evidence ids this run authorized for the reviewer that produced the
+    #: candidate (prefetch units plus the reviewer's own pr_context reads).
+    evidence_ids: frozenset[str] = frozenset()
+
+    def normalized_changed_files(self) -> set[str]:
+        return {_normalize_rel_path(path) for path in self.changed_files}
 
 
 class ReviewValidator:
-    """Validates candidate findings with hard checks (no LLM)."""
+    """Validates candidate findings against the frozen PR boundary."""
 
-    def __init__(self, ctx: ValidationContext) -> None:
+    def __init__(
+        self, ctx: ValidationContext, *, seen_fingerprints: set[str] | None = None
+    ) -> None:
         self._ctx = ctx
-        self._workspace = Path(ctx.workspace).resolve()
-        self._local_target = self._resolve_local_target(ctx.local_target)
-        self._changed_files = {self._normalize_rel_path(path) for path in ctx.changed_files}
-        self._seen_fingerprints: set[str] = set()
+        self._changed_files = ctx.normalized_changed_files()
+        # Shared across every dimension of one run so the same finding cannot be
+        # accepted twice by two reviewers.
+        self._seen_fingerprints = (
+            seen_fingerprints if seen_fingerprints is not None else set()
+        )
         self.stats = {"accepted": 0, "rejected": 0, "needs_confirmation": 0}
 
     def validate_candidates(
         self, candidates: list[ReviewFindingCandidate], dimension: str
     ) -> ReviewDimensionResult:
         result = ReviewDimensionResult(dimension=dimension, status="validated")
-        # 收集可能被修正过行号的 candidate，确保下游拿到的 line 是修正后的值
-        validated_candidates: list[ReviewFindingCandidate] = []
+        validated: list[ReviewFindingCandidate] = []
         for candidate in candidates:
-            verdict, candidate = self._validate_one(candidate, dimension)
-            validated_candidates.append(candidate)
+            verdict = self._validate_one(candidate, dimension)
+            validated.append(candidate)
             if verdict.verdict == FindingVerdict.ACCEPTED:
                 result.accepted.append(candidate)
                 self.stats["accepted"] += 1
@@ -60,7 +79,7 @@ class ReviewValidator:
             else:
                 result.uncertain.append((candidate, verdict))
                 self.stats["needs_confirmation"] += 1
-        result.candidates = validated_candidates
+        result.candidates = validated
         logger.debug(
             "validator dimension={} accepted={} rejected={} needs_confirmation={}",
             dimension,
@@ -71,236 +90,100 @@ class ReviewValidator:
         return result
 
     def _validate_one(
-        self, c: ReviewFindingCandidate, dimension: str
-    ) -> tuple[ReviewFindingVerdict, ReviewFindingCandidate]:
-        """assign a single candidate finding with accepted/rejected/uncertain"""
-        if c.severity not in SEVERITY_ORDER:
+        self, candidate: ReviewFindingCandidate, dimension: str
+    ) -> ReviewFindingVerdict:
+        if candidate.severity not in SEVERITY_ORDER:
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.REJECTED,
-                reason=f"invalid severity: {c.severity}",
-            ), c
-        if not c.file or not c.title:
+                reason=f"invalid severity: {candidate.severity}",
+            )
+        if not candidate.file or not candidate.title:
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.REJECTED,
                 reason="missing required field (file or title)",
-            ), c
-        fp = self._fingerprint(c)
-        if fp in self._seen_fingerprints:
+            )
+        if candidate.side not in _VALID_SIDES:
+            return ReviewFindingVerdict(
+                verdict=FindingVerdict.REJECTED,
+                reason=f"invalid side: {candidate.side}",
+            )
+        fingerprint = self._fingerprint(candidate)
+        if fingerprint in self._seen_fingerprints:
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.REJECTED, reason="duplicate finding"
-            ), c
-        self._seen_fingerprints.add(fp)
+            )
+        self._seen_fingerprints.add(fingerprint)
 
         profile = get_reviewer_profile(dimension)
         if profile is None:
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.REJECTED,
                 reason=f"unknown reviewer profile: {dimension}",
-            ), c
+            )
         detail_errors = Schema.validate_json_schema_value(
-            c.details, profile.details_schema, "details"
+            candidate.details, profile.details_schema, "details"
         )
         if detail_errors:
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.REJECTED,
                 reason="invalid reviewer details: " + "; ".join(detail_errors),
-            ), c
+            )
 
-        file_path = self._resolve_candidate_path(c.file)
-        if file_path is None:
-            boundary = "target" if self._local_target is not None else "workspace"
-            return ReviewFindingVerdict(
-                verdict=FindingVerdict.REJECTED,
-                reason=f"path outside {boundary}: {c.file}",
-            ), c
-        if not file_path.is_file():
-            return ReviewFindingVerdict(
-                verdict=FindingVerdict.REJECTED,
-                reason=f"file not found: {c.file}",
-            ), c
-        if c.line is not None and self._ctx.max_line_lookup:
-            if not self._line_in_range(file_path, c.line):
-                return ReviewFindingVerdict(
-                    verdict=FindingVerdict.REJECTED,
-                    reason=f"line {c.line} out of range for {c.file}",
-                ), c
-        normalized_file = self._workspace_relative_path(file_path)
-        if self._changed_files and normalized_file not in self._changed_files:
+        path = _normalize_rel_path(candidate.file)
+        if path not in self._changed_files:
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.UNCERTAIN,
                 reason="file not in changed set",
-                missing_evidence="file is outside PR/diff scope",
-            ), c
-        if not c.evidence.strip():
+                missing_evidence=(
+                    "the pull request does not change this file, so the finding "
+                    "points outside the reviewed diff"
+                ),
+            )
+        if candidate.line is not None:
+            ranges = self._ctx.changed_ranges.get(path, ())
+            if ranges and not line_in_ranges(candidate.line, ranges):
+                return ReviewFindingVerdict(
+                    verdict=FindingVerdict.UNCERTAIN,
+                    reason=f"line {candidate.line} is not part of the diff",
+                    missing_evidence=(
+                        "the reported line is unchanged by this pull request; "
+                        "cite a line the diff touched"
+                    ),
+                )
+        unknown_refs = [
+            ref for ref in candidate.evidence_refs if ref not in self._ctx.evidence_ids
+        ]
+        if unknown_refs:
+            return ReviewFindingVerdict(
+                verdict=FindingVerdict.UNCERTAIN,
+                reason="unknown evidence reference: " + ", ".join(unknown_refs[:5]),
+                missing_evidence=(
+                    "findings may only cite evidence ids returned by this run's "
+                    "evidence or its pr_context reads"
+                ),
+            )
+        if not candidate.evidence.strip():
             return ReviewFindingVerdict(
                 verdict=FindingVerdict.UNCERTAIN,
                 reason="no evidence provided",
                 missing_evidence="candidate lacks supporting evidence snippet",
-            ), c
-        role = ALL_REVIEW_ROLES.get(dimension)
-        needs_evidence = role.evidence_required if role else False
-        if needs_evidence:
-            matched, actual_line = self._evidence_matches(file_path, c.evidence, c.line)
-            if not matched:
-                return ReviewFindingVerdict(
-                    verdict=FindingVerdict.UNCERTAIN,
-                    reason="evidence not found in file",
-                    missing_evidence="candidate evidence snippet does not match the target file",
-                ), c
-            if actual_line is not None and actual_line != c.line:
-                logger.debug(
-                    "validator corrected line {} -> {} for {}",
-                    c.line,
-                    actual_line,
-                    c.title,
-                )
-                c = replace(c, line=actual_line)
-        else:
-            matched, actual_line = self._evidence_matches(file_path, c.evidence, c.line)
-            if matched and actual_line is not None and actual_line != c.line:
-                logger.debug(
-                    "validator corrected line {} -> {} for {}",
-                    c.line,
-                    actual_line,
-                    c.title,
-                )
-                c = replace(c, line=actual_line)
-        return ReviewFindingVerdict(verdict=FindingVerdict.ACCEPTED), c
+            )
+        # Cited evidence ids are checked above (every ref must exist); a finding
+        # that cites nothing is judged on its inline evidence, so an extra
+        # "must cite" rule would not add information here.
+        return ReviewFindingVerdict(verdict=FindingVerdict.ACCEPTED)
 
-    def _fingerprint(self, c: ReviewFindingCandidate) -> str:
-        key = f"{c.file}:{c.line or 0}:{c.title.lower().strip()}"
+    @staticmethod
+    def _fingerprint(candidate: ReviewFindingCandidate) -> str:
+        key = f"{candidate.file}:{candidate.line or 0}:{candidate.title.lower().strip()}"
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
-    def _line_in_range(self, path: Path, line: int) -> bool:
-        if line < 1:
-            return False
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as f:
-                count = sum(1 for _ in f)
-            return line <= count
-        except OSError as e:
-            logger.warning("file open failed:{}", e)
-            return False
 
-    def _resolve_local_target(self, raw: str | None) -> Path | None:
-        if not raw or not str(raw).strip():
-            return None
-        try:
-            path = Path(str(raw)).expanduser()
-            # 相对路径按 workspace 解析，避免被进程 CWD 错误地解析到其他目录
-            if not path.is_absolute():
-                path = self._workspace / path
-            return path.resolve()
-        except OSError:
-            return None
+def _normalize_rel_path(raw: str) -> str:
+    value = (raw or "").strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value.lstrip("/")
 
-    def _resolve_candidate_path(self, raw: str) -> Path | None:
-        value = raw.strip()
-        if not value:
-            return None
-        candidate = Path(value)
-        if candidate.is_absolute():
-            if self._local_target is None:
-                return None
-            try:
-                resolved = candidate.expanduser().resolve()
-            except OSError:
-                return None
-            return resolved if self._is_under_allowed_target(resolved) else None
-        try:
-            resolved = (self._workspace / candidate).resolve()
-        except (OSError, ValueError):
-            return None
-        if not self._is_under_allowed_target(resolved):
-            return None
-        return resolved
 
-    def _is_under_allowed_target(self, resolved: Path) -> bool:
-        if self._local_target is not None:
-            target = self._local_target
-            if not target.exists():
-                return False
-            if target.is_file():
-                return resolved == target
-            try:
-                resolved.relative_to(target)
-                return True
-            except ValueError:
-                return False
-        try:
-            resolved.relative_to(self._workspace)
-            return True
-        except ValueError:
-            return False
-
-    @staticmethod
-    def _normalize_rel_path(raw: str) -> str:
-        return raw.replace("\\", "/").strip().lstrip("./")
-
-    def _workspace_relative_path(self, path: Path) -> str:
-        try:
-            return path.relative_to(self._workspace).as_posix()
-        except ValueError:
-            return self._normalize_rel_path(str(path))
-
-    @classmethod
-    def _evidence_matches(
-        cls, path: Path, evidence: str, line: int | None = None
-    ) -> tuple[bool, int | None]:
-        """Check if evidence exists in the file near the reported line.
-
-        Returns (matched, actual_line) where actual_line is the real 1-based
-        line number where evidence was found, or None if not found.
-        """
-        snippets = cls._evidence_snippets(evidence)
-        if not snippets:
-            return False, None
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False, None
-        if line is not None:
-            lines_list = text.splitlines()
-            total = len(lines_list)
-            start = max(line - 16, 0)
-            end = min(line + 15, total)
-            nearby = " ".join(" ".join(item.split()) for item in lines_list[start:end])
-            for snippet in snippets:
-                if snippet in nearby:
-                    for i in range(start, end):
-                        if snippet in " ".join(lines_list[i].split()):
-                            return True, i + 1
-                    return True, line
-            # Narrow window missed — fall back to full-file search
-            for snippet in snippets:
-                for i, file_line in enumerate(lines_list):
-                    if snippet in " ".join(file_line.split()):
-                        return True, i + 1
-            return False, None
-        normalized_text = " ".join(text.split())
-        for snippet in snippets:
-            if snippet in normalized_text:
-                return True, None
-        return False, None
-
-    @staticmethod
-    def _evidence_snippets(evidence: str) -> list[str]:
-        raw = evidence.strip()
-        if not raw:
-            return []
-        candidates: list[str] = []
-        candidates.extend(match.strip() for match in re.findall(r"`([^`\n]+)`", raw))
-        cleaned = re.sub(
-            r"^\s*(?:line|lines)\s+\d+(?:\s*[-:]\s*\d+)?\s*[:：-]\s*", "", raw, flags=re.I
-        )
-        cleaned = re.sub(r"^\s*[-*+>]\s*", "", cleaned)
-        candidates.append(cleaned)
-        snippets: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            snippet = " ".join(candidate.split()).strip()
-            if not snippet or snippet in seen:
-                continue
-            seen.add(snippet)
-            snippets.append(snippet)
-        return snippets
+__all__ = ["ReviewValidator", "ValidationContext"]

@@ -14,23 +14,28 @@ class ReviewMetaKey:
     """Session metadata keys for code review state.
 
     Review activation is decided solely by the presence of a valid
-    ``review_target``; the legacy toggle/depth variant has been removed.
+    ``review_target``; a target is always a pull request, so the persisted
+    metadata names the repository and PR instead of a local path.
     """
 
     TARGET = "review_target"
     TARGET_TYPE = "review_target_type"
     ACTION = "review_action"
     REQUESTED_DIMENSIONS = "review_focus"
-    LOCAL_ROOT = "review_local_root"
-    LOCAL_TARGET = "review_local_target"
-    LOCAL_SCOPE_KIND = "review_local_scope_kind"
+    REPOSITORY_ID = "review_repository_id"
+    PULL_REQUEST_ID = "review_pull_request_id"
+    PULL_REQUEST_NUMBER = "review_pull_request_number"
+    BASE_REPO = "review_base_repo"
+    HEAD_REPO = "review_head_repo"
+    BASE_SHA = "review_base_sha"
+    HEAD_SHA = "review_head_sha"
+    MERGE_BASE_SHA = "review_merge_base_sha"
     MAX_CONCURRENT_SUBAGENTS = "max_concurrent_subagents"
     ALLOWED_DIMENSIONS = "allowed_review_dimensions"
     EVIDENCE_PROVIDER = "_review_evidence_service"
-    #: In-process handoff of the admitted snapshot's frozen net diff, so
-    #: prefetch reviews exactly the change captured at admission instead of
-    #: re-reading a worktree that may have moved on. Never persisted to session
-    #: metadata and never forwarded to reviewer metadata.
+    #: In-process handoff of the admitted snapshot's patches, so prefetch
+    #: reviews exactly the change frozen at admission. Never persisted to
+    #: session metadata and never forwarded to reviewer metadata.
     FROZEN_DIFF = "_review_frozen_diff"
     # One-shot ReviewAgent run state (stable wire contract consumed by
     # WebUI/API and the report artifact API).
@@ -53,8 +58,9 @@ class ReviewMetaKey:
     #: not inject the same report twice.
     HANDOFF_RUN_ID = "review_handoff_run_id"
 
-ReviewTargetType = Literal["auto", "local"]
-ReviewScopeKind = Literal["file", "directory", "repo"]
+ReviewTargetType = Literal["pull_request"]
+#: Canonical wire value of the only supported review target type.
+PULL_REQUEST_TARGET_TYPE = "pull_request"
 
 
 class ReviewAction(StrEnum):
@@ -149,14 +155,26 @@ def normalize_review_dimension(value: str | None) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
-class LocalReviewScope:
-    """Resolved local review boundary derived from the requested target."""
+class PullRequestTarget:
+    """The frozen pull request a review run is bound to.
 
-    kind: ReviewScopeKind
-    review_root: str
-    scope_paths: list[str] = field(default_factory=list)
-    target_path: str | None = None
-    reason: str = ""
+    Every later read is pinned to ``base_sha``/``head_sha``/``merge_base_sha``;
+    no member of this object names a branch, a URL to fetch or a local path.
+    """
+
+    repository: str
+    number: int
+    base_repo: str
+    head_repo: str
+    base_sha: str
+    head_sha: str
+    merge_base_sha: str
+    snapshot_id: str = ""
+    url: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.repository}#{self.number}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +185,7 @@ class ReviewPlan:
     action: ReviewAction
     roles: list[ReviewRole]
     user_requirements: str = ""
-    local_scope: LocalReviewScope | None = None
+    pull_request: PullRequestTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +294,13 @@ class ReviewAssignment:
 
 @dataclass(frozen=True, slots=True)
 class ReviewFindingCandidate:
-    """A candidate finding produced by a dimension subagent."""
+    """A candidate finding produced by a dimension subagent.
+
+    ``file`` is the repository-relative path on the PR's head side; ``side``
+    distinguishes a head-side location from a merge-base one. ``evidence_refs``
+    may only name evidence the run actually handed the reviewer — the validator
+    rejects references the model invented.
+    """
 
     severity: str
     dimension: str
@@ -289,6 +313,9 @@ class ReviewFindingCandidate:
     details: dict[str, Any] = field(default_factory=dict)
     confidence: str = "high"
     source: str = ""
+    side: str = "new"
+    end_line: int | None = None
+    evidence_refs: tuple[str, ...] = ()
 
 
 class FindingVerdict(StrEnum):
@@ -364,31 +391,19 @@ class ReviewDimensionResult:
 class ReviewEvidenceProvider(Protocol):
     """Structural protocol for evidence retrieval used by prefetch and loop.
 
-    Review evidence is the admitted diff only; there is no whole-repository
-    retrieval member.
+    Review evidence is the admitted change only: the provider is handed the
+    frozen snapshot patches, and no member of this protocol can read a
+    working tree, a branch or a default ref.
     """
-
-    async def local_changed_context(
-        self,
-        *,
-        review_query: str | None,
-        max_results: int,
-        include_tests: bool | None,
-        local_scope: LocalReviewScope | None = None,
-        frozen_diff: dict[str, Any] | None = None,
-    ) -> str: ...
 
     async def dispatch(
         self,
         *,
         target_type: str,
         action: str,
-        target_subpath: str | None = None,
-        target_subpath_kind: str | None = None,
         review_query: str | None = None,
         max_results: int = 5,
         include_tests: bool | None = None,
-        local_scope: LocalReviewScope | None = None,
         trace_id: str = "",
         frozen_diff: dict[str, Any] | None = None,
     ) -> str: ...

@@ -20,10 +20,14 @@ from nanoreview.agent.subagent_profiles import (
 from nanoreview.review.contracts import reviewer_contract
 from nanoreview.utils.prompt_templates import render_template
 
-_SOFT_TOOLS = frozenset({"read_file", "list_dir", "grep"})
-_REVIEWER_REQUIRED_TOOLS = frozenset({"read_file", "list_dir", "grep"})
+#: A reviewer reads the pull request only: the host injects the frozen diff and
+#: binds a ``pr_context`` session pinned to the snapshot's SHAs. There is no
+#: repository reader (``read_file``/``grep``/``list_dir``) in this scope, so a
+#: reviewer cannot read a working tree or a branch the PR never touched.
+_SOFT_TOOLS = frozenset({"pr_context"})
+_REVIEWER_REQUIRED_TOOLS = frozenset({"pr_context"})
 #: Tools whose successful call proves the reviewer read target evidence.
-_REVIEWER_EVIDENCE_TOOLS = frozenset({"read_file", "grep"})
+_REVIEWER_EVIDENCE_TOOLS = frozenset({"pr_context"})
 
 #: Profile id -> execution scope. Every registered profile must appear here;
 #: lookup is explicit so a newly registered profile without a scope fails loudly
@@ -255,10 +259,10 @@ async def _handle_reviewer_result(
             stop_reason=stop_reason,
         )
     if not findings:
-        # Evidence is provided two ways: the host injects assigned excerpts
-        # into the reviewer's frozen task, and the reviewer may read the target
-        # directly with ``read_file``/``grep``. An empty finding list is only
-        # incomplete when neither channel supplied evidence.
+        # Evidence is provided two ways: the host injects the frozen diff into
+        # the reviewer's task, and the reviewer may read the pinned PR with
+        # ``pr_context``. An empty finding list is only incomplete when neither
+        # channel supplied evidence.
         has_assigned_evidence = bool((metadata or {}).get("assigned_evidence"))
         has_read_evidence = any(
             event.get("name") in _REVIEWER_EVIDENCE_TOOLS

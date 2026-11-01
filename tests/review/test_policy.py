@@ -7,6 +7,13 @@ severities survive validation unchanged.
 from __future__ import annotations
 
 from nanoreview.review.output.finalizer import ReviewFinalizer
+#: The new validator reads no filesystem: the changed set is declared directly.
+def _finalizer(*args: object, **kwargs: object) -> ReviewFinalizer:
+    args = list(args)
+    if args:
+        args.pop(0)
+    kwargs.setdefault("changed_files", ["src/app.py"])
+    return ReviewFinalizer(*args, **kwargs)
 from nanoreview.review.types import SEVERITY_ORDER
 
 
@@ -33,7 +40,7 @@ def test_unified_strategy_keeps_all_severity_levels(tmp_path) -> None:
         }
         for index, severity in enumerate(SEVERITY_ORDER)
     ]
-    finalizer = ReviewFinalizer(str(workspace))
+    finalizer = _finalizer(str(workspace))
 
     result = finalizer.validate_findings("security", findings)
 

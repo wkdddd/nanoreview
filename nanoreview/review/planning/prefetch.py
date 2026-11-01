@@ -283,14 +283,14 @@ async def maybe_prefetch_review_context(
     trace_id = uuid.uuid4().hex[:8]
     started = time.perf_counter()
     query = plan.user_requirements or "code review bug security performance maintainability entry points config"
+    frozen_diff = session_meta.get(ReviewMetaKey.FROZEN_DIFF)
     logger.info(
-        "review.prefetch.start trace_id={} action={} target_type={} target={} scope_kind={} review_root={} query_chars={} max_results={}",
+        "review.prefetch.start trace_id={} action={} target_type={} target={} files={} query_chars={} max_results={}",
         trace_id,
         plan.action.value,
         plan.target_type,
         plan.target,
-        plan.local_scope.kind if plan.local_scope else "",
-        plan.local_scope.review_root if plan.local_scope else "",
+        len(frozen_diff.get("patches") or {}) if isinstance(frozen_diff, dict) else 0,
         len(query),
         _DEFAULT_EVIDENCE_MAX_RESULTS,
     )
@@ -302,21 +302,21 @@ async def maybe_prefetch_review_context(
         target_type=plan.target_type,
         status="start",
         metadata={
-            "scope_kind": plan.local_scope.kind if plan.local_scope else None,
-            "review_root": plan.local_scope.review_root if plan.local_scope else None,
-            "scope_paths_count": len(plan.local_scope.scope_paths) if plan.local_scope else 0,
+            "frozen_files": (
+                len(frozen_diff.get("patches") or {})
+                if isinstance(frozen_diff, dict)
+                else 0
+            ),
         },
     )
     try:
-        target_type = plan.target_type if plan.target_type != "auto" else "local"
-        frozen_diff = session_meta.get(ReviewMetaKey.FROZEN_DIFF)
+        target_type = plan.target_type
         result = await evidence_service.dispatch(
             target_type=target_type,
             action=plan.action.value,
             review_query=query,
             max_results=_DEFAULT_EVIDENCE_MAX_RESULTS,
             include_tests=True,
-            local_scope=plan.local_scope,
             trace_id=trace_id,
             frozen_diff=frozen_diff if isinstance(frozen_diff, dict) else None,
         )

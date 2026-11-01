@@ -1,32 +1,84 @@
-"""Extract and normalize review targets before plan construction."""
+"""Parse the pull request a review turn refers to.
+
+A review target is a GitHub pull request. Nothing in this module resolves a
+local path, a branch or a repository snapshot: it only turns the target text
+into an ``owner/name#number`` reference that admission can resolve through the
+GitHub API.
+"""
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+
+_PR_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?github\.com/(?P<owner>[\w.-]+)/(?P<name>[\w.-]+)"
+    r"/pull/(?P<number>\d+)/?$",
+    re.IGNORECASE,
+)
+_PR_SLUG_RE = re.compile(
+    r"^(?P<owner>[\w.-]+)/(?P<name>[\w.-]+?)(?:\.git)?#(?P<number>\d+)$",
+    re.IGNORECASE,
+)
 
 
-def infer_review_target_type(target: str | None) -> str | None:
-    """Local paths are the only supported review target."""
-    if not target:
+class ReviewTargetError(ValueError):
+    """The target text is not a pull request reference."""
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestReference:
+    owner: str
+    name: str
+    number: int
+
+    @property
+    def repository(self) -> str:
+        return f"{self.owner}/{self.name}"
+
+    def __str__(self) -> str:
+        return f"{self.repository}#{self.number}"
+
+
+def parse_pull_request_reference(value: str) -> PullRequestReference:
+    """Accept a PR URL or ``owner/name#number``; reject everything else."""
+    text = (value or "").strip()
+    match = _PR_URL_RE.match(text) or _PR_SLUG_RE.match(text)
+    if match is None:
+        raise ReviewTargetError(
+            "A review target must be a GitHub pull request URL "
+            "(https://github.com/owner/name/pull/123) or owner/name#123."
+        )
+    return PullRequestReference(
+        owner=match.group("owner"),
+        name=match.group("name"),
+        number=int(match.group("number")),
+    )
+
+
+def try_parse_pull_request_reference(value: str) -> PullRequestReference | None:
+    try:
+        return parse_pull_request_reference(value)
+    except ReviewTargetError:
         return None
-    return "local"
 
 
 def extract_review_target(text: str) -> tuple[str, str] | None:
-    local_match = re.search(r"(?i)(?:review|code\s*review|审查|评审)\s+([^\s，。；;\r\n]+)", text)
-    if local_match:
-        target = local_match.group(1).strip(" `\"'")
-        if target:
-            return target, target
-    path_match = re.search(
-        r"(?P<path>(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|~[\\/]|/)[^\s`\"'，。；;]+)",
-        text,
+    """Find a pull request reference inside free text, if the text holds one."""
+    match = re.search(
+        r"https?://(?:www\.)?github\.com/[\w.-]+/[\w.-]+/pull/\d+",
+        text or "",
+        re.IGNORECASE,
     )
-    if path_match:
-        target = path_match.group("path").rstrip(".,;:!?)）】]")
-        if target:
-            return target, target
-    stripped = text.strip().strip(" `\"'")
-    if stripped and not re.search(r"\s", stripped):
-        if re.match(r"^[A-Za-z]:[\\/]", stripped) or stripped.startswith(("/", "./", "../", "~")):
-            return stripped, stripped
-    return None
+    if match is None:
+        return None
+    target = match.group(0)
+    return target, target
+
+
+__all__ = [
+    "PullRequestReference",
+    "ReviewTargetError",
+    "extract_review_target",
+    "parse_pull_request_reference",
+    "try_parse_pull_request_reference",
+]

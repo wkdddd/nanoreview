@@ -1,22 +1,28 @@
-"""Shared review admission boundary for every review entry point.
+"""Shared pull-request review admission for every review entry point.
 
-CLI, the structured API, and WebUI submissions all funnel through
-:class:`ReviewAdmissionService` so that a review is validated, snapshotted,
-and registered exactly once, before any transport delivers an execution task.
-Transports keep only protocol parsing, delivery, and status reads.
+CLI, the structured API and the WebUI all funnel through
+:class:`ReviewAdmissionService`, so a review is validated, frozen into a
+snapshot and registered exactly once, before any transport delivers an
+execution task. Transports keep only protocol parsing, delivery and status
+reads.
 
-Admission is *all-or-nothing*: a rejected request creates no session, no run,
-no snapshot, and no history. A rejected submitter gets a stable
-:class:`ReviewAdmissionError` code it can render and correct against.
+Admission is *all-or-nothing*:
+
+* a rejected request creates no run, no snapshot and no session metadata;
+* the review input is a GitHub pull request pinned to the SHAs captured now,
+  so a later push cannot change what is reviewed;
+* the run row is written before the snapshot, so a crash between the two
+  leaves a ``queued`` run that startup normalizes to ``interrupted`` rather
+  than a snapshot no run can reach.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from enum import StrEnum
-from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from loguru import logger
 
@@ -24,31 +30,37 @@ from nanoreview.agent.review_state import (
     REVIEW_TERMINAL_STATUSES,
     ReviewPhase,
     ReviewRunStatus,
-    compute_input_fingerprint,
     new_review_run_id,
 )
-from nanoreview.review.input.local_git import (
-    GitDiffUnavailableError,
-    GitUnavailableError,
-    NetDiff,
-    collect_net_diff,
-    find_git_root,
+from nanoreview.review.input.github import (
+    GitHubAuthError,
+    GitHubClient,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubRateLimitError,
+    GitHubRepository,
+    GitHubUnavailableError,
+    parse_repository_target,
 )
 from nanoreview.review.input.normalizers import (
     normalize_requested_dimensions,
     normalize_review_action,
 )
-from nanoreview.review.input.snapshot import (
-    ReviewSnapshotError,
-    ReviewSnapshotStore,
-    build_snapshot,
+from nanoreview.review.input.pr_snapshot import (
+    PullRequestSnapshotService,
+    SnapshotPreparationError,
 )
-from nanoreview.review.source.utils import clean_scope_paths
 from nanoreview.review.types import (
-    LocalReviewScope,
+    PULL_REQUEST_TARGET_TYPE,
+    PullRequestTarget,
     ReviewAction,
     ReviewMetaKey,
     ReviewPlan,
+)
+from nanoreview.storage.records import (
+    PullRequestRecord,
+    RepositoryRecord,
+    ReviewSnapshot,
 )
 
 
@@ -58,26 +70,36 @@ class ReviewAdmissionCode(StrEnum):
     INVALID_ACTION = "invalid_action"
     INVALID_TARGET_TYPE = "invalid_target_type"
     INVALID_DIMENSIONS = "invalid_dimensions"
-    TARGET_REQUIRED = "target_required"
-    RELATIVE_PATH_NOT_ALLOWED = "relative_path_not_allowed"
-    TARGET_NOT_FOUND = "target_not_found"
-    TARGET_NOT_FILE_OR_DIRECTORY = "target_not_file_or_directory"
-    SCOPE_OUTSIDE_TARGET = "scope_outside_target"
-    SCOPE_PATH_NOT_FOUND = "scope_path_not_found"
-    NOT_A_GIT_REPO = "not_a_git_repo"
-    DIFF_UNAVAILABLE = "diff_unavailable"
-    EMPTY_DIFF = "empty_diff"
-    SCOPE_NO_CHANGES = "scope_no_changes"
-    DUPLICATE_REVIEW = "duplicate_review"
+    INVALID_REPOSITORY = "invalid_repository"
+    INVALID_PULL_REQUEST = "invalid_pull_request"
+    REPOSITORY_NOT_FOUND = "repository_not_found"
+    PULL_REQUEST_NOT_FOUND = "pull_request_not_found"
+    GITHUB_AUTH_FAILED = "github_auth_failed"
+    GITHUB_RATE_LIMITED = "github_rate_limited"
+    GITHUB_UNAVAILABLE = "github_unavailable"
+    PULL_REQUEST_EMPTY = "pull_request_empty"
+    PULL_REQUEST_CHANGED = "pull_request_changed"
     SNAPSHOT_FAILED = "snapshot_failed"
+    DUPLICATE_REVIEW = "duplicate_review"
+    DUPLICATE_REQUEST = "duplicate_request"
+    PERSISTENCE_FAILED = "persistence_failed"
 
 
 #: HTTP status that best expresses each rejection code to structured clients.
 _CODE_STATUS: dict[ReviewAdmissionCode, int] = {
-    ReviewAdmissionCode.TARGET_NOT_FOUND: 404,
-    ReviewAdmissionCode.SCOPE_PATH_NOT_FOUND: 404,
+    ReviewAdmissionCode.INVALID_REPOSITORY: 400,
+    ReviewAdmissionCode.INVALID_PULL_REQUEST: 400,
+    ReviewAdmissionCode.REPOSITORY_NOT_FOUND: 404,
+    ReviewAdmissionCode.PULL_REQUEST_NOT_FOUND: 404,
+    ReviewAdmissionCode.PULL_REQUEST_EMPTY: 422,
+    ReviewAdmissionCode.GITHUB_AUTH_FAILED: 502,
+    ReviewAdmissionCode.GITHUB_RATE_LIMITED: 429,
+    ReviewAdmissionCode.GITHUB_UNAVAILABLE: 502,
     ReviewAdmissionCode.DUPLICATE_REVIEW: 409,
-    ReviewAdmissionCode.SNAPSHOT_FAILED: 500,
+    ReviewAdmissionCode.DUPLICATE_REQUEST: 409,
+    ReviewAdmissionCode.PULL_REQUEST_CHANGED: 409,
+    ReviewAdmissionCode.SNAPSHOT_FAILED: 502,
+    ReviewAdmissionCode.PERSISTENCE_FAILED: 500,
 }
 
 
@@ -114,19 +136,16 @@ class ReviewAdmissionError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ReviewAdmissionRequest:
-    """Transport-independent review request presented to admission."""
+    """Transport-independent pull-request review request."""
 
-    target: str | None = None
-    target_type: str | None = None
+    repository: str | None = None
+    pull_request: int | None = None
     action: str | None = None
-    scope: list[str] | None = None
     focus: str | list[str] | None = None
     content: str = ""
     session_key: str | None = None
-    cwd: str | None = None
-    max_concurrent_subagents: int | None = None
-    #: WebUI/API submissions must pass server-local absolute paths.
-    enforce_absolute: bool = False
+    #: Client-supplied idempotency key; it only prevents a duplicate submit.
+    request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,401 +154,401 @@ class ReviewAdmission:
 
     session_key: str
     run_id: str
-    input_fingerprint: str
+    request_id: str | None
+    repository_id: int
+    pull_request_id: int
+    pull_request: PullRequestTarget
     action: ReviewAction
-    target_type: str
-    target: str
-    content: str
-    plan: ReviewPlan | None
-    scope: LocalReviewScope | None
-    snapshot_ref: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+    snapshot: ReviewSnapshot
+    plan: ReviewPlan
+    input_fingerprint: str
+    metadata: dict[str, Any]
+
+    @property
+    def target(self) -> str:
+        return self.pull_request.label
+
+    @property
+    def target_type(self) -> str:
+        return PULL_REQUEST_TARGET_TYPE
+
+    @property
+    def snapshot_ref(self) -> str:
+        return self.snapshot.id
 
 
-def _is_absolute_target(value: str) -> bool:
-    return Path(value).expanduser().is_absolute()
+class SessionMetadataWriter(Protocol):
+    """Persist a session's review navigation metadata."""
+
+    async def update_metadata(self, session_key: str, payload: dict[str, Any]) -> None: ...
+
+    async def get_metadata(self, session_key: str) -> dict[str, Any] | None: ...
+
+
+class FileSessionMetadataWriter:
+    """Adapter over the file-backed :class:`SessionManager`.
+
+    The review domain never touches a ``Session`` object; it only needs the
+    metadata of one session key. Keeping that behind this adapter means the
+    migration of session storage changes one class, not every admission call.
+    """
+
+    def __init__(self, sessions: Any) -> None:
+        self._sessions = sessions
+
+    async def update_metadata(self, session_key: str, payload: dict[str, Any]) -> None:
+        def _write() -> None:
+            session = self._sessions.get_or_create(session_key)
+            session.metadata.update(payload)
+            self._sessions.save(session)
+
+        await asyncio.to_thread(_write)
+
+    async def get_metadata(self, session_key: str) -> dict[str, Any] | None:
+        def _read() -> dict[str, Any]:
+            session = self._sessions.get_or_create(session_key)
+            return dict(session.metadata)
+
+        return await asyncio.to_thread(_read)
+
+
+def _github_code(exc: GitHubError) -> ReviewAdmissionCode:
+    if isinstance(exc, GitHubNotFoundError):
+        return ReviewAdmissionCode.REPOSITORY_NOT_FOUND
+    if isinstance(exc, GitHubAuthError):
+        return ReviewAdmissionCode.GITHUB_AUTH_FAILED
+    if isinstance(exc, GitHubRateLimitError):
+        return ReviewAdmissionCode.GITHUB_RATE_LIMITED
+    if isinstance(exc, GitHubUnavailableError):
+        return ReviewAdmissionCode.GITHUB_UNAVAILABLE
+    return ReviewAdmissionCode.GITHUB_UNAVAILABLE
 
 
 class ReviewAdmissionService:
-    """Validate, snapshot, and register one local review run."""
+    """Validate, snapshot and register one pull-request review run."""
 
     def __init__(
         self,
         *,
+        github: GitHubClient,
+        storage: Any,
         sessions: Any,
-        workspace: Path,
-        store: ReviewSnapshotStore | None = None,
+        snapshot_service: PullRequestSnapshotService | None = None,
     ) -> None:
-        self._sessions = sessions
-        self._workspace = Path(workspace)
-        self._store = store or ReviewSnapshotStore(self._workspace)
+        self._github = github
+        self._storage = storage
+        self._sessions: SessionMetadataWriter = (
+            sessions if hasattr(sessions, "update_metadata") else FileSessionMetadataWriter(sessions)
+        )
+        self._snapshots = snapshot_service or PullRequestSnapshotService(github)
 
     # -- public API ---------------------------------------------------------
 
-    def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
+    async def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
         """Validate *request* and return an accepted admission, or raise."""
+        action = self._resolve_action(request)
+        roles = self._resolve_roles(request)
+        owner, name, number = self._resolve_target(request)
+        session_key = (request.session_key or "").strip() or f"review:{uuid.uuid4().hex[:12]}"
+        await self._reject_unavailable(session_key, request.request_id)
+
+        repository_row = await self._resolve_repository(f"{owner}/{name}")
+        pull_row, pull_number = await self._resolve_pull_request(repository_row, number)
+        run_id = new_review_run_id()
         try:
-            action = normalize_review_action(request.action)
+            await self._storage.runs.create(
+                run_id=run_id,
+                session_key=session_key,
+                repository_id=repository_row.id,
+                pull_request_id=pull_row.id,
+                request_id=request.request_id,
+                status=ReviewRunStatus.RUNNING.value,
+                phase=ReviewPhase.PREPARE.value,
+            )
+        except Exception as exc:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.PERSISTENCE_FAILED,
+                f"Cannot register the review run: {exc}",
+            ) from exc
+
+        snapshot = await self._prepare_snapshot(
+            run_id=run_id,
+            owner=owner,
+            name=name,
+            number=pull_number,
+            repository_id=repository_row.id,
+        )
+        try:
+            await self._storage.runs.save_snapshot(snapshot)
+            await self._storage.runs.mark_running(
+                run_id,
+                base_sha=snapshot.base_sha,
+                head_sha=snapshot.head_sha,
+                merge_base_sha=snapshot.merge_base_sha,
+            )
+        except Exception as exc:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.PERSISTENCE_FAILED,
+                f"Cannot persist the review snapshot: {exc}",
+            ) from exc
+
+        target = PullRequestTarget(
+            repository=repository_row.full_name,
+            number=number,
+            base_repo=snapshot.base_repo,
+            head_repo=snapshot.head_repo,
+            base_sha=snapshot.base_sha,
+            head_sha=snapshot.head_sha,
+            merge_base_sha=snapshot.merge_base_sha,
+            snapshot_id=snapshot.id,
+            url=str(snapshot.metadata.get("html_url") or "") or None,
+        )
+        plan = ReviewPlan(
+            target=str(target.url or target.label),
+            target_name=target.label,
+            target_type=PULL_REQUEST_TARGET_TYPE,
+            action=action,
+            roles=roles,
+            user_requirements=(request.content or "").strip(),
+            pull_request=target,
+        )
+        metadata = self._metadata_payload(
+            admission_target=target,
+            plan=plan,
+            repository_id=repository_row.id,
+            pull_request_id=pull_row.id,
+            run_id=run_id,
+            snapshot=snapshot,
+            focus=request.focus,
+        )
+        try:
+            await self._sessions.update_metadata(session_key, metadata)
+        except Exception as exc:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.PERSISTENCE_FAILED,
+                f"Cannot persist the review session metadata: {exc}",
+            ) from exc
+
+        logger.info(
+            "review.admission.accepted session={} run_id={} pr={} head={} files={} gaps={}",
+            session_key,
+            run_id,
+            target.label,
+            snapshot.head_sha[:12],
+            len(snapshot.changed_files),
+            len(snapshot.gaps),
+        )
+        return ReviewAdmission(
+            session_key=session_key,
+            run_id=run_id,
+            request_id=request.request_id,
+            repository_id=repository_row.id,
+            pull_request_id=pull_row.id,
+            pull_request=target,
+            action=action,
+            snapshot=snapshot,
+            plan=plan,
+            input_fingerprint=snapshot.input_fingerprint,
+            metadata=metadata,
+        )
+
+    # -- validation ---------------------------------------------------------
+
+    @staticmethod
+    def _resolve_action(request: ReviewAdmissionRequest) -> ReviewAction:
+        try:
+            return normalize_review_action(request.action)
         except ValueError as exc:
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.INVALID_ACTION, str(exc), field="action"
             ) from exc
+
+    @staticmethod
+    def _resolve_roles(request: ReviewAdmissionRequest) -> list[Any]:
         try:
-            roles = normalize_requested_dimensions(request.focus)
+            return normalize_requested_dimensions(request.focus)
         except ValueError as exc:
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.INVALID_DIMENSIONS, str(exc), field="focus"
             ) from exc
 
-        target = (request.target or "").strip()
-        if not target:
+    @staticmethod
+    def _resolve_target(request: ReviewAdmissionRequest) -> tuple[str, str, int]:
+        raw_repository = (request.repository or "").strip()
+        if not raw_repository:
             raise ReviewAdmissionError(
-                ReviewAdmissionCode.TARGET_REQUIRED,
-                "A review target is required.",
-                field="target",
+                ReviewAdmissionCode.INVALID_REPOSITORY,
+                "A GitHub repository is required.",
+                field="repository",
             )
-        if request.target_type and request.target_type.strip().lower() not in {
-            "auto", "local", "",
-        }:
+        try:
+            owner, name = parse_repository_target(raw_repository)
+        except GitHubError as exc:
             raise ReviewAdmissionError(
-                ReviewAdmissionCode.INVALID_TARGET_TYPE,
-                f"Unknown target type '{request.target_type}'. Only local targets are supported.",
-                field="target_type",
+                ReviewAdmissionCode.INVALID_REPOSITORY, exc.message, field="repository"
+            ) from exc
+        number = request.pull_request
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.INVALID_PULL_REQUEST,
+                "A positive pull request number is required.",
+                field="pull_request",
             )
-        session_key = request.session_key or f"review:{uuid.uuid4().hex[:12]}"
+        return owner, name, number
 
-        self._reject_duplicate(session_key)
-
-        return self._persist(
-            self._admit_local(
-                request=request,
-                session_key=session_key,
-                action=action,
-                roles=roles,
-                target=target,
-            )
-        )
-
-    # -- persistence --------------------------------------------------------
-
-    def _persist(self, admission: ReviewAdmission) -> ReviewAdmission:
-        """Persist the accepted run's navigation metadata on its session.
-
-        Admission owns this write: the run is created, the snapshot stored,
-        and the session metadata saved inside one boundary, so a crash between
-        delivery and registration cannot leave a session pointing at a run
-        that was never recorded.
-        """
-        session = self._sessions.get_or_create(admission.session_key)
-        session.metadata.update(admission.metadata)
-        self._sessions.save(session)
-        return admission
-
-    # -- rejection helpers --------------------------------------------------
-
-    def _reject_duplicate(self, session_key: str) -> None:
-        """Refuse a second review for a session that already owns one."""
-        session = self._sessions.get_or_create(session_key)
-        existing_run = session.metadata.get(ReviewMetaKey.RUN_ID)
-        if not existing_run:
+    async def _reject_unavailable(self, session_key: str, request_id: str | None) -> None:
+        """Refuse a repeated submit or a session whose review is still running."""
+        if request_id:
+            existing = await self._storage.runs.find_by_request_id(request_id)
+            if existing is not None:
+                raise ReviewAdmissionError(
+                    ReviewAdmissionCode.DUPLICATE_REQUEST,
+                    f"Request '{request_id}' was already submitted as run '{existing.id}'.",
+                    field="request_id",
+                )
+        metadata = await self._sessions.get_metadata(session_key) or {}
+        run_id = metadata.get(ReviewMetaKey.RUN_ID)
+        if not run_id:
             return
-        status = str(session.metadata.get(ReviewMetaKey.STATUS) or "running")
-        raise ReviewAdmissionError(
-            ReviewAdmissionCode.DUPLICATE_REVIEW,
-            (
-                f"Session '{session_key}' already owns review run '{existing_run}' "
-                f"with status '{status}'. Start a new review session instead."
-            ),
-        )
-
-    # -- admission paths ----------------------------------------------------
-
-    def _admit_local(
-        self,
-        *,
-        request: ReviewAdmissionRequest,
-        session_key: str,
-        action: ReviewAction,
-        roles: list[Any],
-        target: str,
-    ) -> ReviewAdmission:
-        resolved_target = self._resolve_local_target(request, target)
-        scope = self._resolve_local_scope(request, resolved_target)
-        review_root = Path(scope.review_root)
-
-        # Only local diff review is supported: every admitted run captures the
-        # net workspace change relative to HEAD (staged + unstaged + untracked).
-        net_diff: NetDiff = self._collect_diff(review_root, scope)
-
-        plan = ReviewPlan(
-            target=str(resolved_target),
-            target_name=target,
-            target_type="local",
-            action=action,
-            roles=roles,
-            user_requirements=(request.content or "").strip(),
-            local_scope=scope,
-        )
-        run_id = new_review_run_id()
-        fingerprint = compute_input_fingerprint(
-            target=str(resolved_target),
-            target_type="local",
-            action=action.value,
-            roles=[role.name for role in roles],
-            scope={
-                "kind": scope.kind,
-                "review_root": scope.review_root,
-                "scope_paths": sorted(scope.scope_paths),
-                "target_path": scope.target_path,
-            },
-            evidence_manifest=[{"path": path} for path in sorted(net_diff.patches)],
-            extra_metadata={"session": session_key, "git_head": net_diff.head_sha},
-        )
-        snapshot_ref = self._write_snapshot(
-            build_snapshot(
-                run_id=run_id,
-                session_key=session_key,
-                action=action.value,
-                target_type="local",
-                target=str(resolved_target),
-                input_fingerprint=fingerprint,
-                local_scope={
-                    "kind": scope.kind,
-                    "review_root": scope.review_root,
-                    "scope_paths": list(scope.scope_paths),
-                    "target_path": scope.target_path,
-                },
-                git_head=net_diff.head_sha,
-                net_diff=net_diff.patches,
-                changed_files=net_diff.changed_files,
-                extra_metadata={
-                    "skipped_files": net_diff.skipped,
-                    "outside_scope_files": net_diff.outside_scope_files,
-                },
-            )
-        )
-        logger.info(
-            "review.admission.accepted session={} run_id={} action={} scope_kind={} scope_paths={}",
-            session_key,
-            run_id,
-            action.value,
-            scope.kind,
-            len(scope.scope_paths),
-        )
-        return ReviewAdmission(
-            session_key=session_key,
-            run_id=run_id,
-            input_fingerprint=fingerprint,
-            action=action,
-            target_type="local",
-            target=str(resolved_target),
-            content=request.content.strip() or f"Review {resolved_target}",
-            plan=plan,
-            scope=scope,
-            snapshot_ref=snapshot_ref,
-            metadata=self._metadata_payload(
-                plan=plan,
-                run_id=run_id,
-                fingerprint=fingerprint,
-                snapshot_ref=snapshot_ref,
-                focus=request.focus,
-                max_concurrent_subagents=request.max_concurrent_subagents,
-            ),
-        )
-
-    # -- validation ---------------------------------------------------------
-
-    def _resolve_local_target(
-        self, request: ReviewAdmissionRequest, target: str
-    ) -> Path:
-        if request.enforce_absolute and not _is_absolute_target(target):
+        status = str(metadata.get(ReviewMetaKey.STATUS) or "")
+        terminal = {item.value for item in REVIEW_TERMINAL_STATUSES}
+        if status and status not in terminal:
             raise ReviewAdmissionError(
-                ReviewAdmissionCode.RELATIVE_PATH_NOT_ALLOWED,
-                f"Review target must be an absolute local path: '{target}'.",
-                field="target",
-            )
-        base = Path(request.cwd).expanduser() if request.cwd else Path.cwd()
-        candidate = Path(target).expanduser()
-        resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
-        if not resolved.exists():
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.TARGET_NOT_FOUND,
-                f"Review target does not exist: {resolved}",
-                field="target",
-            )
-        if not (resolved.is_file() or resolved.is_dir()):
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.TARGET_NOT_FILE_OR_DIRECTORY,
-                f"Review target is neither a file nor a directory: {resolved}",
-                field="target",
-            )
-        return resolved
-
-    def _resolve_local_scope(
-        self, request: ReviewAdmissionRequest, resolved_target: Path
-    ) -> LocalReviewScope:
-        """Resolve the review root and scope paths for a local target."""
-        base = Path(request.cwd).expanduser() if request.cwd else Path.cwd()
-        explicit = clean_scope_paths(request.scope)
-
-        if resolved_target.is_file():
-            git_root = find_git_root(resolved_target)
-            review_root = git_root or resolved_target.parent
-            target_rel = resolved_target.relative_to(review_root).as_posix()
-            scope_paths = self._validate_scope_paths(
-                explicit, base=base, review_root=review_root, fallback=[target_rel]
-            )
-            return LocalReviewScope(
-                kind="file",
-                review_root=str(review_root),
-                scope_paths=scope_paths,
-                target_path=target_rel,
-                reason="file_target",
-            )
-
-        review_root = resolved_target
-        scope_paths = self._validate_scope_paths(
-            explicit, base=base, review_root=review_root, fallback=[]
-        )
-        kind = "directory" if not scope_paths else "directory"
-        return LocalReviewScope(
-            kind=kind,  # type: ignore[arg-type]
-            review_root=str(review_root),
-            scope_paths=scope_paths,
-            target_path=".",
-            reason="directory_target",
-        )
-
-    def _validate_scope_paths(
-        self,
-        scope: list[str],
-        *,
-        base: Path,
-        review_root: Path,
-        fallback: list[str],
-    ) -> list[str]:
-        if not scope:
-            return list(fallback)
-        root = review_root.resolve()
-        validated: list[str] = []
-        for raw in scope:
-            candidate = Path(raw).expanduser()
-            absolute = (candidate if candidate.is_absolute() else base / candidate).resolve()
-            if not absolute.exists():
-                raise ReviewAdmissionError(
-                    ReviewAdmissionCode.SCOPE_PATH_NOT_FOUND,
-                    f"Review scope path does not exist: {absolute}",
-                    field="scope",
-                )
-            try:
-                rel = absolute.relative_to(root).as_posix()
-            except ValueError as exc:
-                raise ReviewAdmissionError(
-                    ReviewAdmissionCode.SCOPE_OUTSIDE_TARGET,
-                    f"Review scope path is outside the review target: {absolute}",
-                    field="scope",
-                ) from exc
-            if rel not in validated:
-                validated.append(rel)
-        return validated
-
-    def _collect_diff(self, review_root: Path, scope: LocalReviewScope) -> NetDiff:
-        try:
-            net_diff = collect_net_diff(
-                review_root, scope_paths=scope.scope_paths or None
-            )
-        except GitDiffUnavailableError as exc:
-            # The root is a Git worktree but its diff could not be read.
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.DIFF_UNAVAILABLE,
-                f"Cannot read the workspace diff for '{review_root}': {exc}",
-                field="target",
-            ) from exc
-        except GitUnavailableError as exc:
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.NOT_A_GIT_REPO,
+                ReviewAdmissionCode.DUPLICATE_REVIEW,
                 (
-                    "Diff review requires a Git repository; "
-                    f"'{review_root}' is not inside a Git worktree."
+                    f"Session '{session_key}' already owns review run '{run_id}' "
+                    f"with status '{status}'. Wait for it to finish or cancel it."
                 ),
-                field="target",
-            ) from exc
-
-        if net_diff.is_empty:
-            if net_diff.changed_files and scope.scope_paths:
-                raise ReviewAdmissionError(
-                    ReviewAdmissionCode.SCOPE_NO_CHANGES,
-                    (
-                        "The selected scope has no changes relative to HEAD. "
-                        f"Changed files outside scope: {', '.join(net_diff.outside_scope_files)}"
-                    ),
-                    field="scope",
-                )
-            if not net_diff.has_changes:
-                raise ReviewAdmissionError(
-                    ReviewAdmissionCode.EMPTY_DIFF,
-                    "The workspace has no changes relative to HEAD; nothing to review.",
-                    field="target",
-                )
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.SCOPE_NO_CHANGES,
-                "The selected scope has no reviewable changes relative to HEAD.",
-                field="scope",
             )
-        return net_diff
 
-    # -- persistence --------------------------------------------------------
+    # -- GitHub -------------------------------------------------------------
 
-    def _write_snapshot(self, snapshot: dict[str, Any]) -> str:
+    async def _resolve_repository(self, repository: str) -> RepositoryRecord:
         try:
-            return self._store.write(snapshot)
-        except ReviewSnapshotError as exc:
+            resolved: GitHubRepository = await self._github.resolve_repository(repository)
+        except GitHubError as exc:
+            raise ReviewAdmissionError(
+                _github_code(exc), exc.message, field="repository"
+            ) from exc
+        return await self._storage.repositories.upsert_repository(
+            owner=resolved.owner,
+            name=resolved.name,
+            url=resolved.url,
+            default_branch=resolved.default_branch,
+        )
+
+    async def _resolve_pull_request(
+        self, repository: RepositoryRecord, number: int
+    ) -> tuple[PullRequestRecord, int]:
+        try:
+            pull = await self._github.get_pull_request(
+                repository.owner, repository.name, number
+            )
+        except GitHubNotFoundError as exc:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.PULL_REQUEST_NOT_FOUND,
+                f"Pull request #{number} was not found in {repository.full_name}.",
+                field="pull_request",
+            ) from exc
+        except GitHubError as exc:
+            raise ReviewAdmissionError(_github_code(exc), exc.message) from exc
+        row = await self._storage.repositories.upsert_pull_request(
+            repository_id=repository.id,
+            number=pull.number,
+            title=pull.title,
+            state=pull.state,
+            draft=pull.draft,
+            author=pull.author,
+            base_ref=pull.base_ref,
+            head_ref=pull.head_ref,
+            head_sha=pull.head_sha,
+            base_sha=pull.base_sha,
+            html_url=pull.html_url,
+            updated_at=pull.updated_at,
+        )
+        return row, pull.number
+
+    async def _prepare_snapshot(
+        self,
+        *,
+        run_id: str,
+        owner: str,
+        name: str,
+        number: int,
+        repository_id: int,
+    ) -> ReviewSnapshot:
+        try:
+            snapshot = await self._snapshots.prepare(
+                run_id=run_id, owner=owner, name=name, number=number
+            )
+        except SnapshotPreparationError as exc:
+            code = (
+                ReviewAdmissionCode.PULL_REQUEST_CHANGED
+                if exc.code == "pull_request_changed"
+                else ReviewAdmissionCode.SNAPSHOT_FAILED
+            )
+            raise ReviewAdmissionError(code, exc.message) from exc
+        except GitHubError as exc:
+            raise ReviewAdmissionError(_github_code(exc), exc.message) from exc
+        except Exception as exc:  # preparation failures are input problems, not crashes
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.SNAPSHOT_FAILED,
-                f"Cannot capture the review input snapshot: {exc}",
+                f"Cannot capture the pull request snapshot: {exc}",
             ) from exc
+        snapshot = replace(snapshot, repository_id=repository_id)
+        if not snapshot.changed_files:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.PULL_REQUEST_EMPTY,
+                (
+                    f"Pull request #{number} has no reviewable file changes at "
+                    f"{snapshot.head_sha[:12]}."
+                ),
+                field="pull_request",
+            )
+        return snapshot
+
+    # -- persistence --------------------------------------------------------
 
     @staticmethod
     def _metadata_payload(
         *,
+        admission_target: PullRequestTarget,
         plan: ReviewPlan,
+        repository_id: int,
+        pull_request_id: int,
         run_id: str,
-        fingerprint: str,
-        snapshot_ref: str,
+        snapshot: ReviewSnapshot,
         focus: str | list[str] | None,
-        max_concurrent_subagents: int | None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        return {
             ReviewMetaKey.TARGET: plan.target,
-            ReviewMetaKey.TARGET_TYPE: plan.target_type,
+            ReviewMetaKey.TARGET_TYPE: PULL_REQUEST_TARGET_TYPE,
             ReviewMetaKey.ACTION: plan.action.value,
             ReviewMetaKey.REQUESTED_DIMENSIONS: focus,
             ReviewMetaKey.ALLOWED_DIMENSIONS: [role.name for role in plan.roles],
-            ReviewMetaKey.SNAPSHOT_REF: snapshot_ref,
+            ReviewMetaKey.REPOSITORY_ID: repository_id,
+            ReviewMetaKey.PULL_REQUEST_ID: pull_request_id,
+            ReviewMetaKey.PULL_REQUEST_NUMBER: admission_target.number,
+            ReviewMetaKey.BASE_REPO: snapshot.base_repo,
+            ReviewMetaKey.HEAD_REPO: snapshot.head_repo,
+            ReviewMetaKey.BASE_SHA: snapshot.base_sha,
+            ReviewMetaKey.HEAD_SHA: snapshot.head_sha,
+            ReviewMetaKey.MERGE_BASE_SHA: snapshot.merge_base_sha,
+            ReviewMetaKey.SNAPSHOT_REF: snapshot.id,
             ReviewMetaKey.RUN_ID: run_id,
             ReviewMetaKey.STATUS: ReviewRunStatus.RUNNING.value,
             ReviewMetaKey.PHASE: ReviewPhase.PREPARE.value,
-            ReviewMetaKey.INPUT_FINGERPRINT: fingerprint,
+            ReviewMetaKey.INPUT_FINGERPRINT: snapshot.input_fingerprint,
         }
-        if max_concurrent_subagents:
-            payload[ReviewMetaKey.MAX_CONCURRENT_SUBAGENTS] = max_concurrent_subagents
-        if plan.local_scope is not None:
-            payload[ReviewMetaKey.LOCAL_ROOT] = plan.local_scope.review_root
-            payload[ReviewMetaKey.LOCAL_SCOPE_KIND] = plan.local_scope.kind
-            root = Path(plan.local_scope.review_root)
-            target_path = plan.local_scope.target_path
-            local_target = (
-                root / target_path if target_path and target_path != "." else root
-            )
-            payload[ReviewMetaKey.LOCAL_TARGET] = str(local_target.resolve())
-        return payload
 
 
 __all__ = [
+    "REVIEW_TERMINAL_STATUSES",
+    "FileSessionMetadataWriter",
     "ReviewAdmission",
     "ReviewAdmissionCode",
     "ReviewAdmissionError",
     "ReviewAdmissionRequest",
     "ReviewAdmissionService",
-    "REVIEW_TERMINAL_STATUSES",
+    "SessionMetadataWriter",
 ]

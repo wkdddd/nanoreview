@@ -15,6 +15,21 @@ from __future__ import annotations
 import pytest
 from loguru import logger
 
+#: The frozen PR boundary the finalizer tests validate against. The new
+#: validator reads no filesystem, so the old ``workspace`` argument is dropped
+#: and the changed set is declared here.
+_CHANGED_FILES = ["src/app.py"]
+
+
+def _finalizer(*args: object, **kwargs: object) -> ReviewFinalizer:
+    """Construct the finalizer without the removed positional workspace."""
+    args = list(args)
+    if args:
+        args.pop(0)
+    kwargs.setdefault("changed_files", list(_CHANGED_FILES))
+    return ReviewFinalizer(*args, **kwargs)
+
+
 from nanoreview.review.output.finalizer import (
     ReviewFinalizer,
     reviewer_failure_reason,
@@ -115,7 +130,7 @@ class TestDimensionNormalization:
 
 class TestValidateFindings:
     def test_valid_findings_become_accepted_candidates(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
 
         result = f.validate_findings(
             "security",
@@ -138,12 +153,12 @@ class TestValidateFindings:
         assert [candidate.title for candidate in result.accepted] == ["Injection"]
 
     def test_an_empty_findings_array_is_no_findings(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
 
         assert f.validate_findings("security", []).status == "no_findings"
 
     def test_normalizes_the_dimension_label(self, workspace):
-        f = ReviewFinalizer(workspace, allowed_dimensions={"maintainability"})
+        f = _finalizer(workspace, allowed_dimensions={"maintainability"})
 
         result = f.validate_findings(
             "Maintainability Reviewer",
@@ -167,7 +182,7 @@ class TestValidateFindings:
         assert result.dimension == "maintainability"
 
     def test_accepts_spawn_labels_with_task_suffix(self, workspace):
-        f = ReviewFinalizer(workspace, allowed_dimensions={"performance"})
+        f = _finalizer(workspace, allowed_dimensions={"performance"})
 
         validated = f.validate_findings(
             "Performance Reviewer for review-webui/index.html",
@@ -194,7 +209,7 @@ class TestValidateFindings:
         assert not result.errors
 
     def test_disallowed_dimension_is_skipped_not_reported(self, workspace):
-        f = ReviewFinalizer(workspace, allowed_dimensions={"maintainability"})
+        f = _finalizer(workspace, allowed_dimensions={"maintainability"})
 
         skipped = f.validate_findings(
             "security",
@@ -220,7 +235,7 @@ class TestValidateFindings:
         assert "No actionable issues found" not in result.report_markdown
 
     def test_medium_and_low_candidates_are_kept(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
 
         result = f.validate_findings(
             "security",
@@ -256,7 +271,7 @@ class TestValidateFindings:
 
 class TestDimensionFailure:
     def test_a_failed_reviewer_is_incomplete_with_a_bounded_reason(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
 
         failed = f.dimension_failure("security", "provider timeout")
         result = f.finalize((failed,), target_name="repo")
@@ -267,7 +282,7 @@ class TestDimensionFailure:
         assert "No actionable issues found" not in result.report_markdown
 
     def test_an_empty_reason_still_explains_the_gap(self, workspace):
-        failed = ReviewFinalizer(workspace).dimension_failure("security", "   ")
+        failed = _finalizer(workspace).dimension_failure("security", "   ")
 
         assert failed.errors == ["reviewer did not complete"]
 
@@ -286,14 +301,14 @@ class TestDimensionFailure:
 
 class TestFinalize:
     def test_finalize_without_dimensions_is_incomplete_not_clean(self, workspace):
-        result = ReviewFinalizer(workspace).finalize((), target_name="repo")
+        result = _finalizer(workspace).finalize((), target_name="repo")
 
         assert result.errors == ["No review dimension results were produced."]
         assert "Review incomplete" in result.report_markdown
         assert "No actionable issues found" not in result.report_markdown
 
     def test_finalize_produces_report(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -319,7 +334,7 @@ class TestFinalize:
 
     def test_report_is_rendered_from_every_given_dimension(self, workspace):
         """The finalizer renders exactly the set it is handed (no accumulation)."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         first = f.validate_findings("security", _findings([
             {
                 "severity": "high",
@@ -358,7 +373,7 @@ class TestFinalize:
             raise RuntimeError("render exploded")
 
         monkeypatch.setattr(report_module, "render_review_report", _boom)
-        result = ReviewFinalizer(workspace).finalize((), target_name="repo")
+        result = _finalizer(workspace).finalize((), target_name="repo")
 
         assert any("render exploded" in error for error in result.errors)
         assert "Report rendering failed" in result.report_markdown
@@ -366,7 +381,7 @@ class TestFinalize:
 
 class TestNeedsConfirmation:
     def test_no_confirmation_needed_when_every_candidate_is_clear(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -389,7 +404,7 @@ class TestNeedsConfirmation:
         assert result.needs_confirmation == []
 
     def test_uncertain_items_remain_in_needs_confirmation(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -417,7 +432,7 @@ class TestNeedsConfirmation:
 class TestJudge:
     @pytest.mark.asyncio
     async def test_ai_judge_can_reject_a_hard_accepted_candidate(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -454,7 +469,7 @@ class TestJudge:
         self, workspace
     ):
         """No judge instance: candidates must not silently pass as accepted."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -491,7 +506,7 @@ class TestJudge:
         self, workspace
     ):
         """A judge that raises outright must surface candidates, not accept them."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -524,7 +539,7 @@ class TestJudge:
     @pytest.mark.asyncio
     async def test_judge_returns_stats_usage_and_bounded_error(self, workspace):
         """The finalizer passes the judge's immutable result through untouched."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -575,7 +590,7 @@ class TestJudge:
     @pytest.mark.asyncio
     async def test_a_budget_rejected_judge_keeps_the_report_a_draft(self, workspace):
         """A rejected candidate set adjudicates nothing: no candidate is confirmed."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -624,7 +639,7 @@ class TestJudge:
     @pytest.mark.asyncio
     async def test_an_escalated_failure_reports_a_bounded_error(self, workspace):
         """An escaping judge failure returns a bounded error for the supervisor."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -656,7 +671,7 @@ class TestJudge:
         self, workspace
     ):
         """An empty verdict map over real candidates is a gap, not a clean pass."""
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -683,7 +698,7 @@ class TestJudge:
 
     @pytest.mark.asyncio
     async def test_an_empty_candidate_set_needs_no_judge_pass(self, workspace):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         empty = ReviewDimensionResult(dimension="security", status="no_findings")
 
         execution, judged = await f.judge(FakeJudge({}), (empty,))
@@ -695,7 +710,7 @@ class TestJudge:
     async def test_judge_applies_verdicts_to_accepted_and_uncertain_candidates(
         self, workspace
     ):
-        f = ReviewFinalizer(workspace)
+        f = _finalizer(workspace)
         validated = f.validate_findings(
             "security",
             _findings(
@@ -735,7 +750,7 @@ class TestLogging:
         try:
             # The runner never hands the finalizer an unstructured answer: it
             # rejects it first. What must not happen is a JSON parse error here.
-            f = ReviewFinalizer(workspace)
+            f = _finalizer(workspace)
             f.validate_findings("bug-risk", [])
         finally:
             logger.remove(sink_id)
@@ -748,7 +763,7 @@ class TestLogging:
             lambda message: warnings.append(str(message)), level="WARNING"
         )
         try:
-            ReviewFinalizer(workspace, allowed_dimensions={"bug"}).validate_findings(
+            _finalizer(workspace, allowed_dimensions={"bug"}).validate_findings(
                 "security", []
             )
         finally:

@@ -37,7 +37,7 @@ def test_execution_profiles_use_dedicated_scopes_and_require_shared_tools() -> N
     assert profiles["performance"].scope == PERFORMANCE_REVIEWER_SCOPE
     assert profiles["maintainability"].scope == MAINTAINABILITY_REVIEWER_SCOPE
     assert profiles["general"].scope == GENERAL_REVIEWER_SCOPE
-    assert profiles["bug"].required_tools == frozenset({"read_file", "list_dir", "grep"})
+    assert profiles["bug"].required_tools == frozenset({"pr_context"})
 
 
 def test_execution_profiles_use_independent_scopes_and_required_tools() -> None:
@@ -49,7 +49,7 @@ def test_execution_profiles_use_independent_scopes_and_required_tools() -> None:
         MAINTAINABILITY_REVIEWER_SCOPE,
         GENERAL_REVIEWER_SCOPE,
     }
-    expected_required = frozenset({"read_file", "list_dir", "grep"})
+    expected_required = frozenset({"pr_context"})
     assert all(profile.required_tools == expected_required for profile in profiles.values())
 
 
@@ -132,11 +132,11 @@ def _completed_result(findings: list[dict[str, object]], **extra: object) -> Age
     return AgentRunResult(
         final_content="reviewer finished",
         messages=[
-            {"role": "tool", "name": "read_file", "content": "evidence"},
+            {"role": "tool", "name": "pr_context", "content": "evidence"},
             {"role": "assistant", "content": "reviewer finished"},
         ],
         tool_events=[
-            {"name": "read_file", "status": "ok", "detail": "evidence"},
+            {"name": "pr_context", "status": "ok", "detail": "evidence"},
         ],
         structured_output=payload,
         stop_reason="completed",

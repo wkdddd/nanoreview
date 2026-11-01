@@ -22,6 +22,7 @@ from nanoreview.review.admission import (
     ReviewAdmissionError,
     ReviewAdmissionRequest,
 )
+from nanoreview.review.input.targets import try_parse_pull_request_reference
 from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.helpers import safe_filename
 from nanoreview.utils.media_decode import (
@@ -51,6 +52,35 @@ API_CHAT_ID = "default"
 # ---------------------------------------------------------------------------
 # Response helpers
 # ---------------------------------------------------------------------------
+
+
+def _review_request_from_payload(review_payload: dict[str, Any], session_key: str):
+    """Build the admission request from the structured ``review`` body.
+
+    The supported shape is ``{"repository": "owner/name", "pull_request": 123,
+    "focus": [...], "request_id": "..."}``. A ``target`` holding a pull-request
+    URL is still accepted for older clients; a local path is rejected.
+    """
+    repository = review_payload.get("repository")
+    number = review_payload.get("pull_request")
+    if (not isinstance(repository, str) or not repository.strip()) and isinstance(
+        review_payload.get("target"), str
+    ):
+        reference = try_parse_pull_request_reference(review_payload["target"])
+        if reference is not None:
+            repository, number = reference.repository, reference.number
+    if isinstance(number, str) and number.strip().isdigit():
+        number = int(number.strip())
+    request_id = review_payload.get("request_id")
+    return ReviewAdmissionRequest(
+        repository=repository if isinstance(repository, str) else None,
+        pull_request=number if isinstance(number, int) and not isinstance(number, bool) else None,
+        action=review_payload.get("action"),
+        focus=review_payload.get("focus"),
+        content=str(review_payload.get("content") or ""),
+        session_key=session_key,
+        request_id=request_id if isinstance(request_id, str) and request_id.strip() else None,
+    )
 
 
 def _error_json(status: int, message: str, err_type: str = "invalid_request_error") -> web.Response:
@@ -258,16 +288,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
         if not isinstance(review_payload, dict):
             return _error_json(400, "Field 'review' must be an object")
         try:
-            admission = agent_loop.admit_review(
-                ReviewAdmissionRequest(
-                    target=review_payload.get("target"),
-                    target_type=review_payload.get("target_type"),
-                    action=review_payload.get("action"),
-                    scope=review_payload.get("scope"),
-                    focus=review_payload.get("focus"),
-                    session_key=session_key,
-                    enforce_absolute=True,
-                )
+            admission = await agent_loop.admit_review(
+                _review_request_from_payload(review_payload, session_key)
             )
         except ReviewAdmissionError as exc:
             logger.info(
@@ -275,7 +297,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response:
             )
             return web.json_response(exc.as_payload(), status=exc.status)
         if not text.strip():
-            text = admission.content
+            text = (
+                str(admission.plan.user_requirements or "").strip()
+                or f"Review pull request {admission.target}."
+            )
         review_metadata = {
             "_review_admitted": admission.run_id,
             "review_target": admission.target,

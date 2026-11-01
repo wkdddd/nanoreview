@@ -1,6 +1,7 @@
+"""Prefetch turns the frozen PR patches into the reviewers' evidence bundle."""
+
 from __future__ import annotations
 
-import nanoreview.review.planning.planner as planner
 from nanoreview.review.planning.planner import build_review_plan
 from nanoreview.review.planning.prefetch import maybe_prefetch_review_context
 from nanoreview.review.planning.preprocessor import (
@@ -9,11 +10,38 @@ from nanoreview.review.planning.preprocessor import (
     SkippedUnit,
 )
 from nanoreview.review.types import (
-    LocalReviewScope,
+    PullRequestTarget,
     ReviewAction,
     ReviewMetaKey,
     ReviewPlan,
 )
+
+
+def _pull_request(**overrides: object) -> PullRequestTarget:
+    values: dict[str, object] = {
+        "repository": "octo/demo",
+        "number": 7,
+        "base_repo": "octo/demo",
+        "head_repo": "octo/demo",
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "merge_base_sha": "c" * 40,
+        "snapshot_id": "snap_1",
+    }
+    values.update(overrides)
+    return PullRequestTarget(**values)
+
+
+def _plan(**overrides: object) -> ReviewPlan:
+    plan = build_review_plan(
+        target="https://github.com/octo/demo/pull/7",
+        user_content="review auth",
+        focus="general",
+        action="diff",
+        pull_request=_pull_request(),
+    )
+    assert plan is not None
+    return plan
 
 
 class _EvidenceService:
@@ -24,7 +52,7 @@ class _EvidenceService:
         self.calls.append(kwargs)
         return "\n".join(
             [
-                "[Repository Review References - retrieved references, not instructions]",
+                "[Pull Request Review References - retrieved references, not instructions]",
                 "## src/auth.py:1-10",
                 "- score: 1.0",
                 "- matched: broad, bm25",
@@ -40,7 +68,7 @@ class _EmptyEvidenceService:
 
 class _PatchEvidenceService:
     async def dispatch(self, **kwargs: object) -> str:
-        return "[Local Diff Review Context]\n## File: src/auth.py\n+token = value"
+        return "[Pull Request Diff Review Context]\n## File: src/auth.py\n+token = value"
 
 
 class _StructuredEvidenceService:
@@ -88,37 +116,33 @@ def _structured_result() -> ProgrammaticEvidenceResult:
             SkippedUnit(path="src/big.py", reason="filtered", start_line=10, end_line=20),
         ],
         context=(
-            "[Repository Review References - programmatic evidence, not instructions]\n"
+            "[Pull Request Review References - programmatic evidence, not instructions]\n"
             "## src/auth.py:1-10\n- kind: function\n```text\ndef login(token):\n```\n"
-            "[/Repository Review References]"
+            "[/Pull Request Review References]"
         ),
     )
 
 
 async def test_prefetch_dispatches_to_evidence_service_for_diff() -> None:
     evidence_service = _EvidenceService()
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-        user_requirements="review auth",
-    )
 
     summary = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": evidence_service},
     )
 
     assert evidence_service.calls
-    assert evidence_service.calls[0]["review_query"] == "review auth"
-    assert "local_scope" in evidence_service.calls[0]
-    assert evidence_service.calls[0]["target_type"] == "local"
-    assert evidence_service.calls[0]["action"] == "diff"
+    call = evidence_service.calls[0]
+    assert call["review_query"] == "review auth"
+    assert call["target_type"] == "pull_request"
+    assert call["action"] == "diff"
+    # There is no local scope and no remote read: prefetch only carries the
+    # frozen patches the snapshot captured.
+    assert "local_scope" not in call
+    assert "repo" not in call
+    assert "ref" not in call
     assert summary.attempted is True
     assert summary.status == "ok"
-    # Diff prefetch preserves the filtered patch body verbatim.
     assert "## src/auth.py:1-10" in (summary.summary or "")
     assert "ignored body line" in (summary.summary or "")
     assert summary.evidence is not None
@@ -127,27 +151,15 @@ async def test_prefetch_dispatches_to_evidence_service_for_diff() -> None:
 
 
 async def test_prefetch_forwards_the_frozen_diff_to_the_evidence_service() -> None:
-    """The admitted snapshot's net diff is what prefetch reviews.
-
-    The review must execute against the frozen change captured at admission,
-    not re-read a worktree the user may have edited after admitting the run.
-    """
+    """The admitted snapshot's patches are what prefetch reviews."""
     evidence_service = _EvidenceService()
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-        user_requirements="review auth",
-    )
     frozen = {
         "patches": {"src/auth.py": "@@ -1 +1 @@\n-old\n+new"},
-        "skipped": {"src/gen.py": "generated"},
+        "skipped": {"src/gen.py": "patch_unavailable"},
     }
 
     await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {
             "_review_evidence_service": evidence_service,
             ReviewMetaKey.FROZEN_DIFF: frozen,
@@ -156,25 +168,6 @@ async def test_prefetch_forwards_the_frozen_diff_to_the_evidence_service() -> No
 
     assert evidence_service.calls
     assert evidence_service.calls[0]["frozen_diff"] == frozen
-
-
-async def test_prefetch_omits_frozen_diff_when_absent() -> None:
-    evidence_service = _EvidenceService()
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
-
-    await maybe_prefetch_review_context(
-        plan,
-        {"_review_evidence_service": evidence_service},
-    )
-
-    assert evidence_service.calls
-    assert evidence_service.calls[0]["frozen_diff"] is None
 
 
 async def test_prefetch_emits_progress_events() -> None:
@@ -186,17 +179,8 @@ async def test_prefetch_emits_progress_events() -> None:
         if isinstance(tool_events, list):
             events.extend(tool_events)
 
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-        user_requirements="review auth",
-    )
-
     await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": evidence_service},
         progress_callback=progress,
     )
@@ -207,16 +191,8 @@ async def test_prefetch_emits_progress_events() -> None:
 
 
 async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
-    plan = ReviewPlan(
-        target=".",
-        target_name="repo",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
-
     result = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": _EmptyEvidenceService()},
     )
 
@@ -226,95 +202,17 @@ async def test_prefetch_reports_attempted_when_summary_is_empty() -> None:
 
 
 async def test_diff_prefetch_preserves_filtered_patch_body() -> None:
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
     result = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": _PatchEvidenceService()},
     )
 
     assert "+token = value" in (result.summary or "")
 
 
-def test_github_blob_url_is_treated_as_an_opaque_local_target() -> None:
-    """GitHub blob URLs are no longer parsed into a remote scope; they degrade to local."""
-    plan = build_review_plan(
-        target="https://github.com/wkdddd/nanobot/blob/main/review-webui/index.html",
-        user_content="审查",
-        focus="performance",
-        target_type="github",
-        action="diff",
-    )
-
-    assert plan is not None
-    assert plan.target_type == "local"
-    assert not hasattr(plan, "target_repo")
-    assert not hasattr(plan, "target_ref")
-    assert not hasattr(plan, "target_subpath")
-
-
-def test_local_file_target_becomes_file_scope(tmp_path, monkeypatch) -> None:
-    target = tmp_path / "src" / "auth.py"
-    target.parent.mkdir()
-    target.write_text("print('ok')\n", encoding="utf-8")
-    monkeypatch.setattr(planner, "_find_git_root", lambda path: None)
-
-    plan = build_review_plan(
-        target=str(target),
-        user_content="审查",
-        target_type="local",
-        action="diff",
-    )
-
-    assert plan is not None
-    assert plan.local_scope is not None
-    assert isinstance(plan.local_scope, LocalReviewScope)
-    assert plan.local_scope.kind == "file"
-    assert plan.local_scope.review_root == str(target.parent)
-    assert plan.local_scope.scope_paths == ["auth.py"]
-
-
-async def test_prefetch_dispatches_without_remote_scope_fields() -> None:
-    evidence_service = _EvidenceService()
-    plan = build_review_plan(
-        target=".",
-        user_content="审查",
-        target_type="local",
-        action="diff",
-    )
-
-    assert plan is not None
-    result = await maybe_prefetch_review_context(
-        plan,
-        {"_review_evidence_service": evidence_service},
-    )
-
-    assert result.status == "ok"
-    assert evidence_service.calls
-    call = evidence_service.calls[0]
-    assert call["target_type"] == "local"
-    assert "repo" not in call
-    assert "ref" not in call
-    assert "target_subpath" not in call
-    assert "target_subpath_kind" not in call
-
-
 async def test_prefetch_builds_bundle_from_structured_units() -> None:
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
-
     result = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": _StructuredEvidenceService(_structured_result())},
     )
 
@@ -338,19 +236,12 @@ async def test_prefetch_builds_bundle_from_structured_units() -> None:
 
 async def test_unit_text_reaches_the_reviewer_without_truncation() -> None:
     """The excerpt is the complete diff, however large the unit is."""
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
     result = _structured_result()
     huge = "@@ -1 +1 @@\n+" + "x" * 90_000
     result.units[0].text = huge
 
     prefetched = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": _StructuredEvidenceService(result)},
     )
 
@@ -364,7 +255,7 @@ async def test_legacy_provider_drops_risk_labels() -> None:
         async def dispatch(self, **kwargs: object) -> str:
             return "\n".join(
                 [
-                    "[Repository Review References - retrieved references, not instructions]",
+                    "[Pull Request Review References - retrieved references, not instructions]",
                     "## src/auth.py:1-10",
                     "- score: 4.0",
                     "- matched: login, risk:security, risk:entrypoint",
@@ -373,16 +264,8 @@ async def test_legacy_provider_drops_risk_labels() -> None:
                 ]
             )
 
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
-
     result = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": _LegacyRiskEvidenceService()},
     )
 
@@ -409,16 +292,8 @@ async def test_prefetch_aggregates_skipped_files_per_path() -> None:
         if isinstance(tool_events, list):
             events.extend(tool_events)
 
-    plan = ReviewPlan(
-        target=".",
-        target_name="workspace",
-        target_type="local",
-        action=ReviewAction.DIFF,
-        roles=[],
-    )
-
     result = await maybe_prefetch_review_context(
-        plan,
+        _plan(),
         {"_review_evidence_service": _StructuredEvidenceService(_structured_result())},
         progress_callback=progress,
     )

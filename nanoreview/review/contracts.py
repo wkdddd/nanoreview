@@ -34,12 +34,18 @@ _REQUIRED_FINDING_FIELDS = (
     "details",
 )
 _FINDING_TEXT_FIELDS = ("file", "title", "evidence", "impact", "recommendation")
+_VALID_SIDES = frozenset(("new", "old"))
 
 #: Fence languages stripped before parsing. A fenced block is accepted because
 #: it is still a single JSON value; prose around it is not.
 _FENCE_PREFIXES = ("```json", "```JSON", "```")
 
-_REVIEWER_SHAPE = '{"findings":[{"severity":"high","file":"a.py","line":12,...}]}'
+_REVIEWER_SHAPE = (
+    '{"findings":[{"severity":"high","file":"src/a.py","line":12,'
+    '"end_line":12,"side":"new","title":"...","evidence":"...",'
+    '"evidence_refs":["ev-001"],"impact":"...","recommendation":"...",'
+    '"details":{...}}]}'
+)
 _JUDGE_SHAPE = '{"verdicts":[{"id":"<candidate id>","decision":"accept|reject|needs_confirmation","reason":"...","confidence":"high"}]}'
 
 
@@ -121,6 +127,13 @@ def validate_reviewer_findings(
         if not isinstance(raw, dict):
             problems.append(f"{path} must be an object")
             continue
+        # ``location.file_id`` / ``start_line`` are the names the review task
+        # uses; accept them as aliases so a model that follows the task wording
+        # is not rejected for naming.
+        if "file" not in raw and isinstance(raw.get("file_id"), str):
+            raw = {**raw, "file": raw["file_id"]}
+        if "line" not in raw and isinstance(raw.get("start_line"), int):
+            raw = {**raw, "line": raw["start_line"]}
         missing = [name for name in _REQUIRED_FINDING_FIELDS if name not in raw]
         if missing:
             problems.append(f"{path} missing required fields: {', '.join(missing)}")
@@ -141,12 +154,35 @@ def validate_reviewer_findings(
         if not isinstance(details, dict):
             problems.append(f"{path}.details must be an object")
             continue
+        side = str(raw.get("side") or "new").strip().lower()
+        if side not in _VALID_SIDES:
+            problems.append(f"{path}.side must be one of {sorted(_VALID_SIDES)}")
+            continue
+        end_line = raw.get("end_line")
+        if end_line is not None:
+            if isinstance(end_line, bool) or not isinstance(end_line, int):
+                problems.append(f"{path}.end_line must be an integer or null")
+                continue
+            if end_line < 1:
+                problems.append(f"{path}.end_line must be >= 1")
+                continue
+        evidence_refs = raw.get("evidence_refs")
+        if evidence_refs is None:
+            evidence_refs = []
+        if not isinstance(evidence_refs, list) or not all(
+            isinstance(item, str) for item in evidence_refs
+        ):
+            problems.append(f"{path}.evidence_refs must be an array of strings")
+            continue
         finding = {
             "severity": severity,
             "file": str(raw.get("file", "")).strip(),
             "line": line,
+            "end_line": end_line,
+            "side": side,
             "title": str(raw.get("title", "")).strip(),
             "evidence": str(raw.get("evidence", "")).strip(),
+            "evidence_refs": [item.strip() for item in evidence_refs if item.strip()],
             "impact": str(raw.get("impact", "")).strip(),
             "recommendation": str(raw.get("recommendation", "")).strip(),
             "details": details,
@@ -178,7 +214,11 @@ def reviewer_contract(dimension: str) -> OutputContract:
         name=f"reviewer.{dimension}",
         parse=_parse,
         shape=_REVIEWER_SHAPE,
-        extra_instructions="Use an empty findings array when no issue is confirmed.",
+        extra_instructions=(
+            "Use an empty findings array when no issue is confirmed. Every "
+            "finding must cite the evidence_id values this task supplied in "
+            "evidence_refs; ids you did not receive are rejected."
+        ),
     )
 
 

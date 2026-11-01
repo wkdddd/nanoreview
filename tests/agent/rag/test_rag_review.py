@@ -22,7 +22,6 @@ from nanoreview.review.planning.preprocessor import (
     ProgrammaticEvidenceService,
 )
 from nanoreview.review.source.utils import changed_lines_from_patch
-from nanoreview.review.types import LocalReviewScope
 
 
 class _LogSink:
@@ -83,34 +82,18 @@ def test_rrf_merge_combines_ranked_lists() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_evidence_dispatches_local_changed_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_review_evidence_requires_the_frozen_snapshot(tmp_path: Path) -> None:
+    """Without a snapshot there is no review input: dispatch raises."""
+    import pytest as _pytest
+
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    monkeypatch.setattr(
-        service,
-        "local_changed_patches",
-        lambda _workspace=None: (
-            {"src/auth.py": "@@ -1 +1 @@\n-old\n+new", "docs/readme.md": "+ignored"},
-            {},
-        ),
-    )
-
-    result = await service.local_changed_context(
-        review_query="regression",
-        max_results=5,
-        include_tests=True,
-        local_scope=LocalReviewScope(
-            kind="directory",
-            review_root=str(tmp_path),
-            scope_paths=["src"],
-            target_path=".",
-            reason="directory_target",
-        ),
-    )
-
-    assert result.startswith("[Repository Review References")
-    assert "src/auth.py" in result
-    assert "docs/readme.md" not in result
-    assert "+new" in result
+    with _pytest.raises(ValueError, match="frozen pull-request snapshot"):
+        await service.dispatch(
+            target_type="pull_request",
+            action="diff",
+            review_query="regression",
+            frozen_diff=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -120,15 +103,12 @@ async def test_local_diff_prefers_the_frozen_snapshot_over_the_worktree(
     """A frozen diff is reviewed verbatim; the live worktree is never read."""
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
 
-    def _must_not_read(_workspace=None):  # noqa: ANN001 - patched method
-        raise AssertionError("frozen diff review must not re-read the worktree")
-
-    monkeypatch.setattr(service, "local_changed_patches", _must_not_read)
-
-    result = await service.local_changed_context(
+    # The evidence service has no worktree reader at all: reviewing the frozen
+    # patches is the only path.
+    result = await service.dispatch(
+        target_type="pull_request",
+        action="diff",
         review_query="review",
-        max_results=5,
-        include_tests=True,
         frozen_diff={
             "patches": {"src/auth.py": "@@ -1,2 +1,2 @@\n-old\n+frozen"},
             "skipped": {},
@@ -141,25 +121,17 @@ async def test_local_diff_prefers_the_frozen_snapshot_over_the_worktree(
 
 
 @pytest.mark.asyncio
-async def test_frozen_diff_evidence_ignores_a_divergent_worktree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """产物只由 frozen patch 决定：活工作树正文与 patch 不一致也不影响证据。"""
+async def test_frozen_diff_evidence_reads_no_worktree(tmp_path: Path) -> None:
+    """产物只由 frozen patch 决定；证据层没有任何工作树读取入口。"""
     target = tmp_path / "src" / "auth.py"
     target.parent.mkdir(parents=True)
     target.write_text("live_only_marker = 42\n", encoding="utf-8")
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    # Catches any attempt to enumerate the worktree a second time.
-    monkeypatch.setattr(
-        service,
-        "local_changed_summary",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not rescan the worktree")),
-    )
 
-    result = await service.local_changed_context(
+    result = await service.dispatch(
+        target_type="pull_request",
+        action="diff",
         review_query="review",
-        max_results=5,
-        include_tests=True,
         frozen_diff={
             "patches": {"src/auth.py": "@@ -1,2 +1,2 @@\n-old_marker = 1\n+frozen_token = 2"},
             "skipped": {},
@@ -183,39 +155,6 @@ async def test_dispatch_rejects_non_diff_actions(tmp_path: Path, action: str) ->
     assert service.last_result is None
 
 
-def test_local_changed_patches_uses_net_head_diff_not_staged_concat(
-    tmp_path: Path,
-) -> None:
-    """A staged-then-edited file yields one HEAD->worktree patch.
-
-    Concatenating the staged (``HEAD -> index``) and unstaged
-    (``index -> worktree``) diffs would expose the intermediate staged snapshot
-    (``STAGED``) alongside the final worktree state, so the reviewer would see
-    two states of the same change.
-    """
-    _git(tmp_path, "init")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    _git(tmp_path, "config", "user.name", "Test User")
-    target = tmp_path / "app.py"
-    target.write_text("one\nold two\n", encoding="utf-8")
-    _git(tmp_path, "add", "app.py")
-    _git(tmp_path, "commit", "-m", "init")
-
-    target.write_text("one\nSTAGED\n", encoding="utf-8")
-    _git(tmp_path, "add", "app.py")  # intermediate staged state
-    target.write_text("one\nFINAL\n", encoding="utf-8")  # final worktree state
-
-    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    patches, skipped = service.local_changed_patches()
-
-    assert skipped == {}
-    patch = patches["app.py"]
-    assert "-old two" in patch
-    assert "+FINAL" in patch
-    # The intermediate staged state must never leak into the review.
-    assert "STAGED" not in patch
-
-
 @pytest.mark.asyncio
 async def test_local_diff_keeps_an_oversized_patch_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -224,16 +163,11 @@ async def test_local_diff_keeps_an_oversized_patch_whole(
     # However large a single-file patch is, it is one complete unit: the
     # evidence layer never slices or drops it, so budget fitting happens later.
     patch = "+" + ("x" * 40_000)
-    monkeypatch.setattr(
-        service,
-        "local_changed_patches",
-        lambda _workspace=None: ({"src/large.py": patch}, {}),
-    )
-
-    result = await service.local_changed_context(
+    result = await service.dispatch(
+        target_type="pull_request",
+        action="diff",
         review_query="review",
-        max_results=5,
-        include_tests=True,
+        frozen_diff={"patches": {"src/large.py": patch}, "skipped": {}},
     )
 
     assert service.last_result is not None
@@ -244,73 +178,6 @@ async def test_local_diff_keeps_an_oversized_patch_whole(
     # The rendered context is a bounded manifest for display only; the reviewer
     # reads ``unit.text`` through the evidence bundle excerpt.
     assert "src/large.py" in result
-
-
-def test_local_changed_summary_cli_fallback_maps_subdirectory_target(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without GitPython, diff paths map to the directory target root.
-
-    Git reports ``diff --name-only`` paths relative to the worktree root, so a
-    subdirectory target must have them converted (and the untracked listing,
-    which is cwd-relative, must be queried from the same root) before the
-    evidence service can attribute the change to the target.
-    """
-    _git(tmp_path, "init")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    _git(tmp_path, "config", "user.name", "Test User")
-    (tmp_path / "pkg").mkdir()
-    (tmp_path / "root_only.py").write_text("x = 1\n", encoding="utf-8")
-    tracked = tmp_path / "pkg" / "app.py"
-    tracked.write_text("one\nold two\n", encoding="utf-8")
-    _git(tmp_path, "add", "pkg/app.py")
-    _git(tmp_path, "add", "root_only.py")
-    _git(tmp_path, "commit", "-m", "init")
-
-    tracked.write_text("one\nnew two\n", encoding="utf-8")  # unstaged
-    staged = tmp_path / "pkg" / "staged.py"
-    staged.write_text("a\n", encoding="utf-8")
-    _git(tmp_path, "add", "pkg/staged.py")  # staged
-    untracked = tmp_path / "pkg" / "new_file.py"
-    untracked.write_text("alpha\nbeta\n", encoding="utf-8")  # untracked
-
-    # Force the CLI fallback by making ``import git`` fail.
-    monkeypatch.setitem(sys.modules, "git", None)
-
-    target = tmp_path / "pkg"
-    service = ReviewEvidenceService(ProgrammaticEvidenceService(target))
-    summary = service.local_changed_summary()
-
-    # Every path is relative to the *target* (``pkg``), never the worktree.
-    assert summary.files == ["app.py", "new_file.py", "staged.py"]
-    assert summary.touched_lines["app.py"] == [2]
-    assert summary.touched_lines["staged.py"] == [1]
-    assert summary.touched_lines["new_file.py"] == [1, 2]
-    assert "root_only.py" not in summary.files
-
-
-def test_local_changed_summary_parses_staged_unstaged_and_untracked_lines(tmp_path: Path) -> None:
-    _git(tmp_path, "init")
-    _git(tmp_path, "config", "user.email", "test@example.com")
-    _git(tmp_path, "config", "user.name", "Test User")
-    (tmp_path / "src").mkdir()
-    tracked = tmp_path / "src" / "app.py"
-    tracked.write_text("one\nold two\nthree\nold four\n", encoding="utf-8")
-    _git(tmp_path, "add", "src/app.py")
-    _git(tmp_path, "commit", "-m", "init")
-
-    tracked.write_text("one\nnew two\nthree\nold four\n", encoding="utf-8")
-    _git(tmp_path, "add", "src/app.py")
-    tracked.write_text("one\nnew two\nthree\nnew four\n", encoding="utf-8")
-    untracked = tmp_path / "src" / "new_file.py"
-    untracked.write_text("alpha\nbeta\n", encoding="utf-8")
-
-    service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
-    summary = service.local_changed_summary()
-
-    assert summary.files == ["src/app.py", "src/new_file.py"]
-    assert summary.touched_lines["src/app.py"] == [2, 4]
-    assert summary.touched_lines["src/new_file.py"] == [1, 2]
 
 
 def test_repository_rag_prioritizes_chunks_overlapping_touched_lines() -> None:
@@ -450,11 +317,6 @@ async def test_dispatch_hands_the_whole_patch_to_the_preprocessor(
 ) -> None:
     service = ReviewEvidenceService(ProgrammaticEvidenceService(tmp_path))
     patch = "@@ -1 +1 @@\n-old\n+new"
-    monkeypatch.setattr(
-        service,
-        "local_changed_patches",
-        lambda _workspace=None: ({"src/auth.py": patch}, {}),
-    )
     captured: dict[str, object] = {}
 
     def fake_diff_units(
@@ -469,11 +331,10 @@ async def test_dispatch_hands_the_whole_patch_to_the_preprocessor(
     monkeypatch.setattr(service.preprocessor, "diff_units", fake_diff_units)
 
     result = await service.dispatch(
-        target_type="local",
+        target_type="pull_request",
         action="diff",
         review_query="auth",
-        max_results=5,
-        include_tests=True,
+        frozen_diff={"patches": {"src/auth.py": patch}, "skipped": {}},
     )
 
     assert result == "context"

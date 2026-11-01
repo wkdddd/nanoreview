@@ -24,6 +24,7 @@ from nanoreview.agent.subagent_profiles import (
     SubagentExecutionLimits,
     SubagentExecutionProfile,
 )
+from nanoreview.agent.tools.base import Tool
 from nanoreview.agent.tools.context import ToolContext
 from nanoreview.agent.tools.file_state import FileStates
 from nanoreview.agent.tools.loader import ToolLoader
@@ -160,8 +161,15 @@ class SubagentManager:
         profile: SubagentExecutionProfile,
         workspace: Path | None = None,
         tools_config: ToolsConfig | None = None,
+        extra_tools: list[Tool] | None = None,
     ) -> ToolRegistry:
-        """Build an isolated tool registry authorized by the profile scope."""
+        """Build an isolated tool registry authorized by the profile scope.
+
+        ``extra_tools`` are host-bound instances the loader cannot construct
+        (for example ``pr_context``, whose session is pinned to one review
+        snapshot). They are registered in the same registry, so they inherit the
+        same per-run lifecycle and are never shared between reviewers.
+        """
         denied_names: set[str] = set()
         registry = ToolRegistry()
         loader = ToolLoader()
@@ -179,6 +187,15 @@ class SubagentManager:
             scope=profile.scope,
             denied_names=denied_names,
         )
+        for tool in extra_tools or ():
+            if registry.has(tool.name):
+                logger.warning(
+                    "subagent.tools.extra_collision profile_id={} tool={}",
+                    profile.id,
+                    tool.name,
+                )
+                continue
+            registry.register(tool)
         loaded_names = frozenset(registry.tool_names)
         required_tools = frozenset(getattr(profile, "required_tools", frozenset()))
         missing_tools = required_tools - loaded_names
@@ -246,9 +263,12 @@ class SubagentManager:
         return self._build_tool_context(workspace, tools_config)
 
     def build_tools(
-        self, profile: SubagentExecutionProfile, workspace: Path
+        self,
+        profile: SubagentExecutionProfile,
+        workspace: Path,
+        extra_tools: list[Tool] | None = None,
     ) -> ToolRegistry:
-        return self._build_tools(profile, workspace=workspace)
+        return self._build_tools(profile, workspace=workspace, extra_tools=extra_tools)
 
     @staticmethod
     def build_system_prompt(
@@ -343,6 +363,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
         execution_limits: SubagentExecutionLimits | None = None,
+        extra_tools: list[Tool] | None = None,
     ) -> str:
         """Start a dedicated review subagent whose result returns to the caller.
 
@@ -388,6 +409,7 @@ class SubagentManager:
                 origin_message_id,
                 origin_metadata,
                 execution_limits,
+                extra_tools,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -421,6 +443,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         origin_metadata: dict[str, Any] | None = None,
         execution_limits: SubagentExecutionLimits | None = None,
+        extra_tools: list[Tool] | None = None,
     ) -> None:
         """Execute one profile-configured subagent and announce its result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -447,7 +470,9 @@ class SubagentManager:
                 if profile.workspace_resolver is not None
                 else self.workspace
             )
-            tools = self.build_tools(profile, sub_workspace)
+            tools = self.build_tools(
+                profile, sub_workspace, extra_tools=extra_tools
+            )
             system_prompt = self.build_system_prompt(profile, metadata, sub_workspace)
             workspace_scope = subagent_workspace_scope(
                 profile, sub_workspace, self.restrict_to_workspace

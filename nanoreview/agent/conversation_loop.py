@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,7 +70,6 @@ from nanoreview.bus.events import InboundMessage, OutboundMessage
 from nanoreview.bus.queue import MessageBus
 from nanoreview.events import NO_EVENTS, EventSink, StreamDeltaEvent, StreamEndEvent
 from nanoreview.review import apply_review_metadata_from_message
-from nanoreview.review.types import ReviewMetaKey
 from nanoreview.utils.artifacts import generated_image_paths_from_messages
 from nanoreview.utils.document import extract_documents
 from nanoreview.utils.helpers import image_placeholder_text
@@ -764,20 +762,12 @@ class ConversationLoop:
         )
 
     def _resolve_scope_root(self, session_metadata: Mapping[str, Any]) -> Path:
-        """Target repository root for the conversation turn's scope.
+        """Workspace root for the conversation turn's scope.
 
-        The session's persisted review root wins; an invalid value falls back to
-        the application workspace, which is only used for session/report/artifact
-        persistence and never substitutes for the target repository root.
+        A review session is bound to a pull request, not to a local checkout, so
+        the conversation scope is always the application workspace; it is used
+        for session/report persistence and never substitutes for a repository.
         """
-        raw = session_metadata.get(ReviewMetaKey.LOCAL_ROOT)
-        if isinstance(raw, (str, os.PathLike)) and str(raw).strip():
-            try:
-                candidate = Path(raw).expanduser()
-                if candidate.is_absolute() and candidate.is_dir():
-                    return candidate.resolve()
-            except OSError:
-                pass
         return self._workspace
 
     def _set_registry_context(

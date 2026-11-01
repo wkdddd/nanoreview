@@ -92,8 +92,6 @@ from nanoreview.agent.review_loop import (
     persist_review_subagent_result,
 )
 from nanoreview.agent.review_state import (
-    ReviewArtifactError,
-    ReviewArtifactStore,
     ReviewPhase,
     ReviewRunStatus,
 )
@@ -215,6 +213,36 @@ def _stream_chunks(text: str, *, chunk_size: int = 2048) -> list[str]:
     return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
+class _LazyReviewProxy:
+    """Resolve a review dependency from the coordinator on first attribute use.
+
+    Review storage (PostgreSQL) and the GitHub client are only needed once a
+    review actually runs; the proxy keeps conversation-only processes free of
+    both while failing loudly — with the real error — when a review needs them.
+    """
+
+    def __init__(self, coordinator: "SessionCoordinator", factory: Callable[[], Any]) -> None:
+        self._coordinator_ref = coordinator
+        self._factory = factory
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._factory(), name)
+
+
+def _run_repository(coordinator: "SessionCoordinator") -> Any:
+    return coordinator.storage().runs
+
+
+class _LazyRunRepository(_LazyReviewProxy):
+    def __init__(self, coordinator: "SessionCoordinator") -> None:
+        super().__init__(coordinator, lambda: _run_repository(coordinator))
+
+
+class _LazyGitHubClient(_LazyReviewProxy):
+    def __init__(self, coordinator: "SessionCoordinator") -> None:
+        super().__init__(coordinator, coordinator.github)
+
+
 class SessionRoute(StrEnum):
     """Which agent phase owns the session right now."""
 
@@ -284,6 +312,9 @@ class SessionCoordinator:
         disabled_skills: list[str] | None = None,
         tools_config: "ToolsConfig | None" = None,
         review_config: ReviewConfig | None = None,
+        storage: Any | None = None,
+        github: Any | None = None,
+        root_config: Any | None = None,
         provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
         model_presets: dict[str, ModelPresetConfig] | None = None,
@@ -337,6 +368,15 @@ class SessionCoordinator:
         # Normalised once so every consumer reads real fields instead of
         # getattr-with-default on a possibly missing config.
         self.review_config = review_config or ReviewConfig()
+        #: PostgreSQL persistence for review runs/snapshots/reports and the
+        #: GitHub client reviewers read through. Both are created lazily from
+        #: config on first review use, so a conversation-only process never
+        #: needs a database, while a review without one fails loudly instead of
+        #: silently downgrading to file storage.
+        self._storage_service = storage
+        self._github_client = github
+        #: Root config, kept for lazily building the review storage/client.
+        self._root_config = root_config
         self.exec_config = _tc.exec
         #: Builds a provider for a role that names its own ``provider``:
         #: ``(provider_name, model) -> (provider, resolved_provider_name)``.
@@ -406,9 +446,8 @@ class SessionCoordinator:
         # Review side: the coordinator owns every run's blackboard (the single
         # mutable authority); ReviewLoop only receives a writer handle and a
         # read-only view of it.
-        self._review_artifacts = ReviewArtifactStore(workspace)
         self._review_boards = ReviewBoardStore(
-            sessions=self.sessions, artifacts=self._review_artifacts
+            sessions=self.sessions, runs=_LazyRunRepository(self)
         )
         self.review_loop = ReviewLoop(
             workspace=workspace,
@@ -421,6 +460,8 @@ class SessionCoordinator:
             max_concurrent_subagents=self.review_config.max_concurrent_subagents,
             review_config=self.review_config,
             judge_factory=self._build_review_judge,
+            runs=_LazyRunRepository(self),
+            github=_LazyGitHubClient(self),
         )
         #: Authoritative admission/domain service for every review entry point.
         self._admission_service: ReviewAdmissionService | None = None
@@ -554,6 +595,7 @@ class SessionCoordinator:
             preset_snapshot_loader=preset_snapshot_loader,
             role_provider_factory=role_provider_factory,
             dream_config=getattr(config, "dream", None),
+            root_config=config,
             **extra,
         )
 
@@ -875,16 +917,35 @@ class SessionCoordinator:
 
     # -- admission ----------------------------------------------------------
 
+    def storage(self) -> Any:
+        """The PostgreSQL storage bundle, created from config on first use."""
+        if self._storage_service is None:
+            from nanoreview.storage.database import Database
+            from nanoreview.storage.repositories import Storage
+
+            database = Database.from_config(self._root_config)
+            self._storage_service = Storage(database)
+        return self._storage_service
+
+    def github(self) -> Any:
+        """The review GitHub client, created from config on first use."""
+        if self._github_client is None:
+            from nanoreview.review.input.github import GitHubClient
+
+            self._github_client = GitHubClient.from_config(self._root_config)
+        return self._github_client
+
     def admissions(self) -> ReviewAdmissionService:
         """Shared admission/domain service used by every review entry point."""
         if self._admission_service is None:
             self._admission_service = ReviewAdmissionService(
+                github=self.github(),
+                storage=self.storage(),
                 sessions=self.sessions,
-                workspace=self.workspace,
             )
         return self._admission_service
 
-    def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
+    async def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
         """Validate, snapshot, and register one review run before delivery."""
         live = self._review_boards.view(request.session_key or "")
         if live is not None:
@@ -895,7 +956,7 @@ class SessionCoordinator:
                     f"'{live.run_id}' in progress."
                 ),
             )
-        admission = self.admissions().admit(request)
+        admission = await self.admissions().admit(request)
         # The coordinator creates the run's blackboard: from here on it is the
         # only writer, and the loop only receives a narrow writer handle.
         self._review_boards.create(admission)
@@ -905,14 +966,14 @@ class SessionCoordinator:
         """Shared admission/domain service used by every review entry point."""
         return self.admissions()
 
-    def admit_review(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
+    async def admit_review(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
         """Single admission boundary transports call before publishing a task."""
         session_key = (request.session_key or "").strip()
         if not session_key:
             request = dataclasses.replace(
                 request, session_key=f"review:{uuid.uuid4().hex[:12]}"
             )
-        return self.admit(request)
+        return await self.admit(request)
 
     def reset_review_run(self, session_key: str) -> None:
         """Drop the review run *and* its persisted metadata (used by ``/new``).
@@ -1280,7 +1341,7 @@ class SessionCoordinator:
 
     # -- handoff ------------------------------------------------------------
 
-    def pending_handoff(self, session: Session) -> ReviewHandoff | None:
+    async def pending_handoff(self, session: Session) -> ReviewHandoff | None:
         """The handoff the next conversation turn must inject, if any."""
         result = self.result(session)
         if not self._review_settled(session):
@@ -1289,7 +1350,7 @@ class SessionCoordinator:
             return None
         if session.metadata.get(ReviewMetaKey.HANDOFF_RUN_ID) == result.run_id:
             return None
-        report = self._read_report(result)
+        report = await self._read_report(result)
         if report is None and result.handoff is not ReviewHandoffState.FAILED:
             result = dataclasses.replace(
                 result,
@@ -1331,24 +1392,20 @@ class SessionCoordinator:
             len(handoff.report_markdown or ""),
         )
 
-    def _read_report(self, result: ReviewResult) -> str | None:
+    async def _read_report(self, result: ReviewResult) -> str | None:
         """Load the authoritative report markdown for *result*."""
         if not result.report_ref:
             return None
         try:
-            artifact = self._review_artifacts.read(
-                run_id=result.run_id,
-                session_key=result.session_key,
-                input_fingerprint=result.input_fingerprint,
-            )
-        except ReviewArtifactError as exc:
+            report = await _run_repository(self).get_report(result.run_id)
+        except Exception as exc:
             logger.warning(
-                "review.handoff.artifact_unreadable run_id={} reason={}",
+                "review.handoff.report_unreadable run_id={} reason={}",
                 result.run_id,
-                exc.reason,
+                exc,
             )
             return None
-        markdown = artifact.get("report_markdown")
+        markdown = getattr(report, "markdown", None)
         return markdown if isinstance(markdown, str) and markdown.strip() else None
 
     def _prompt_budget(self) -> int:
@@ -1570,7 +1627,7 @@ class SessionCoordinator:
         target_root = self._resolve_target_root(session)
         turn_id = f"{session_key}:{time.time_ns()}"
 
-        handoff = self.pending_handoff(session)
+        handoff = await self.pending_handoff(session)
         if handoff is not None and not handoff.fits:
             return self.report_too_large_response(msg, handoff)
 
@@ -1588,14 +1645,9 @@ class SessionCoordinator:
     def _resolve_target_root(self, session: Session) -> Path:
         """Resolve the file-path base / default command cwd for a turn.
 
-        A session that carried a review uses the reviewed repository root; every
-        other session uses the configured workspace.
+        Reviews no longer carry a local repository root — the review input is a
+        pull request — so every session uses the configured workspace.
         """
-        local_root = session.metadata.get(ReviewMetaKey.LOCAL_ROOT)
-        if isinstance(local_root, str) and local_root.strip():
-            root = Path(local_root)
-            if root.is_dir():
-                return root
         return self.workspace
 
     def _persist_command_turn(
