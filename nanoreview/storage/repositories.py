@@ -617,6 +617,21 @@ class ReviewRunRepository:
                     delete(ReviewRunRow).where(ReviewRunRow.id == run_id)
                 )
 
+    async def clear_request_id(self, run_id: str) -> None:
+        """Release a run's idempotency key.
+
+        ``request_id`` is unique across runs, so a row that keeps it after the
+        run was interrupted would make every retry with the same key fail on
+        the unique constraint instead of starting a new run.
+        """
+        async with self._db.session() as session:
+            async with session.begin():
+                await session.execute(
+                    update(ReviewRunRow)
+                    .where(ReviewRunRow.id == run_id)
+                    .values(request_id=None)
+                )
+
 
 def _pull_request_record(row: PullRequestRow) -> PullRequestRecord:
     return PullRequestRecord(

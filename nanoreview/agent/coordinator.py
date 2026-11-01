@@ -442,6 +442,9 @@ class SessionCoordinator:
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Per-session pending queues for mid-turn message injection.
         self._pending_queues: dict[str, asyncio.Queue] = {}
+        # Serializes concurrent review admissions for one session (kept apart
+        # from ``_session_locks`` so turn cleanup never touches these).
+        self._admission_locks: dict[str, asyncio.Lock] = {}
 
         # Review side: the coordinator owns every run's blackboard (the single
         # mutable authority); ReviewLoop only receives a writer handle and a
@@ -946,21 +949,33 @@ class SessionCoordinator:
         return self._admission_service
 
     async def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
-        """Validate, snapshot, and register one review run before delivery."""
-        live = self._review_boards.view(request.session_key or "")
-        if live is not None:
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.DUPLICATE_REVIEW,
-                (
-                    f"Session '{live.session_key}' already has review run "
-                    f"'{live.run_id}' in progress."
-                ),
-            )
-        admission = await self.admissions().admit(request)
-        # The coordinator creates the run's blackboard: from here on it is the
-        # only writer, and the loop only receives a narrow writer handle.
-        self._review_boards.create(admission)
-        return admission
+        """Validate, snapshot, and register one review run before delivery.
+
+        Serialized per session key: admission is async now (GitHub resolution,
+        PostgreSQL reads), so two concurrent submissions for one session would
+        both pass the live-board check and both register a run. The check runs
+        again inside the lock, which is what makes the second submit a clean
+        rejection instead of a double run.
+        """
+        lock = self._admission_locks.setdefault(
+            request.session_key or "_review_admission", asyncio.Lock()
+        )
+        async with lock:
+            live = self._review_boards.view(request.session_key or "")
+            if live is not None:
+                raise ReviewAdmissionError(
+                    ReviewAdmissionCode.DUPLICATE_REVIEW,
+                    (
+                        f"Session '{live.session_key}' already has review run "
+                        f"'{live.run_id}' in progress."
+                    ),
+                )
+            admission = await self.admissions().admit(request)
+            # The coordinator creates the run's blackboard: from here on it is
+            # the only writer, and the loop only receives a narrow writer
+            # handle.
+            self._review_boards.create(admission)
+            return admission
 
     def review_admissions(self) -> ReviewAdmissionService:
         """Shared admission/domain service used by every review entry point."""

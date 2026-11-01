@@ -432,6 +432,11 @@ class ReviewAdmissionService:
                     f"Request '{request_id}' was already submitted as run '{existing.id}'.",
                     field="request_id",
                 )
+            if existing is not None:
+                # The interrupted run never delivered a result; release its
+                # idempotency key so the retry's insert cannot hit the unique
+                # constraint.
+                await self._storage.runs.clear_request_id(existing.id)
         metadata = await self._sessions.get_metadata(session_key) or {}
         run_id = metadata.get(ReviewMetaKey.RUN_ID)
         if not run_id:
@@ -440,7 +445,7 @@ class ReviewAdmissionService:
         terminal = {item.value for item in REVIEW_TERMINAL_STATUSES}
         if status and status not in terminal:
             row = await self._storage.runs.get(str(run_id))
-            if row is not None and row.status != "interrupted":
+            if row is not None and row.status in ("running", "queued"):
                 raise ReviewAdmissionError(
                     ReviewAdmissionCode.DUPLICATE_REVIEW,
                     (
@@ -448,17 +453,31 @@ class ReviewAdmissionService:
                         f"with status '{status}'. Wait for it to finish or cancel it."
                     ),
                 )
-            # The executor of this run is gone; the DB row confirms it. Repair
-            # the stale metadata so the gate opens for the retry.
-            await self._sessions.update_metadata(
-                session_key,
-                {
+            # The database is the authority: the run either reached a terminal
+            # state (its metadata save failed) or lost its executor
+            # (interrupted/missing). Sync the stale metadata to what the DB
+            # knows, then let the retry proceed.
+            if row is not None and row.status == "interrupted":
+                await self._storage.runs.clear_request_id(row.id)
+            if row is None:
+                repaired = {
                     ReviewMetaKey.STATUS: ReviewRunStatus.ERROR.value,
                     ReviewMetaKey.PHASE: ReviewPhase.DONE.value,
                     ReviewMetaKey.SUMMARY: INTERRUPTED_RUN_REASON,
                     ReviewMetaKey.ERROR: INTERRUPTED_RUN_REASON,
-                },
-            )
+                }
+            else:
+                repaired = {
+                    ReviewMetaKey.STATUS: row.status,
+                    ReviewMetaKey.PHASE: (
+                        row.phase
+                        if row.status != "interrupted"
+                        else ReviewPhase.DONE.value
+                    ),
+                    ReviewMetaKey.SUMMARY: row.summary or "",
+                    ReviewMetaKey.ERROR: row.error or "",
+                }
+            await self._sessions.update_metadata(session_key, repaired)
 
     async def _discard_run(self, run_id: str) -> None:
         """Best-effort removal of a run row whose admission did not complete.

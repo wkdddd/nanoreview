@@ -82,6 +82,7 @@ class FakeRuns:
     snapshots: list[Any] = field(default_factory=list)
     marked: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    cleared: list[str] = field(default_factory=list)
     by_request: dict[str, Any] = field(default_factory=dict)
     store: dict[str, Any] = field(default_factory=dict)
 
@@ -96,6 +97,9 @@ class FakeRuns:
 
     async def delete(self, run_id: str) -> None:
         self.deleted.append(run_id)
+
+    async def clear_request_id(self, run_id: str) -> None:
+        self.cleared.append(run_id)
 
     async def get(self, run_id: str) -> Any | None:
         return self.store.get(run_id)
@@ -287,7 +291,12 @@ async def test_admit_rejects_duplicate_request_id() -> None:
 
 @pytest.mark.asyncio
 async def test_admit_allows_retry_after_the_process_lost_the_run() -> None:
-    """An interrupted run never delivered a result: request_id is reusable."""
+    """An interrupted run never delivered a result: request_id is reusable.
+
+    The old row's idempotency key must be released first — ``request_id`` is
+    unique across runs, so the retry's insert would otherwise fail on the
+    constraint.
+    """
     runs = FakeRuns()
 
     @dataclass(frozen=True)
@@ -303,6 +312,7 @@ async def test_admit_allows_retry_after_the_process_lost_the_run() -> None:
         )
     )
     assert admission.run_id != "run-old"
+    assert runs.cleared == ["run-old"]
 
 
 @pytest.mark.asyncio
@@ -344,6 +354,9 @@ async def test_admit_repairs_stale_session_metadata_after_a_restart() -> None:
     class _Interrupted:
         id: str = "run-1"
         status: str = "interrupted"
+        phase: str = "cleanup"
+        summary: str | None = None
+        error: str | None = "process restarted before the run finished"
 
     runs.store["run-1"] = _Interrupted()
     service, *_ = _service(sessions=sessions, runs=runs)
@@ -360,6 +373,47 @@ async def test_admit_repairs_stale_session_metadata_after_a_restart() -> None:
     assert admission.run_id != "run-1"
     repaired = sessions.stored["review:test"]
     assert repaired[ReviewMetaKey.RUN_ID] == admission.run_id
+    assert runs.cleared == ["run-1"]
+
+
+@pytest.mark.asyncio
+async def test_admit_repairs_metadata_when_the_run_finished_but_the_save_failed() -> None:
+    """A terminal DB row with stale ``running`` metadata must not block forever.
+
+    The board's terminal transaction commits before the session metadata save;
+    if that save fails and the process restarts, the session still claims a
+    running review the database knows is finished.
+    """
+    sessions = FakeSessions()
+    sessions.stored["review:test"] = {
+        ReviewMetaKey.RUN_ID: "run-1",
+        ReviewMetaKey.STATUS: "running",
+    }
+    runs = FakeRuns()
+
+    @dataclass(frozen=True)
+    class _Completed:
+        id: str = "run-1"
+        status: str = "completed"
+        phase: str = "done"
+        summary: str = "all clear"
+        error: str | None = None
+
+    runs.store["run-1"] = _Completed()
+    service, *_ = _service(sessions=sessions, runs=runs)
+
+    admission = await service.admit(
+        ReviewAdmissionRequest(
+            repository="octo/demo", pull_request=7, session_key="review:test"
+        )
+    )
+
+    assert admission.run_id != "run-1"
+    repaired = sessions.stored["review:test"]
+    assert repaired[ReviewMetaKey.RUN_ID] == admission.run_id
+    # The interrupted-style synthetic repair was not applied to a real
+    # terminal row's identity: no key clearing happened.
+    assert runs.cleared == []
 
 
 @pytest.mark.asyncio
