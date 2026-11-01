@@ -604,6 +604,19 @@ class ReviewRunRepository:
                 )
                 return int(result.rowcount or 0)
 
+    async def delete(self, run_id: str) -> None:
+        """Remove a run row outright.
+
+        Used by admission when a run was registered but never started: the row
+        is deleted instead of being left as a zombie ``running`` entry whose
+        ``request_id`` would block every retry.
+        """
+        async with self._db.session() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(ReviewRunRow).where(ReviewRunRow.id == run_id)
+                )
+
 
 def _pull_request_record(row: PullRequestRow) -> PullRequestRecord:
     return PullRequestRecord(
@@ -656,6 +669,16 @@ class Storage:
 
     async def close(self) -> None:
         await self.database.dispose()
+
+    async def startup(self) -> int:
+        """One-time boot preparation: verify the schema, close orphaned runs.
+
+        Runs left ``running``/``queued`` by a crashed process can never finish;
+        they are normalized to ``interrupted`` once per process, before any new
+        review can be admitted. Never call this while reviews may be running.
+        """
+        await self.database.verify_schema()
+        return await self.runs.mark_interrupted()
 
 
 __all__ = [

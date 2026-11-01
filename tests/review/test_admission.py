@@ -81,6 +81,7 @@ class FakeRuns:
     created: list[dict[str, Any]] = field(default_factory=list)
     snapshots: list[Any] = field(default_factory=list)
     marked: list[dict[str, Any]] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
     by_request: dict[str, Any] = field(default_factory=dict)
 
     async def create(self, **kwargs: Any) -> None:
@@ -91,6 +92,9 @@ class FakeRuns:
 
     async def mark_running(self, run_id: str, **kwargs: Any) -> None:
         self.marked.append({"run_id": run_id, **kwargs})
+
+    async def delete(self, run_id: str) -> None:
+        self.deleted.append(run_id)
 
     async def find_by_request_id(self, request_id: str) -> Any | None:
         return self.by_request.get(request_id)
@@ -344,13 +348,40 @@ async def test_admit_maps_head_moved_to_pull_request_changed() -> None:
             "pull_request_changed", "the pull request changed"
         )
 
-    service, *_ = _service(snapshot_service=_SnapshotStub(prepare))
+    service, github, runs, _sessions = _service(
+        snapshot_service=_SnapshotStub(prepare)
+    )
     with pytest.raises(ReviewAdmissionError) as exc:
         await service.admit(
             ReviewAdmissionRequest(repository="octo/demo", pull_request=7)
         )
     assert exc.value.code == ReviewAdmissionCode.PULL_REQUEST_CHANGED
     assert exc.value.status == 409
+    # The run row was registered before preparation failed; a run that never
+    # started must not stay behind as a zombie ``running`` row — it would
+    # block this request_id forever.
+    assert len(runs.created) == 1
+    assert runs.deleted == [runs.created[0]["run_id"]]
+    assert runs.snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_admit_discards_the_run_row_when_persistence_fails() -> None:
+    service, _github, runs, _sessions = _service()
+
+    async def failing_save(snapshot: Any) -> None:
+        raise OSError("disk full")
+
+    runs.save_snapshot = failing_save  # type: ignore[method-assign]
+
+    with pytest.raises(ReviewAdmissionError) as exc:
+        await service.admit(
+            ReviewAdmissionRequest(repository="octo/demo", pull_request=7)
+        )
+    assert exc.value.code == ReviewAdmissionCode.PERSISTENCE_FAILED
+    assert runs.deleted == [runs.created[0]["run_id"]]
+    # No session metadata either: the rejection is all-or-nothing.
+    assert _sessions.stored == {}
 
 
 @pytest.mark.asyncio

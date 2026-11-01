@@ -471,11 +471,17 @@ def create_app(
     app["model_name"] = model_name
     app["request_timeout"] = request_timeout
 
+    async def _prepare_storage(_app: web.Application) -> None:
+        # One-time boot normalization for review storage: close runs a previous
+        # process left ``running`` before this server admits new reviews.
+        await agent_loop.prepare_review_storage()
+
     async def _close_agent(_app: web.Application) -> None:
         # Release coordinator-owned resources (MCP connections and their owner
         # tasks) when the API stops, so no server subprocess outlives the app.
         await agent_loop.aclose()
 
+    app.on_startup.append(_prepare_storage)
     app.on_cleanup.append(_close_agent)
 
     app.router.add_post("/v1/chat/completions", handle_chat_completions)

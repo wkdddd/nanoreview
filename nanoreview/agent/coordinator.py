@@ -375,6 +375,10 @@ class SessionCoordinator:
         #: silently downgrading to file storage.
         self._storage_service = storage
         self._github_client = github
+        #: Whether these two were created here from config (and are therefore
+        #: ours to close) or injected by an owner who manages their lifecycle.
+        self._owns_storage = storage is None
+        self._owns_github = github is None
         #: Root config, kept for lazily building the review storage/client.
         self._root_config = root_config
         self.exec_config = _tc.exec
@@ -1704,6 +1708,7 @@ class SessionCoordinator:
     async def run(self) -> None:
         """Run the coordinator, dispatching messages as tasks for /stop."""
         self._running = True
+        await self.prepare_review_storage()
         self._start_dream_scheduler()
 
         while self._running:
@@ -2125,6 +2130,41 @@ class SessionCoordinator:
 
         await self.close_background_tasks()
         await self.mcp.aclose()
+
+        # Review-only resources the coordinator created itself: an injected
+        # storage/client belongs to its owner's lifecycle, a lazily created
+        # one would otherwise leak its engine/connection pool on shutdown.
+        if self._storage_service is not None and self._owns_storage:
+            with suppress(Exception):
+                await self._storage_service.close()
+            self._storage_service = None
+        if self._github_client is not None and self._owns_github:
+            with suppress(Exception):
+                await self._github_client.aclose()
+            self._github_client = None
+
+    async def prepare_review_storage(self) -> None:
+        """Boot-time normalization for PostgreSQL-backed reviews.
+
+        Runs left ``running``/``queued`` by a previous process can never finish;
+        they are closed as ``interrupted`` once per process, before any new
+        review is admitted. Callers that never enter :meth:`run` (the CLI
+        one-shot review) must invoke this themselves before ``admit_review``.
+
+        A conversation-only process (no ``database.url``) never touches the
+        database, and a database that is unreachable at boot only disables
+        review admission later — it must not stop conversation turns.
+        """
+        url = getattr(getattr(self._root_config, "database", None), "url", None)
+        if not url:
+            return
+        try:
+            interrupted = await self.storage().startup()
+        except Exception as exc:  # noqa: BLE001 - boot must not die on storage
+            logger.warning("review.storage.startup_failed reason={}", exc)
+            return
+        if interrupted:
+            logger.info("review.storage.interrupted_runs_closed count={}", interrupted)
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

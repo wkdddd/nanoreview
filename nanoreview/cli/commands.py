@@ -1133,6 +1133,10 @@ def review(
     interactive = _resolve_cli_chat_mode(chat, fail_on=fail_on)
 
     bus = MessageBus()
+    # The concurrency knob lives on the review config the coordinator is built
+    # from; admission no longer carries it per request.
+    if max_concurrent_subagents:
+        loaded.review.max_concurrent_subagents = max_concurrent_subagents
     agent_loop = SessionCoordinator.from_config(loaded, bus)
 
     renderer = StreamRenderer(
@@ -1143,10 +1147,9 @@ def review(
     async def run_once() -> None:
         exit_code = 0
         try:
-            effective_max_subagents = (
-                max_concurrent_subagents
-                or loaded.review.max_concurrent_subagents
-            )
+            # One-time boot normalization: close runs a previous process left
+            # ``running`` before this process admits its review.
+            await agent_loop.prepare_review_storage()
             # Every CLI review gets its own session; the shared admission
             # boundary validates the target, captures the input snapshot, and
             # registers the run before any work is delivered.

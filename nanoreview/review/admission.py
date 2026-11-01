@@ -271,14 +271,19 @@ class ReviewAdmissionService:
                 f"Cannot register the review run: {exc}",
             ) from exc
 
-        snapshot = await self._prepare_snapshot(
-            run_id=run_id,
-            owner=owner,
-            name=name,
-            number=pull_number,
-            repository_id=repository_row.id,
-        )
+        # Everything after the run row exists is one admission transaction in
+        # spirit: if any step fails, the run is discarded outright. A run that
+        # never started must not stay behind as a zombie ``running`` row — it
+        # would block this request_id forever and report a review in progress
+        # that does not exist.
         try:
+            snapshot = await self._prepare_snapshot(
+                run_id=run_id,
+                owner=owner,
+                name=name,
+                number=pull_number,
+                repository_id=repository_row.id,
+            )
             await self._storage.runs.save_snapshot(snapshot)
             await self._storage.runs.mark_running(
                 run_id,
@@ -286,47 +291,45 @@ class ReviewAdmissionService:
                 head_sha=snapshot.head_sha,
                 merge_base_sha=snapshot.merge_base_sha,
             )
+
+            target = PullRequestTarget(
+                repository=repository_row.full_name,
+                number=number,
+                base_repo=snapshot.base_repo,
+                head_repo=snapshot.head_repo,
+                base_sha=snapshot.base_sha,
+                head_sha=snapshot.head_sha,
+                merge_base_sha=snapshot.merge_base_sha,
+                snapshot_id=snapshot.id,
+                url=str(snapshot.metadata.get("html_url") or "") or None,
+            )
+            plan = ReviewPlan(
+                target=str(target.url or target.label),
+                target_name=target.label,
+                target_type=PULL_REQUEST_TARGET_TYPE,
+                action=action,
+                roles=roles,
+                user_requirements=(request.content or "").strip(),
+                pull_request=target,
+            )
+            metadata = self._metadata_payload(
+                admission_target=target,
+                plan=plan,
+                repository_id=repository_row.id,
+                pull_request_id=pull_row.id,
+                run_id=run_id,
+                snapshot=snapshot,
+                focus=request.focus,
+            )
+            await self._sessions.update_metadata(session_key, metadata)
+        except ReviewAdmissionError:
+            await self._discard_run(run_id)
+            raise
         except Exception as exc:
+            await self._discard_run(run_id)
             raise ReviewAdmissionError(
                 ReviewAdmissionCode.PERSISTENCE_FAILED,
                 f"Cannot persist the review snapshot: {exc}",
-            ) from exc
-
-        target = PullRequestTarget(
-            repository=repository_row.full_name,
-            number=number,
-            base_repo=snapshot.base_repo,
-            head_repo=snapshot.head_repo,
-            base_sha=snapshot.base_sha,
-            head_sha=snapshot.head_sha,
-            merge_base_sha=snapshot.merge_base_sha,
-            snapshot_id=snapshot.id,
-            url=str(snapshot.metadata.get("html_url") or "") or None,
-        )
-        plan = ReviewPlan(
-            target=str(target.url or target.label),
-            target_name=target.label,
-            target_type=PULL_REQUEST_TARGET_TYPE,
-            action=action,
-            roles=roles,
-            user_requirements=(request.content or "").strip(),
-            pull_request=target,
-        )
-        metadata = self._metadata_payload(
-            admission_target=target,
-            plan=plan,
-            repository_id=repository_row.id,
-            pull_request_id=pull_row.id,
-            run_id=run_id,
-            snapshot=snapshot,
-            focus=request.focus,
-        )
-        try:
-            await self._sessions.update_metadata(session_key, metadata)
-        except Exception as exc:
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.PERSISTENCE_FAILED,
-                f"Cannot persist the review session metadata: {exc}",
             ) from exc
 
         logger.info(
@@ -420,6 +423,17 @@ class ReviewAdmissionService:
                     f"with status '{status}'. Wait for it to finish or cancel it."
                 ),
             )
+
+    async def _discard_run(self, run_id: str) -> None:
+        """Best-effort removal of a run row whose admission did not complete.
+
+        Secondary failures here are logged and swallowed: the original
+        admission error is the one worth surfacing.
+        """
+        try:
+            await self._storage.runs.delete(run_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must mask nothing
+            logger.warning("review.admission.discard_failed run_id={} reason={}", run_id, exc)
 
     # -- GitHub -------------------------------------------------------------
 

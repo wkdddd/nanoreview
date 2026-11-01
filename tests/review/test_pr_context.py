@@ -230,6 +230,28 @@ async def test_judge_path_scope_blocks_reads_outside_the_bound_paths() -> None:
 
 
 @pytest.mark.asyncio
+async def test_judge_path_scope_blocks_search_outside_the_bound_paths() -> None:
+    """``search`` with no scope must not widen a bounded role to the whole tree."""
+    session, github = _session(
+        limits=JUDGE_CONTEXT_LIMITS,
+        path_scopes=("src",),
+        tree={"src/a.py": 20, "docs/readme.md": 10, "secrets/keys.txt": 30},
+        texts={
+            ("acme", "src/a.py", _HEAD): "token here\n",
+            ("acme", "secrets/keys.txt", _HEAD): "token here\n",
+        },
+    )
+
+    result = await session.search("token")
+
+    assert not result.is_error
+    assert "src/a.py" in result.text
+    assert "secrets/keys.txt" not in result.text
+    # The bounded session never fetched content outside its scopes.
+    assert all(read[1].startswith("src/") for read in github.reads)
+
+
+@pytest.mark.asyncio
 async def test_path_traversal_is_rejected() -> None:
     session, _ = _session()
 

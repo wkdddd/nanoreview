@@ -589,6 +589,14 @@ class PrContextSession:
         for path in sorted(tree.paths):
             if prefix and not path.startswith(prefix):
                 continue
+            # A bounded role (the Judge) must not reach the whole tree through
+            # ``search``: an empty scope would otherwise widen its candidate
+            # set from the scoped files to every path in the repository.
+            if self._path_scopes and not any(
+                path == bounded or path.startswith(f"{bounded}/")
+                for bounded in self._path_scopes
+            ):
+                continue
             name = path.rsplit("/", 1)[-1]
             if glob and not match_glob(path, name, glob):
                 continue
