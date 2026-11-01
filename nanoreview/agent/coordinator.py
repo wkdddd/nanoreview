@@ -92,6 +92,7 @@ from nanoreview.agent.review_loop import (
     persist_review_subagent_result,
 )
 from nanoreview.agent.review_state import (
+    INTERRUPTED_RUN_REASON,
     ReviewPhase,
     ReviewRunStatus,
 )
@@ -152,11 +153,6 @@ REVIEW_ALLOWED_COMMANDS = frozenset({"/status", "/stop"})
 #: Index / handoff markers stored on the persisted session messages.
 REVIEW_CONTEXT_EVENT = "review_context"
 REVIEW_HANDOFF_EVENT = "review_handoff"
-
-#: Reason recorded when a run lost its executor before producing a result.
-INTERRUPTED_RUN_REASON = (
-    "the review was interrupted before it produced a result and cannot be resumed"
-)
 
 #: Cancellation message stamped on the tasks ``/stop`` cancels, so a cancelled
 #: entry point can tell a deliberate stop from a timeout, a client disconnect
@@ -2151,12 +2147,17 @@ class SessionCoordinator:
         review is admitted. Callers that never enter :meth:`run` (the CLI
         one-shot review) must invoke this themselves before ``admit_review``.
 
-        A conversation-only process (no ``database.url``) never touches the
+        A conversation-only process (no configured DSN) never touches the
         database, and a database that is unreachable at boot only disables
         review admission later — it must not stop conversation turns.
         """
-        url = getattr(getattr(self._root_config, "database", None), "url", None)
-        if not url:
+        from nanoreview.storage.database import DatabaseNotConfiguredError, resolve_database_url
+
+        try:
+            resolve_database_url(
+                getattr(getattr(self._root_config, "database", None), "url", None)
+            )
+        except DatabaseNotConfiguredError:
             return
         try:
             interrupted = await self.storage().startup()

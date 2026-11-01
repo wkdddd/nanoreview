@@ -139,7 +139,10 @@ class ReviewValidator:
                     "points outside the reviewed diff"
                 ),
             )
-        if candidate.line is not None:
+        if candidate.line is not None and candidate.side != "old":
+            # ``changed_ranges`` holds new-side line numbers only; an old-side
+            # (merge base) line number cannot be checked against them, so the
+            # boundary check stays on the changed-file set for that side.
             ranges = self._ctx.changed_ranges.get(path, ())
             if ranges and not line_in_ranges(candidate.line, ranges):
                 return ReviewFindingVerdict(

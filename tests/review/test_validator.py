@@ -7,8 +7,6 @@ the reviewer.
 
 from __future__ import annotations
 
-import pytest
-
 from nanoreview.review.output.validator import ReviewValidator, ValidationContext
 
 
@@ -70,6 +68,11 @@ class TestAccepted:
     def test_line_outside_declared_ranges_accepted_when_ranges_unknown(self) -> None:
         """Without diff ranges the validator cannot claim the line is untouched."""
         result = _validate(_finding(), validator=_validator(changed_ranges={}))
+        assert len(result.accepted) == 1
+
+    def test_old_side_line_is_not_checked_against_new_side_ranges(self) -> None:
+        """Merge-base line numbers cannot be validated by new-side ranges."""
+        result = _validate(_finding(side="old", line=3))
         assert len(result.accepted) == 1
 
     def test_end_line_and_side_are_preserved(self) -> None:

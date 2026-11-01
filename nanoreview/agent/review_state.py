@@ -75,6 +75,11 @@ REVIEW_TERMINAL_STATUSES = frozenset(
     {ReviewRunStatus.COMPLETED, ReviewRunStatus.ERROR, ReviewRunStatus.STOPPED}
 )
 
+#: Reason recorded when a run lost its executor before producing a result.
+INTERRUPTED_RUN_REASON = (
+    "the review was interrupted before it produced a result and cannot be resumed"
+)
+
 #: Child (reviewer/judge) error/failure reason length cap. Error text stored on
 #: the board must be bounded so a huge subagent transcript or provider trace
 #: cannot inflate the in-process audit trail.

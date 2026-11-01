@@ -83,6 +83,7 @@ class FakeRuns:
     marked: list[dict[str, Any]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     by_request: dict[str, Any] = field(default_factory=dict)
+    store: dict[str, Any] = field(default_factory=dict)
 
     async def create(self, **kwargs: Any) -> None:
         self.created.append(kwargs)
@@ -95,6 +96,9 @@ class FakeRuns:
 
     async def delete(self, run_id: str) -> None:
         self.deleted.append(run_id)
+
+    async def get(self, run_id: str) -> Any | None:
+        return self.store.get(run_id)
 
     async def find_by_request_id(self, request_id: str) -> Any | None:
         return self.by_request.get(request_id)
@@ -268,6 +272,7 @@ async def test_admit_rejects_duplicate_request_id() -> None:
     @dataclass(frozen=True)
     class _Existing:
         id: str = "run-existing"
+        status: str = "running"
 
     runs.by_request["req-1"] = _Existing()
     service, *_ = _service(runs=runs)
@@ -281,13 +286,41 @@ async def test_admit_rejects_duplicate_request_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_admit_allows_retry_after_the_process_lost_the_run() -> None:
+    """An interrupted run never delivered a result: request_id is reusable."""
+    runs = FakeRuns()
+
+    @dataclass(frozen=True)
+    class _Interrupted:
+        id: str = "run-old"
+        status: str = "interrupted"
+
+    runs.by_request["req-1"] = _Interrupted()
+    service, _github, runs, _sessions = _service(runs=runs)
+    admission = await service.admit(
+        ReviewAdmissionRequest(
+            repository="octo/demo", pull_request=7, request_id="req-1"
+        )
+    )
+    assert admission.run_id != "run-old"
+
+
+@pytest.mark.asyncio
 async def test_admit_rejects_session_with_running_review() -> None:
     sessions = FakeSessions()
     sessions.stored["review:test"] = {
         ReviewMetaKey.RUN_ID: "run-1",
         ReviewMetaKey.STATUS: "running",
     }
-    service, *_ = _service(sessions=sessions)
+    runs = FakeRuns()
+
+    @dataclass(frozen=True)
+    class _Running:
+        id: str = "run-1"
+        status: str = "running"
+
+    runs.store["run-1"] = _Running()
+    service, *_ = _service(sessions=sessions, runs=runs)
     with pytest.raises(ReviewAdmissionError) as exc:
         await service.admit(
             ReviewAdmissionRequest(
@@ -295,6 +328,57 @@ async def test_admit_rejects_session_with_running_review() -> None:
             )
         )
     assert exc.value.code == ReviewAdmissionCode.DUPLICATE_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_admit_repairs_stale_session_metadata_after_a_restart() -> None:
+    """A crash orphans the session metadata; the retry repairs, not rejects."""
+    sessions = FakeSessions()
+    sessions.stored["review:test"] = {
+        ReviewMetaKey.RUN_ID: "run-1",
+        ReviewMetaKey.STATUS: "running",
+    }
+    runs = FakeRuns()
+
+    @dataclass(frozen=True)
+    class _Interrupted:
+        id: str = "run-1"
+        status: str = "interrupted"
+
+    runs.store["run-1"] = _Interrupted()
+    service, *_ = _service(sessions=sessions, runs=runs)
+
+    admission = await service.admit(
+        ReviewAdmissionRequest(
+            repository="octo/demo", pull_request=7, session_key="review:test"
+        )
+    )
+
+    # The stale running entry did not block the retry, and the session now
+    # belongs to the new run (the repair write is superseded by the new
+    # admission's own metadata).
+    assert admission.run_id != "run-1"
+    repaired = sessions.stored["review:test"]
+    assert repaired[ReviewMetaKey.RUN_ID] == admission.run_id
+
+
+@pytest.mark.asyncio
+async def test_admit_maps_a_storage_outage_to_a_stable_code() -> None:
+    """The database being down is a rejection, not a raw driver traceback."""
+    runs = FakeRuns()
+
+    async def down(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("connection refused")
+
+    runs.find_by_request_id = down  # type: ignore[method-assign]
+    service, *_ = _service(runs=runs)
+    with pytest.raises(ReviewAdmissionError) as exc:
+        await service.admit(
+            ReviewAdmissionRequest(
+                repository="octo/demo", pull_request=7, request_id="req-1"
+            )
+        )
+    assert exc.value.code == ReviewAdmissionCode.PERSISTENCE_FAILED
 
 
 @pytest.mark.asyncio

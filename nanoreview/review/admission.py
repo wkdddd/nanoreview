@@ -27,6 +27,7 @@ from typing import Any, Protocol
 from loguru import logger
 
 from nanoreview.agent.review_state import (
+    INTERRUPTED_RUN_REASON,
     REVIEW_TERMINAL_STATUSES,
     ReviewPhase,
     ReviewRunStatus,
@@ -245,7 +246,23 @@ class ReviewAdmissionService:
     # -- public API ---------------------------------------------------------
 
     async def admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
-        """Validate *request* and return an accepted admission, or raise."""
+        """Validate *request* and return an accepted admission, or raise.
+
+        Every rejection is a :class:`ReviewAdmissionError` with a stable code —
+        including storage failures (database down, schema not migrated), so a
+        rejecting transport never leaks a raw driver traceback.
+        """
+        try:
+            return await self._admit(request)
+        except ReviewAdmissionError:
+            raise
+        except Exception as exc:
+            raise ReviewAdmissionError(
+                ReviewAdmissionCode.PERSISTENCE_FAILED,
+                f"Review admission failed: {exc}",
+            ) from exc
+
+    async def _admit(self, request: ReviewAdmissionRequest) -> ReviewAdmission:
         action = self._resolve_action(request)
         roles = self._resolve_roles(request)
         owner, name, number = self._resolve_target(request)
@@ -400,10 +417,16 @@ class ReviewAdmissionService:
         return owner, name, number
 
     async def _reject_unavailable(self, session_key: str, request_id: str | None) -> None:
-        """Refuse a repeated submit or a session whose review is still running."""
+        """Refuse a repeated submit or a session whose review is still running.
+
+        A run left ``interrupted`` (process restarted before it finished) never
+        delivered a result, so both its request_id and its session are
+        reusable: the stale session metadata is normalized here — the same
+        repair the conversation gate applies — instead of blocking the retry.
+        """
         if request_id:
             existing = await self._storage.runs.find_by_request_id(request_id)
-            if existing is not None:
+            if existing is not None and existing.status != "interrupted":
                 raise ReviewAdmissionError(
                     ReviewAdmissionCode.DUPLICATE_REQUEST,
                     f"Request '{request_id}' was already submitted as run '{existing.id}'.",
@@ -416,12 +439,25 @@ class ReviewAdmissionService:
         status = str(metadata.get(ReviewMetaKey.STATUS) or "")
         terminal = {item.value for item in REVIEW_TERMINAL_STATUSES}
         if status and status not in terminal:
-            raise ReviewAdmissionError(
-                ReviewAdmissionCode.DUPLICATE_REVIEW,
-                (
-                    f"Session '{session_key}' already owns review run '{run_id}' "
-                    f"with status '{status}'. Wait for it to finish or cancel it."
-                ),
+            row = await self._storage.runs.get(str(run_id))
+            if row is not None and row.status != "interrupted":
+                raise ReviewAdmissionError(
+                    ReviewAdmissionCode.DUPLICATE_REVIEW,
+                    (
+                        f"Session '{session_key}' already owns review run '{run_id}' "
+                        f"with status '{status}'. Wait for it to finish or cancel it."
+                    ),
+                )
+            # The executor of this run is gone; the DB row confirms it. Repair
+            # the stale metadata so the gate opens for the retry.
+            await self._sessions.update_metadata(
+                session_key,
+                {
+                    ReviewMetaKey.STATUS: ReviewRunStatus.ERROR.value,
+                    ReviewMetaKey.PHASE: ReviewPhase.DONE.value,
+                    ReviewMetaKey.SUMMARY: INTERRUPTED_RUN_REASON,
+                    ReviewMetaKey.ERROR: INTERRUPTED_RUN_REASON,
+                },
             )
 
     async def _discard_run(self, run_id: str) -> None:
