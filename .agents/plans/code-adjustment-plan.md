@@ -131,7 +131,7 @@
 - 新 snapshot 与报告不再写 Planner 专属数据，改记预处理接纳、任务分配与预算跳过；报告去掉 `Mode:` 行与 `Triage Outcome` 段，只列所选 Reviewer。
 - **前端暂不修改**：现有 Auto 将启动 general，Custom 继续支持多选；Auto 文案暂时不准确，记录为后续前端事项。
 - 验收口径：新审查不再产生 Planner 模型调用；默认 general、五项自由组合生效；现有证据准备与审查能力保留，前端现有提交流程可继续使用。
-- 遗留：当前确认节点（run 黑板与结构化输出收敛）里对 Planner 角色的描述需按「无 Planner」重写，尚未实施。
+- 遗留：run 黑板节点里对 Planner 角色的描述已随 `7c000b1d` 按「无 Planner」重写。
 
 ### run 黑板与结构化输出收敛（2026-10-25，已验收）
 
@@ -196,4 +196,3 @@ git diff --check
 - diff-only 预处理清理（2026-10-22 追加：移除 `classify_path` 语言分类与 `unsupported_code_type` 跳过，任何路径的 diff 都按文本证据处理）、reviewer 三态/general 均已实施，待验收；原 Planner 分诊随节点移除作废。
 - WebUI 的 reviewer mode 三态适配、Dream 配置表单与草稿态展示留待已确认的前端节点。
 - `tests/agent/rag/test_rag_review.py` 的 local_changed_summary 用例依赖 git 子进程，在本机沙箱中属既有环境失败。
-
