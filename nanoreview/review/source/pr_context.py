@@ -41,10 +41,16 @@ _SIDE_OLD = "old"
 
 @dataclass(frozen=True, slots=True)
 class PrContextLimits:
-    """Per-run budgets frozen when the agent starts."""
+    """Per-run read budgets frozen when the agent starts.
+
+    There is deliberately no tool-call count here: the runner's
+    ``max_iterations`` and the token budgets (per-result caps plus the
+    input-budget governor) already bound how much a run can read, and a call
+    count adds an artificial failure mode without protecting anything real.
+    ``PrContextSession.tool_calls`` is still counted for observability only.
+    """
 
     allowed_actions: frozenset[str] = _ALL_ACTIONS
-    max_tool_calls: int = 24
     max_read_lines: int = 200
     max_read_bytes: int = 8 * 1024
     max_source_files: int = 128
@@ -56,11 +62,9 @@ class PrContextLimits:
     scan_seconds: float = 30.0
 
 
-REVIEWER_CONTEXT_LIMITS = PrContextLimits(
-    allowed_actions=_ALL_ACTIONS, max_tool_calls=24
-)
+REVIEWER_CONTEXT_LIMITS = PrContextLimits(allowed_actions=_ALL_ACTIONS)
 JUDGE_CONTEXT_LIMITS = PrContextLimits(
-    allowed_actions=frozenset({"diff", "read", "search"}), max_tool_calls=6
+    allowed_actions=frozenset({"diff", "read", "search"})
 )
 
 
@@ -496,12 +500,9 @@ class PrContextSession:
             return self._error(
                 f"{action}: this role may only use {sorted(self._limits.allowed_actions)}"
             )
+        # Observability only: reads are bounded by per-result caps and the
+        # input-budget governor, not by a call count.
         self.tool_calls += 1
-        if self.tool_calls > self._limits.max_tool_calls:
-            return self._error(
-                f"{action}: tool-call budget exhausted "
-                f"({self._limits.max_tool_calls} calls); answer with the evidence already read"
-            )
         return None
 
     def _error(self, message: str) -> ContextResult:

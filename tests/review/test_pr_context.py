@@ -142,19 +142,17 @@ async def test_read_line_and_byte_budgets_are_enforced() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reviewer_tool_call_budget_is_visible() -> None:
+async def test_reviewer_reads_are_not_call_capped() -> None:
+    """No tool-call count limit: only token budgets bound how much is read."""
     session, _ = _session(texts={("acme", "src/a.py", _HEAD): "line\n"})
-    for _ in range(REVIEWER_CONTEXT_LIMITS.max_tool_calls):
+    for _ in range(40):
         result = await session.read("src/a.py")
         assert not result.is_error
-
-    exhausted = await session.read("src/a.py")
-    assert exhausted.is_error
-    assert "budget exhausted" in exhausted.text
+    assert session.tool_calls == 40
 
 
 @pytest.mark.asyncio
-async def test_judge_cannot_list_and_has_a_six_call_budget() -> None:
+async def test_judge_cannot_list_actions_outside_its_role() -> None:
     session, _ = _session(
         limits=JUDGE_CONTEXT_LIMITS,
         texts={("acme", "src/a.py", _HEAD): "line\n"},
@@ -164,9 +162,9 @@ async def test_judge_cannot_list_and_has_a_six_call_budget() -> None:
     assert blocked.is_error
     assert "may only use" in blocked.text
 
-    for _ in range(JUDGE_CONTEXT_LIMITS.max_tool_calls):
+    # Its allowed actions work without a call cap either.
+    for _ in range(10):
         assert not (await session.read("src/a.py")).is_error
-    assert (await session.read("src/a.py")).is_error
 
 
 @pytest.mark.asyncio
